@@ -109,6 +109,7 @@ class Bridge(QObject):
     media_finished = pyqtSignal(object)
     windows_metadata_finished = pyqtSignal(object, object, object)
     uefi_preparation_finished = pyqtSignal(object, object, object)
+    device_refresh_finished = pyqtSignal(object, object)
 
 
 class Window(QMainWindow):
@@ -118,6 +119,8 @@ class Window(QMainWindow):
         self.inspection: ImageInspection | None = None
         self.inspection_identity: object | None = None
         self.write_recommendation: WriteMethodRecommendation | None = None
+        self.device_refresh_generation = 0
+        self.device_refresh_busy = False
         self.checksum_busy = False
         self.devices: list[Device] = []
         self.writer: ImageWriter | None = None
@@ -160,6 +163,7 @@ class Window(QMainWindow):
         self.bridge.uefi_preparation_finished.connect(
             self.on_uefi_preparation_finished
         )
+        self.bridge.device_refresh_finished.connect(self.on_devices_refreshed)
         QShortcut(QKeySequence.StandardKey.Open, self, activated=self.choose_image)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_devices)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.show_log)
@@ -369,25 +373,73 @@ class Window(QMainWindow):
             self.load_image(Path(urls[0].toLocalFile()))
             event.acceptProposedAction()
 
-    def refresh_devices(self) -> None:
+    def refresh_devices(self, _checked: bool = False) -> None:
+        if self.operation_active:
+            return
+        self.device_refresh_generation += 1
+        generation = self.device_refresh_generation
+        include_external = self.show_external.isChecked()
+        ignored = self.ignored_devices()
+        self.device_refresh_busy = True
+        self.device_combo.setEnabled(False)
+        self.update_ready()
+        self.status.setText("Scanning removable drives…")
+
+        def work() -> None:
+            try:
+                result: object = tuple(
+                    device for device in list_devices(include_external)
+                    if not device.read_only and device.stable_id not in ignored
+                )
+            except Exception as error:
+                result = error
+            self.bridge.device_refresh_finished.emit(generation, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_devices_refreshed(self, generation: object, result: object) -> None:
+        if generation != self.device_refresh_generation:
+            return
+        previous = self.selected_device()
+        previous_key = (
+            (previous.stable_id or previous.path) if previous is not None else None
+        )
+        self.device_refresh_busy = False
+        self.device_combo.blockSignals(True)
         self.device_combo.clear()
-        try:
-            ignored = self.ignored_devices()
-            self.devices = [
-                d for d in list_devices(self.show_external.isChecked())
-                if not d.read_only and d.stable_id not in ignored
-            ]
-            self.logger.info("Detected removable targets: %s", ", ".join(d.path for d in self.devices) or "none")
+        error_message = ""
+        if isinstance(result, Exception):
+            self.logger.warning("Drive discovery failed: %s", result)
+            self.devices = []
+            self.device_combo.addItem("Could not inspect drives")
+            error_message = str(result)
+        elif isinstance(result, tuple) and all(
+            isinstance(item, Device) for item in result
+        ):
+            self.devices = list(result)
+            self.logger.info(
+                "Detected removable targets: %s",
+                ", ".join(device.path for device in self.devices) or "none",
+            )
             for device in self.devices:
                 self.device_combo.addItem(device.label)
             if not self.devices:
                 self.device_combo.addItem("No removable drives found")
-        except Exception as error:
-            self.logger.exception("Drive discovery failed")
+            elif previous_key is not None:
+                for index, device in enumerate(self.devices):
+                    if (device.stable_id or device.path) == previous_key:
+                        self.device_combo.setCurrentIndex(index)
+                        break
+        else:
+            self.logger.error("Drive discovery returned an invalid internal result")
             self.devices = []
             self.device_combo.addItem("Could not inspect drives")
-            self.status.setText(str(error))
+            error_message = "Drive discovery returned an invalid result"
+        self.device_combo.blockSignals(False)
+        self.device_combo.setEnabled(bool(self.devices))
         self.on_device_changed()
+        if error_message:
+            self.status.setText(error_message)
 
     def selected_device(self) -> Device | None:
         index = self.device_combo.currentIndex()
@@ -514,9 +566,12 @@ class Window(QMainWindow):
             and plan.minimum_target_bytes <= device.size
         )
         self.write_button.setEnabled(
-            enough_space and not self.operation_active and self.inspection is not None and not self.checksum_busy
+            enough_space and not self.operation_active and self.inspection is not None
+            and not self.checksum_busy and not self.device_refresh_busy
         )
-        self.tools_button.setEnabled(bool(device) and not self.operation_active)
+        self.tools_button.setEnabled(
+            bool(device) and not self.operation_active and not self.device_refresh_busy
+        )
         if device:
             serial = device.serial or device.wwn or "not reported"
             media_type = "Removable media" if device.removable else "External fixed disk"

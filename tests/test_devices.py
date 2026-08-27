@@ -1,11 +1,12 @@
 import json
 # SPDX-License-Identifier: AGPL-3.0-or-later
+import subprocess
 import unittest
 from unittest.mock import patch
 
 from isopropyl.devices import (
-    Device, format_size, image_is_on_device, list_devices, parse_lsblk,
-    path_is_on_device,
+    MAX_DEVICE_DISCOVERY_OUTPUT, Device, DeviceDiscoveryError, format_size,
+    image_is_on_device, list_devices, parse_lsblk, path_is_on_device,
 )
 
 
@@ -62,9 +63,34 @@ class DeviceTests(unittest.TestCase):
     @patch("isopropyl.devices.subprocess.run")
     def test_lsblk_is_explicitly_requested_as_a_tree(self, run):
         run.return_value.stdout = '{"blockdevices": []}'
+        run.return_value.stderr = ""
+        run.return_value.returncode = 0
         list_devices()
         command = run.call_args.args[0]
         self.assertIn("--tree", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 15)
+        self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_device_discovery_timeout_and_output_are_bounded(self):
+        def timed_out(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired("lsblk", 15)
+
+        with self.assertRaisesRegex(DeviceDiscoveryError, "timed out"):
+            list_devices(runner=timed_out)
+
+        completed = subprocess.CompletedProcess(
+            ["lsblk"], 0, "x" * (MAX_DEVICE_DISCOVERY_OUTPUT + 1), "",
+        )
+        with self.assertRaisesRegex(DeviceDiscoveryError, "too much output"):
+            list_devices(runner=lambda *_args, **_kwargs: completed)
+
+    def test_device_discovery_failure_and_invalid_json_are_normalized(self):
+        failed = subprocess.CompletedProcess(["lsblk"], 1, "", "no device access")
+        with self.assertRaisesRegex(DeviceDiscoveryError, "no device access"):
+            list_devices(runner=lambda *_args, **_kwargs: failed)
+        invalid = subprocess.CompletedProcess(["lsblk"], 0, "not json", "")
+        with self.assertRaisesRegex(DeviceDiscoveryError, "invalid data"):
+            list_devices(runner=lambda *_args, **_kwargs: invalid)
 
     @patch("isopropyl.devices.os.stat")
     def test_detects_image_stored_on_target_partition(self, stat):

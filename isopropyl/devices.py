@@ -6,6 +6,15 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
+from collections.abc import Callable
+
+
+DEVICE_DISCOVERY_TIMEOUT_SECONDS = 15
+MAX_DEVICE_DISCOVERY_OUTPUT = 2 * 1024 * 1024
+
+
+class DeviceDiscoveryError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -99,14 +108,38 @@ def parse_lsblk(payload: str, include_usb_hdds: bool = False) -> list[Device]:
     return devices
 
 
-def list_devices(include_usb_hdds: bool = False) -> list[Device]:
+def list_devices(
+    include_usb_hdds: bool = False,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> list[Device]:
     fields = "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,MAJ:MIN,MOUNTPOINTS,RO"
-    result = subprocess.run(
-        ["lsblk", "--tree", "--bytes", "--json", "--output", fields],
-        check=True, capture_output=True, text=True,
-    )
+    execute = runner or subprocess.run
+    try:
+        result = execute(
+            ["lsblk", "--tree", "--bytes", "--json", "--output", fields],
+            check=False, capture_output=True, text=True,
+            timeout=DEVICE_DISCOVERY_TIMEOUT_SECONDS, shell=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise DeviceDiscoveryError("Drive discovery timed out") from error
+    except OSError as error:
+        raise DeviceDiscoveryError("Could not start drive discovery") from error
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    if len(stdout.encode("utf-8")) + len(stderr.encode("utf-8")) > (
+        MAX_DEVICE_DISCOVERY_OUTPUT
+    ):
+        raise DeviceDiscoveryError("Drive discovery produced too much output")
+    if result.returncode:
+        detail = stderr.strip()[-2048:]
+        raise DeviceDiscoveryError(detail or "Drive discovery failed")
+    try:
+        devices = parse_lsblk(stdout, include_usb_hdds)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise DeviceDiscoveryError("Drive discovery returned invalid data") from error
     return sorted(
-        parse_lsblk(result.stdout, include_usb_hdds),
+        devices,
         key=lambda device: (device.size, device.vendor.casefold(), device.model.casefold(), device.path),
     )
 

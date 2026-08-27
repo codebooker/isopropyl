@@ -65,6 +65,9 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.settings_home = tempfile.TemporaryDirectory()
         with patch("isopropyl.app.list_devices", return_value=[]):
             self.window = Window()
+        # Any queued result from the constructor's worker is now deliberately stale.
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
         self.window.image = Path(self.settings_home.name) / "windows.iso"
         self.window.image.write_bytes(b"fixture")
         self.window.inspection = optical_windows_inspection()
@@ -124,6 +127,33 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertEqual(plan.mode, WriteMode.EXTRACTED_ISO)
         self.assertTrue(plan.executable)
         self.assertLessEqual(plan.minimum_target_bytes, self.window.devices[0].size)
+
+    def test_stale_device_refresh_cannot_replace_newer_target_state(self):
+        original = self.window.devices[0]
+        self.window.device_refresh_generation = 9
+        replacement = Device(
+            "/dev/sdy", original.size, "Other", "ISOpropyl", "usb", "OTHER",
+            "", "65:143", True, True, False, (), (),
+        )
+
+        self.window.on_devices_refreshed(8, (replacement,))
+
+        self.assertEqual(self.window.devices, [original])
+
+    def test_current_device_refresh_replaces_targets_and_clears_busy_state(self):
+        self.window.device_refresh_generation = 4
+        self.window.device_refresh_busy = True
+        replacement = Device(
+            "/dev/sdy", 16 * 1024**3, "Other", "ISOpropyl", "usb", "OTHER",
+            "", "65:143", True, True, False, (), (),
+        )
+
+        self.window.on_devices_refreshed(4, (replacement,))
+
+        self.assertEqual(self.window.devices, [replacement])
+        self.assertFalse(self.window.device_refresh_busy)
+        self.assertTrue(self.window.device_combo.isEnabled())
+        self.assertEqual(self.window.selected_device(), replacement)
 
 
 if __name__ == "__main__":

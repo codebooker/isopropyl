@@ -108,7 +108,7 @@ Status meanings:
 | Rufus UI/workflow | Status | ISOpropyl evidence and remaining work |
 |---|---:|---|
 | Device model, capacity, path, serial/WWN | **Done** | Deterministic size/model/path sorting and explicit identity display. |
-| Bounded background device refresh | **Planned** | Device enumeration is currently synchronous and `lsblk` has no explicit timeout/output bound; move it off the Qt UI thread with stale-result suppression. |
+| Bounded background device refresh | **Done** | `lsblk` runs off the Qt thread with a 15-second timeout, a 2 MiB combined-output ceiling, normalized failures, generation tokens that discard stale results, and write controls disabled while target state is refreshing. |
 | Ignore selected USB devices | **Done** | Persistent stable-ID denylist and reset controls. |
 | Show USB hard drives/SSDs | **Done** | Visible explicit opt-in; root/internal disks remain excluded. |
 | Partition scheme selector | **Partial** | MBR/GPT available for restore; current ISO profile fixes GPT. |

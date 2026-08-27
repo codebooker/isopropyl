@@ -58,8 +58,8 @@ evidence.
 
 ## Product quality
 
-- Move bounded `lsblk` device discovery to a background worker with generation
-  tokens so stale refreshes can never replace newer target state.
+- Continue applying the bounded-worker and stale-result pattern used by device
+  discovery to any future host probes that could delay the UI.
 - Localization, system/high-contrast appearance, keyboard and screen-reader QA.
 - Conflicting-process diagnostics and narrowly bounded I/O retries.
 - Cluster size, filesystem, partition-layout, and volume-label controls where the
