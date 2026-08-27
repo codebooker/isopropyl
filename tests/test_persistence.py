@@ -92,6 +92,7 @@ class PersistenceTests(unittest.TestCase):
 
 PROGRAMS = {
     "pkexec": "/usr/bin/pkexec",
+    "flock": "/usr/bin/flock",
     "sfdisk": "/usr/sbin/sfdisk",
     "partprobe": "/usr/sbin/partprobe",
     "udevadm": "/usr/bin/udevadm",
@@ -205,12 +206,16 @@ class FakeProcess:
 
 
 class BackendHarness:
-    def __init__(self, root: Path, *, fail_command=None, wrong_geometry=False):
+    def __init__(
+        self, root: Path, *, fail_command=None, fail_code=1,
+        wrong_geometry=False,
+    ):
         self.root = root
         self.device = persistence_device()
         self.initial = initial_layout(root)
         self.state = "initial"
         self.fail_command = fail_command
+        self.fail_code = fail_code
         self.wrong_geometry = wrong_geometry
         self.processes = []
 
@@ -247,7 +252,7 @@ class BackendHarness:
 
     def popen(self, argv, **kwargs):
         command = list(argv)
-        code = 1 if self.fail_command and any(
+        code = self.fail_code if self.fail_command and any(
             item == self.fail_command or item.endswith("/" + self.fail_command)
             for item in command
         ) else 0
@@ -372,7 +377,7 @@ class PersistenceBackendPlanTests(unittest.TestCase):
             self.assertEqual(
                 persistence_partition_command(plan),
                 [
-                    "/usr/bin/pkexec", "/usr/sbin/sfdisk", "--lock=yes",
+                    "/usr/bin/pkexec", "/usr/sbin/sfdisk", "--lock=nonblock",
                     "--no-reread", "--append", "/dev/sdz",
                 ],
             )
@@ -381,6 +386,35 @@ class PersistenceBackendPlanTests(unittest.TestCase):
                 persistence_partition_script(plan),
             )
             self.assertEqual(persistence_format_command(plan)[-3:], ["-L", "writable", "/dev/sdz2"])
+            self.assertEqual(
+                persistence_format_command(plan)[:9],
+                [
+                    "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive",
+                    "--nonblock", "--conflict-exit-code", "75", "--no-fork",
+                    "/dev/sdz", "/usr/sbin/mkfs.ext4",
+                ],
+            )
+
+    def test_missing_cooperative_lock_fails_before_device_lookup(self):
+        calls = []
+
+        def lookup(_path):
+            calls.append("lookup")
+            return persistence_device()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_media(root)
+            with self.assertRaisesRegex(PersistenceBackendError, "flock"):
+                build_casper_persistence_backend_plan(
+                    root,
+                    persistence_device(),
+                    1024 * MIB,
+                    ubuntu_casper_profile("24.04"),
+                    finder=lambda name: None if name == "flock" else find_program(name),
+                    device_lookup=lookup,
+                )
+        self.assertEqual(calls, [])
 
     def test_plan_rejects_release_mismatch_full_disk_wrong_label_and_extra_partition(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -892,6 +926,41 @@ class PersistenceBackendExecutorTests(unittest.TestCase):
             self.assertEqual(harness.state, "initial")
             self.assertTrue(any("--delete" in process.argv for process in harness.processes))
             self.assertNotIn("persistent", (root / "boot/grub/grub.cfg").read_text())
+
+    def test_mkfs_lock_conflict_has_specific_error_and_cleans_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_media(root)
+            harness = BackendHarness(
+                root, fail_command="mkfs.ext4", fail_code=75,
+            )
+            plan = harness.build()
+            with self.assertRaisesRegex(
+                PersistenceBackendError, "lock-aware storage operation",
+            ):
+                harness.executor().execute(plan)
+            self.assertEqual(harness.state, "initial")
+            self.assertTrue(any("--delete" in process.argv for process in harness.processes))
+            self.assertTrue(all(
+                "--lock=nonblock" in process.argv
+                for process in harness.processes
+                if any(item.endswith("/sfdisk") for item in process.argv)
+            ))
+
+    def test_unwrapped_exit_75_is_not_misreported_as_a_lock_conflict(self):
+        def popen(argv, **kwargs):
+            return FakeProcess(
+                argv, code=75, stderr_data=b"partprobe temporary failure", **kwargs,
+            )
+
+        executor = CasperPersistenceExecutor(popen=popen)
+        with self.assertRaisesRegex(
+            PersistenceBackendError, "partprobe temporary failure",
+        ) as raised:
+            executor._run_process([
+                "/usr/bin/pkexec", "/usr/sbin/partprobe", "/dev/sdz",
+            ])
+        self.assertNotIn("lock-aware", str(raised.exception))
 
     def test_cancel_between_config_updates_rolls_back_first_and_deletes_partition(self):
         with tempfile.TemporaryDirectory() as directory:

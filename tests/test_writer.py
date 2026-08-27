@@ -212,14 +212,50 @@ class WriterTests(unittest.TestCase):
             updates = []
             writer.write(image, harness.device, lambda done, total: updates.append((done, total)))
         self.assertEqual(updates[-1], (12, 12))
-        self.assertEqual(harness.processes[0].argv[:2], ["/usr/bin/pkexec", "/usr/bin/dd"])
-        self.assertIn("of=/dev/sdz", harness.processes[0].argv)
+        argv = harness.processes[0].argv
+        self.assertEqual(argv[:2], ["/usr/bin/pkexec", "/usr/bin/flock"])
+        self.assertEqual(argv[2:9], [
+            "--exclusive", "--nonblock", "--conflict-exit-code", "75",
+            "--no-fork", "/dev/sdz", "/usr/bin/dd",
+        ])
+        self.assertIn("of=/dev/sdz", argv)
         self.assertFalse(harness.processes[0].kwargs["shell"])
         self.assertTrue(all(call[1]["shell"] is False for call in harness.run_calls))
         self.assertIn(
             ["/usr/bin/udisksctl", "unmount", "--block-device", "/dev/sdz1"],
             [call[0] for call in harness.run_calls],
         )
+
+    def test_missing_or_untrusted_flock_fails_before_unmount(self):
+        for value in (None, "flock", "/tmp/flock", "/usr/bin/../bin/flock"):
+            with self.subTest(value=value):
+                harness = WriterHarness()
+
+                def finder(name, value=value):
+                    return value if name == "flock" else trusted_tool(name)
+
+                writer = ImageWriter(
+                    which=finder, runner=harness.runner, popen=harness.popen,
+                    device_lookup=harness.lookup,
+                    block_stat=lambda _path: block_status(),
+                )
+                with self.assertRaises(WriterToolUnavailable):
+                    writer.write(Path("unused.img"), harness.device, lambda _d, _t: None)
+                self.assertEqual(harness.run_calls, [])
+                self.assertEqual(harness.processes, [])
+
+    def test_raw_write_lock_conflict_has_specific_message(self):
+        harness = WriterHarness()
+        harness.process_factory = lambda argv, kwargs: FakeProcess(
+            argv, stderr_data=b"generic flock diagnostic", code=75, **kwargs,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.img"
+            image.write_bytes(b"hello world!")
+            with self.assertRaisesRegex(
+                WriterError, "Another lock-aware storage operation",
+            ):
+                harness.writer().write(image, harness.device, lambda _d, _t: None)
 
     def test_actual_block_number_mismatch_stops_before_unmount_or_write(self):
         harness = WriterHarness()
@@ -325,10 +361,33 @@ class WriterTests(unittest.TestCase):
             )
             self.assertTrue(writer.verify(image, harness.device.path, lambda _d, _t: None))
             verify_process = harness.processes[-1]
+            self.assertEqual(
+                verify_process.argv[:2], ["/usr/bin/pkexec", "/usr/bin/flock"],
+            )
+            self.assertEqual(
+                verify_process.argv[verify_process.argv.index("/dev/sdz") + 1],
+                "/usr/bin/dd",
+            )
             self.assertIn(f"count={len(content)}", verify_process.argv)
             self.assertFalse(verify_process.kwargs["shell"])
             image.write_bytes(b"changed data")
             with self.assertRaisesRegex(WriterSafetyError, "image changed"):
+                writer.verify(image, harness.device.path, lambda _d, _t: None)
+
+    def test_block_verification_lock_conflict_is_not_reported_as_hash_mismatch(self):
+        harness = WriterHarness()
+        writer = harness.writer()
+        content = b"hello world!"
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.img"
+            image.write_bytes(content)
+            writer.write(image, harness.device, lambda _d, _t: None)
+            harness.process_factory = lambda argv, kwargs: FakeProcess(
+                argv, stderr_data=b"busy", code=75, **kwargs,
+            )
+            with self.assertRaisesRegex(
+                WriterError, "Another lock-aware storage operation",
+            ):
                 writer.verify(image, harness.device.path, lambda _d, _t: None)
 
     def test_bare_block_verification_and_changed_poweroff_target_fail_closed(self):

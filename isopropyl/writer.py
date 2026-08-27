@@ -16,6 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .devices import Device, parse_lsblk
+from .locking import (
+    CooperativeLockError,
+    cooperative_lock_command,
+    lock_conflict_message,
+    resolve_flock,
+)
 from .sources import (
     ImageSource,
     ImageSourceError,
@@ -113,6 +119,15 @@ def resolve_writer_tools(
         name: _validate_tool_path(name, which(name))
         for name in ("pkexec", "dd", "udisksctl", "lsblk")
     })
+
+
+def _resolve_writer_flock(
+    which: Callable[[str], str | None],
+) -> str:
+    try:
+        return resolve_flock(which)
+    except CooperativeLockError as error:
+        raise WriterToolUnavailable(str(error)) from error
 
 
 def _partition_belongs_to_device(device_path: str, partition_path: str) -> bool:
@@ -382,6 +397,10 @@ class ImageWriter:
         self._check_cancelled()
         validate_device_selection(device, writable=True)
         tools = resolve_writer_tools(self._which)
+        # Resolve and bind the cooperative lock helper before unmounting or
+        # otherwise changing device state.  A missing or forged helper must
+        # fail while the selected drive is still untouched.
+        flock = _resolve_writer_flock(self._which)
         source = open_image_source(image)
         total = source.measure(maximum=device.size, cancel_check=self._check_cancelled)
         source_identity = source.identity
@@ -398,13 +417,18 @@ class ImageWriter:
         self._assert_source_bound(source, source_identity, total)
         self._check_cancelled()
         if source.compressed:
-            self._write_stream(source, device, tools, total, progress)
+            self._write_stream(source, device, tools, flock, total, progress)
             return
         self._revalidate(device, tools, writable=True)
-        command = [
-            tools.pkexec, tools.dd, f"if={source.path}", f"of={device.path}",
-            "bs=4M", "conv=fsync", "status=progress",
-        ]
+        command = cooperative_lock_command(
+            tools.pkexec,
+            flock,
+            device.path,
+            [
+                tools.dd, f"if={source.path}", f"of={device.path}",
+                "bs=4M", "conv=fsync", "status=progress",
+            ],
+        )
         logger.info("Starting raw write to %s (%d bytes)", device.path, total)
         environment = os.environ.copy()
         environment.update({"LC_ALL": "C", "LANG": "C"})
@@ -446,7 +470,9 @@ class ImageWriter:
             self._set_process(None)
         self._check_cancelled()
         if code:
-            raise WriterError(diagnostics.text() or "The privileged writer failed")
+            raise WriterError(lock_conflict_message(
+                code, diagnostics.text() or "The privileged writer failed",
+            ))
         self._assert_source_bound(source, source_identity, total)
         progress(total, total)
         logger.info("Raw write completed for %s", device.path)
@@ -456,15 +482,21 @@ class ImageWriter:
         source: ImageSource,
         device: Device,
         tools: WriterTools,
+        flock: str,
         total: int,
         progress: Progress,
     ) -> None:
         self._assert_source_bound(source, source.identity, total)
         self._revalidate(device, tools, writable=True)
-        command = [
-            tools.pkexec, tools.dd, f"of={device.path}", "bs=4M",
-            "conv=fsync", "status=none",
-        ]
+        command = cooperative_lock_command(
+            tools.pkexec,
+            flock,
+            device.path,
+            [
+                tools.dd, f"of={device.path}", "bs=4M",
+                "conv=fsync", "status=none",
+            ],
+        )
         logger.info(
             "Starting decompressed %s write to %s (%d bytes)",
             source.compression, device.path, total,
@@ -505,8 +537,11 @@ class ImageWriter:
             raise WriterError("The privileged writer produced too much diagnostic output")
         if code:
             raise WriterError(
-                diagnostic.decode(errors="replace").replace("\x00", "").strip()
-                or "The privileged writer failed"
+                lock_conflict_message(
+                    code,
+                    diagnostic.decode(errors="replace").replace("\x00", "").strip()
+                    or "The privileged writer failed",
+                )
             )
         if done != total:
             raise OSError(f"Could only write {done} of {total} decompressed bytes")
@@ -564,11 +599,21 @@ class ImageWriter:
             return matches
 
         tools = resolve_writer_tools(self._which)
+        # Verification is read-only, but it still requires a stable snapshot:
+        # otherwise a second cooperative writer could change bytes midway
+        # through hashing and produce a meaningless result.  Use the same
+        # exclusive whole-disk lock for the bounded read-back command.
+        flock = _resolve_writer_flock(self._which)
         self._revalidate(device, tools, writable=False)
-        command = [
-            tools.pkexec, tools.dd, f"if={device_path}", "bs=4M", f"count={size}",
-            "iflag=count_bytes", "status=none",
-        ]
+        command = cooperative_lock_command(
+            tools.pkexec,
+            flock,
+            device.path,
+            [
+                tools.dd, f"if={device_path}", "bs=4M", f"count={size}",
+                "iflag=count_bytes", "status=none",
+            ],
+        )
         try:
             process = self._spawn(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -604,8 +649,11 @@ class ImageWriter:
             raise WriterError("Verification produced too much diagnostic output")
         if code:
             raise WriterError(
-                diagnostic.decode(errors="replace").replace("\x00", "").strip()
-                or "Could not read the drive for verification"
+                lock_conflict_message(
+                    code,
+                    diagnostic.decode(errors="replace").replace("\x00", "").strip()
+                    or "Could not read the drive for verification",
+                )
             )
         if done != size:
             raise OSError(f"Could only verify {done} of {size} bytes")

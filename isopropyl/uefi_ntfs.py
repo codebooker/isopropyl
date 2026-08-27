@@ -58,6 +58,12 @@ from .formatting import (
     validate_explicit_partition_metadata,
     validate_multi_plan,
 )
+from .locking import (
+    CooperativeLockError,
+    cooperative_lock_command,
+    lock_conflict_message,
+    resolve_flock,
+)
 
 UEFI_NTFS_FAMILY = "uefi-ntfs"
 UEFI_NTFS_VERSION = "2.8-rufus-2368e49a"
@@ -124,6 +130,7 @@ class BoundArtifact:
 @dataclass(frozen=True)
 class UefiNtfsTools:
     pkexec: str
+    flock: str
     dd: str
     sfdisk: str
     lsblk: str
@@ -459,8 +466,13 @@ def build_uefi_ntfs_media_plan(
         raise UefiNtfsSafetyError(
             "The staged tree does not fit in the exact UEFI:NTFS data partition"
         )
+    try:
+        flock = resolve_flock(finder)
+    except CooperativeLockError as error:
+        raise UefiNtfsUnavailable(str(error)) from error
     tools = UefiNtfsTools(
         multi_tools.pkexec,
+        flock,
         _trusted_tool("dd", finder),
         multi_tools.sfdisk,
         multi_tools.lsblk,
@@ -532,6 +544,14 @@ def validate_uefi_ntfs_media_plan(plan: UefiNtfsMediaPlan) -> None:
             _trusted_tool(name, lambda requested, n=name, p=path: p if requested == n else None)
         except UefiNtfsUnavailable as error:
             raise UefiNtfsSafetyError("The plan contains an untrusted tool path") from error
+    try:
+        resolved_flock = resolve_flock(
+            lambda name: plan.tools.flock if name == "flock" else None
+        )
+    except CooperativeLockError as error:
+        raise UefiNtfsSafetyError("The plan contains an untrusted tool path") from error
+    if resolved_flock != plan.tools.flock:
+        raise UefiNtfsSafetyError("The plan contains inconsistent tool paths")
 
 
 class UefiNtfsExecutor:
@@ -717,7 +737,13 @@ class UefiNtfsExecutor:
                 raise UefiNtfsCancelled("UEFI:NTFS writing was cancelled")
             if process.returncode:
                 raise UefiNtfsError(
-                    _bounded(stderr.decode(errors="replace"), "Privileged raw I/O failed")
+                    lock_conflict_message(
+                        process.returncode,
+                        _bounded(
+                            stderr.decode(errors="replace"),
+                            "Privileged raw I/O failed",
+                        ),
+                    )
                 )
             return stdout
         except (UefiNtfsError, UefiNtfsCancelled):
@@ -735,17 +761,24 @@ class UefiNtfsExecutor:
     ) -> None:
         common = ["bs=1048576", "count=1", "iflag=fullblock", "status=none"]
         self._run_dd(
-            [
-                plan.tools.pkexec, plan.tools.dd, f"of={boot_partition}",
-                *common, "conv=fsync,notrunc",
-            ],
+            cooperative_lock_command(
+                plan.tools.pkexec,
+                plan.tools.flock,
+                plan.device.path,
+                [
+                    plan.tools.dd, f"of={boot_partition}",
+                    *common, "conv=fsync,notrunc",
+                ],
+            ),
             plan.artifact.data,
         )
         readback = self._run_dd(
-            [
-                plan.tools.pkexec, plan.tools.dd, f"if={boot_partition}",
-                *common,
-            ],
+            cooperative_lock_command(
+                plan.tools.pkexec,
+                plan.tools.flock,
+                plan.device.path,
+                [plan.tools.dd, f"if={boot_partition}", *common],
+            ),
             None,
         )
         if len(readback) != UEFI_NTFS_SIZE or not hmac.compare_digest(

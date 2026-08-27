@@ -13,8 +13,10 @@ evidence.
    SSDs.
 2. Test unplug, cancellation, authentication refusal, short writes, full disks,
    mount conflicts, and cleanup failures without weakening identity checks.
-3. Add a privileged exclusive whole-target ownership primitive that remains held
-   across the complete destructive transaction, without an unsafe bypass.
+3. Evolve the shipped fail-fast, per-command cooperative whole-device locks into
+   a privileged broker/private-namespace design that can retain ownership across
+   the complete destructive transaction. Continue describing Linux BSD locks as
+   advisory rather than claiming they exclude uncooperative privileged writers.
 4. Confirm the GPT partition type and removable-media fallback loaders across a
    documented firmware matrix.
 5. Ship reproducible native packages and at least one portable format with signed

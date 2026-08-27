@@ -169,7 +169,7 @@ Status meanings:
 | Hide system/internal disks | **Done** | Root backing device excluded; whole-device safety model enforced. |
 | Revalidate device identity | **Done** | Path, size, model, serial/WWN, transport, and major:minor around destructive boundaries. |
 | Bind partition-node identity | **Done** | Multi-partition workflows bind every direct child path to kernel parent and major:minor identity, verify the block node with `lstat`, and repeat exact geometry and identity checks before each filesystem creation. |
-| Exclusive target ownership | **Planned** | Identity rechecks and unmounting ship, but ISOpropyl does not yet hold a privileged whole-device lock/exclusive descriptor across the complete destructive transaction. No unsafe bypass will be exposed. |
+| Exclusive target ownership | **Partial** | Every destructive child command now fails fast behind a whole-device cooperative `flock`; `sfdisk` uses its native nonblocking lock. This coordinates lock-aware tools but remains advisory and per-command. A privileged transaction broker/private namespace is still required for stronger end-to-end ownership, and no unsafe bypass will be exposed. |
 | Fixed privileged argv/no shell | **Done** | Absolute trusted tools and bounded child processes. |
 | Verified boot components | **Partial** | A release-bundled catalog pins the UEFI:NTFS source commit, exact size, and SHA-256; explicit consent, identity-safe cache binding, in-memory privileged transfer, and full read-back are integrated. GRUB/Syslinux catalogs and signed ISOpropyl release metadata remain. |
 | No unsigned remote scripts | **Policy** | ISOpropyl will never execute a downloaded installer/downloader script. |

@@ -300,6 +300,15 @@ class PlanTests(unittest.TestCase):
             plan.payloads[0].trust, PayloadTrust.MICROSOFT_UEFI_CA_2011,
         )
         self.assertGreater(plan.data_capacity, plan.content.required_capacity)
+        self.assertEqual(plan.tools.flock, "/usr/bin/flock")
+
+    def test_missing_cooperative_lock_fails_during_plan_preflight(self):
+        missing_flock = lambda name: None if name == "flock" else finder(name)
+        with tempfile.TemporaryDirectory() as directory, fixture_constants():
+            with self.assertRaisesRegex(UefiNtfsUnavailable, "flock"):
+                build_plan(
+                    staging_tree(Path(directory)), finder=missing_flock,
+                )
 
     def test_supports_x86_arm64_and_explicit_unsigned_architectures(self):
         architectures = ("x86", "ARM64", "ARM", "RISC-V64")
@@ -357,6 +366,7 @@ class PlanTests(unittest.TestCase):
                 ),
                 replace(plan, architectures=("ARM64",)),
                 replace(plan, tools=replace(plan.tools, dd="/tmp/dd")),
+                replace(plan, tools=replace(plan.tools, flock="/tmp/flock")),
             )
             for forged in cases:
                 with self.subTest(forged=forged):
@@ -505,6 +515,14 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(content.calls[0][1:], ("/dev/sdz1", False))
         dd_calls = [call for call in processes if "/usr/bin/dd" in call[0]]
         self.assertEqual(len(dd_calls), 2)
+        self.assertEqual(
+            dd_calls[0][0][:9],
+            [
+                "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive",
+                "--nonblock", "--conflict-exit-code", "75", "--no-fork",
+                "/dev/sdz", "/usr/bin/dd",
+            ],
+        )
         self.assertEqual(dd_calls[0][1], ARTIFACT_DATA)
         self.assertIsNone(dd_calls[1][1])
         self.assertFalse(any("cache" in argument for call in dd_calls for argument in call[0]))
@@ -565,6 +583,22 @@ class ExecutorTests(unittest.TestCase):
             with self.assertRaisesRegex(UefiNtfsError, "cleanly unmounted"):
                 executor.execute(plan)
         self.assertEqual(processes, [])
+
+    def test_raw_dd_lock_conflict_has_specific_error(self):
+        calls = []
+
+        def popen(argv, **kwargs):
+            process = FakeProcess(argv, b"", calls, **kwargs)
+            process.returncode = 75
+            return process
+
+        executor = UefiNtfsExecutor(
+            layout_executor=FakeLayoutExecutor(),  # type: ignore[arg-type]
+            content_executor=FakeContentExecutor(),  # type: ignore[arg-type]
+            popen=popen,
+        )
+        with self.assertRaisesRegex(UefiNtfsError, "lock-aware storage operation"):
+            executor._run_dd(("/usr/bin/pkexec", "/usr/bin/dd"), b"payload")
 
     def test_cancel_before_start_touches_nothing_and_executor_is_single_use(self):
         with tempfile.TemporaryDirectory() as directory, fixture_constants():

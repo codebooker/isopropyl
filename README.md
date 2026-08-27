@@ -11,9 +11,13 @@
 
 [Features](#features) · [Install](#installation) · [ISO mode](#iso-mode) · [Safety](#safety-model) · [Roadmap](ROADMAP.md)
 
+<sub>RAW DD &nbsp;•&nbsp; UEFI ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; READ-BACK VERIFICATION</sub>
+
 </div>
 
 ![ISOpropyl application window inspecting a Windows 11 ISO](data/screenshot.png)
+
+<p align="center"><sub>Inspect the image, choose an explicit write method, and verify the exact removable target before anything is erased.</sub></p>
 
 ISOpropyl creates bootable USB and SD media without asking you to surrender a
 whole graphical application to root. It combines straightforward DD writing
@@ -100,8 +104,10 @@ Destructive disk software deserves boring, explicit safeguards. ISOpropyl:
   identity, then rechecks them around unmounting and immediately before writes;
 - refuses an image or staging tree stored on the destination drive;
 - runs privileged tools with fixed argument arrays—never constructed shell text;
-- time-bounds local privileged-command wrappers and uses bounded
-  terminate/kill/reap handling on cancellation, callback failure, or timeout;
+- wraps privileged destructive tools in fail-fast, whole-device cooperative
+  locks that coordinate with systemd-udevd and other lock-aware storage tools;
+- time-bounds short-lived privileged-command wrappers and uses bounded
+  terminate/kill/reap handling when cancelling long-running destructive tools;
 - will not overwrite backup, optical-capture, extraction, or staging outputs;
 - keeps drive erasure and destructive media testing outside the normal write
   button, with separate confirmations.
@@ -126,7 +132,8 @@ architecture/firmware profiles are tracked in the
 ## Requirements
 
 - Linux with Python 3.10 or newer and PyQt 6.5 or newer.
-- `lsblk`, `findmnt`, `udisksctl`, `pkexec`, and GNU `dd` for normal device work.
+- `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`
+  for normal device work.
 - 7-Zip (`7z`) for ISO cataloging and safe extraction.
 - `sfdisk` and `mkfs.vfat` for FAT32 ISO mode; `mkfs.ntfs` (usually supplied by
   `ntfs-3g`) for large-file UEFI:NTFS media.
@@ -143,6 +150,8 @@ Optional tools unlock additional workflows:
 | Experimental matched Ubuntu persistence profile | `mkfs.ext4` |
 | Surface and fake-capacity tests | `badblocks`, `f3probe` |
 | Additional ISO inspection | `xorriso` |
+| Zstandard-compressed images | Python `zstandard` module or `zstd` |
+| Legacy Unix `.Z` images | `gzip` |
 
 ISO mode needs temporary free space for the extracted tree. Splitting a large
 WIM conservatively requires room for the extracted WIM and its split parts at
@@ -173,8 +182,8 @@ You can also launch the working tree directly:
 
 Install required host tools through your distribution's package manager. On
 Debian/Ubuntu-family systems, the relevant package names commonly include
-`p7zip-full`, `udisks2`, `fdisk`, `dosfstools`, `e2fsprogs`, `ntfs-3g`,
-`wimtools`, and `qemu-utils`.
+`p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `e2fsprogs`,
+`ntfs-3g`, `wimtools`, and `qemu-utils`.
 
 The first UEFI:NTFS use asks permission to download a 1 MiB helper from its
 release-pinned Rufus source URL. ISOpropyl verifies the exact byte count and
@@ -231,7 +240,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 400 tests. Device-facing tests mock block
+The suite currently contains more than 450 tests. Device-facing tests mock block
 devices and privileged commands; the automated suite never writes a real drive.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
 path.
@@ -257,6 +266,9 @@ ISOpropyl is inspired by the clarity and capability of
 Linux-native implementation. The optional UEFI:NTFS runtime helper is an
 unmodified, hash-pinned upstream artifact with separate licensing documented in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The official symbol, repository banner, palette, and naming guidance live in
+[BRANDING.md](BRANDING.md).
 
 Copyright is held by ISOpropyl contributors. The project is free software under
 the [GNU Affero General Public License v3.0 or later](LICENSE).

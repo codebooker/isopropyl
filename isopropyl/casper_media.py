@@ -892,6 +892,7 @@ class CasperLayoutExecutor(MultiFormatExecutor):
         if device.path != plan.device_path or device.identity != plan.device_identity:
             raise DeviceChangedError("The layout does not belong to the selected drive")
         tools: MultiFormatTools = resolve_multi_tools(plan, self._which)
+        flock = self._resolve_flock()
         report = stage or (lambda _message: None)
 
         current = self._assert_identity(plan, tools)  # type: ignore[arg-type]
@@ -944,7 +945,9 @@ class CasperLayoutExecutor(MultiFormatExecutor):
             self._verify_partition_nodes(
                 plan, tools, partitions, partition_identities,
             )
-            self._run_process(command)
+            self._run_process(self._locked_format_command(
+                command, tools, flock, plan.device_path,
+            ))
         self._run_process([tools.udevadm, "settle"])
         self._assert_identity(plan, tools)  # type: ignore[arg-type]
         self._assert_logical_sector_size(plan, tools)

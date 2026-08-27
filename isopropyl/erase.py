@@ -34,10 +34,17 @@ from enum import Enum
 from typing import BinaryIO
 
 from .devices import Device, format_size, parse_lsblk
+from .locking import (
+    CooperativeLockError,
+    cooperative_lock_command,
+    lock_conflict_message,
+    resolve_flock,
+)
 
 QUICK_BOUNDARY_BYTES = 16 * 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 16 * 1024
 MAX_ERROR_CHARACTERS = 2048
+PROCESS_STOP_TIMEOUT_SECONDS = 2.0
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _TRUSTED_TOOL_DIRECTORIES = tuple(_TRUSTED_TOOL_PATH.split(":"))
 _WHOLE_DISK = re.compile(
@@ -85,6 +92,7 @@ class EraseTools:
     udisksctl: str
     lsblk: str
     dd: str
+    flock: str
 
 
 @dataclass(frozen=True)
@@ -148,7 +156,7 @@ def _trusted_which(name: str) -> str | None:
 
 
 def _validate_tool_path(name: str, value: str | None) -> str:
-    if not value:
+    if not isinstance(value, str) or not value:
         raise EraseUnavailable(f"{name} is required to erase a drive but was not found")
     if not os.path.isabs(value):
         raise EraseUnavailable(f"Could not resolve a safe absolute path for {name}")
@@ -157,7 +165,8 @@ def _validate_tool_path(name: str, value: str | None) -> str:
     # elsewhere (for example /usr/bin/dd -> /usr/lib/.../coreutils/dd).
     resolved = os.path.normpath(value)
     if (
-        os.path.dirname(resolved) not in _TRUSTED_TOOL_DIRECTORIES
+        resolved != value
+        or os.path.dirname(resolved) not in _TRUSTED_TOOL_DIRECTORIES
         or os.path.basename(resolved) != name
     ):
         raise EraseUnavailable(f"Refusing untrusted {name} path: {value!r}")
@@ -167,10 +176,15 @@ def _validate_tool_path(name: str, value: str | None) -> str:
 def resolve_erase_tools(
     finder: Callable[[str], str | None] = _trusted_which,
 ) -> EraseTools:
-    return EraseTools(**{
+    resolved = {
         name: _validate_tool_path(name, finder(name))
         for name in ("pkexec", "udisksctl", "lsblk", "dd")
-    })
+    }
+    try:
+        resolved["flock"] = resolve_flock(finder)
+    except CooperativeLockError as error:
+        raise EraseUnavailable(str(error)) from error
+    return EraseTools(**resolved)
 
 
 def _validate_device(device: Device) -> None:
@@ -277,7 +291,7 @@ def validate_erase_plan(plan: ErasePlan) -> None:
         raise EraseSafetyError("The erase plan contains an invalid confirmation phrase")
     if plan.warnings != _warnings_for(plan.device, plan.mode):
         raise EraseSafetyError("The erase plan contains invalid safety warnings")
-    for name in ("pkexec", "udisksctl", "lsblk", "dd"):
+    for name in ("pkexec", "udisksctl", "lsblk", "dd", "flock"):
         try:
             _validate_tool_path(name, getattr(plan.tools, name, None))
         except EraseUnavailable as error:
@@ -289,19 +303,26 @@ def erase_command(plan: ErasePlan, byte_range: EraseRange) -> tuple[str, ...]:
     validate_erase_plan(plan)
     if byte_range not in plan.ranges:
         raise EraseSafetyError("The requested byte range is not part of this erase plan")
-    return (
-        plan.tools.pkexec,
-        plan.tools.dd,
-        "if=/dev/zero",
-        f"of={plan.device.path}",
-        "bs=4194304",
-        f"count={byte_range.length}",
-        "iflag=count_bytes",
-        f"seek={byte_range.offset}",
-        "oflag=seek_bytes",
-        "conv=fsync,notrunc",
-        "status=progress",
-    )
+    try:
+        return tuple(cooperative_lock_command(
+            plan.tools.pkexec,
+            plan.tools.flock,
+            plan.device.path,
+            (
+                plan.tools.dd,
+                "if=/dev/zero",
+                f"of={plan.device.path}",
+                "bs=4194304",
+                f"count={byte_range.length}",
+                "iflag=count_bytes",
+                f"seek={byte_range.offset}",
+                "oflag=seek_bytes",
+                "conv=fsync,notrunc",
+                "status=progress",
+            ),
+        ))
+    except CooperativeLockError as error:
+        raise EraseSafetyError("The erase plan contains an unsafe locked command") from error
 
 
 class _DDProgressParser:
@@ -339,33 +360,57 @@ class EraseRunner:
         run_command: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         device_lister: DeviceLister | None = None,
         stat_func: Callable[[str], os.stat_result] = os.stat,
+        process_stop_timeout: float = PROCESS_STOP_TIMEOUT_SECONDS,
     ) -> None:
+        if process_stop_timeout <= 0:
+            raise ValueError("process_stop_timeout must be positive")
         self._popen = popen
         self._run_command = run_command
         self._device_lister = device_lister
         self._stat = stat_func
+        self._process_stop_timeout = process_stop_timeout
         self._cancelled = threading.Event()
         self._process: subprocess.Popen[bytes] | None = None
         self._process_lock = threading.Lock()
+        self._process_stop_lock = threading.Lock()
         self._started = False
 
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    @staticmethod
-    def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
-        try:
-            process.terminate()
+    def _terminate_process(self, process: subprocess.Popen[bytes]) -> None:
+        """Bounded terminate -> wait -> kill -> wait, including race-safe reaping."""
+        with self._process_stop_lock:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    # The process may have exited between poll() and terminate().
+                    pass
             try:
-                process.wait(timeout=2)
+                process.wait(timeout=self._process_stop_timeout)
+                return
             except subprocess.TimeoutExpired:
+                pass
+            except OSError:
+                if process.poll() is not None:
+                    return
+            try:
                 process.kill()
-        except OSError:
-            # The process may have exited between poll() and terminate().
-            pass
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=self._process_stop_timeout)
+            except subprocess.TimeoutExpired as error:
+                raise EraseError(
+                    "The privileged erase process could not be stopped and reaped"
+                ) from error
+            except OSError as error:
+                if process.poll() is None:
+                    raise EraseError(
+                        "The privileged erase process could not be stopped and reaped"
+                    ) from error
 
     def cancel(self) -> None:
         self._cancelled.set()
@@ -565,21 +610,26 @@ class EraseRunner:
                     if parsed is not None:
                         report(parsed)
             code = process.wait()
-            for reader in readers:
-                reader.join(timeout=1)
         finally:
             try:
                 # A progress callback or parser failure must never leave a
                 # privileged writer running after this method has unwound.
                 self._terminate_process(process)
             finally:
+                for reader in readers:
+                    reader.join(timeout=self._process_stop_timeout)
                 with self._process_lock:
                     if self._process is process:
                         self._process = None
         self._check_cancelled()
         if code:
             raise EraseError(
-                _bounded_message(diagnostics.text(), f"Zero-write failed with exit status {code}")
+                lock_conflict_message(
+                    code,
+                    _bounded_message(
+                        diagnostics.text(), f"Zero-write failed with exit status {code}",
+                    ),
+                )
             )
         report(byte_range.length)
 

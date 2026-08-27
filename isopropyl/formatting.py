@@ -15,6 +15,14 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .devices import Device, parse_lsblk
+from .locking import (
+    CooperativeLockError,
+    add_native_sfdisk_lock,
+    cooperative_lock_command,
+    is_cooperative_lock_command,
+    lock_conflict_message,
+    resolve_flock,
+)
 
 
 class FormattingError(RuntimeError):
@@ -676,20 +684,20 @@ def multi_partition_script(plan: MultiFormatPlan) -> bytes:
 
 
 def partition_command(plan: FormatPlan, tools: FormatTools) -> list[str]:
-    return [
-        tools.pkexec, tools.sfdisk, "--lock=yes", "--wipe", "always",
-        "--wipe-partitions", "always", plan.device_path,
-    ]
+    return add_native_sfdisk_lock([
+        tools.pkexec, tools.sfdisk, "--wipe", "always", "--wipe-partitions",
+        "always", plan.device_path,
+    ], tools.sfdisk)
 
 
 def multi_partition_command(
     plan: MultiFormatPlan, tools: MultiFormatTools,
 ) -> list[str]:
     validate_multi_plan(plan)
-    return [
-        tools.pkexec, tools.sfdisk, "--lock=yes", "--wipe", "always",
-        "--wipe-partitions", "always", plan.device_path,
-    ]
+    return add_native_sfdisk_lock([
+        tools.pkexec, tools.sfdisk, "--wipe", "always", "--wipe-partitions",
+        "always", plan.device_path,
+    ], tools.sfdisk)
 
 
 def _format_command(
@@ -1067,10 +1075,37 @@ class FormatExecutor:
                         raise FormattingError("A formatting child timed out")
             if process.returncode:
                 message = stderr.decode(errors="replace").strip()
-                raise FormattingError(message or f"Command failed: {argv[1]}")
+                fallback = message or f"Command failed: {argv[1]}"
+                if is_cooperative_lock_command(argv):
+                    fallback = lock_conflict_message(process.returncode, fallback)
+                raise FormattingError(
+                    fallback
+                )
         finally:
             self._process = None
         self._check_cancelled()
+
+    def _resolve_flock(self) -> str:
+        try:
+            return resolve_flock(self._which)
+        except CooperativeLockError as error:
+            raise MissingFormatToolError(str(error)) from error
+
+    @staticmethod
+    def _locked_format_command(
+        command: Sequence[str],
+        tools: FormatTools | MultiFormatTools,
+        flock: str,
+        whole_device: str,
+    ) -> list[str]:
+        if not command or command[0] != tools.pkexec:
+            raise FormattingError("The filesystem command lost its privilege binding")
+        try:
+            return cooperative_lock_command(
+                tools.pkexec, flock, whole_device, command[1:],
+            )
+        except CooperativeLockError as error:
+            raise FormattingError(str(error)) from error
 
     def _unmount(self, device: Device, tools: FormatTools) -> None:
         targets = device.partitions or ((device.path,) if device.mountpoints else ())
@@ -1124,6 +1159,7 @@ class FormatExecutor:
             raise DeviceChangedError("The format plan does not belong to the selected drive")
         validate_label(plan.filesystem, plan.label)
         tools = resolve_tools(plan, self._which)  # Preflight before touching the drive.
+        flock = self._resolve_flock()
         report = stage or (lambda _message: None)
 
         current = self._assert_identity(plan, tools)
@@ -1141,7 +1177,9 @@ class FormatExecutor:
         self._assert_identity(plan, tools)
 
         report("Creating filesystem")
-        self._run_process(format_command(plan, tools, partition))
+        self._run_process(self._locked_format_command(
+            format_command(plan, tools, partition), tools, flock, plan.device_path,
+        ))
         self._run_process([tools.udevadm, "settle"])
         report("Complete")
         return partition
@@ -1292,6 +1330,7 @@ class MultiFormatExecutor(FormatExecutor):
                 "The multi-partition plan does not belong to the selected drive"
             )
         tools = resolve_multi_tools(plan, self._which)  # Preflight before device access.
+        flock = self._resolve_flock()
         report = stage or (lambda _message: None)
 
         current = self._assert_identity(plan, tools)  # type: ignore[arg-type]
@@ -1328,7 +1367,9 @@ class MultiFormatExecutor(FormatExecutor):
             self._verify_partition_nodes(
                 plan, tools, partitions, partition_identities,
             )
-            self._run_process(command)
+            self._run_process(self._locked_format_command(
+                command, tools, flock, plan.device_path,
+            ))
         self._run_process([tools.udevadm, "settle"])
         self._assert_identity(plan, tools)  # type: ignore[arg-type]
         self._verify_explicit_geometry(plan, tools, partitions)

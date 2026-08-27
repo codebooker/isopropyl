@@ -8,7 +8,7 @@ import stat
 import subprocess
 import threading
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from unittest.mock import patch
 
 from isopropyl.devices import Device
@@ -17,6 +17,7 @@ from isopropyl.media_test import (
     BadblocksProgressParser,
     CapacityStatus,
     MediaTestCancelled,
+    MediaTestError,
     MediaTestMode,
     MediaTestRunner,
     MediaTestSafetyError,
@@ -48,6 +49,7 @@ def removable_device(**changes: object) -> Device:
 
 PROGRAMS = {
     "pkexec": "/usr/bin/pkexec",
+    "flock": "/usr/bin/flock",
     "udisksctl": "/usr/bin/udisksctl",
     "badblocks": "/usr/sbin/badblocks",
     "f3probe": "/usr/bin/f3probe",
@@ -123,6 +125,50 @@ class BlockingProcess:
         self.finished.set()
 
 
+class ProgressThenBlockingStream:
+    def __init__(self, finished: threading.Event, first: bytes) -> None:
+        self.finished = finished
+        self.first = first
+
+    def read1(self, _size: int) -> bytes:
+        if self.first:
+            chunk, self.first = self.first, b""
+            return chunk
+        self.finished.wait(2)
+        return b""
+
+
+class ProgressBlockingProcess(BlockingProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stderr = ProgressThenBlockingStream(
+            self.finished, b"Testing with pattern 0xaa: 20.00% done\n",
+        )
+
+
+class UnstoppableProcess:
+    def __init__(self) -> None:
+        self.returncode = None
+        self.stdout = io.BytesIO()
+        self.stderr = io.BytesIO()
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = 0
+
+    def poll(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls += 1
+        raise subprocess.TimeoutExpired("fake", timeout)
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+
 class PlanTests(unittest.TestCase):
     def test_builds_one_to_four_documented_write_read_patterns(self):
         for passes in range(1, 5):
@@ -138,7 +184,15 @@ class PlanTests(unittest.TestCase):
                 )
                 for phase in plan.phases:
                     self.assertEqual(phase.argv[0], "/usr/bin/pkexec")
-                    self.assertEqual(phase.argv[1], "/usr/sbin/badblocks")
+                    self.assertEqual(
+                        phase.argv[:8],
+                        (
+                            "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive",
+                            "--nonblock", "--conflict-exit-code", "75",
+                            "--no-fork", "/dev/sdb",
+                        ),
+                    )
+                    self.assertEqual(phase.argv[8], "/usr/sbin/badblocks")
                     self.assertIn("-w", phase.argv)
                     self.assertEqual(phase.argv[-1], "/dev/sdb")
 
@@ -153,8 +207,10 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(
             plan.phases[0].argv,
             (
-                "/usr/bin/pkexec", "/usr/bin/f3probe", "--destructive",
-                "--time-ops", "/dev/sdb",
+                "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive",
+                "--nonblock", "--conflict-exit-code", "75", "--no-fork",
+                "/dev/sdb", "/usr/bin/f3probe", "--destructive", "--time-ops",
+                "/dev/sdb",
             ),
         )
 
@@ -198,6 +254,11 @@ class PlanTests(unittest.TestCase):
             build_media_test_plan(
                 removable_device(), MediaTestMode.FULL_SURFACE, finder=no_badblocks,
             )
+        no_flock = lambda name: None if name == "flock" else find_program(name)
+        with self.assertRaisesRegex(MediaTestUnavailable, "flock"):
+            build_media_test_plan(
+                removable_device(), MediaTestMode.FULL_SURFACE, finder=no_flock,
+            )
 
     def test_rejects_relative_program_resolution(self):
         with self.assertRaises(MediaTestUnavailable):
@@ -205,6 +266,16 @@ class PlanTests(unittest.TestCase):
                 removable_device(), MediaTestMode.FULL_SURFACE,
                 finder=lambda name: name,
             )
+
+    def test_rejects_absolute_but_untrusted_or_misnamed_programs(self):
+        for forged in ("/tmp/badblocks", "/usr/bin/true"):
+            with self.subTest(path=forged), self.assertRaises(MediaTestUnavailable):
+                build_media_test_plan(
+                    removable_device(), MediaTestMode.FULL_SURFACE,
+                    finder=lambda name, forged=forged: (
+                        forged if name == "badblocks" else find_program(name)
+                    ),
+                )
 
     @patch("isopropyl.media_test.shutil.which")
     def test_default_tool_search_ignores_the_calling_users_path(self, which):
@@ -327,6 +398,114 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], MediaTestCancelled)
 
+    def test_rejects_forged_destructive_argv_before_target_interaction(self):
+        original = build_media_test_plan(
+            removable_device(), MediaTestMode.FULL_SURFACE, finder=find_program,
+        )
+        original_argv = original.phases[0].argv
+        variants: list[tuple[str, ...]] = []
+
+        changed_lock_target = list(original_argv)
+        changed_lock_target[7] = "/dev/sdc"
+        variants.append(tuple(changed_lock_target))
+
+        removed_lock_wrapper = (
+            original_argv[0], *original_argv[8:],
+        )
+        variants.append(tuple(removed_lock_wrapper))
+
+        changed_tool_target = list(original_argv)
+        changed_tool_target[-1] = "/dev/sdc"
+        variants.append(tuple(changed_tool_target))
+
+        changed_tool = list(original_argv)
+        changed_tool[8] = "/usr/bin/true"
+        variants.append(tuple(changed_tool))
+
+        for argv in variants:
+            calls: list[tuple] = []
+            forged_phase = replace(original.phases[0], argv=argv)
+            forged_plan = replace(original, phases=(forged_phase,))
+            runner = MediaTestRunner(
+                popen=lambda *args, **kwargs: calls.append(("popen", args, kwargs)),  # type: ignore[arg-type]
+                run_command=lambda *args, **kwargs: calls.append(("run", args, kwargs)),  # type: ignore[arg-type]
+                device_lister=lambda: calls.append(("listed",)) or [],
+            )
+            with self.subTest(argv=argv), self.assertRaises(MediaTestSafetyError):
+                runner.run(forged_plan, forged_plan.confirmation_phrase)
+            self.assertEqual(calls, [])
+
+    def test_rejects_forged_unmount_path_before_target_interaction(self):
+        calls: list[tuple] = []
+        original = build_media_test_plan(
+            removable_device(), MediaTestMode.FULL_SURFACE, finder=find_program,
+        )
+        forged = replace(original, udisksctl_path="/tmp/udisksctl")
+        runner = MediaTestRunner(
+            popen=lambda *args, **kwargs: calls.append(("popen", args, kwargs)),  # type: ignore[arg-type]
+            run_command=lambda *args, **kwargs: calls.append(("run", args, kwargs)),  # type: ignore[arg-type]
+            device_lister=lambda: calls.append(("listed",)) or [],
+        )
+        with self.assertRaises(MediaTestSafetyError):
+            runner.run(forged, forged.confirmation_phrase)
+        self.assertEqual(calls, [])
+
+    def test_initial_callback_failure_stops_and_reaps_privileged_process(self):
+        calls: list[tuple] = []
+        process = BlockingProcess()
+        runner = self.make_runner([process], calls)  # type: ignore[list-item]
+        plan = build_media_test_plan(
+            removable_device(), MediaTestMode.FULL_SURFACE, finder=find_program,
+        )
+
+        def fail(_update) -> None:
+            raise RuntimeError("callback failed")
+
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            runner.run(plan, plan.confirmation_phrase, fail)
+        self.assertTrue(process.terminated)
+        self.assertIsNotNone(process.poll())
+
+    def test_midstream_callback_failure_stops_and_reaps_privileged_process(self):
+        calls: list[tuple] = []
+        process = ProgressBlockingProcess()
+        runner = self.make_runner([process], calls)  # type: ignore[list-item]
+        plan = build_media_test_plan(
+            removable_device(), MediaTestMode.FULL_SURFACE, finder=find_program,
+        )
+
+        def fail(update) -> None:
+            if update.phase_fraction > 0:
+                raise RuntimeError("midstream callback failed")
+
+        with self.assertRaisesRegex(RuntimeError, "midstream callback failed"):
+            runner.run(plan, plan.confirmation_phrase, fail)
+        self.assertTrue(process.terminated)
+        self.assertIsNotNone(process.poll())
+
+    def test_unreapable_process_fails_boundedly_after_terminate_and_kill(self):
+        calls: list[tuple] = []
+        process = UnstoppableProcess()
+        runner = MediaTestRunner(
+            popen=lambda argv, **kwargs: calls.append(("popen", argv, kwargs)) or process,  # type: ignore[arg-type]
+            run_command=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+            device_lister=lambda: [removable_device()],
+            stat_func=lambda _path: FakeStat(),  # type: ignore[arg-type]
+            process_stop_timeout=0.001,
+        )
+        plan = build_media_test_plan(
+            removable_device(), MediaTestMode.FULL_SURFACE, finder=find_program,
+        )
+
+        with self.assertRaisesRegex(MediaTestError, "could not be stopped and reaped"):
+            runner.run(
+                plan, plan.confirmation_phrase,
+                lambda _update: (_ for _ in ()).throw(RuntimeError("callback failed")),
+            )
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.killed)
+        self.assertEqual(process.wait_calls, 2)
+
     def test_rechecks_identity_and_block_device_before_destructive_command(self):
         calls: list[tuple] = []
         planned = removable_device()
@@ -369,7 +548,7 @@ class RunnerTests(unittest.TestCase):
         ])
         popen_call = calls[1]
         self.assertEqual(popen_call[0], "popen")
-        self.assertNotIn("shell", popen_call[2])
+        self.assertFalse(popen_call[2]["shell"])
         self.assertIsInstance(popen_call[1], list)
         self.assertEqual(popen_call[2]["env"]["LC_ALL"], "C")
         self.assertAlmostEqual(updates[-1].fraction, 1.0)
@@ -386,6 +565,15 @@ class RunnerTests(unittest.TestCase):
         result = runner.run(plan, plan.confirmation_phrase)
         self.assertEqual(result.capacity_status, CapacityStatus.COUNTERFEIT)
         self.assertFalse(result.passed)
+
+    def test_lock_conflict_exit_has_specific_error(self):
+        calls: list[tuple] = []
+        runner = self.make_runner([FakeProcess(75)], calls)
+        plan = build_media_test_plan(
+            removable_device(), MediaTestMode.FULL_SURFACE, finder=find_program,
+        )
+        with self.assertRaisesRegex(MediaTestError, "lock-aware storage operation"):
+            runner.run(plan, plan.confirmation_phrase)
 
     def test_fails_if_target_path_is_not_a_block_device(self):
         calls: list[tuple] = []

@@ -148,6 +148,7 @@ class FormatPlanTests(unittest.TestCase):
     def test_commands_are_argv_and_labels_remain_single_arguments(self):
         plan = create_format_plan(test_device(), "fat32", "mbr", "MY USB")
         self.assertEqual(partition_command(plan, TOOLS)[0:2], [TOOLS.pkexec, TOOLS.sfdisk])
+        self.assertEqual(partition_command(plan, TOOLS)[2], "--lock=nonblock")
         self.assertEqual(
             format_command(plan, TOOLS, "/dev/sdz1"),
             [TOOLS.pkexec, TOOLS.mkfs, "-F", "32", "-n", "MY USB", "/dev/sdz1"],
@@ -508,6 +509,7 @@ class MultiFormatPlanTests(unittest.TestCase):
             multi_partition_command(plan, tools)[:2],
             ["/usr/bin/pkexec", "/usr/bin/sfdisk"],
         )
+        self.assertEqual(multi_partition_command(plan, tools)[2], "--lock=nonblock")
         with self.assertRaises(FormatValidationError):
             multi_format_commands(plan, tools, ("/dev/sdz1",))
         with self.assertRaises(FormatValidationError):
@@ -590,6 +592,14 @@ class FormatExecutorTests(unittest.TestCase):
         self.assertTrue(all(process.kwargs["shell"] is False for process in self.processes))
         self.assertEqual(self.processes[0].inputs[0], partition_script(self.plan))
         self.assertEqual(self.processes[-2].argv[-1], "/dev/sdz1")
+        self.assertEqual(
+            self.processes[-2].argv[:9],
+            [
+                "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive", "--nonblock",
+                "--conflict-exit-code", "75", "--no-fork", "/dev/sdz",
+                "/usr/bin/mkfs.vfat",
+            ],
+        )
         self.assertEqual(stages[-1], "Complete")
 
     def test_preflight_missing_tool_never_unmounts_or_spawns(self):
@@ -601,6 +611,52 @@ class FormatExecutorTests(unittest.TestCase):
             executor.execute(self.device, self.plan)
         executor._popen.assert_not_called()
         executor._runner.assert_not_called()
+
+    def test_missing_flock_preflight_never_unmounts_or_spawns(self):
+        executor = FormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: None if name == "flock" else f"/usr/bin/{name}",
+            popen=Mock(), runner=Mock(),
+        )
+        with self.assertRaisesRegex(MissingFormatToolError, "flock"):
+            executor.execute(self.device, self.plan)
+        executor._popen.assert_not_called()
+        executor._runner.assert_not_called()
+
+    def test_lock_conflict_exit_is_reported_specifically(self):
+        class ConflictProcess(FakeProcess):
+            def communicate(self, input=None, timeout=None):
+                self.inputs.append(input)
+                self.returncode = 75
+                return b"", b"generic failure"
+
+        executor = FormatExecutor(
+            popen=lambda argv, **kwargs: ConflictProcess(argv, **kwargs),
+        )
+        with self.assertRaisesRegex(FormattingError, "Another lock-aware"):
+            executor._run_process([
+                "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive",
+                "--nonblock", "--conflict-exit-code", "75", "--no-fork",
+                "/dev/sdz", "/usr/sbin/mkfs.vfat", "/dev/sdz1",
+            ])
+
+    def test_unwrapped_exit_75_is_not_misreported_as_a_lock_conflict(self):
+        class TemporaryFailureProcess(FakeProcess):
+            def communicate(self, input=None, timeout=None):
+                self.inputs.append(input)
+                self.returncode = 75
+                return b"", b"partprobe temporary failure"
+
+        executor = FormatExecutor(
+            popen=lambda argv, **kwargs: TemporaryFailureProcess(argv, **kwargs),
+        )
+        with self.assertRaisesRegex(
+            FormattingError, "partprobe temporary failure",
+        ) as raised:
+            executor._run_process([
+                "/usr/bin/pkexec", "/usr/sbin/partprobe", "/dev/sdz",
+            ])
+        self.assertNotIn("lock-aware", str(raised.exception))
 
     def test_changed_device_is_rejected_before_unmount(self):
         changed = test_device(serial="DIFFERENT")
@@ -777,6 +833,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
         self.assertEqual(mkfs_commands[0][-1], "/dev/sdz1")
         self.assertIn("/usr/bin/mkfs.ntfs", mkfs_commands[1])
         self.assertEqual(mkfs_commands[1][-1], "/dev/sdz2")
+        self.assertTrue(all(command[1] == "/usr/bin/flock" for command in mkfs_commands))
+        self.assertTrue(all(command[7] == "/dev/sdz" for command in mkfs_commands))
         self.assertEqual(stages[-1], "Complete")
 
     def test_missing_tool_preflight_touches_nothing(self):

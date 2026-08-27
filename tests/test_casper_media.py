@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from unittest.mock import Mock
 
 from isopropyl.casper_media import (
     CasperLayoutExecutor,
@@ -36,6 +37,7 @@ from isopropyl.images import ImageInspection, ImageMember
 from isopropyl.formatting import (
     DeviceChangedError,
     FormattingError,
+    MissingFormatToolError,
     PartitionRole,
     PartitionTable,
 )
@@ -465,6 +467,26 @@ class FakeProcess:
 
 
 class LayoutExecutorTests(unittest.TestCase):
+    def test_missing_flock_preflight_touches_no_device_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _profile, _staging, plan = media_plan(root)
+            runner = Mock()
+            popen = Mock()
+            boundary = Mock()
+            executor = CasperLayoutExecutor(
+                boundary_validator=boundary,
+                device_lookup=lambda _path: device(),
+                which=lambda name: None if name == "flock" else finder(name),
+                runner=runner,
+                popen=popen,
+            )
+            with self.assertRaisesRegex(MissingFormatToolError, "flock"):
+                executor.execute_multi(device(), plan.layout)
+            runner.assert_not_called()
+            popen.assert_not_called()
+            boundary.assert_not_called()
+
     def test_revalidates_exact_geometry_and_nodes_before_each_mkfs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -524,6 +546,8 @@ class LayoutExecutorTests(unittest.TestCase):
             self.assertEqual(len(mkfs), 2)
             self.assertTrue(any("mkfs.vfat" in item for item in mkfs[0]))
             self.assertTrue(any("mkfs.ext4" in item for item in mkfs[1]))
+            self.assertTrue(all(command[1] == "/usr/bin/flock" for command in mkfs))
+            self.assertTrue(all(command[7] == "/dev/sdz" for command in mkfs))
 
     def test_partition_device_identity_swap_stops_before_first_mkfs(self):
         with tempfile.TemporaryDirectory() as directory:

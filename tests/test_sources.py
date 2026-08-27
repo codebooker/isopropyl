@@ -180,7 +180,15 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(process.stdin.getvalue(), PAYLOAD)
             self.assertEqual(updates[-1], (len(PAYLOAD), len(PAYLOAD)))
             command = popen.call_args.args[0]
-            self.assertEqual(command[:2], ["/usr/bin/pkexec", "/usr/bin/dd"])
+            self.assertEqual(
+                command[:8],
+                [
+                    "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive",
+                    "--nonblock", "--conflict-exit-code", "75", "--no-fork",
+                    "/dev/sdz",
+                ],
+            )
+            self.assertEqual(command[8], "/usr/bin/dd")
             self.assertNotIn(f"if={path}", command)
 
     def test_verification_compares_decompressed_bytes(self):

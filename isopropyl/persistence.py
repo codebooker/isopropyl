@@ -28,6 +28,14 @@ from collections.abc import Callable, Sequence
 from .devices import Device, parse_lsblk
 from .formatting import PartitionTable, FormattingError, validate_device
 from .images import ImageInspection
+from .locking import (
+    CooperativeLockError,
+    add_native_sfdisk_lock,
+    cooperative_lock_command,
+    is_cooperative_lock_command,
+    lock_conflict_message,
+    resolve_flock,
+)
 
 MIB = 1024 * 1024
 MIN_PERSISTENCE_BYTES = 256 * MIB
@@ -254,6 +262,7 @@ class MediaLayout:
 @dataclass(frozen=True)
 class PersistenceTools:
     pkexec: str
+    flock: str
     sfdisk: str
     partprobe: str
     udevadm: str
@@ -371,8 +380,13 @@ def _trusted_tool(name: str, finder: Callable[[str], str | None]) -> str:
 def resolve_persistence_tools(
     finder: Callable[[str], str | None] = _trusted_which,
 ) -> PersistenceTools:
+    try:
+        flock = resolve_flock(finder)
+    except CooperativeLockError as error:
+        raise PersistenceBackendUnavailable(str(error)) from error
     return PersistenceTools(
         pkexec=_trusted_tool("pkexec", finder),
+        flock=flock,
         sfdisk=_trusted_tool("sfdisk", finder),
         partprobe=_trusted_tool("partprobe", finder),
         udevadm=_trusted_tool("udevadm", finder),
@@ -400,6 +414,14 @@ def _validate_tools(tools: PersistenceTools) -> None:
             raise PersistenceBackendSafetyError(str(error)) from error
         if resolved != value:
             raise PersistenceBackendSafetyError("The plan contains inconsistent tool paths")
+    try:
+        resolved_flock = resolve_flock(
+            lambda name: tools.flock if name == "flock" else None
+        )
+    except CooperativeLockError as error:
+        raise PersistenceBackendSafetyError(str(error)) from error
+    if resolved_flock != tools.flock:
+        raise PersistenceBackendSafetyError("The plan contains inconsistent tool paths")
 
 
 def _partition_path(device_path: str, number: int) -> str:
@@ -1214,26 +1236,29 @@ def persistence_partition_script(plan: CasperPersistencePlan) -> bytes:
 
 def persistence_partition_command(plan: CasperPersistencePlan) -> list[str]:
     validate_casper_persistence_backend_plan(plan)
-    return [
+    return add_native_sfdisk_lock([
         plan.tools.pkexec,
         plan.tools.sfdisk,
-        "--lock=yes",
         "--no-reread",
         "--append",
         plan.device.path,
-    ]
+    ], plan.tools.sfdisk)
 
 
 def persistence_format_command(plan: CasperPersistencePlan) -> list[str]:
     validate_casper_persistence_backend_plan(plan)
-    return [
+    return cooperative_lock_command(
         plan.tools.pkexec,
-        plan.tools.mkfs_ext4,
-        "-F",
-        "-L",
-        plan.profile.partition_label,
-        plan.partition_path,
-    ]
+        plan.tools.flock,
+        plan.device.path,
+        [
+            plan.tools.mkfs_ext4,
+            "-F",
+            "-L",
+            plan.profile.partition_label,
+            plan.partition_path,
+        ],
+    )
 
 
 def _geometry_matches(
@@ -1496,8 +1521,14 @@ class CasperPersistenceExecutor:
                 raise PersistenceBackendCancelled("Persistence creation was cancelled")
             if process.returncode:
                 detail = stderr.decode("utf-8", errors="replace").strip()
+                fallback = (
+                    detail[-2048:]
+                    or f"Persistence command failed: {argv[-1]}"
+                )
+                if is_cooperative_lock_command(argv):
+                    fallback = lock_conflict_message(process.returncode, fallback)
                 raise PersistenceBackendError(
-                    detail[-2048:] or f"Persistence command failed: {argv[-1]}"
+                    fallback
                 )
         finally:
             with self._lock:
@@ -1641,18 +1672,17 @@ class CasperPersistenceExecutor:
                 ))
             ):
                 return ["partition layout changed; refusing to guess a cleanup target"]
-            self._run_process(
+            self._run_process(add_native_sfdisk_lock(
                 [
                     plan.tools.pkexec,
                     plan.tools.sfdisk,
-                    "--lock=yes",
                     "--no-reread",
                     "--delete",
                     plan.device.path,
                     "2",
                 ],
-                cleanup=True,
-            )
+                plan.tools.sfdisk,
+            ), cleanup=True)
             self._run_process(
                 [plan.tools.pkexec, plan.tools.partprobe, plan.device.path], cleanup=True,
             )

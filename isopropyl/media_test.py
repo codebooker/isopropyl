@@ -29,16 +29,25 @@ from enum import Enum
 from typing import BinaryIO
 
 from .devices import Device, format_size, list_devices
+from .locking import (
+    CooperativeLockError,
+    cooperative_lock_command,
+    lock_conflict_message,
+    resolve_flock,
+)
 
 logger = logging.getLogger("isopropyl")
 
 BADBLOCK_PATTERNS = ("0xaa", "0x55", "0xff", "0x00")
 MAX_CAPTURE_BYTES = 1024 * 1024
+PROCESS_STOP_TIMEOUT_SECONDS = 2.0
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+_TRUSTED_TOOL_DIRECTORIES = frozenset(_TRUSTED_TOOL_PATH.split(":"))
 _WHOLE_DISK = re.compile(
     r"/dev/(?:sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+|mmcblk\d+|ubd[a-z]+)"
 )
 _MAJOR_MINOR = re.compile(r"\d+:\d+")
+_BLOCK_PATH = re.compile(r"/dev/[A-Za-z0-9._+:-]+")
 
 
 class MediaTestMode(Enum):
@@ -125,15 +134,24 @@ class MediaTestResult:
         }
 
 
-def _required_program(name: str, finder: Callable[[str], str | None]) -> str:
-    path = finder(name)
-    if not path:
+def _validate_program_path(name: str, path: object) -> str:
+    if not isinstance(path, str) or not path:
         raise MediaTestUnavailable(
             f"{name} is required for this media test but was not found"
         )
-    if not os.path.isabs(path):
-        raise MediaTestUnavailable(f"Could not resolve a safe absolute path for {name}")
-    return os.path.normpath(path)
+    normalized = os.path.normpath(path)
+    if (
+        not os.path.isabs(path)
+        or normalized != path
+        or os.path.dirname(path) not in _TRUSTED_TOOL_DIRECTORIES
+        or os.path.basename(path) != name
+    ):
+        raise MediaTestUnavailable(f"Refusing untrusted {name} path: {path!r}")
+    return path
+
+
+def _required_program(name: str, finder: Callable[[str], str | None]) -> str:
+    return _validate_program_path(name, finder(name))
 
 
 def _trusted_which(name: str) -> str | None:
@@ -141,16 +159,14 @@ def _trusted_which(name: str) -> str | None:
     return shutil.which(name, path=_TRUSTED_TOOL_PATH)
 
 
-def build_media_test_plan(
-    device: Device,
-    mode: MediaTestMode,
-    *,
-    passes: int = 1,
-    finder: Callable[[str], str | None] = _trusted_which,
-) -> MediaTestPlan:
-    """Validate choices and construct all privileged argv without a shell."""
-    if not isinstance(mode, MediaTestMode):
-        raise ValueError("mode must be a MediaTestMode")
+def _partition_belongs_to_device(device_path: str, partition_path: str) -> bool:
+    separator = "p" if device_path[-1].isdigit() else ""
+    return re.fullmatch(re.escape(device_path) + separator + r"\d+", partition_path) is not None
+
+
+def _validate_device(device: Device) -> None:
+    if not isinstance(device, Device):
+        raise MediaTestSafetyError("A discovered removable Device is required")
     if not device.removable:
         raise MediaTestSafetyError(
             "Destructive media validation is restricted to drives marked removable"
@@ -165,39 +181,26 @@ def build_media_test_plan(
         raise MediaTestSafetyError("The target has no stable kernel device identity")
     if device.transport not in {"usb", "mmc"}:
         raise MediaTestSafetyError("Only removable USB and SD/MMC media can be tested")
-    if not 1 <= passes <= len(BADBLOCK_PATTERNS):
-        raise ValueError("passes must be between 1 and 4")
+    if "/" in device.mountpoints:
+        raise MediaTestSafetyError("The drive backing the running system cannot be tested")
+    for partition in device.partitions:
+        if (
+            not isinstance(partition, str)
+            or not _BLOCK_PATH.fullmatch(partition)
+            or not _partition_belongs_to_device(device.path, partition)
+        ):
+            raise MediaTestSafetyError(
+                f"Unsafe partition path reported for target: {partition!r}"
+            )
 
-    pkexec = _required_program("pkexec", finder)
-    udisksctl = _required_program("udisksctl", finder)
-    phases: list[MediaTestPhase] = []
 
-    if mode in {MediaTestMode.FAKE_CAPACITY, MediaTestMode.COMPLETE}:
-        f3probe = _required_program("f3probe", finder)
-        phases.append(MediaTestPhase(
-            name="Counterfeit-capacity probe",
-            argv=(pkexec, f3probe, "--destructive", "--time-ops", device.path),
-            kind="f3probe",
-        ))
+def _confirmation_for(device: Device) -> str:
+    return f"ERASE {device.path}"
 
-    effective_passes = passes if mode in {
-        MediaTestMode.FULL_SURFACE, MediaTestMode.COMPLETE,
-    } else 0
-    if effective_passes:
-        badblocks = _required_program("badblocks", finder)
-        for index, pattern in enumerate(BADBLOCK_PATTERNS[:effective_passes], start=1):
-            phases.append(MediaTestPhase(
-                name=f"Full-surface pattern {index}/{effective_passes} ({pattern})",
-                argv=(
-                    pkexec, badblocks, "-w", "-s", "-v", "-b", "4096",
-                    "-c", "1024", "-t", pattern, device.path,
-                ),
-                kind="badblocks",
-                pattern=pattern,
-            ))
 
-    confirmation = f"ERASE {device.path}"
-    warnings = (
+def _warnings_for(device: Device) -> tuple[str, ...]:
+    confirmation = _confirmation_for(device)
+    return (
         "THIS TEST IS DESTRUCTIVE AND CANNOT BE UNDONE.",
         (
             f"It will irreversibly erase ALL data on {device.path} "
@@ -210,6 +213,62 @@ def build_media_test_plan(
         "Do not unplug the drive, suspend the computer, or remove power during the test.",
         f"To authorize this separate destructive operation, type exactly: {confirmation}",
     )
+
+
+def build_media_test_plan(
+    device: Device,
+    mode: MediaTestMode,
+    *,
+    passes: int = 1,
+    finder: Callable[[str], str | None] = _trusted_which,
+) -> MediaTestPlan:
+    """Validate choices and construct all privileged argv without a shell."""
+    if not isinstance(mode, MediaTestMode):
+        raise ValueError("mode must be a MediaTestMode")
+    _validate_device(device)
+    if not 1 <= passes <= len(BADBLOCK_PATTERNS):
+        raise ValueError("passes must be between 1 and 4")
+
+    pkexec = _required_program("pkexec", finder)
+    udisksctl = _required_program("udisksctl", finder)
+    try:
+        flock = resolve_flock(finder)
+    except CooperativeLockError as error:
+        raise MediaTestUnavailable(str(error)) from error
+    phases: list[MediaTestPhase] = []
+
+    if mode in {MediaTestMode.FAKE_CAPACITY, MediaTestMode.COMPLETE}:
+        f3probe = _required_program("f3probe", finder)
+        phases.append(MediaTestPhase(
+            name="Counterfeit-capacity probe",
+            argv=tuple(cooperative_lock_command(
+                pkexec, flock, device.path,
+                (f3probe, "--destructive", "--time-ops", device.path),
+            )),
+            kind="f3probe",
+        ))
+
+    effective_passes = passes if mode in {
+        MediaTestMode.FULL_SURFACE, MediaTestMode.COMPLETE,
+    } else 0
+    if effective_passes:
+        badblocks = _required_program("badblocks", finder)
+        for index, pattern in enumerate(BADBLOCK_PATTERNS[:effective_passes], start=1):
+            phases.append(MediaTestPhase(
+                name=f"Full-surface pattern {index}/{effective_passes} ({pattern})",
+                argv=tuple(cooperative_lock_command(
+                    pkexec, flock, device.path,
+                    (
+                        badblocks, "-w", "-s", "-v", "-b", "4096",
+                        "-c", "1024", "-t", pattern, device.path,
+                    ),
+                )),
+                kind="badblocks",
+                pattern=pattern,
+            ))
+
+    confirmation = _confirmation_for(device)
+    warnings = _warnings_for(device)
     return MediaTestPlan(
         device=device,
         mode=mode,
@@ -219,6 +278,81 @@ def build_media_test_plan(
         confirmation_phrase=confirmation,
         warnings=warnings,
     )
+
+
+def validate_media_test_plan(plan: MediaTestPlan) -> None:
+    """Reject forged executable intent before target lookup or unmounting."""
+    if not isinstance(plan, MediaTestPlan):
+        raise MediaTestSafetyError("A MediaTestPlan is required")
+    if not isinstance(plan.mode, MediaTestMode):
+        raise MediaTestSafetyError("The media-test plan contains an invalid mode")
+    _validate_device(plan.device)
+    if plan.mode is MediaTestMode.FAKE_CAPACITY:
+        if plan.passes != 0:
+            raise MediaTestSafetyError("The media-test plan contains an invalid pass count")
+    elif not isinstance(plan.passes, int) or isinstance(plan.passes, bool) or not (
+        1 <= plan.passes <= len(BADBLOCK_PATTERNS)
+    ):
+        raise MediaTestSafetyError("The media-test plan contains an invalid pass count")
+    if plan.confirmation_phrase != _confirmation_for(plan.device):
+        raise MediaTestSafetyError("The media-test plan contains an invalid confirmation phrase")
+    if plan.warnings != _warnings_for(plan.device):
+        raise MediaTestSafetyError("The media-test plan contains invalid safety warnings")
+    try:
+        _validate_program_path("udisksctl", plan.udisksctl_path)
+    except MediaTestUnavailable as error:
+        raise MediaTestSafetyError("The media-test plan contains an untrusted tool path") from error
+
+    expected_specs: list[tuple[str, str, str, tuple[str, ...]]] = []
+    if plan.mode in {MediaTestMode.FAKE_CAPACITY, MediaTestMode.COMPLETE}:
+        expected_specs.append((
+            "Counterfeit-capacity probe", "f3probe", "",
+            ("--destructive", "--time-ops", plan.device.path),
+        ))
+    if plan.mode in {MediaTestMode.FULL_SURFACE, MediaTestMode.COMPLETE}:
+        for index, pattern in enumerate(BADBLOCK_PATTERNS[:plan.passes], start=1):
+            expected_specs.append((
+                f"Full-surface pattern {index}/{plan.passes} ({pattern})",
+                "badblocks",
+                pattern,
+                (
+                    "-w", "-s", "-v", "-b", "4096", "-c", "1024", "-t",
+                    pattern, plan.device.path,
+                ),
+            ))
+    if not isinstance(plan.phases, tuple) or len(plan.phases) != len(expected_specs):
+        raise MediaTestSafetyError("The media-test plan contains unexpected phases")
+
+    first = plan.phases[0] if plan.phases else None
+    if not isinstance(first, MediaTestPhase) or not isinstance(first.argv, tuple) or len(first.argv) < 9:
+        raise MediaTestSafetyError("The media-test plan contains an invalid command")
+    try:
+        pkexec = _validate_program_path("pkexec", first.argv[0])
+        flock = _validate_program_path("flock", first.argv[1])
+    except MediaTestUnavailable as error:
+        raise MediaTestSafetyError("The media-test plan contains an untrusted tool path") from error
+
+    bound_tools: dict[str, str] = {}
+    for phase, (name, kind, pattern, arguments) in zip(plan.phases, expected_specs, strict=True):
+        if not isinstance(phase, MediaTestPhase) or not isinstance(phase.argv, tuple):
+            raise MediaTestSafetyError("The media-test plan contains an invalid phase")
+        if len(phase.argv) < 9:
+            raise MediaTestSafetyError("The media-test plan contains an invalid command")
+        try:
+            tool = _validate_program_path(kind, phase.argv[8])
+            expected_argv = tuple(cooperative_lock_command(
+                pkexec, flock, plan.device.path, (tool, *arguments),
+            ))
+        except (MediaTestUnavailable, CooperativeLockError) as error:
+            raise MediaTestSafetyError(
+                "The media-test plan contains an unsafe locked command"
+            ) from error
+        previous = bound_tools.setdefault(kind, tool)
+        if previous != tool:
+            raise MediaTestSafetyError("The media-test plan changed a bound tool path")
+        expected = MediaTestPhase(name, expected_argv, kind, pattern)
+        if phase != expected:
+            raise MediaTestSafetyError("The media-test plan contains unexpected executable intent")
 
 
 class BadblocksProgressParser:
@@ -268,34 +402,64 @@ class MediaTestRunner:
         run_command: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         device_lister: DeviceLister = list_devices,
         stat_func: Callable[[str], os.stat_result] = os.stat,
+        process_stop_timeout: float = PROCESS_STOP_TIMEOUT_SECONDS,
     ) -> None:
+        if process_stop_timeout <= 0:
+            raise ValueError("process_stop_timeout must be positive")
         self._popen = popen
         self._run_command = run_command
         self._device_lister = device_lister
         self._stat = stat_func
+        self._process_stop_timeout = process_stop_timeout
         self._cancelled = threading.Event()
         self._process: subprocess.Popen[bytes] | None = None
         self._process_lock = threading.Lock()
+        self._process_stop_lock = threading.Lock()
         self._started = False
 
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
+    def _terminate_and_reap(self, process: subprocess.Popen[bytes]) -> None:
+        """Bounded terminate -> kill -> wait, safe under cancellation races."""
+        with self._process_stop_lock:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    # The process may have exited between poll() and terminate().
+                    pass
+            try:
+                process.wait(timeout=self._process_stop_timeout)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            except OSError:
+                if process.poll() is not None:
+                    return
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=self._process_stop_timeout)
+            except subprocess.TimeoutExpired as error:
+                raise MediaTestError(
+                    "The privileged media-test process could not be stopped and reaped"
+                ) from error
+            except OSError as error:
+                if process.poll() is None:
+                    raise MediaTestError(
+                        "The privileged media-test process could not be stopped and reaped"
+                    ) from error
+
     def cancel(self) -> None:
         self._cancelled.set()
         with self._process_lock:
             process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            except OSError:
-                # The process may have exited between poll() and terminate().
-                pass
+        if process is not None:
+            self._terminate_and_reap(process)
 
     def _check_cancelled(self) -> None:
         if self.cancelled:
@@ -385,43 +549,37 @@ class MediaTestRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=environment,
+                shell=False,
             )
         except OSError as error:
             raise MediaTestError(f"Could not start {phase.name}: {error}") from error
         with self._process_lock:
             self._process = process
-        if self.cancelled:
-            try:
-                process.terminate()
-            finally:
-                with self._process_lock:
-                    self._process = None
-            self._check_cancelled()
-        if process.stdout is None or process.stderr is None:
-            with self._process_lock:
-                self._process = None
-            raise MediaTestError(f"Could not capture output from {phase.name}")
-
-        messages: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
-        readers = [
-            threading.Thread(
-                target=self._pipe_reader, args=(process.stdout, "stdout", messages),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=self._pipe_reader, args=(process.stderr, "stderr", messages),
-                daemon=True,
-            ),
-        ]
-        for reader in readers:
-            reader.start()
-
-        parser = BadblocksProgressParser() if phase.kind == "badblocks" else None
-        stdout = bytearray()
-        stderr = bytearray()
-        open_channels = len(readers)
-        progress(MediaTestProgress(phase.name, phase_index, phase_count, 0.0))
+        readers: list[threading.Thread] = []
         try:
+            self._check_cancelled()
+            if process.stdout is None or process.stderr is None:
+                raise MediaTestError(f"Could not capture output from {phase.name}")
+
+            messages: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
+            readers = [
+                threading.Thread(
+                    target=self._pipe_reader, args=(process.stdout, "stdout", messages),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._pipe_reader, args=(process.stderr, "stderr", messages),
+                    daemon=True,
+                ),
+            ]
+            for reader in readers:
+                reader.start()
+
+            parser = BadblocksProgressParser() if phase.kind == "badblocks" else None
+            stdout = bytearray()
+            stderr = bytearray()
+            open_channels = len(readers)
+            progress(MediaTestProgress(phase.name, phase_index, phase_count, 0.0))
             while open_channels:
                 self._check_cancelled()
                 try:
@@ -443,12 +601,15 @@ class MediaTestRunner:
                         ))
 
             code = process.wait()
-            for reader in readers:
-                reader.join(timeout=1)
         finally:
-            with self._process_lock:
-                if self._process is process:
-                    self._process = None
+            try:
+                self._terminate_and_reap(process)
+            finally:
+                for reader in readers:
+                    reader.join(timeout=self._process_stop_timeout)
+                with self._process_lock:
+                    if self._process is process:
+                        self._process = None
         self._check_cancelled()
         if code == 0 or (phase.kind == "f3probe" and 101 <= code <= 104):
             progress(MediaTestProgress(phase.name, phase_index, phase_count, 1.0))
@@ -464,6 +625,7 @@ class MediaTestRunner:
             raise MediaTestSafetyError("A media-test runner cannot be reused")
         self._started = True
         self._check_cancelled()
+        validate_media_test_plan(plan)
         if not hmac.compare_digest(confirmation, plan.confirmation_phrase):
             raise MediaTestSafetyError(
                 f"Confirmation did not exactly match {plan.confirmation_phrase!r}"
@@ -495,7 +657,11 @@ class MediaTestRunner:
             if phase.kind == "badblocks":
                 if code:
                     raise MediaTestError(
-                        rendered[-2048:] or f"badblocks failed with exit status {code}"
+                        lock_conflict_message(
+                            code,
+                            rendered[-2048:]
+                            or f"badblocks failed with exit status {code}",
+                        )
                     )
                 bad_blocks.update(parse_bad_block_lines(stdout))
             elif code == 0:
@@ -506,7 +672,11 @@ class MediaTestRunner:
                 capacity_status = CapacityStatus.COUNTERFEIT
             else:
                 raise MediaTestError(
-                    rendered[-2048:] or f"f3probe failed with exit status {code}"
+                    lock_conflict_message(
+                        code,
+                        rendered[-2048:]
+                        or f"f3probe failed with exit status {code}",
+                    )
                 )
 
         return MediaTestResult(

@@ -22,6 +22,10 @@ issue requesting a private contact channel without disclosing the vulnerability.
   and recheck it before partitioning; 4Kn media fail closed.
 - Privileged commands use fixed argument arrays; ISOpropyl does not build shell
   text or run downloaded scripts.
+- Destructive tools take a nonblocking BSD lock on the whole target for each
+  command. This coordinates with systemd-udevd and other lock-aware storage
+  software, but Linux locks are advisory: they do not exclude an uncooperative
+  privileged writer and are not a transaction-wide ownership lease.
 - UEFI ISO mode extracts into a private tree, rejects traversal, links, special
   files and case collisions, atomically publishes staging, then formats and
   copies through an independently identity-bound plan. It supports either one
