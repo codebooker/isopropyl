@@ -49,6 +49,10 @@ issue requesting a private contact channel without disclosing the vulnerability.
   comparisons are explicitly the conventional assumed 512-byte interpretation.
 - Privileged commands use fixed argument arrays; ISOpropyl does not build shell
   text or run downloaded scripts.
+- Read-only ISO/UDF catalog inspection invokes only trusted-path `7z`, passes a
+  bound image descriptor through `/proc/self/fd`, caps listing output at 16 MiB
+  and 65,536 members, observes image-reselection cancellation and a 20-second
+  deadline, and uses bounded terminate/kill/reap cleanup.
 - A failed unmount may trigger an optional, unprivileged, three-second `fuser`
   probe with a fixed argument vector. Two snapshots share one deadline and pipe
   reads stop as soon as their combined output reaches 64 KiB. Results are limited
@@ -70,12 +74,24 @@ issue requesting a private contact channel without disclosing the vulnerability.
   UEFI:NTFS, WIM, and persistence paths time-bound their local command wrappers
   and use bounded terminate/kill/reap handling; a future dedicated privileged
   helper remains the stronger process-control boundary.
-- The boot-artifact catalog contains one release-pinned UEFI:NTFS v2.8 image.
-  Network acquisition requires explicit consent; the resolver restricts HTTPS
-  origins and redirects, checks exact length and SHA-256, publishes the cache
-  atomically, and verifies it again before every use. The privileged writer
-  receives already-bound bytes through standard input and never opens a
-  user-controlled cache pathname. Cache management considers only exact
+- The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
+  dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
+  2.06/2.12/2.14 blank-media research bundles. It records immutable upstream
+  URLs, exact length, SHA-256, purpose-specific bundle membership, license, and
+  provenance. Generic bundle preparation has cancellation, aggregate progress,
+  a shared connection/download/cache-read/binding deadline, exact-version
+  matching, and no partial return; every cache directory and object is opened
+  no-follow, the parent pathname is revalidated against its bound descriptor,
+  and every stable singly linked regular file is rehashed and frozen as immutable
+  bytes. GRUB entries never satisfy a detected-image dependency. No production
+  BIOS executor consumes these bundles,
+  no downloaded executable or script runs, and version-prefix fallback is
+  forbidden. The working UEFI:NTFS path separately requires explicit consent;
+  its resolver restricts HTTPS origins and redirects, checks exact length and
+  SHA-256, publishes the cache atomically, and verifies it again before every
+  use. Its privileged writer receives already-bound bytes through standard input
+  and never opens a user-controlled cache pathname. Cache management considers
+  only exact
   catalog-known paths opened through no-follow directory descriptors; deletion
   skips links, multiply linked files, and anything whose identity or metadata
   changes between inspection and unlink. Corrupt catalog-known regular files

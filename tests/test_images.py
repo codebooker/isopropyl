@@ -3,6 +3,7 @@ import hashlib
 import gzip
 import os
 import struct
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from isopropyl.images import (
     boot_identity_fields,
     calculate_checksums, classify_boot_paths, compare_expected_checksum,
     inspect_image, parse_7z_listing, parse_expected_checksum,
+    scan_image_contents,
 )
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.partition_tables import PartitionTableInspection
@@ -23,6 +25,32 @@ from isopropyl.eltorito import (
     BootEntry, BootPlatform, ElToritoError, ElToritoInspection, EmulationType,
     ValidationEntry,
 )
+
+
+class FakeCatalogProcess:
+    def __init__(self, output: bytes, returncode: int | None = 0):
+        self.stdout = tempfile.TemporaryFile()
+        self.stdout.write(output)
+        self.stdout.seek(0)
+        self.returncode = returncode
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(["7z"], timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
 
 def add_valid_mbr(data: bytearray, sector_size: int = 512) -> None:
@@ -77,7 +105,7 @@ class ImageTests(unittest.TestCase):
             path.write_bytes(payload)
             before = path.stat()
 
-            def mutate_during_catalog(_path):
+            def mutate_during_catalog(_path, **_kwargs):
                 path.write_bytes(b"X" * len(payload))
                 path.touch()
                 os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
@@ -91,6 +119,37 @@ class ImageTests(unittest.TestCase):
                 self.assertRaisesRegex(OSError, "changed while it was being inspected"),
             ):
                 inspect_image(path)
+
+    def test_catalog_inspection_stays_bound_to_the_original_image_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.img"
+            moved = Path(directory) / "selected-image-moved.img"
+            payload = bytearray(4096)
+            add_valid_mbr(payload)
+            payload[1024:1032] = b"ORIGINAL"
+            path.write_bytes(payload)
+            observed: list[bytes] = []
+
+            def swap_path_during_catalog(_path, *, image_fd=None, **_kwargs):
+                self.assertIsNotNone(image_fd)
+                assert image_fd is not None
+                path.rename(moved)
+                path.write_bytes(b"D" * len(payload))
+                observed.append(os.pread(image_fd, len(payload), 0))
+                return [], False
+
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    side_effect=swap_path_during_catalog,
+                ),
+                self.assertRaisesRegex(OSError, "changed while it was being inspected"),
+            ):
+                inspect_image(path)
+
+            self.assertEqual(observed, [bytes(payload)])
+            self.assertEqual(moved.read_bytes(), bytes(payload))
+            self.assertEqual(path.read_bytes(), b"D" * len(payload))
 
     def test_parses_and_compares_provider_checksum_text(self):
         expected = "a" * 64
@@ -134,6 +193,99 @@ Symbolic Link = boot/grub
             [("EFI", 0, "directory"), ("EFI/BOOT/BOOTX64.EFI", 1234, "file"),
              ("current", 0, "symlink")],
         )
+
+    def test_archive_catalog_never_uses_an_untrusted_path_7z(self):
+        with patch(
+            "isopropyl.images.shutil.which",
+            return_value="/home/example/bin/7z",
+        ) as which:
+            self.assertEqual(scan_image_contents(Path("fixture.iso")), ([], False))
+        which.assert_called_once_with("7z", path="/usr/bin:/bin")
+
+    def test_archive_catalog_output_and_member_count_are_bounded(self):
+        too_large = FakeCatalogProcess(b"X" * 65)
+        with (
+            patch("isopropyl.images._trusted_7z", return_value="/usr/bin/7z"),
+            patch("isopropyl.images.MAX_7Z_CATALOG_BYTES", 64),
+            patch("isopropyl.images.subprocess.Popen", return_value=too_large),
+        ):
+            self.assertEqual(scan_image_contents(Path("fixture.iso")), ([], False))
+
+        listing = """header
+----------
+Path = one
+Folder = -
+Size = 1
+
+Path = two
+Folder = -
+Size = 1
+"""
+        with self.assertRaisesRegex(ValueError, "too many members"):
+            parse_7z_listing(listing, maximum_members=1)
+
+    def test_archive_catalog_scan_is_cancellable_and_reaps_7z(self):
+        process = FakeCatalogProcess(b"", returncode=None)
+
+        def cancelled():
+            raise ImageInspectionCancelled("fixture reselection")
+
+        with (
+            patch("isopropyl.images._trusted_7z", return_value="/usr/bin/7z"),
+            patch("isopropyl.images.subprocess.Popen", return_value=process),
+            self.assertRaisesRegex(ImageInspectionCancelled, "reselection"),
+        ):
+            scan_image_contents(Path("fixture.iso"), cancel_check=cancelled)
+        self.assertTrue(process.terminated)
+        self.assertIsNotNone(process.returncode)
+
+    def test_archive_catalog_scan_is_cancellable_after_stdout_eof(self):
+        process = FakeCatalogProcess(b"", returncode=None)
+        checks = 0
+
+        def cancel_after_eof():
+            nonlocal checks
+            checks += 1
+            if checks > 1:
+                raise ImageInspectionCancelled("fixture post-EOF reselection")
+
+        with (
+            patch("isopropyl.images._trusted_7z", return_value="/usr/bin/7z"),
+            patch("isopropyl.images.subprocess.Popen", return_value=process),
+            self.assertRaisesRegex(ImageInspectionCancelled, "post-EOF"),
+        ):
+            scan_image_contents(
+                Path("fixture.iso"), cancel_check=cancel_after_eof,
+            )
+        self.assertEqual(checks, 2)
+        self.assertTrue(process.terminated)
+
+    def test_archive_catalog_scan_passes_the_bound_image_descriptor(self):
+        listing = b"""header
+----------
+Path = EFI/BOOT/BOOTX64.EFI
+Folder = -
+        Size = 123
+"""
+        process = FakeCatalogProcess(listing)
+        with tempfile.TemporaryFile() as image:
+            with (
+                patch("isopropyl.images._trusted_7z", return_value="/usr/bin/7z"),
+                patch(
+                    "isopropyl.images.subprocess.Popen", return_value=process,
+                ) as popen,
+            ):
+                members, complete = scan_image_contents(
+                    Path("decoy.iso"), image_fd=image.fileno(),
+                )
+                self.assertTrue(complete)
+                self.assertEqual(members[0].path, "EFI/BOOT/BOOTX64.EFI")
+                self.assertEqual(
+                    popen.call_args.kwargs["pass_fds"], (image.fileno(),),
+                )
+                self.assertEqual(
+                    popen.call_args.args[0][-1], f"/proc/self/fd/{image.fileno()}",
+                )
 
     def test_detects_hybrid_iso_and_volume_label(self):
         with tempfile.TemporaryDirectory() as directory:

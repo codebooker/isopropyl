@@ -635,6 +635,23 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("MBR · valid · 512-byte sectors assumed", tooltip)
         self.assertIn("MBR boot code: Syslinux", tooltip)
 
+    def test_image_tooltip_reports_exact_cataloged_syslinux_bundle(self):
+        inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            bootloader="Syslinux/Isolinux",
+            bootloader_version="6.04",
+            bootloader_build="6.04-pre1",
+            bootloader_dependency="syslinux:6.04-pre1",
+        )
+
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_inspection_finished((1, 2, 3, 4), inspection)
+
+        tooltip = self.window.image_detail.toolTip()
+        self.assertIn("Exact boot payload: 6.04-pre1", tooltip)
+        self.assertIn("hash-pinned matching payload bundle is cataloged", tooltip)
+        self.assertIn("BIOS installation remains disabled", tooltip)
+
     def test_settings_persist_binary_units_and_refresh_device_label(self):
         self.window.size_unit_mode = SizeUnitMode.SI
         self.window.refresh_size_labels()

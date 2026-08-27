@@ -354,8 +354,28 @@ def _identity(status: os.stat_result) -> IsoIdentity:
     return IsoIdentity(status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
 
 
-def inspect_eltorito_file(path: Path) -> ElToritoInspection:
+def inspect_eltorito_file(
+    path: Path, *, image_fd: int | None = None,
+) -> ElToritoInspection:
     """Inspect a regular ISO file and reject identity changes during parsing."""
+
+    if image_fd is not None:
+        try:
+            before_status = os.fstat(image_fd)
+            if not stat.S_ISREG(before_status.st_mode):
+                raise ElToritoError("The selected ISO must be a regular file")
+            before = _identity(before_status)
+
+            def read_at(offset: int, length: int) -> bytes:
+                return os.pread(image_fd, length, offset)
+
+            result = _inspect(read_at, before.size)
+            after = _identity(os.fstat(image_fd))
+        except OSError as error:
+            raise ElToritoError(f"Could not read the selected ISO: {error}") from error
+        if after != before:
+            raise IsoChanged("The selected ISO changed while its boot catalog was inspected")
+        return replace(result, source_identity=before)
 
     try:
         with path.open("rb", buffering=0) as stream:

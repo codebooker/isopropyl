@@ -18,6 +18,7 @@ import os
 import re
 import selectors
 import shutil
+import stat
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -26,6 +27,8 @@ from pathlib import Path, PurePosixPath
 
 MAX_BOOT_BLOB_SIZE = 64 * 1024 * 1024
 MAX_BOOT_MEMBERS = 64
+_TRUSTED_7Z_PATH = "/usr/bin:/bin"
+_TRUSTED_7Z_DIRECTORIES = frozenset(_TRUSTED_7Z_PATH.split(":"))
 
 _GRUB_MARKERS = (
     b"GNU GRUB  version %s",
@@ -84,10 +87,13 @@ class BootloaderIdentity:
 class BootloaderAnalysis:
     identities: tuple[BootloaderIdentity, ...]
     issues: tuple[str, ...] = ()
+    complete: bool = True
 
     def resolved(self, family: str) -> BootloaderIdentity | None:
         """Resolve one family, failing closed on conflicting image members."""
 
+        if not self.complete:
+            return None
         wanted = _family_group(family)
         matches = [item for item in self.identities if _family_group(item.family) == wanted]
         if not matches or any(item.ambiguous for item in matches):
@@ -288,13 +294,33 @@ def _normalized_member(path: str) -> str | None:
     return pure.as_posix()
 
 
-def bootloader_member_paths(paths: Iterable[str]) -> tuple[str, ...]:
-    """Select bounded boot payload candidates from an archive catalog."""
+def _looks_like_bootloader_candidate(path: str) -> bool:
+    lowered = path.replace("\\", "/").casefold()
+    name = lowered.rsplit("/", 1)[-1]
+    fallback_shape = lowered.lstrip("/")
+    if re.match(r"^[a-z]:/", fallback_shape):
+        fallback_shape = fallback_shape[3:]
+    return bool(
+        name in {"isolinux.bin", "syslinux.bin", "ldlinux.sys"}
+        or (name in {"normal.mod", "core.img"} and "grub" in lowered)
+        or (name.startswith("grub") and name.endswith(".efi"))
+        or (fallback_shape.startswith("efi/boot/boot") and name.endswith(".efi"))
+    )
+
+
+def _bootloader_member_selection(
+    paths: Iterable[str],
+) -> tuple[tuple[str, ...], bool, bool]:
+    """Select candidates and report whether the bounded selection overflowed."""
 
     selected: list[str] = []
+    seen: set[str] = set()
+    overflowed = False
+    unsafe_candidate = False
     for original in paths:
         path = _normalized_member(original)
         if path is None:
+            unsafe_candidate = unsafe_candidate or _looks_like_bootloader_candidate(original)
             continue
         lowered = path.casefold()
         name = PurePosixPath(lowered).name
@@ -302,11 +328,28 @@ def bootloader_member_paths(paths: Iterable[str]) -> tuple[str, ...]:
         is_grub_module = name in {"normal.mod", "core.img"} and "grub" in lowered
         is_grub_efi = name.startswith("grub") and name.endswith(".efi")
         is_fallback_efi = lowered.startswith("efi/boot/boot") and name.endswith(".efi")
-        if is_syslinux or is_grub_module or is_grub_efi or is_fallback_efi:
-            selected.append(path)
-            if len(selected) >= MAX_BOOT_MEMBERS:
-                break
-    return tuple(dict.fromkeys(selected))
+        if not (is_syslinux or is_grub_module or is_grub_efi or is_fallback_efi):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        if len(selected) >= MAX_BOOT_MEMBERS:
+            overflowed = True
+            break
+        selected.append(path)
+    return tuple(selected), overflowed, unsafe_candidate
+
+
+def bootloader_member_paths(paths: Iterable[str]) -> tuple[str, ...]:
+    """Select bounded boot payload candidates from an archive catalog.
+
+    This compatibility helper returns only the selected paths. Authorization
+    callers must use :func:`analyze_iso_bootloaders`, which also fails closed
+    when the catalog contains more candidates than can be inspected.
+    """
+
+    selected, _overflowed, _unsafe_candidate = _bootloader_member_selection(paths)
+    return selected
 
 
 def analyze_bootloader_members(members: Mapping[str, bytes]) -> BootloaderAnalysis:
@@ -314,10 +357,12 @@ def analyze_bootloader_members(members: Mapping[str, bytes]) -> BootloaderAnalys
 
     identities: list[BootloaderIdentity] = []
     issues: list[str] = []
+    complete = True
     for source, blob in members.items():
         normalized = _normalized_member(source)
         if normalized is None:
             issues.append(f"Skipped unsafe archive member name: {source!r}")
+            complete = False
             continue
         nonstandard = "/boot/grub2/" in f"/{normalized.casefold()}"
         try:
@@ -325,31 +370,49 @@ def analyze_bootloader_members(members: Mapping[str, bytes]) -> BootloaderAnalys
             syslinux = identify_syslinux_blob(blob, normalized)
         except ValueError as error:
             issues.append(f"{normalized}: {error}")
+            complete = False
             continue
         identities.extend(item for item in (grub, syslinux) if item is not None)
 
-    analysis = BootloaderAnalysis(tuple(identities), tuple(issues))
+    analysis = BootloaderAnalysis(tuple(identities), tuple(issues), complete)
     for family in dict.fromkeys(_family_group(item.family) for item in identities):
         matches = [item for item in identities if _family_group(item.family) == family]
-        if matches and analysis.resolved(family) is None:
+        if complete and matches and analysis.resolved(family) is None:
             issues.append(f"Conflicting {family} identities across image members")
-    return BootloaderAnalysis(tuple(identities), tuple(issues))
+    return BootloaderAnalysis(tuple(identities), tuple(issues), complete)
 
 
 MemberReader = Callable[[Path, str], bytes]
 
 
+def _trusted_7z() -> str | None:
+    executable = shutil.which("7z", path=_TRUSTED_7Z_PATH)
+    if not executable:
+        return None
+    normalized = os.path.normpath(executable)
+    if (
+        not os.path.isabs(normalized)
+        or os.path.dirname(normalized) not in _TRUSTED_7Z_DIRECTORIES
+        or os.path.basename(normalized) != "7z"
+    ):
+        return None
+    return normalized
+
+
 def read_archive_member_with_7z(
     image: Path, member: str, *, timeout: float = 15.0,
+    image_fd: int | None = None,
 ) -> bytes:
     """Read one exact member with the host 7z tool, with time and size caps."""
 
-    executable = shutil.which("7z")
+    executable = _trusted_7z()
     if not executable:
         raise OSError("7z is not installed; boot payload members were not read")
+    source = str(image) if image_fd is None else f"/proc/self/fd/{image_fd}"
     process = subprocess.Popen(
-        [executable, "x", "-so", "-spd", "-y", "--", str(image), member],
+        [executable, "x", "-so", "-spd", "-y", "--", source, member],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        pass_fds=(() if image_fd is None else (image_fd,)),
     )
     assert process.stdout is not None
     selector = selectors.DefaultSelector()
@@ -385,7 +448,7 @@ def read_archive_member_with_7z(
 
 def analyze_iso_bootloaders(
     image: Path, member_paths: Iterable[str], *, reader: MemberReader | None = None,
-    timeout: float = 30.0,
+    timeout: float = 30.0, image_fd: int | None = None,
 ) -> BootloaderAnalysis:
     """Read selected image members and analyze payload identity.
 
@@ -393,24 +456,44 @@ def analyze_iso_bootloaders(
     default reader uses host ``7z`` strictly as an unprivileged archive reader.
     """
 
-    if not image.is_file():
-        raise OSError("The selected image is not a regular file")
+    if image_fd is None:
+        if not image.is_file():
+            raise OSError("The selected image is not a regular file")
+    elif not stat.S_ISREG(os.fstat(image_fd).st_mode):
+        raise OSError("The selected image descriptor is not a regular file")
     started = time.monotonic()
     blobs: dict[str, bytes] = {}
     issues: list[str] = []
-    for member in bootloader_member_paths(member_paths):
+    selected, overflowed, unsafe_candidate = _bootloader_member_selection(member_paths)
+    complete = not overflowed and not unsafe_candidate
+    if overflowed:
+        issues.append(
+            f"Bootloader inspection found more than {MAX_BOOT_MEMBERS} candidate "
+            "payloads; exact dependency matching is disabled"
+        )
+    if unsafe_candidate:
+        issues.append(
+            "An unsafe bootloader candidate path was rejected; exact dependency "
+            "matching is disabled"
+        )
+    for member in selected:
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
             issues.append("Bootloader inspection reached its overall time limit")
+            complete = False
             break
         try:
             blobs[member] = (
                 reader(image, member) if reader
                 else read_archive_member_with_7z(
-                    image, member, timeout=min(15.0, remaining)
+                    image, member, timeout=min(15.0, remaining), image_fd=image_fd,
                 )
             )
         except (OSError, TimeoutError, ValueError) as error:
             issues.append(f"{member}: {error}")
+            complete = False
     result = analyze_bootloader_members(blobs)
-    return BootloaderAnalysis(result.identities, tuple(issues) + result.issues)
+    return BootloaderAnalysis(
+        result.identities, tuple(issues) + result.issues,
+        complete and result.complete,
+    )

@@ -282,7 +282,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 620 tests. Device-facing tests mock block
+The suite currently contains more than 640 tests. Device-facing tests mock block
 devices and privileged commands; the automated suite never writes a real drive.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
 path.

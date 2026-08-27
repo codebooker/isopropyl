@@ -1,0 +1,161 @@
+{
+  "catalog_version": 2,
+  "resources": [
+    {
+      "family": "uefi-ntfs",
+      "version": "2.8-rufus-2368e49a",
+      "name": "uefi-ntfs.img",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus/2368e49a82e854d3e702f824648cc723953dbb53/res/uefi/uefi-ntfs.img",
+      "sha256": "72683fa1250eeea772d3399277b434d4e55ba8dd0dc926e52d817e701fc2eb9e",
+      "size": 1048576,
+      "allowed_hosts": []
+    },
+    {
+      "family": "syslinux",
+      "version": "6.03-2014-10-06",
+      "name": "ldlinux.bss",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.03/ldlinux.bss",
+      "sha256": "8814e576abc1aa44dde943b0caaee833a5810142614adeeb4cc725e78a5045b7",
+      "size": 512,
+      "allowed_hosts": []
+    },
+    {
+      "family": "syslinux",
+      "version": "6.03-2014-10-06",
+      "name": "ldlinux.sys",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.03/ldlinux.sys",
+      "sha256": "3f1206e0cc45dbe180e73adaeb221bfc7d5a800095738549390379d7d0282ac3",
+      "size": 68599,
+      "allowed_hosts": []
+    },
+    {
+      "family": "syslinux",
+      "version": "6.03-2014-10-06",
+      "name": "ldlinux.c32",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.03/ldlinux.c32",
+      "sha256": "5cef9ad0d0ca04097262241686c6c3a7306ab9b9cdf24b9d4ee3b16af01a5af2",
+      "size": 122308,
+      "allowed_hosts": []
+    },
+    {
+      "family": "syslinux",
+      "version": "6.04-pre1",
+      "name": "ldlinux.bss",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.04/pre1/ldlinux.bss",
+      "sha256": "cc40ba0349782cb4c9021e54dcc0a4540c3a8b96088b3a5648671926ef44d2f0",
+      "size": 512,
+      "allowed_hosts": []
+    },
+    {
+      "family": "syslinux",
+      "version": "6.04-pre1",
+      "name": "ldlinux.sys",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.04/pre1/ldlinux.sys",
+      "sha256": "73b62767a16200b9af193a7d5c94e9c294c6dbb6d5b17c15038c9f3173c9a7bc",
+      "size": 68121,
+      "allowed_hosts": []
+    },
+    {
+      "family": "syslinux",
+      "version": "6.04-pre1",
+      "name": "ldlinux.c32",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.04/ldlinux.c32",
+      "sha256": "d3472c02263acf9cd1da5db51e263c5484bad13ea68618c403d9cb01ca070aee",
+      "size": 122656,
+      "allowed_hosts": []
+    },
+    {
+      "family": "grub",
+      "version": "2.06",
+      "name": "core.img",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.06/core.img",
+      "sha256": "2b072067f9cd6e8c62e782dc4ae23b192de628e7670c8468ed380d364aa70bf1",
+      "size": 38399,
+      "allowed_hosts": []
+    },
+    {
+      "family": "grub",
+      "version": "2.12",
+      "name": "core.img",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.12/core.img",
+      "sha256": "15902895487c084c8f574666c31e7fa399d05b831fd61c1e3c3eee69d6576924",
+      "size": 35918,
+      "allowed_hosts": []
+    },
+    {
+      "family": "grub",
+      "version": "2.14",
+      "name": "core.img",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.14/core.img",
+      "sha256": "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809",
+      "size": 42742,
+      "allowed_hosts": []
+    }
+  ],
+  "bundles": [
+    {
+      "family": "uefi-ntfs",
+      "version": "2.8-rufus-2368e49a",
+      "purpose": "uefi-ntfs-bridge",
+      "artifacts": ["uefi-ntfs.img"],
+      "license": "GPL-2.0-or-later AND GPL-3.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus/tree/2368e49a82e854d3e702f824648cc723953dbb53/res/uefi"
+    },
+    {
+      "family": "syslinux",
+      "version": "6.03-2014-10-06",
+      "purpose": "matched-bios-payloads",
+      "artifacts": ["ldlinux.bss", "ldlinux.sys"],
+      "license": "GPL-2.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.03"
+    },
+    {
+      "family": "syslinux",
+      "version": "6.03-2014-10-06",
+      "purpose": "blank-bios-module",
+      "artifacts": ["ldlinux.c32"],
+      "license": "GPL-2.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.03"
+    },
+    {
+      "family": "syslinux",
+      "version": "6.04-pre1",
+      "purpose": "matched-bios-payloads",
+      "artifacts": ["ldlinux.bss", "ldlinux.sys"],
+      "license": "GPL-2.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.04/pre1"
+    },
+    {
+      "family": "syslinux",
+      "version": "6.04-pre1",
+      "purpose": "blank-bios-module",
+      "artifacts": ["ldlinux.c32"],
+      "license": "GPL-2.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.04"
+    },
+    {
+      "family": "grub",
+      "version": "2.06",
+      "purpose": "blank-bios-core-image",
+      "artifacts": ["core.img"],
+      "license": "GPL-3.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.06"
+    },
+    {
+      "family": "grub",
+      "version": "2.12",
+      "purpose": "blank-bios-core-image",
+      "artifacts": ["core.img"],
+      "license": "GPL-3.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.12"
+    },
+    {
+      "family": "grub",
+      "version": "2.14",
+      "purpose": "blank-bios-core-image",
+      "artifacts": ["core.img"],
+      "license": "GPL-3.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.14"
+    }
+  ]
+}

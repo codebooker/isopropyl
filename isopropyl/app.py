@@ -28,7 +28,9 @@ from .backup import (
     DriveImager, VirtualDriveImager, validate_virtual_backup_destination,
     virtual_backup_required_space,
 )
-from .bootloaders import delete_cached_artifacts, inventory_cache
+from .bootloaders import (
+    CatalogError, bundle_for_dependency, delete_cached_artifacts, inventory_cache,
+)
 from .casper_media import (
     CasperMediaCancelled, CasperMediaExecutor, CasperStagingExecutor,
     build_casper_media_plan, build_casper_staging_plan,
@@ -2168,8 +2170,22 @@ class Window(QMainWindow):
                     f"Exact boot payload: {self.inspection.bootloader_build} "
                     f"({self.inspection.bootloader_dependency})"
                 )
+                try:
+                    matching_bundle = bundle_for_dependency(
+                        self.inspection.bootloader_dependency,
+                    )
+                except CatalogError as error:
+                    matching_bundle = None
+                    self.logger.warning("Boot-helper catalog is unavailable: %s", error)
+                if matching_bundle is not None:
+                    detail_lines.append(
+                        "A hash-pinned matching payload bundle is cataloged; "
+                        "BIOS installation remains disabled until its media executor is audited"
+                    )
             elif self.inspection.bootloader_identity_ambiguous:
-                detail_lines.append("Bootloader identity conflicts across image members")
+                detail_lines.append(
+                    "Bootloader identity inspection is incomplete or conflicting"
+                )
             elif self.inspection.bootloader_version:
                 detail_lines.append(
                     f"Bootloader version {self.inspection.bootloader_version}; exact build unknown"

@@ -620,7 +620,9 @@ def build_write_plan(
     if bios and inspection.bootloader == "Unknown":
         blockers.append("The BIOS bootloader is unknown; ISOpropyl will not guess an installer.")
     if bios and inspection.bootloader_identity_ambiguous:
-        blockers.append(f"Conflicting {inspection.bootloader} identities were detected.")
+        blockers.append(
+            f"The {inspection.bootloader} identity is incomplete or conflicting."
+        )
     elif (
         bios and inspection.bootloader in {"GRUB", "Syslinux/Isolinux"}
         and not inspection.bootloader_dependency

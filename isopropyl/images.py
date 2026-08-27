@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import os
 import re
+import select
 import shutil
 import stat
 import subprocess
@@ -41,6 +42,10 @@ COMPRESSION_SUFFIXES = frozenset({
 })
 MAX_INSPECTION_EXPANDED_BYTES = 64 * 1024**4
 INSPECTION_TIMEOUT_SECONDS = 5 * 60.0
+_TRUSTED_7Z_PATH = "/usr/bin:/bin"
+_TRUSTED_7Z_DIRECTORIES = frozenset(_TRUSTED_7Z_PATH.split(":"))
+MAX_7Z_CATALOG_BYTES = 16 * 1024 * 1024
+MAX_IMAGE_MEMBERS = 65_536
 
 
 class ImageInspectionCancelled(Exception):
@@ -206,7 +211,12 @@ def boot_identity_fields(
             }
         )
     ]
-    ambiguous = bool(related) and identity is None
+    dependency_family = declared_bootloader in {
+        "GRUB", "Syslinux", "Isolinux", "Syslinux/Isolinux",
+    }
+    ambiguous = identity is None and (
+        bool(related) or (dependency_family and not analysis.complete)
+    )
     if not identity:
         return "", "", "", ambiguous, analysis.issues
     return (
@@ -215,7 +225,9 @@ def boot_identity_fields(
     )
 
 
-def parse_7z_listing(output: str) -> list[ImageMember]:
+def parse_7z_listing(
+    output: str, *, maximum_members: int = MAX_IMAGE_MEMBERS,
+) -> list[ImageMember]:
     marker = "----------\n"
     if marker not in output:
         return []
@@ -227,6 +239,8 @@ def parse_7z_listing(output: str) -> list[ImageMember]:
         if not current.get("Path"):
             current.clear()
             return
+        if len(parsed) >= maximum_members:
+            raise ValueError("The image catalog contains too many members")
         try:
             size = int(current.get("Size") or 0)
         except ValueError:
@@ -246,20 +260,126 @@ def parse_7z_listing(output: str) -> list[ImageMember]:
     return parsed
 
 
-def scan_image_contents(path: Path) -> tuple[list[ImageMember], bool]:
-    executable = shutil.which("7z")
+def _trusted_7z() -> str | None:
+    executable = shutil.which("7z", path=_TRUSTED_7Z_PATH)
+    if not executable:
+        return None
+    normalized = os.path.normpath(executable)
+    if (
+        not os.path.isabs(normalized)
+        or os.path.dirname(normalized) not in _TRUSTED_7Z_DIRECTORIES
+        or os.path.basename(normalized) != "7z"
+    ):
+        return None
+    return normalized
+
+
+def scan_image_contents(
+    path: Path, *, image_fd: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> tuple[list[ImageMember], bool]:
+    executable = _trusted_7z()
     if not executable:
         return [], False
+    source = str(path) if image_fd is None else f"/proc/self/fd/{image_fd}"
     try:
-        result = subprocess.run(
-            [executable, "l", "-slt", str(path)], capture_output=True, text=True,
-            timeout=20, check=False,
+        process = subprocess.Popen(
+            [executable, "l", "-slt", source],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(() if image_fd is None else (image_fd,)),
         )
+    except (OSError, subprocess.SubprocessError):
+        return [], False
+    if process.stdout is None:
+        _stop_catalog_process(process)
+        return [], False
+    descriptor = process.stdout.fileno()
+    output = bytearray()
+    deadline = time.monotonic() + 20.0
+    failed = False
+    try:
+        os.set_blocking(descriptor, False)
+        while True:
+            if cancel_check is not None:
+                cancel_check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failed = True
+                break
+            try:
+                readable, _, _ = select.select(
+                    (descriptor,), (), (), min(0.1, remaining),
+                )
+            except (OSError, ValueError):
+                failed = True
+                break
+            if not readable:
+                continue
+            try:
+                block = os.read(
+                    descriptor,
+                    min(64 * 1024, MAX_7Z_CATALOG_BYTES + 1 - len(output)),
+                )
+            except BlockingIOError:
+                continue
+            except OSError:
+                failed = True
+                break
+            if not block:
+                break
+            output.extend(block)
+            if len(output) > MAX_7Z_CATALOG_BYTES:
+                failed = True
+                break
+        if failed:
+            return [], False
+        while process.poll() is None:
+            if cancel_check is not None:
+                cancel_check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return [], False
+            try:
+                process.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        returncode = process.poll()
+        if returncode:
+            return [], False
+        try:
+            listing = output.decode("utf-8", errors="replace")
+            return parse_7z_listing(listing), True
+        except ValueError:
+            return [], False
+    finally:
+        if process.poll() is None:
+            _stop_catalog_process(process)
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+
+
+def _stop_catalog_process(process: subprocess.Popen[bytes]) -> None:
+    """Bounded terminate/kill/reap for the unprivileged archive lister."""
+
+    try:
+        if process.poll() is None:
+            process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=0.25)
     except (OSError, subprocess.TimeoutExpired):
-        return [], False
-    if result.returncode:
-        return [], False
-    return parse_7z_listing(result.stdout), True
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=0.25)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _read_partition_evidence(
@@ -415,6 +535,8 @@ def inspect_image(
             cancel_check=check_inspection,
             maximum_expanded_bytes=maximum_expanded_bytes,
         )
+        is_compressed = source.compressed
+        compression = source.compression
     finally:
         source.close()
 
@@ -432,57 +554,88 @@ def inspect_image(
         # Keep accepting explicitly chosen unknown regular files as raw bytes;
         # structured formats above remain a fail-closed denylist.
         kind = "Raw image"
-    members, contents_scanned = scan_image_contents(path) if not source.compressed else ([], False)
-    modes, architectures, bootloader, windows_installer = classify_boot_paths(
-        [member.path for member in members]
-    )
-    eltorito: ElToritoInspection | None = None
-    eltorito_issues: tuple[str, ...] = ()
-    if not source.compressed and is_iso9660:
-        try:
-            eltorito = inspect_eltorito_file(path)
-        except ElToritoNotFound:
-            pass
-        except ElToritoError as error:
-            eltorito_issues = (str(error),)
-    if eltorito is not None:
-        catalog_modes = {
-            BootPlatform.BIOS_X86: "BIOS",
-            BootPlatform.EFI: "UEFI",
-            BootPlatform.POWERPC: "PowerPC",
-            BootPlatform.MAC: "Mac",
-        }
-        detected = set(modes)
-        detected.update(
-            catalog_modes[platform] for platform in eltorito.bootable_platforms
+    inspection_fd = -1
+    if not is_compressed:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        inspection_fd = os.open(path, flags)
+        bound = os.fstat(inspection_fd)
+        bound_identity = (
+            bound.st_dev, bound.st_ino, bound.st_size,
+            bound.st_mtime_ns, bound.st_ctime_ns,
         )
-        modes = tuple(
-            mode for mode in ("BIOS", "UEFI", "PowerPC", "Mac")
-            if mode in detected
+        if not stat.S_ISREG(bound.st_mode) or bound_identity != observed_identity:
+            os.close(inspection_fd)
+            raise OSError("The selected image changed before catalog inspection")
+    try:
+        members, contents_scanned = (
+            scan_image_contents(
+                path, image_fd=inspection_fd, cancel_check=check_inspection,
+            )
+            if inspection_fd >= 0 else ([], False)
         )
-    version = build = dependency = ""
-    identity_ambiguous = False
-    identity_issues: tuple[str, ...] = ()
-    if not source.compressed and bootloader in {"GRUB", "Syslinux/Isolinux"}:
-        analysis = analyze_iso_bootloaders(path, [member.path for member in members])
-        version, build, dependency, identity_ambiguous, identity_issues = boot_identity_fields(
-            analysis, bootloader
+        modes, architectures, bootloader, windows_installer = classify_boot_paths(
+            [member.path for member in members]
         )
-    uefi_payloads: tuple[ImageUefiPayload, ...] = ()
-    uefi_issues: tuple[str, ...] = ()
-    if not source.compressed and "UEFI" in modes:
-        uefi_analysis = inspect_iso_uefi_payloads(
-            path, [member.path for member in members]
-        )
-        uefi_payloads = uefi_analysis.payloads
-        uefi_issues = uefi_analysis.issues
+        eltorito: ElToritoInspection | None = None
+        eltorito_issues: tuple[str, ...] = ()
+        if inspection_fd >= 0 and is_iso9660:
+            try:
+                eltorito = inspect_eltorito_file(path, image_fd=inspection_fd)
+            except ElToritoNotFound:
+                pass
+            except ElToritoError as error:
+                eltorito_issues = (str(error),)
+        if eltorito is not None:
+            catalog_modes = {
+                BootPlatform.BIOS_X86: "BIOS",
+                BootPlatform.EFI: "UEFI",
+                BootPlatform.POWERPC: "PowerPC",
+                BootPlatform.MAC: "Mac",
+            }
+            detected = set(modes)
+            detected.update(
+                catalog_modes[platform] for platform in eltorito.bootable_platforms
+            )
+            modes = tuple(
+                mode for mode in ("BIOS", "UEFI", "PowerPC", "Mac")
+                if mode in detected
+            )
+        version = build = dependency = ""
+        identity_ambiguous = False
+        identity_issues: tuple[str, ...] = ()
+        if inspection_fd >= 0 and bootloader in {"GRUB", "Syslinux/Isolinux"}:
+            analysis = analyze_iso_bootloaders(
+                path, [member.path for member in members], image_fd=inspection_fd,
+            )
+            version, build, dependency, identity_ambiguous, identity_issues = boot_identity_fields(
+                analysis, bootloader
+            )
+        uefi_payloads: tuple[ImageUefiPayload, ...] = ()
+        uefi_issues: tuple[str, ...] = ()
+        if inspection_fd >= 0 and "UEFI" in modes:
+            uefi_analysis = inspect_iso_uefi_payloads(
+                path, [member.path for member in members], image_fd=inspection_fd,
+            )
+            uefi_payloads = uefi_analysis.payloads
+            uefi_issues = uefi_analysis.issues
+        if inspection_fd >= 0:
+            final_bound = os.fstat(inspection_fd)
+            final_bound_identity = (
+                final_bound.st_dev, final_bound.st_ino, final_bound.st_size,
+                final_bound.st_mtime_ns, final_bound.st_ctime_ns,
+            )
+            if final_bound_identity != observed_identity:
+                raise OSError("The selected image changed while it was being inspected")
+    finally:
+        if inspection_fd >= 0:
+            os.close(inspection_fd)
     result = ImageInspection(
         size=size, kind=kind, volume_label=volume_label, has_mbr=has_mbr,
         has_gpt=has_gpt, is_iso9660=is_iso9660,
         looks_windows=_looks_like_windows(path, volume_label),
         boot_modes=modes, architectures=architectures, bootloader=bootloader,
         has_windows_installer=windows_installer, contents_scanned=contents_scanned,
-        compression=source.compression, members=tuple(members),
+        compression=compression, members=tuple(members),
         bootloader_version=version, bootloader_build=build,
         bootloader_dependency=dependency,
         bootloader_identity_ambiguous=identity_ambiguous,

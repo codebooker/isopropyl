@@ -7,16 +7,18 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 from isopropyl.bootloaders import (
-    BootloaderCatalog, BootloaderResource, CatalogError, DependencyUnavailable,
-    DownloadError, delete_cached_artifacts, fetch_resource, installed_tool_matches,
-    inventory_cache, load_catalog, resolve_artifact, resolve_system_tool,
-    reverify_artifact,
+    BootloaderBundle, BootloaderCatalog, BootloaderResource, CatalogError,
+    DependencyUnavailable, DownloadError, bind_resource_bytes,
+    bundle_for_dependency, delete_cached_artifacts, fetch_resource, installed_tool_matches,
+    inventory_cache, load_catalog, prepare_bundle, resolve_artifact,
+    resolve_system_tool, reverify_artifact,
 )
 
 
@@ -47,7 +49,8 @@ def resource(
 class BootloaderTests(unittest.TestCase):
     def test_bundled_catalog_is_valid_and_network_inactive(self):
         catalog = load_catalog()
-        self.assertEqual(len(catalog.resources), 1)
+        self.assertEqual(len(catalog.resources), 10)
+        self.assertEqual(len(catalog.bundles), 8)
         image = catalog.find(
             "uefi-ntfs", "2.8-rufus-2368e49a", "uefi-ntfs.img",
         )
@@ -59,17 +62,39 @@ class BootloaderTests(unittest.TestCase):
             "72683fa1250eeea772d3399277b434d4e55ba8dd0dc926e52d817e701fc2eb9e",
         )
         self.assertEqual(image.allowed_hosts, ("raw.githubusercontent.com",))
+        syslinux = catalog.find_bundle(
+            "syslinux", "6.04-pre1", "matched-bios-payloads",
+        )
+        self.assertIsNotNone(syslinux)
+        assert syslinux is not None
+        self.assertEqual(syslinux.artifact_names, ("ldlinux.bss", "ldlinux.sys"))
+        grub = catalog.find_bundle("grub", "2.14", "blank-bios-core-image")
+        self.assertIsNotNone(grub)
+        self.assertIsNone(bundle_for_dependency("grub:2.14", catalog=catalog))
+
+    def test_dependency_bundle_matching_never_truncates_versions(self):
+        catalog = load_catalog()
+        exact = bundle_for_dependency("syslinux:6.04-pre1", catalog=catalog)
+        self.assertIsNotNone(exact)
+        self.assertIsNone(
+            bundle_for_dependency("syslinux:6.04-pre1-custom", catalog=catalog)
+        )
+        self.assertIsNone(
+            bundle_for_dependency("grub:2.14-downstream1", catalog=catalog)
+        )
+        self.assertIsNone(bundle_for_dependency("syslinux:../../6.04", catalog=catalog))
 
     def test_catalog_rejects_http_and_unsafe_names(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "catalog.json"
             base = {
-                "catalog_version": 1,
+                "catalog_version": 2,
                 "resources": [{
                     "family": "grub", "version": "2.12", "name": "core.img",
                     "url": "http://example.test/core.img", "sha256": "0" * 64,
                     "size": 12,
                 }],
+                "bundles": [],
             }
             path.write_text(json.dumps(base), encoding="utf-8")
             with self.assertRaises(CatalogError):
@@ -79,6 +104,110 @@ class BootloaderTests(unittest.TestCase):
             path.write_text(json.dumps(base), encoding="utf-8")
             with self.assertRaises(CatalogError):
                 load_catalog(path)
+
+    def test_catalog_rejects_bundle_with_missing_or_mixed_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            payload = {
+                "catalog_version": 2,
+                "resources": [{
+                    "family": "syslinux", "version": "6.03",
+                    "name": "ldlinux.sys",
+                    "url": "https://example.test/ldlinux.sys",
+                    "sha256": "0" * 64, "size": 12,
+                }],
+                "bundles": [{
+                    "family": "syslinux", "version": "6.04",
+                    "purpose": "matched-bios-payloads",
+                    "artifacts": ["ldlinux.bss", "ldlinux.sys"],
+                    "license": "GPL-2.0-or-later",
+                    "provenance_url": "https://example.test/source",
+                }],
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(CatalogError, "missing resource"):
+                load_catalog(path)
+
+    def test_catalog_rejects_case_alias_resource_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            common = {
+                "version": "2.12", "name": "core.img",
+                "url": "https://example.test/core.img",
+                "sha256": "0" * 64, "size": 12,
+            }
+            payload = {
+                "catalog_version": 2,
+                "resources": [
+                    {"family": "grub", **common},
+                    {"family": "GRUB", **common},
+                ],
+                "bundles": [],
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(CatalogError, "Duplicate"):
+                load_catalog(path)
+
+    def test_exact_bundle_is_downloaded_and_frozen_as_immutable_bytes(self):
+        first_value = b"boot sector payload"
+        second_value = b"loader payload"
+        first = resource(
+            first_value, family="syslinux", version="6.04", name="ldlinux.bss",
+        )
+        second = resource(
+            second_value, family="syslinux", version="6.04", name="ldlinux.sys",
+        )
+        bundle = BootloaderBundle(
+            "syslinux", "6.04", "matched-bios-payloads",
+            ("ldlinux.bss", "ldlinux.sys"), "GPL-2.0-or-later",
+            "https://example.test/source",
+        )
+
+        def opener(request, **_kwargs):
+            # Test resources share the fixture URL; the download order binds
+            # each response to the exact catalog hash and size.
+            opener.calls += 1
+            return Response(
+                first_value if opener.calls == 1 else second_value,
+                request.full_url,
+            )
+
+        opener.calls = 0
+        with tempfile.TemporaryDirectory() as directory:
+            prepared = prepare_bundle(
+                "syslinux", "6.04", "matched-bios-payloads",
+                catalog=BootloaderCatalog((first, second), (bundle,)),
+                cache_dir=Path(directory), opener=opener,
+            )
+            for path in Path(directory).rglob("ldlinux.*"):
+                path.write_bytes(b"tampered after binding")
+
+        self.assertEqual(prepared.family, "syslinux")
+        self.assertEqual(prepared.version, "6.04")
+        self.assertEqual(
+            tuple((item.name, item.data) for item in prepared.artifacts),
+            (("ldlinux.bss", first_value), ("ldlinux.sys", second_value)),
+        )
+        self.assertEqual(prepared.total_size, len(first_value) + len(second_value))
+
+    def test_bundle_binding_rejects_links(self):
+        value = b"trusted bootloader bytes"
+        item = resource(value)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.write_bytes(value)
+            symbolic = root / "core.img"
+            symbolic.symlink_to(target)
+            with self.assertRaises(DownloadError):
+                bind_resource_bytes(symbolic, item)
+            symbolic.unlink()
+            real = root / "core.img"
+            real.write_bytes(value)
+            hard = root / "hard"
+            os.link(real, hard)
+            with self.assertRaisesRegex(DownloadError, "singly linked"):
+                bind_resource_bytes(real, item)
 
     def test_download_is_cached_only_after_hash_and_size_verification(self):
         value = b"trusted bootloader bytes"
@@ -95,6 +224,39 @@ class BootloaderTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), value)
             self.assertEqual(fetch_resource(resource(value), Path(directory), open_download), path)
             self.assertEqual(calls, 1)
+
+    def test_download_handles_short_unbuffered_file_writes(self):
+        value = b"trusted bootloader bytes"
+        real_fdopen = os.fdopen
+
+        class ShortWritingOutput:
+            def __init__(self, descriptor):
+                self.stream = real_fdopen(descriptor, "wb", buffering=0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.stream.close()
+
+            def write(self, data):
+                return self.stream.write(data[:1])
+
+            def fileno(self):
+                return self.stream.fileno()
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "isopropyl.bootloaders.os.fdopen",
+                side_effect=lambda descriptor, *_args, **_kwargs: ShortWritingOutput(
+                    descriptor
+                ),
+            ):
+                path = fetch_resource(
+                    resource(value), Path(directory),
+                    lambda *_args, **_kwargs: Response(value),
+                )
+            self.assertEqual(path.read_bytes(), value)
 
     def test_bad_hash_and_untrusted_redirect_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -154,6 +316,204 @@ class BootloaderTests(unittest.TestCase):
                 )
         self.assertFalse(opened)
 
+    def test_blocked_response_is_cut_off_by_overall_deadline(self):
+        release = threading.Event()
+
+        class BlockingResponse:
+            def read(self, _size=-1):
+                release.wait(5)
+                return b""
+
+            def geturl(self):
+                return "https://downloads.example.test/core.img"
+
+            def close(self):
+                release.set()
+
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(DownloadError, "overall time limit"):
+                fetch_resource(
+                    resource(), Path(directory),
+                    lambda *_args, **_kwargs: BlockingResponse(),
+                    overall_timeout=0.05,
+                )
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_blocked_connection_setup_is_cut_off_by_overall_deadline(self):
+        release = threading.Event()
+
+        def blocked_opener(*_args, **_kwargs):
+            release.wait(5)
+            return Response(b"trusted bootloader bytes")
+
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(DownloadError, "overall time limit"):
+                    fetch_resource(
+                        resource(), Path(directory), blocked_opener,
+                        overall_timeout=0.05,
+                    )
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_blocked_cache_verification_is_cut_off_by_overall_deadline(self):
+        value = b"trusted bootloader bytes"
+        release = threading.Event()
+        real_read = os.read
+
+        def blocked_read(descriptor, size):
+            release.wait(5)
+            return real_read(descriptor, size)
+
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "grub" / "2.12" / "core.img"
+                path.parent.mkdir(parents=True)
+                path.write_bytes(value)
+                with patch("isopropyl.bootloaders.os.read", side_effect=blocked_read):
+                    with self.assertRaisesRegex(DownloadError, "overall time limit"):
+                        fetch_resource(
+                            resource(value), root,
+                            lambda *_args, **_kwargs: self.fail(
+                                "a valid cache hit must not open the network"
+                            ),
+                            overall_timeout=0.05,
+                        )
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_bundle_binding_obeys_the_shared_deadline(self):
+        value = b"trusted bootloader bytes"
+        release = threading.Event()
+        real_read = os.read
+
+        def blocked_read(descriptor, size):
+            release.wait(5)
+            return real_read(descriptor, size)
+
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "core.img"
+                path.write_bytes(value)
+                with patch("isopropyl.bootloaders.os.read", side_effect=blocked_read):
+                    with self.assertRaisesRegex(DownloadError, "overall time limit"):
+                        bind_resource_bytes(
+                            path, resource(value),
+                            deadline=time.monotonic() + 0.05,
+                        )
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_blocked_cache_fsync_is_cut_off_by_overall_deadline(self):
+        value = b"trusted bootloader bytes"
+        release = threading.Event()
+        real_fsync = os.fsync
+
+        def blocked_fsync(descriptor):
+            release.wait(5)
+            return real_fsync(descriptor)
+
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                with patch(
+                    "isopropyl.bootloaders.os.fsync", side_effect=blocked_fsync,
+                ):
+                    with self.assertRaisesRegex(DownloadError, "overall time limit"):
+                        fetch_resource(
+                            resource(value), Path(directory),
+                            lambda *_args, **_kwargs: Response(value),
+                            overall_timeout=0.05,
+                        )
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_download_never_traverses_a_parent_cache_symlink(self):
+        value = b"trusted bootloader bytes"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache"
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            root.mkdir()
+            (root / "grub").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(DownloadError, "unsafe"):
+                fetch_resource(
+                    resource(value), root,
+                    lambda *_args, **_kwargs: Response(value),
+                )
+            self.assertEqual(list(outside.rglob("*")), [])
+
+    def test_parent_directory_swap_after_publish_is_detected(self):
+        value = b"trusted bootloader bytes"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache"
+            parent = root / "grub" / "2.12"
+            moved = Path(directory) / "moved-parent"
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            real_replace = os.replace
+
+            def swap_parent_after_replace(source, destination, **kwargs):
+                result = real_replace(source, destination, **kwargs)
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+                return result
+
+            with patch(
+                "isopropyl.bootloaders.os.replace",
+                side_effect=swap_parent_after_replace,
+            ):
+                with self.assertRaisesRegex(DownloadError, "cache path changed"):
+                    fetch_resource(
+                        resource(value), root,
+                        lambda *_args, **_kwargs: Response(value),
+                    )
+            self.assertFalse((outside / "core.img").exists())
+            self.assertEqual((moved / "core.img").read_bytes(), value)
+
+    def test_bundle_reports_aggregate_progress(self):
+        first_value = b"first"
+        second_value = b"second payload"
+        first = resource(
+            first_value, family="syslinux", version="6.04", name="ldlinux.bss",
+        )
+        second = resource(
+            second_value, family="syslinux", version="6.04", name="ldlinux.sys",
+        )
+        bundle = BootloaderBundle(
+            "syslinux", "6.04", "matched-bios-payloads",
+            ("ldlinux.bss", "ldlinux.sys"), "GPL-2.0-or-later",
+            "https://example.test/source",
+        )
+        calls = 0
+        updates: list[tuple[int, int]] = []
+
+        def opener(request, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return Response(first_value if calls == 1 else second_value, request.full_url)
+
+        with tempfile.TemporaryDirectory() as directory:
+            prepare_bundle(
+                "syslinux", "6.04", "matched-bios-payloads",
+                catalog=BootloaderCatalog((first, second), (bundle,)),
+                cache_dir=Path(directory), opener=opener,
+                progress=lambda done, total: updates.append((done, total)),
+            )
+        self.assertTrue(updates)
+        total = len(first_value) + len(second_value)
+        self.assertEqual(updates[-1], (total, total))
+        self.assertTrue(all(done <= total for done, total in updates))
+
     def test_installed_exact_version_is_preferred(self):
         def run(_args, **_kwargs):
             return subprocess.CompletedProcess([], 0, "grub-install (GRUB) 2.12-5ubuntu2", "")
@@ -166,6 +526,40 @@ class BootloaderTests(unittest.TestCase):
             self.assertIsNone(installed_tool_matches("grub-install", "2.12.1", run))
             resolved = resolve_system_tool("grub", "2.12", "grub-install", runner=run)
             self.assertEqual(resolved.source, "system-tool")
+
+    def test_system_tool_discovery_uses_only_trusted_directories(self):
+        with patch(
+            "isopropyl.bootloaders.shutil.which",
+            return_value="/home/example/bin/grub-install",
+        ) as which:
+            self.assertIsNone(installed_tool_matches("grub-install", "2.12"))
+        which.assert_called_once_with(
+            "grub-install", path="/usr/sbin:/usr/bin:/sbin:/bin",
+        )
+
+    def test_system_tool_discovery_rejects_program_paths(self):
+        with patch("isopropyl.bootloaders.shutil.which") as which:
+            self.assertIsNone(installed_tool_matches("../grub-install", "2.12"))
+        which.assert_not_called()
+
+    def test_system_tool_discovery_rejects_malformed_versions(self):
+        with patch("isopropyl.bootloaders.shutil.which") as which:
+            for version in ("", "latest", "2", "../../2.12", "2.12 extra"):
+                self.assertIsNone(installed_tool_matches("grub-install", version))
+        which.assert_not_called()
+
+    def test_injected_bundle_must_have_the_exact_purpose_artifacts(self):
+        value = b"boot sector payload"
+        first = resource(
+            value, family="syslinux", version="6.04", name="ldlinux.bss",
+        )
+        incomplete = BootloaderBundle(
+            "syslinux", "6.04", "matched-bios-payloads",
+            ("ldlinux.bss",), "GPL-2.0-or-later", "https://example.test/source",
+        )
+        catalog = BootloaderCatalog((first,), (incomplete,))
+        with self.assertRaisesRegex(CatalogError, "unsupported artifact set"):
+            bundle_for_dependency("syslinux:6.04", catalog=catalog)
 
     def test_host_tool_cannot_satisfy_a_boot_artifact_request(self):
         with patch("isopropyl.bootloaders.shutil.which", return_value="/usr/sbin/grub-install"):

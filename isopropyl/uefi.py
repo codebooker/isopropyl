@@ -520,10 +520,14 @@ def inspect_iso_uefi_payloads(
     *,
     reader: ArchiveReader | None = None,
     timeout: float = 30.0,
+    image_fd: int | None = None,
 ) -> ImageUefiAnalysis:
     """Read selected EFI members without privilege and inspect their PE structure."""
-    if not image.is_file():
-        raise OSError("The selected image is not a regular file")
+    if image_fd is None:
+        if not image.is_file():
+            raise OSError("The selected image is not a regular file")
+    elif not stat.S_ISREG(os.fstat(image_fd).st_mode):
+        raise OSError("The selected image descriptor is not a regular file")
     started = time.monotonic()
     payloads: list[ImageUefiPayload] = []
     issues: list[str] = []
@@ -537,7 +541,7 @@ def inspect_iso_uefi_payloads(
                 reader(image, member)
                 if reader is not None
                 else read_archive_member_with_7z(
-                    image, member, timeout=min(15.0, remaining)
+                    image, member, timeout=min(15.0, remaining), image_fd=image_fd,
                 )
             )
             parsed = inspect_pe_bytes(blob)

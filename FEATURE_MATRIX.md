@@ -62,12 +62,12 @@ Status meanings:
 | MBR marker/boot-code analysis | **Done** | Under the conventional 512-byte-LBA interpretation, validates primary entries, overlaps, bounds, boot flags, mandatory protective fields, hybrid rules, and bounded EBR chains; classifies empty, Windows, GRUB, Syslinux, and unrecognized boot code. |
 | GPT detection | **Done** | Validates 512/4096-byte-sector primary and backup headers, exact revision/reserved fields, reciprocal locations, header and array CRC32, matching arrays, GUIDs, entry size/attributes, 16 KiB reservations, usable ranges, entry bounds/overlaps, and exact protective/hybrid MBR mirroring. |
 | ISO 9660 and volume label | **Done** | Primary volume descriptor and label inspection. |
-| Joliet/Rock Ridge/UDF contents | **Partial** | 7-Zip catalogs/extracts the tested ISO/UDF media safely; ISO mode rejects links rather than materializing them, and expert toggles are absent. |
+| Joliet/Rock Ridge/UDF contents | **Partial** | A trusted system 7-Zip catalogs tested ISO/UDF media through the bound image descriptor with a 16 MiB/65,536-member ceiling, cancellation, a 20-second subprocess deadline, and bounded terminate/kill/reap; ISO mode separately rejects links rather than materializing them, and expert toggles are absent. |
 | El Torito catalogs | **Done** | Strict bounded validation entry, sections, platforms, emulation, boot flags, LBAs, extents, overlap, and identity checks. Embedded filesystems are not parsed. |
 | BIOS/UEFI path detection | **Done** | Combines member paths with El Torito evidence. Construction remains UEFI-only. |
 | UEFI fallback architectures | **Done** | x86, x64, ARM, ARM64, RISC-V64, and LoongArch64 fallback names. ISO execution requires a recognized non-empty fallback loader. |
-| GRUB/GRUB2 identity | **Partial** | Bounded payload inspection reports exact downstream build when evidence permits; no construction/download caller. |
-| Syslinux/Isolinux identity | **Partial** | Exact release/custom-build conflicts detected; no C32 compatibility/executor integration. |
+| GRUB/GRUB2 identity | **Partial** | Bounded, descriptor-bound payload inspection reports an exact downstream build when evidence permits; unsafe candidate names, candidate overflow, read failure, oversized payload, or timeout disables dependency matching. Hash-pinned 2.06/2.12/2.14 Rufus-built `core.img` files exist only as dormant blank-media research bundles: they deliberately do not satisfy detected-image dependencies, no BIOS construction caller is enabled, and downstream builds are never prefix-matched. |
+| Syslinux/Isolinux identity | **Partial** | Exact release/custom-build conflicts are detected through descriptor-bound reads; unsafe candidate names, candidate overflow, read failure, oversized payload, or timeout fails closed. Atomic, hash-pinned exact `6.03-2014-10-06` and `6.04-pre1` payload bundles can be prepared into immutable bytes, but no audited BIOS installer consumes them and C32 replacement remains unintegrated. |
 | Windows Boot Manager | **Partial** | Detects installer paths and UEFI payloads; WIM/ESD metadata and edition/index selection are exposed. Offline BCD construction and cryptographic trust remain. |
 | UEFI PE architecture/subsystem | **Done** | Strict structural parser for selected EFI payloads. |
 | Authenticode signature reporting | **Partial** | Reports certificate-table structure as `present-unverified`; no cryptographic chain or signer trust. |
@@ -77,7 +77,7 @@ Status meanings:
 | Image/staging stored on target | **Done** | Refused before destructive work, then rechecked in constructed execution. |
 | Conflicting-process diagnostics | **Done** | When an unmount fails, two bounded, read-only optional `fuser` snapshots identify stable visible owners by sanitized process name, PID, and numeric UID across raw writing, backup, restore, erase, media test, optical capture, ISO construction, persistence, and UEFI:NTFS paths. Pipe reads stop at the shared output/deadline ceiling; ISOpropyl never asks `fuser` to kill an owner, trusts no command-line arguments from `/proc`, and preserves the original failure when the probe is unavailable or incomplete. |
 | Distro-specific DD-only rules | **Planned** | Needs a versioned compatibility catalog and fixtures. |
-| Automatic GRUB/Syslinux downloads | **Planned** | Verified-download infrastructure exists, but there is no user-facing GRUB/Syslinux caller or release catalog yet. UEFI:NTFS uses the same underlying safety model but is a separate payload family. |
+| Automatic GRUB/Syslinux downloads | **Partial** | A release-bundled v2 catalog pins exact immutable upstream URLs, sizes, SHA-256 digests, purpose-specific bundle membership, licenses, and provenance for selected GRUB/Syslinux payloads. Preparation uses no-follow cache directories, detects parent-path replacement, is cancellable, progress-aware, deadline-bounded across connection/download/cache reads/binding, exact-match-only, and returns no partial set or mutable cache path. Only exact Syslinux identities have dependency mappings; the GRUB entries remain blank-media research inputs. BIOS construction and its opt-in GUI caller remain disabled, so none are downloaded during normal writes. |
 
 ## Windows-specific construction and customization
 
@@ -171,7 +171,7 @@ Status meanings:
 | Bind partition-node identity | **Done** | Multi-partition workflows bind every direct child path to kernel parent and major:minor identity, verify the block node with `lstat`, and repeat exact geometry and identity checks before each filesystem creation. |
 | Exclusive target ownership | **Partial** | Every destructive child command now fails fast behind a whole-device cooperative `flock`; `sfdisk` uses its native nonblocking lock. This coordinates lock-aware tools but remains advisory and per-command. A privileged transaction broker/private namespace is still required for stronger end-to-end ownership, and no unsafe bypass will be exposed. |
 | Fixed privileged argv/no shell | **Done** | Absolute trusted tools and bounded child processes. |
-| Verified boot components | **Partial** | A release-bundled catalog pins the UEFI:NTFS source commit, exact size, and SHA-256; explicit consent, identity-safe cache binding, in-memory privileged transfer, and full read-back are integrated. GRUB/Syslinux catalogs and signed ISOpropyl release metadata remain. |
+| Verified boot components | **Partial** | A release-bundled catalog pins UEFI:NTFS plus selected Syslinux/GRUB bundles by immutable source commit, exact size, SHA-256, license, and provenance. UEFI:NTFS has explicit consent, identity-safe cache binding, in-memory privileged transfer, and full read-back. Generic bundles bind singly linked no-follow files into immutable bytes, but have no privileged consumer. Project-owned signed ISOpropyl release metadata remains. |
 | No unsigned remote scripts | **Policy** | ISOpropyl will never execute a downloaded installer/downloader script. |
 | Opt-in network use | **Policy** | UEFI:NTFS acquisition requires explicit confirmation; no remote code or script is executed. Future downloads require the same explicit action and pinned provenance. |
 | Reproducible builds | **Partial** | Standard package metadata and CI exist; locked inputs and reproduction attestations remain. |
@@ -191,8 +191,9 @@ Status meanings:
 5. Add Windows To Go through wimlib and offline boot configuration.
 6. Add cryptographic Secure Boot trust and authenticated revocation data.
 7. Complete FFU/VTSI/direct WIM/ESD and image-output formats.
-8. Add signed opt-in downloaders, FreeDOS, UEFI Shell, and audited GRUB/Syslinux
-   payload catalogs.
+8. Add project-owned signed manifests and corresponding-source-compliant hosting,
+   then audited BIOS consumers for the dormant GRUB/Syslinux payloads; add
+   signed opt-in FreeDOS and UEFI Shell acquisition.
 9. Finish localization, conflict diagnostics, signed reproducible packaging, and
    physical certification of safe expert format controls.
 

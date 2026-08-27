@@ -65,11 +65,17 @@ the active extractor, WIM splitter, formatter, or constructed-media executor.
 
 ## Bootloader dependency policy
 
-`isopropyl/data/bootloaders-v1.json` currently contains one UEFI:NTFS v2.8 image
-pinned to an immutable Rufus source commit, exact size, and SHA-256. Resolver
-code enforces HTTPS origin/redirect hosts, atomic caching, and pre-use
-verification. The GUI obtains explicit consent before acquisition, and the
-privileged writer consumes verified in-memory bytes instead of the cache path.
+`isopropyl/data/bootloaders-v2.json` contains the working UEFI:NTFS v2.8 image,
+exact Syslinux `6.03-2014-10-06` and `6.04-pre1` payload sets, and dormant GRUB
+2.06/2.12/2.14 blank-media research bundles. All entries are pinned to immutable
+upstream snapshots with exact sizes, SHA-256 digests, license identifiers, and
+provenance. Resolver code enforces HTTPS origin/redirect hosts, purpose-specific
+bundle membership, no-follow descriptor-bound atomic caching, parent-path
+revalidation, and pre-use verification under one caller-visible deadline. The
+UEFI:NTFS GUI obtains explicit consent before acquisition, and its privileged
+writer consumes verified in-memory bytes instead of the cache path. No GUI or
+BIOS executor consumes the GRUB/Syslinux bundles, and GRUB bundles deliberately
+do not satisfy detected-image dependency keys.
 
 Every additional catalog entry requires documented upstream provenance, license
 review, exact version/custom-build compatibility, size and digest review,

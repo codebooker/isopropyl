@@ -36,9 +36,13 @@ evidence.
 
 ### Linux boot and persistence
 
-- Populate GRUB/Syslinux catalog entries only with license-reviewed,
-  upstream-provenanced payloads, signed release metadata, exact sizes and hashes;
-  preserve the same consent and pre-use checks already used by UEFI:NTFS.
+- Move the reviewed GRUB/Syslinux bundle metadata to project-owned signed
+  release manifests and a corresponding-source-compliant artifact service;
+  keep exact-match-only immutable preparation.
+- Add a narrowly scoped, read-back-verified Syslinux MBR/FAT installer before
+  exposing the dormant payload bundles or removing any BIOS blocker. GRUB BIOS
+  follows only after its prefix, module set, filesystem, and boot-region layout
+  can be reproduced and verified without executing downloaded code.
 - Add bounded support for the embedded UEFI GRUB configuration used by current
   official Ubuntu media, rather than assuming a synthetic extracted path. Then
   hardware-certify the immutable Casper workflow across 512- and 4096-byte
