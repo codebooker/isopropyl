@@ -44,13 +44,27 @@ installer customization, verification, backups, formatting, and media tools.
   bridge obtained from a version-and-hash-pinned upstream artifact.
 - Stream `.gz`, `.gzip`, `.bz2`, `.bzip2`, `.xz`, `.lzma`, `.zst`, `.zstd`,
   legacy `.Z`, and single-file ZIP images without creating an expanded copy.
+  Five-field file identity binds inspection and confirmation; the writer then
+  opens one no-follow descriptor and keeps it through the privileged write.
+  Every decoded read is rechecked before its bytes can be yielded, and a changed
+  descriptor fails closed.
 - Inspect and convert VHD, VHDX, QCOW, and QCOW2 containers through a bounded,
   identity-checked `qemu-img` staging step—container headers are never written
   as if they were disk sectors.
 
 ### Understand an image before writing it
 
-- Detect raw, MBR/hybrid, GPT, ISO 9660, BIOS, and UEFI layouts.
+- For raw and ISO inputs, structurally validate MBR, extended-partition chains,
+  protective/hybrid MBR, and reciprocal primary/backup GPT metadata—including
+  mandatory protective fields, revisions, reserved bytes, CRCs, bounds, GUIDs,
+  attributes, and overlaps—before recommending DD. Plain MBR geometry uses the
+  conventional 512-byte-LBA interpretation; GPT logical-sector size is detected
+  and validated at 512 or 4096 bytes.
+- Treat legal compressed images whose partition metadata falls outside the
+  bounded prefix/tail capture as “inspection incomplete,” never as corrupt or
+  automatically DD-ready.
+- Classify common Windows, GRUB, and Syslinux MBR boot code and surface malformed
+  partition metadata instead of treating a signature alone as a valid disk.
 - Parse El Torito boot catalogs and report their BIOS/UEFI boot entries.
 - Inspect removable-media EFI executables, PE architecture, certificate-table
   presence, and SBAT structure without pretending that structure equals trust.
@@ -89,8 +103,15 @@ ISOpropyl warns before enabling this option, and S-mode media should not use it.
   and content-compared before publication.
 - Capture readable optical media to ISO without modifying the disc.
 - Restore a drive as FAT12, FAT16, FAT32, exFAT, NTFS, UDF 2.01, ext2, ext3,
-  or ext4 using MBR or GPT. The UI states the legacy-FAT limits and partitioned
-  UDF's macOS automount caveat.
+  or ext4 using MBR or GPT. Exact, geometry-safe allocation-unit choices are
+  available for FAT/exFAT/NTFS and portable block-size choices for ext. Automatic
+  appears only when the modeled formatter-default policy is conservatively valid
+  once logical-sector geometry is known; if discovery omits that geometry, the
+  choice is provisional and is revalidated before unmounting. An explicit safe
+  size is required when a known default cannot be guaranteed. The UI switches to
+  GPT when known geometry proves a full-capacity partition exceeds MBR's 32-bit
+  sector fields, and states the legacy-FAT limits and partitioned UDF's macOS
+  automount caveat.
 - Run destructive bad-block passes and F3 fake-capacity probes as separate,
   heavily warned workflows.
 - Zero the full device or only its boundary metadata regions.
@@ -107,6 +128,16 @@ Destructive disk software deserves boring, explicit safeguards. ISOpropyl:
 - operates only on validated whole-device paths beneath `/dev`;
 - binds the selected model, capacity, serial/WWN, transport, and major:minor
   identity, then rechecks them around unmounting and immediately before writes;
+- binds the image selected for inspection to the image approved for writing,
+  including device, inode, size, modification time, and change time, then streams
+  from the writer's identity-checked no-follow descriptor instead of asking
+  privileged `dd` to reopen a pathname;
+- refuses to preselect DD when a validated image layout uses a logical-sector
+  size different from the selected target, or when the selected target does not
+  report the sector size needed to validate structured partition LBAs; for plain
+  MBR this is explicitly the conventional assumed 512-byte interpretation;
+- binds the target's logical-sector size before destructive restore work and
+  rechecks it again before the selected formatter runs;
 - refuses an image or staging tree stored on the destination drive;
 - runs privileged tools with fixed argument arrays—never constructed shell text;
 - wraps privileged destructive tools in fail-fast, whole-device cooperative
@@ -250,7 +281,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 500 tests. Device-facing tests mock block
+The suite currently contains more than 570 tests. Device-facing tests mock block
 devices and privileged commands; the automated suite never writes a real drive.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
 path.

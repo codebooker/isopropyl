@@ -7,6 +7,7 @@ import threading
 import logging
 import shutil
 import json
+import stat
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -52,14 +53,16 @@ from .extraction import (
 from .formatting import (
     Filesystem as FormatFilesystem, FormatCancelled, FormatExecutor,
     PartitionTable as FormatPartitionTable, create_format_plan,
-    restore_filesystem_size_supported,
+    restore_allocation_unit_sizes, restore_filesystem_geometry_supported,
 )
 from .images import (
-    ImageInspection, calculate_checksums, compare_expected_checksum, inspect_image,
+    ImageInspection, ImageInspectionCancelled, calculate_checksums,
+    compare_expected_checksum, inspect_image,
 )
 from .iso import (
     ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget, WriteMode, WritePlan,
-    WriteMethodRecommendation, build_write_plan, recommend_write_method,
+    WriteMethodRecommendation, build_write_plan, partition_sector_mismatch,
+    partition_sector_unverified, recommend_write_method,
 )
 from .iso_staging import (
     IsoStagingCancelled, IsoStagingExecutor, IsoStagingPlan,
@@ -123,7 +126,7 @@ class Bridge(QObject):
     # exceed that, so keep byte counters as Python objects across threads.
     progress = pyqtSignal(object, object, str)
     finished = pyqtSignal(bool, str)
-    inspection_finished = pyqtSignal(object, object)
+    inspection_finished = pyqtSignal(object, object, object)
     checksums_finished = pyqtSignal(object, object)
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
@@ -140,6 +143,9 @@ class Window(QMainWindow):
         self.image: Path | None = None
         self.inspection: ImageInspection | None = None
         self.inspection_identity: object | None = None
+        self.inspection_cancel_event = threading.Event()
+        self.inspection_generation = 0
+        self.inspection_busy = False
         self.write_recommendation: WriteMethodRecommendation | None = None
         self.device_refresh_generation = 0
         self.device_refresh_busy = False
@@ -416,6 +422,12 @@ class Window(QMainWindow):
             return
         self.image = path.resolve()
         path = self.image
+        self.inspection_cancel_event.set()
+        inspection_cancel_event = threading.Event()
+        self.inspection_cancel_event = inspection_cancel_event
+        self.inspection_generation += 1
+        inspection_generation = self.inspection_generation
+        self.inspection_busy = True
         self.logger.info("Selected image %s", path)
         self.inspection = None
         self.inspection_identity = None
@@ -449,11 +461,25 @@ class Window(QMainWindow):
         self.on_device_changed()
 
         def work() -> None:
+            def check_cancelled() -> None:
+                if inspection_cancel_event.is_set():
+                    raise ImageInspectionCancelled("Image inspection was cancelled")
+
             try:
-                result: object = inspect_image(path)
+                result: object = inspect_image(
+                    path,
+                    expected_identity=identity,
+                    cancel_check=check_cancelled,
+                )
+            except ImageInspectionCancelled:
+                return
             except Exception as error:
                 result = error
-            self.bridge.inspection_finished.emit(identity, result)
+            if inspection_cancel_event.is_set():
+                return
+            self.bridge.inspection_finished.emit(
+                identity, result, inspection_generation,
+            )
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -646,6 +672,9 @@ class Window(QMainWindow):
                 inspection,
                 self.archive_entries(),
                 target_size=device.size if device is not None else None,
+                target_logical_sector_size=(
+                    device.logical_sector_size if device is not None else None
+                ),
             )
         except ValueError as error:
             self.write_recommendation = None
@@ -660,8 +689,11 @@ class Window(QMainWindow):
         self.write_recommendation = recommendation
         selected = (
             previous
-            if previous in recommendation.available_modes else
-            recommendation.recommended_mode
+            if (
+                recommendation.recommended_mode is not None
+                and previous in recommendation.available_modes
+            )
+            else recommendation.recommended_mode
         )
         labels = {
             WriteMode.DD: "DD mode — exact byte-for-byte copy",
@@ -674,6 +706,10 @@ class Window(QMainWindow):
         if selected is not None:
             index = self.write_method.findData(selected.value)
             self.write_method.setCurrentIndex(index)
+        else:
+            # A method that remains available only as an explicit expert choice
+            # must not become selected merely because it is the combo's first item.
+            self.write_method.setCurrentIndex(-1)
         self.write_method.blockSignals(False)
         self.write_method.setEnabled(bool(recommendation.available_modes))
         prefix = (
@@ -681,7 +717,7 @@ class Window(QMainWindow):
             if recommendation.recommended_mode is WriteMode.EXTRACTED_ISO else
             "Recommended: DD mode. "
             if recommendation.recommended_mode is WriteMode.DD else
-            "No write method is currently available. "
+            "No method is recommended. "
         )
         detail = prefix + recommendation.reason
         if (
@@ -700,13 +736,19 @@ class Window(QMainWindow):
     def on_write_method_changed(self) -> None:
         mode = self.selected_write_mode()
         if self.inspection is not None:
-            label = "ISO mode" if mode is WriteMode.EXTRACTED_ISO else "DD mode"
+            label = (
+                "ISO mode" if mode is WriteMode.EXTRACTED_ISO else
+                "DD mode" if mode is WriteMode.DD else
+                "Choose a write method"
+            )
             self.image_detail.setText(f"{label} · {self.inspection.summary}")
         iso_mode = mode is WriteMode.EXTRACTED_ISO
         self.verify.setChecked(True if iso_mode else self.verify.isChecked())
         self.verify.setEnabled(not self.operation_active and not iso_mode)
         self.write_button.setText(
-            "Write in ISO mode" if iso_mode else "Write in DD mode"
+            "Write in ISO mode" if iso_mode else
+            "Write in DD mode" if mode is WriteMode.DD else
+            "Choose write method"
         )
         self.update_persistence_controls()
         self.update_ready()
@@ -782,8 +824,56 @@ class Window(QMainWindow):
                 "Choose an available write method before continuing.",
             )
             return
+        try:
+            current_identity = image_identity(self.image)
+        except OSError as error:
+            QMessageBox.critical(self, "Image unavailable", str(error))
+            return
+        if current_identity != self.inspection_identity:
+            QMessageBox.warning(
+                self,
+                "Image changed",
+                "The image changed after inspection. Select it again before writing.",
+            )
+            return
         compatibility_warning = None
-        if self.inspection.has_windows_installer:
+        if self.inspection.partition_table_malformed:
+            compatibility_warning = (
+                "This image contains malformed MBR or GPT partition metadata. "
+                "A byte-for-byte copy preserves that damage and may not boot.\n\n"
+                "Only continue if you intentionally need the image's exact bytes."
+            )
+        elif self.inspection.partition_table_incomplete:
+            compatibility_warning = (
+                "This compressed image stores partition metadata outside "
+                "ISOpropyl's bounded inspection capture. The table is not known to "
+                "be damaged, but it could not be fully validated.\n\n"
+                "Only continue if you intentionally accept an unverified exact copy."
+            )
+        elif partition_sector_mismatch(
+            self.inspection, device.logical_sector_size,
+        ):
+            relationship = (
+                "Under the conventional assumed 512-byte MBR interpretation, "
+                "this image and the selected drive have different logical sector sizes."
+                if self.inspection.partition_table_kind == "mbr" else
+                "This image and the selected drive use different logical sector sizes."
+            )
+            compatibility_warning = (
+                relationship + " A byte-for-byte copy would place partition metadata "
+                "at the wrong target LBAs and is not expected to boot.\n\n"
+                "Only continue if you intentionally need the image's exact bytes."
+            )
+        elif partition_sector_unverified(
+            self.inspection, device.logical_sector_size,
+        ):
+            compatibility_warning = (
+                "The selected drive did not report its logical sector size, so "
+                "ISOpropyl cannot validate this image's structured partition LBAs "
+                "against the target.\n\nOnly continue if you intentionally accept "
+                "an unverified exact copy."
+            )
+        elif self.inspection.has_windows_installer:
             compatibility_warning = (
                 "Most Windows ISOs need the filesystem-aware "
                 "workflow, so a byte-for-byte copy may not boot from USB.\n\n"
@@ -836,8 +926,23 @@ class Window(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         )
         if answer == QMessageBox.StandardButton.Yes:
+            try:
+                confirmed_identity = image_identity(self.image)
+            except OSError as error:
+                QMessageBox.critical(self, "Image unavailable", str(error))
+                return
+            if confirmed_identity != self.inspection_identity:
+                QMessageBox.warning(
+                    self,
+                    "Image changed",
+                    "The image changed during confirmation. Select it again "
+                    "before writing.",
+                )
+                return
             self.logger.info("Confirmed write: image=%s target=%s identity=%s", self.image, device.path, device.identity)
-            self.start_write(self.image, device, self.verify.isChecked())
+            self.start_write(
+                self.image, device, self.verify.isChecked(), confirmed_identity,
+            )
 
     def confirm_iso_write(self, device: Device) -> None:
         image = self.image
@@ -860,6 +965,7 @@ class Window(QMainWindow):
         try:
             recommendation = recommend_write_method(
                 inspection, entries, target_size=device.size,
+                target_logical_sector_size=device.logical_sector_size,
             )
         except ValueError as error:
             QMessageBox.warning(self, "ISO mode unavailable", str(error))
@@ -884,11 +990,24 @@ class Window(QMainWindow):
         )
         self.start_constructed_iso_write(list(entries), plan)
 
-    def start_write(self, image: Path, device: Device, should_verify: bool) -> None:
+    def start_write(
+        self,
+        image: Path,
+        device: Device,
+        should_verify: bool,
+        expected_source_identity: tuple[int, int, int, int, int],
+    ) -> None:
         try:
             source_identity = image_identity(image)
         except OSError as error:
             QMessageBox.critical(self, "Image unavailable", str(error))
+            return
+        if source_identity != expected_source_identity:
+            QMessageBox.warning(
+                self,
+                "Image changed",
+                "The image changed after confirmation. Select it again before writing.",
+            )
             return
         self.writer = ImageWriter()
         self.virtual_stager = VirtualDiskStager() if self.inspection and self.inspection.virtual_format else None
@@ -905,6 +1024,11 @@ class Window(QMainWindow):
                 ]
                 if not matches or matches[0].identity != device.identity:
                     raise RuntimeError("The selected drive changed or was disconnected. Refresh and select it again.")
+                if matches[0].logical_sector_size != device.logical_sector_size:
+                    raise RuntimeError(
+                        "The selected drive's logical sector size changed. "
+                        "Refresh and select it again."
+                    )
                 if image_is_on_device(str(image), device):
                     raise RuntimeError(
                         "The selected image is stored on the target drive. Move it to another disk before writing."
@@ -915,6 +1039,16 @@ class Window(QMainWindow):
                 write_source = image
                 if self.virtual_stager is not None:
                     info = inspect_virtual_disk(image)
+                    virtual_identity = (
+                        info.identity.device, info.identity.inode,
+                        info.identity.size, info.identity.modified_ns,
+                        info.identity.changed_ns,
+                    )
+                    if virtual_identity != expected_source_identity:
+                        raise RuntimeError(
+                            "The selected virtual disk changed after confirmation. "
+                            "Choose it again before writing."
+                        )
                     staged = self.virtual_stager.stage(
                         info,
                         lambda d, t: self.bridge.progress.emit(d, t, "Converting virtual disk"),
@@ -924,6 +1058,9 @@ class Window(QMainWindow):
                     self.writer.write(
                         write_source, device,
                         lambda d, t: self.bridge.progress.emit(d, t, "Writing"),
+                        expected_identity=(
+                            expected_source_identity if staged is None else None
+                        ),
                     )
                     if should_verify:
                         self.bridge.progress.emit(0, write_source.stat().st_size * 2, "Verifying")
@@ -1031,6 +1168,9 @@ class Window(QMainWindow):
             self.update_ready()
 
     def cancel(self) -> None:
+        was_inspecting = self.inspection_busy
+        self.inspection_cancel_event.set()
+        self.inspection_busy = False
         active = tuple(filter(None, (
             self.writer, self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner, self.extractor, self.virtual_stager,
@@ -1045,9 +1185,16 @@ class Window(QMainWindow):
             self.cancel_button.setEnabled(False)
             for operation in active:
                 operation.cancel()
+        elif was_inspecting:
+            self.status.setText("Image inspection cancelled")
+            self.image_detail.setText("Image inspection cancelled")
+            self.write_method_reason.setText(
+                "Select the image again to restart inspection."
+            )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self.operation_active:
+            self.inspection_cancel_event.set()
             event.accept()
             return
         answer = QMessageBox.warning(
@@ -1397,6 +1544,7 @@ class Window(QMainWindow):
         layout.addWidget(notice)
         layout.addWidget(QLabel("Filesystem"))
         filesystem = QComboBox()
+        filesystem.setObjectName("restoreFilesystem")
         filesystem_choices = (
             (
                 "FAT12 — tiny legacy media (up to "
@@ -1420,25 +1568,113 @@ class Window(QMainWindow):
             ("ext3 — journaled legacy Linux", FormatFilesystem.EXT3),
             ("ext4 — Linux-focused", FormatFilesystem.EXT4),
         )
-        for text, candidate in filesystem_choices:
-            if restore_filesystem_size_supported(candidate, device.size):
-                filesystem.addItem(text, candidate)
-        filesystem.setCurrentIndex(filesystem.findData(FormatFilesystem.FAT32))
         layout.addWidget(filesystem)
-        filesystem_note = QLabel(
+        filesystem_note_text = (
             "Only full-capacity formats compatible with this drive's size are listed. "
             "FAT12/FAT16 limits are conservative formatter envelopes, not universal "
             "device-compatibility promises. A partitioned UDF drive works on Linux "
             "and Windows but is generally not mounted automatically by macOS."
         )
+        filesystem_note = QLabel(filesystem_note_text)
         filesystem_note.setWordWrap(True)
         filesystem_note.setObjectName("muted")
         layout.addWidget(filesystem_note)
         layout.addWidget(QLabel("Partition table"))
         table = QComboBox()
+        table.setObjectName("restorePartitionTable")
         table.addItem("MBR — widest legacy compatibility", FormatPartitionTable.MBR)
         table.addItem("GPT — modern systems", FormatPartitionTable.GPT)
         layout.addWidget(table)
+        allocation_label = QLabel("Allocation unit size")
+        layout.addWidget(allocation_label)
+        allocation = QComboBox()
+        allocation.setObjectName("restoreAllocationUnit")
+        layout.addWidget(allocation)
+        allocation_note = QLabel()
+        allocation_note.setWordWrap(True)
+        allocation_note.setObjectName("muted")
+        layout.addWidget(allocation_note)
+
+        def refresh_allocation_units() -> None:
+            selected_filesystem = filesystem.currentData()
+            selected_table = table.currentData()
+            logical_sector_size = device.logical_sector_size
+            allocation.blockSignals(True)
+            allocation.clear()
+            choices: tuple[int, ...] = ()
+            automatic_supported = bool(
+                selected_filesystem is not None
+                and restore_filesystem_geometry_supported(
+                    selected_filesystem,
+                    device.size,
+                    logical_sector_size,
+                    selected_table,
+                )
+            )
+            if automatic_supported:
+                allocation.addItem("Automatic — formatter default", None)
+            if selected_filesystem is not None:
+                choices = restore_allocation_unit_sizes(
+                    selected_filesystem,
+                    device.size,
+                    logical_sector_size,
+                    selected_table,
+                )
+            for size in choices:
+                allocation.addItem(
+                    f"{self.display_size(size)} · {size:,} bytes", size,
+                )
+                allocation.setItemData(
+                    allocation.count() - 1,
+                    f"Exact allocation unit: {size:,} bytes",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+            allocation.blockSignals(False)
+            allocation.setEnabled(allocation.count() > 1)
+            review = buttons.button(QDialogButtonBox.StandardButton.Ok)
+            review.setEnabled(filesystem.count() > 0 and allocation.count() > 0)
+            if selected_filesystem in {
+                FormatFilesystem.EXT2,
+                FormatFilesystem.EXT3,
+                FormatFilesystem.EXT4,
+            }:
+                allocation_label.setText("Filesystem block size")
+                if not logical_sector_size:
+                    allocation_note.setText(
+                        "The drive did not report a logical sector size, so only "
+                        "the host formatter's Automatic choice is available. "
+                        "ISOpropyl will verify the geometry before erasing."
+                    )
+                else:
+                    allocation_note.setText(
+                        "Explicit ext block-size choices are limited to portable "
+                        "1, 2, or 4 KiB values compatible with the reported logical "
+                        "sector; Automatic follows the host mke2fs policy."
+                    )
+            else:
+                allocation_label.setText("Allocation unit size")
+                if selected_filesystem is FormatFilesystem.UDF:
+                    allocation_note.setText(
+                        "UDF uses the target's logical sector size automatically; "
+                        "overriding it would reduce interoperability."
+                    )
+                elif not logical_sector_size:
+                    allocation_note.setText(
+                        "The drive did not report a logical sector size during "
+                        "discovery, so only the formatter default is available. "
+                        "ISOpropyl will still verify the sector size before erasing."
+                    )
+                elif selected_filesystem is FormatFilesystem.NTFS:
+                    allocation_note.setText(
+                        "NTFS values above 4 KiB disable filesystem compression; "
+                        "values above 64 KiB also exceed Rufus's compatibility-oriented "
+                        "range and may not work on older systems."
+                    )
+                else:
+                    allocation_note.setText(
+                        "Only exact sizes compatible with the planned partition, "
+                        "filesystem limits, and reported logical sector are shown."
+                    )
         layout.addWidget(QLabel("Volume label (optional)"))
         label = QLineEdit("USB")
         layout.addWidget(label)
@@ -1446,6 +1682,49 @@ class Window(QMainWindow):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Review erase…")
+
+        def refresh_restore_geometry() -> None:
+            selected_table = table.currentData()
+            previous = filesystem.currentData()
+            filesystem.blockSignals(True)
+            filesystem.clear()
+            for text, candidate in filesystem_choices:
+                automatic = restore_filesystem_geometry_supported(
+                    candidate,
+                    device.size,
+                    device.logical_sector_size,
+                    selected_table,
+                )
+                explicit = restore_allocation_unit_sizes(
+                    candidate,
+                    device.size,
+                    device.logical_sector_size,
+                    selected_table,
+                )
+                if automatic or explicit:
+                    filesystem.addItem(text, candidate)
+            preferred_index = filesystem.findData(previous)
+            if preferred_index < 0:
+                preferred_index = filesystem.findData(FormatFilesystem.FAT32)
+            filesystem.setCurrentIndex(preferred_index if preferred_index >= 0 else 0)
+            filesystem.blockSignals(False)
+            if filesystem.count() == 0:
+                filesystem_note.setText(
+                    "No restore filesystem supports the drive's reported capacity, "
+                    "partition table, and logical sector size. ISOpropyl will not "
+                    "repartition it."
+                )
+            else:
+                filesystem_note.setText(filesystem_note_text)
+            refresh_allocation_units()
+
+        filesystem.currentIndexChanged.connect(refresh_allocation_units)
+        table.currentIndexChanged.connect(refresh_restore_geometry)
+        refresh_restore_geometry()
+        if filesystem.count() == 0:
+            gpt_index = table.findData(FormatPartitionTable.GPT)
+            if gpt_index >= 0:
+                table.setCurrentIndex(gpt_index)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -1453,7 +1732,8 @@ class Window(QMainWindow):
             return
         try:
             plan = create_format_plan(
-                device, filesystem.currentData(), table.currentData(), label.text()
+                device, filesystem.currentData(), table.currentData(), label.text(),
+                allocation_unit_size=allocation.currentData(),
             )
         except ValueError as error:
             QMessageBox.warning(self, "Invalid format options", str(error))
@@ -1473,7 +1753,25 @@ class Window(QMainWindow):
             f"ALL DATA WILL BE ERASED\n\n{self.display_device(device)}\n"
             f"Serial: {device.serial or device.wwn or 'not reported'}\n"
             f"New layout: {plan.partition_table.value.upper()}, "
-            f"{plan.filesystem.value.upper()}, label {plan.label or '(none)'}\n\n"
+            f"{plan.filesystem.value.upper()}, label {plan.label or '(none)'}\n"
+            + (
+                "Filesystem block size: "
+                if plan.filesystem in {
+                    FormatFilesystem.EXT2,
+                    FormatFilesystem.EXT3,
+                    FormatFilesystem.EXT4,
+                }
+                else "Allocation unit size: "
+            )
+            + (
+                "formatter default"
+                if plan.allocation_unit_size is None
+                else (
+                    f"{self.display_size(plan.allocation_unit_size)} "
+                    f"({plan.allocation_unit_size:,} bytes)"
+                )
+            )
+            + "\n\n"
             "Check the device path, model, size, and serial before continuing.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
@@ -1755,7 +2053,15 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Media test found a problem", details)
         self.refresh_devices()
 
-    def on_inspection_finished(self, identity: object, result: object) -> None:
+    def on_inspection_finished(
+        self,
+        identity: object,
+        result: object,
+        generation: object | None = None,
+    ) -> None:
+        if generation is not None and generation != self.inspection_generation:
+            return
+        self.inspection_busy = False
         if not self.image:
             return
         try:
@@ -1798,6 +2104,65 @@ class Window(QMainWindow):
                 f"Architectures: {', '.join(self.inspection.architectures) or 'not detected'}",
                 f"Bootloader: {self.inspection.bootloader}",
             ]
+            if self.inspection.partition_table_incomplete:
+                detail_lines.append("Partition structure: Inspection incomplete")
+            elif self.inspection.partition_table_valid is not None:
+                table_state = (
+                    "valid" if self.inspection.partition_table_valid else "malformed"
+                )
+                table_names = {
+                    "gpt": "GPT",
+                    "hybrid-gpt": "Hybrid MBR/GPT",
+                    "mbr": "MBR",
+                    "malformed": "Malformed",
+                }
+                structure_details = [
+                    table_names.get(
+                        self.inspection.partition_table_kind,
+                        self.inspection.partition_table_kind or "Unknown",
+                    ),
+                ]
+                if table_state.casefold() not in {
+                    detail.casefold() for detail in structure_details
+                }:
+                    structure_details.append(table_state)
+                if self.inspection.partition_table_sector_size:
+                    assumption = (
+                        " assumed"
+                        if self.inspection.partition_table_kind == "mbr" else ""
+                    )
+                    structure_details.append(
+                        f"{self.inspection.partition_table_sector_size}-byte sectors"
+                        f"{assumption}"
+                    )
+                detail_lines.append(
+                    "Partition structure: " + " · ".join(structure_details)
+                )
+                boot_code_names = {
+                    "grub": "GRUB",
+                    "syslinux": "Syslinux",
+                    "windows": "Windows",
+                    "empty": "Empty",
+                    "unrecognized": "Unrecognized",
+                }
+                detail_lines.append(
+                    "MBR boot code: "
+                    + boot_code_names.get(
+                        self.inspection.mbr_boot_code,
+                        self.inspection.mbr_boot_code or "Not detected",
+                    )
+                )
+            if self.inspection.partition_table_issues:
+                detail_lines.append("Partition-table issues:")
+                detail_lines.extend(
+                    f"  {issue}"
+                    for issue in self.inspection.partition_table_issues[:8]
+                )
+                if len(self.inspection.partition_table_issues) > 8:
+                    detail_lines.append(
+                        "  … "
+                        f"{len(self.inspection.partition_table_issues) - 8} more"
+                    )
             if self.inspection.bootloader_build:
                 detail_lines.append(
                     f"Exact boot payload: {self.inspection.bootloader_build} "
@@ -3425,11 +3790,14 @@ def main() -> int:
     return app.exec()
 
 
-def image_identity(path: Path) -> tuple[int, int, int, int]:
+def image_identity(path: Path) -> tuple[int, int, int, int, int]:
     info = path.stat()
-    if not path.is_file():
+    if not stat.S_ISREG(info.st_mode):
         raise OSError("The selected image is not a regular file")
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    return (
+        info.st_dev, info.st_ino, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
 
 
 def looks_like_windows_image(path: Path) -> bool:

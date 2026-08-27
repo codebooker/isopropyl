@@ -44,10 +44,9 @@ _WHOLE_DISK = re.compile(
 )
 _BLOCK_PATH = re.compile(r"/dev/[A-Za-z0-9._+:-]+")
 _MAJOR_MINOR = re.compile(r"\d+:\d+")
-_DD_BYTES = re.compile(br"(?:^|[\r\n])\s*(\d+)\s+bytes")
 _LSBLK_FIELDS = (
     "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,"
-    "MAJ:MIN,MOUNTPOINTS,RO"
+    "MAJ:MIN,MOUNTPOINTS,RO,LOG-SEC"
 )
 
 
@@ -73,20 +72,6 @@ class WriterTools:
     dd: str
     udisksctl: str
     lsblk: str
-
-
-class _BoundedTail:
-    def __init__(self, limit: int = MAX_DIAGNOSTIC_BYTES) -> None:
-        self.limit = limit
-        self.data = bytearray()
-
-    def append(self, value: bytes) -> None:
-        self.data.extend(value)
-        if len(self.data) > self.limit:
-            del self.data[:-self.limit]
-
-    def text(self) -> str:
-        return bytes(self.data).decode("utf-8", errors="replace").replace("\x00", "").strip()
 
 
 def _bounded_message(value: object, fallback: str) -> str:
@@ -159,6 +144,9 @@ def validate_device_selection(device: Device, *, writable: bool) -> None:
         or not all(isinstance(value, str) for value in device.mountpoints)
         or not isinstance(device.partitions, tuple)
         or not all(isinstance(value, str) for value in device.partitions)
+        or isinstance(device.logical_sector_size, bool)
+        or not isinstance(device.logical_sector_size, int)
+        or device.logical_sector_size < 0
     ):
         raise WriterSafetyError("The discovered drive information is malformed")
     if not _WHOLE_DISK.fullmatch(device.path):
@@ -254,6 +242,10 @@ def revalidate_device(
     if current is None or current.identity != expected.identity:
         raise WriterSafetyError(
             "The selected drive disappeared or its identity changed; rescan and select it again"
+        )
+    if current.logical_sector_size != expected.logical_sector_size:
+        raise WriterSafetyError(
+            "The selected drive's logical sector size changed; rescan and select it again"
         )
     validate_device_selection(current, writable=writable)
     try:
@@ -388,12 +380,22 @@ class ImageWriter:
             current = open_image_source(source.path)
         except (OSError, ImageSourceError) as error:
             raise WriterSafetyError("The selected image is no longer available") from error
-        if current.identity != identity:
-            raise WriterSafetyError("The selected image changed after it was measured")
-        if not current.compressed and current.identity.size != total:
-            raise WriterSafetyError("The selected image size changed after it was measured")
+        try:
+            if current.identity != identity:
+                raise WriterSafetyError("The selected image changed after it was measured")
+            if not current.compressed and current.identity.size != total:
+                raise WriterSafetyError("The selected image size changed after it was measured")
+        finally:
+            current.close()
 
-    def write(self, image: Path, device: Device, progress: Progress) -> None:
+    def write(
+        self,
+        image: Path,
+        device: Device,
+        progress: Progress,
+        *,
+        expected_identity: tuple[int, int, int, int, int] | None = None,
+    ) -> None:
         self._check_cancelled()
         validate_device_selection(device, writable=True)
         tools = resolve_writer_tools(self._which)
@@ -402,80 +404,38 @@ class ImageWriter:
         # fail while the selected drive is still untouched.
         flock = _resolve_writer_flock(self._which)
         source = open_image_source(image)
-        total = source.measure(maximum=device.size, cancel_check=self._check_cancelled)
-        source_identity = source.identity
-        self._prepared_identity = source_identity
-        self._prepared_size = total
-        self._prepared_device = device
-        self._check_cancelled()
-
-        # Revalidate on both sides of unmounting.  This remains outside the
-        # overridable unmount method so subclasses cannot bypass the guard.
-        self._revalidate(device, tools, writable=True)
-        self.unmount(device)
-        self._revalidate(device, tools, writable=True)
-        self._assert_source_bound(source, source_identity, total)
-        self._check_cancelled()
-        if source.compressed:
-            self._write_stream(source, device, tools, flock, total, progress)
-            return
-        self._revalidate(device, tools, writable=True)
-        command = cooperative_lock_command(
-            tools.pkexec,
-            flock,
-            device.path,
-            [
-                tools.dd, f"if={source.path}", f"of={device.path}",
-                "bs=4M", "conv=fsync", "status=progress",
-            ],
-        )
-        logger.info("Starting raw write to %s (%d bytes)", device.path, total)
-        environment = os.environ.copy()
-        environment.update({"LC_ALL": "C", "LANG": "C"})
         try:
-            process = self._spawn(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE, env=environment, shell=False,
+            observed_identity = (
+                source.identity.device, source.identity.inode,
+                source.identity.size, source.identity.modified_ns,
+                source.identity.changed_ns,
             )
-        except OSError as error:
-            raise WriterError(_bounded_message(error, "Could not start the privileged writer")) from error
-        self._set_process(process)
-        if process.stderr is None:
-            self._terminate_process(process)
-            self._set_process(None)
-            raise WriterError("Could not capture privileged writer output")
-        diagnostics = _BoundedTail()
-        parser_tail = b""
-        reported = 0
-        code = -1
-        try:
-            read = getattr(process.stderr, "read1", None) or process.stderr.read
-            while True:
-                self._check_cancelled()
-                chunk = read(4096)
-                if not chunk:
-                    break
-                diagnostics.append(chunk)
-                data = parser_tail + chunk
-                matches = list(_DD_BYTES.finditer(data))
-                if matches:
-                    current = min(total, max(reported, int(matches[-1].group(1))))
-                    if current != reported:
-                        reported = current
-                        progress(reported, total)
-                parser_tail = data[-256:]
-            code = process.wait()
+            if expected_identity is not None and observed_identity != expected_identity:
+                raise WriterSafetyError(
+                    "The selected image changed after confirmation"
+                )
+            total = source.measure(
+                maximum=device.size, cancel_check=self._check_cancelled,
+            )
+            source_identity = source.identity
+            self._prepared_identity = source_identity
+            self._prepared_size = total
+            self._prepared_device = device
+            self._check_cancelled()
+
+            # Revalidate on both sides of unmounting.  This remains outside the
+            # overridable unmount method so subclasses cannot bypass the guard.
+            self._revalidate(device, tools, writable=True)
+            self.unmount(device)
+            self._revalidate(device, tools, writable=True)
+            self._assert_source_bound(source, source_identity, total)
+            self._check_cancelled()
+            # Every source is streamed from its one O_NOFOLLOW-bound descriptor.
+            # Passing a pathname to privileged dd would reintroduce a
+            # check-to-open race after the target has already been unmounted.
+            self._write_stream(source, device, tools, flock, total, progress)
         finally:
-            self._terminate_process(process)
-            self._set_process(None)
-        self._check_cancelled()
-        if code:
-            raise WriterError(lock_conflict_message(
-                code, diagnostics.text() or "The privileged writer failed",
-            ))
-        self._assert_source_bound(source, source_identity, total)
-        progress(total, total)
-        logger.info("Raw write completed for %s", device.path)
+            source.close()
 
     def _write_stream(
         self,
@@ -498,8 +458,9 @@ class ImageWriter:
             ],
         )
         logger.info(
-            "Starting decompressed %s write to %s (%d bytes)",
-            source.compression, device.path, total,
+            "Starting descriptor-bound %s write to %s (%d bytes)",
+            source.compression if source.compressed else "raw",
+            device.path, total,
         )
         try:
             process = self._spawn(
@@ -545,10 +506,23 @@ class ImageWriter:
             )
         if done != total:
             raise OSError(f"Could only write {done} of {total} decompressed bytes")
+        self._assert_source_bound(source, source.identity, total)
         progress(total, total)
-        logger.info("Decompressed write completed for %s", device.path)
+        logger.info("Descriptor-bound write completed for %s", device.path)
 
     def verify(self, image: Path, device_path: str, progress: Progress) -> bool:
+        source = open_image_source(image)
+        try:
+            return self._verify_source(source, device_path, progress)
+        finally:
+            source.close()
+
+    def _verify_source(
+        self,
+        source: ImageSource,
+        device_path: str,
+        progress: Progress,
+    ) -> bool:
         self._check_cancelled()
 
         def checked_progress(done: int, total: int) -> None:
@@ -556,7 +530,6 @@ class ImageWriter:
                 raise WriteCancelled("Verification was cancelled")
             progress(done, total)
 
-        source = open_image_source(image)
         try:
             target_status = self._block_stat(device_path)
         except OSError as error:
@@ -696,14 +669,14 @@ def sha256_file(path: Path, progress: Progress | None = None, limit: int | None 
 def verify_image(image: Path, device_path: str, progress: Progress) -> bool:
     """Verify regular-file targets; block devices require an identity-bound writer."""
 
-    source = open_image_source(image)
-    size = source.measure()
-    target = Path(device_path)
-    status = target.stat()
-    if stat.S_ISBLK(status.st_mode):
-        raise WriterSafetyError(
-            "Use ImageWriter.verify after ImageWriter.write for a raw block device"
-        )
-    source_hash = sha256_source(source, size)
-    target_hash = sha256_file(target, progress, size)
-    return source_hash == target_hash
+    with open_image_source(image) as source:
+        size = source.measure()
+        target = Path(device_path)
+        status = target.stat()
+        if stat.S_ISBLK(status.st_mode):
+            raise WriterSafetyError(
+                "Use ImageWriter.verify after ImageWriter.write for a raw block device"
+            )
+        source_hash = sha256_source(source, size)
+        target_hash = sha256_file(target, progress, size)
+        return source_hash == target_hash

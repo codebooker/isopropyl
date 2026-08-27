@@ -66,6 +66,7 @@ class FileIdentity:
     inode: int
     size: int
     modified_ns: int
+    changed_ns: int
 
 
 @dataclass(frozen=True)
@@ -121,7 +122,10 @@ def _file_identity(path: Path, label: str) -> FileIdentity:
         raise VirtualDiskError(f"{label} is not available: {error}") from error
     if not stat.S_ISREG(status.st_mode):
         raise VirtualDiskError(f"{label} must be a regular file")
-    return FileIdentity(status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
+    return FileIdentity(
+        status.st_dev, status.st_ino, status.st_size,
+        status.st_mtime_ns, status.st_ctime_ns,
+    )
 
 
 def resolve_qemu_img(path: Path | None = None) -> ToolIdentity:

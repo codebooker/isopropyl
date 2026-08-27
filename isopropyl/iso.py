@@ -364,6 +364,7 @@ def build_write_plan(
     requested_filesystem: FileSystem | None = None,
     firmware_target: FirmwareTarget = FirmwareTarget.AUTOMATIC,
     target_size: int | None = None,
+    target_logical_sector_size: int | None = None,
 ) -> WritePlan:
     """Build a pure, immutable plan; never partitions, formats, mounts, or writes."""
     mode = select_write_mode(inspection, requested_mode)
@@ -371,12 +372,49 @@ def build_write_plan(
         raise PlanError("The firmware target is invalid")
     if target_size is not None and target_size < 0:
         raise PlanError("Target size cannot be negative")
+    if (
+        target_logical_sector_size is not None
+        and (
+            isinstance(target_logical_sector_size, bool)
+            or not isinstance(target_logical_sector_size, int)
+            or target_logical_sector_size < 0
+        )
+    ):
+        raise PlanError("Target logical sector size cannot be negative")
 
     if mode is WriteMode.DD:
         if target_size is not None and target_size < inspection.size:
             raise PlanError("The target is smaller than the byte-for-byte image")
         warnings: tuple[str, ...] = ()
-        if not inspection.raw_compatible:
+        if inspection.partition_table_malformed:
+            warnings = (
+                "This image contains malformed MBR or GPT metadata. DD mode remains "
+                "available only as an explicit byte-for-byte choice and may not boot.",
+            )
+        elif inspection.partition_table_incomplete:
+            warnings = (
+                "The compressed image's partition table could not be fully inspected "
+                "within the bounded prefix/tail metadata capture. DD mode remains an "
+                "explicit exact-copy choice, but ISOpropyl cannot recommend it as a "
+                "validated disk layout.",
+            )
+        elif partition_sector_mismatch(
+            inspection, target_logical_sector_size,
+        ):
+            mismatch = _sector_mismatch_reason(inspection)
+            warnings = (
+                mismatch + " DD mode remains an explicit exact-copy choice, but "
+                "the resulting partition table will not describe the target correctly.",
+            )
+        elif partition_sector_unverified(
+            inspection, target_logical_sector_size,
+        ):
+            warnings = (
+                "The selected target did not report its logical sector size. DD mode "
+                "remains an explicit exact-copy choice, but ISOpropyl cannot validate "
+                "the image's structured partition LBAs against this drive.",
+            )
+        elif not inspection.raw_compatible:
             warnings = ("This optical-only ISO may not boot when copied byte-for-byte.",)
         return WritePlan(
             mode=mode, firmware_target=FirmwareTarget.AUTOMATIC, layout=None,
@@ -601,11 +639,49 @@ def build_write_plan(
     )
 
 
+def partition_sector_mismatch(
+    inspection: ImageInspection,
+    target_logical_sector_size: int | None,
+) -> bool:
+    """Return whether a validated disk layout uses target-incompatible LBAs."""
+
+    return bool(
+        inspection.partition_table_valid is True
+        and inspection.partition_table_sector_size > 0
+        and target_logical_sector_size is not None
+        and target_logical_sector_size > 0
+        and inspection.partition_table_sector_size != target_logical_sector_size
+    )
+
+
+def partition_sector_unverified(
+    inspection: ImageInspection,
+    target_logical_sector_size: int | None,
+) -> bool:
+    """Return whether a selected target omitted needed sector-size metadata."""
+
+    return bool(
+        inspection.partition_table_valid is True
+        and inspection.partition_table_sector_size > 0
+        and target_logical_sector_size == 0
+    )
+
+
+def _sector_mismatch_reason(inspection: ImageInspection) -> str:
+    if inspection.partition_table_kind == "mbr":
+        return (
+            "Under the conventional assumed 512-byte MBR interpretation, the "
+            "image and selected target have different logical sector sizes."
+        )
+    return "The image and selected target use different logical sector sizes."
+
+
 def recommend_write_method(
     inspection: ImageInspection,
     entries: Iterable[ArchiveEntry] = (),
     *,
     target_size: int | None = None,
+    target_logical_sector_size: int | None = None,
 ) -> WriteMethodRecommendation:
     """Recommend a visible write method without silently changing the user's choice."""
     if target_size is not None and (
@@ -613,18 +689,52 @@ def recommend_write_method(
         or target_size < 0
     ):
         raise PlanError("Target size cannot be negative")
+    if (
+        target_logical_sector_size is not None
+        and (
+            isinstance(target_logical_sector_size, bool)
+            or not isinstance(target_logical_sector_size, int)
+            or target_logical_sector_size < 0
+        )
+    ):
+        raise PlanError("Target logical sector size cannot be negative")
     frozen_entries = tuple(entries)
     dd_plan = build_write_plan(
         inspection, frozen_entries, requested_mode=WriteMode.DD,
+        target_logical_sector_size=target_logical_sector_size,
     )
     dd_available = target_size is None or dd_plan.minimum_target_bytes <= target_size
+    sector_mismatch = partition_sector_mismatch(
+        inspection, target_logical_sector_size,
+    )
+    sector_unverified = partition_sector_unverified(
+        inspection, target_logical_sector_size,
+    )
     is_iso = inspection.is_iso9660 or inspection.kind == "Optical ISO"
     if not is_iso:
         modes = (WriteMode.DD,) if dd_available else ()
+        malformed = inspection.partition_table_malformed
+        incomplete = inspection.partition_table_incomplete
+        requires_explicit_dd = (
+            malformed or incomplete or sector_mismatch or sector_unverified
+        )
         return WriteMethodRecommendation(
             modes,
-            WriteMode.DD if dd_available else None,
+            WriteMode.DD if dd_available and not requires_explicit_dd else None,
             (
+                "The image contains malformed partition metadata. DD mode remains "
+                "available as an explicit byte-for-byte choice, but is not recommended."
+                if dd_available and malformed else
+                "The compressed image's partition table could not be fully inspected. "
+                "DD remains an explicit exact-copy choice, but is not recommended."
+                if dd_available and incomplete else
+                _sector_mismatch_reason(inspection) + " DD remains an explicit "
+                "exact-copy choice, but is not recommended."
+                if dd_available and sector_mismatch else
+                "The selected target did not report its logical sector size. DD "
+                "remains an explicit exact-copy choice, but its structured partition "
+                "layout cannot be recommended without that geometry."
+                if dd_available and sector_unverified else
                 "DD mode is required for raw and virtual disk images because it "
                 "preserves their existing partition layout."
                 if dd_available else
@@ -671,13 +781,32 @@ def recommend_write_method(
             "ISO mode is recommended for this Windows installer so its files, "
             "large-WIM handling, and selected customization can be applied."
         )
-    elif iso_available and not inspection.raw_compatible:
+    elif iso_available and (
+        not inspection.raw_compatible or sector_mismatch or sector_unverified
+    ):
         recommended = WriteMode.EXTRACTED_ISO
         reason = (
+            "ISO mode is recommended because "
+            + _sector_mismatch_reason(inspection).removesuffix(".").lower()
+            + "."
+            if sector_mismatch else
+            "ISO mode is recommended because the selected target did not report "
+            "the logical sector size needed to validate the image's partition LBAs."
+            if sector_unverified else
+            "ISO mode is recommended because the compressed image's partition table "
+            "could not be fully inspected within the bounded prefix/tail metadata "
+            "capture."
+            if inspection.partition_table_incomplete else
+            "ISO mode is recommended because the image's MBR or GPT metadata is "
+            "malformed and should not be treated as a raw-write-ready disk layout."
+            if inspection.partition_table_malformed else
             "ISO mode is recommended because this optical-only image has no "
             "USB-native MBR or GPT layout to preserve with DD."
         )
-    elif dd_available:
+    elif (
+        dd_available and inspection.raw_compatible
+        and not sector_mismatch and not sector_unverified
+    ):
         recommended = WriteMode.DD
         reason = (
             "DD mode is recommended for this hybrid ISO because it preserves the "
@@ -686,6 +815,22 @@ def recommend_write_method(
     elif iso_available:
         recommended = WriteMode.EXTRACTED_ISO
         reason = "Only the filesystem-aware ISO layout fits the selected target."
+    elif dd_available:
+        recommended = None
+        reason = (
+            _sector_mismatch_reason(inspection) + " DD remains an explicit "
+            "exact-copy choice, but is not recommended."
+            if sector_mismatch else
+            "The selected target did not report its logical sector size. DD remains "
+            "an explicit exact-copy choice, but is not recommended for a structured "
+            "partition image."
+            if sector_unverified else
+            "The compressed image's partition table could not be fully inspected. DD "
+            "remains an explicit exact-copy choice, but is not recommended."
+            if inspection.partition_table_incomplete else
+            "The image's MBR or GPT metadata is malformed. DD mode remains available "
+            "as an explicit byte-for-byte choice, but is not recommended."
+        )
     else:
         recommended = None
         reason = iso_error or "No safe write method fits the selected target."

@@ -19,7 +19,7 @@ class DeviceTests(unittest.TestCase):
             {"path": "/dev/sdb", "type": "disk", "size": 8000000000, "rm": True,
              "hotplug": True, "tran": "usb", "model": "Flash", "vendor": "Acme",
              "serial": "ABC", "wwn": None, "maj:min": "8:16",
-             "mountpoints": [None], "ro": False,
+             "mountpoints": [None], "ro": False, "log-sec": 4096,
              "children": [{"path": "/dev/sdb1", "type": "part", "mountpoints": ["/media/usb"]}]},
             {"path": "/dev/loop0", "type": "loop", "size": 10, "rm": False,
              "hotplug": False, "tran": None, "mountpoints": [None]},
@@ -27,6 +27,7 @@ class DeviceTests(unittest.TestCase):
         found = parse_lsblk(json.dumps(payload))
         self.assertEqual([d.path for d in found], ["/dev/sdb"])
         self.assertEqual(found[0].partitions, ("/dev/sdb1",))
+        self.assertEqual(found[0].logical_sector_size, 4096)
         self.assertEqual(found[0].identity, ("/dev/sdb", 8000000000, "ABC", "", "Flash", "8:16"))
 
     def test_root_usb_is_never_a_target(self):
@@ -131,6 +132,7 @@ class DeviceTests(unittest.TestCase):
         list_devices()
         command = run.call_args.args[0]
         self.assertIn("--tree", command)
+        self.assertIn("LOG-SEC", command[-1])
         self.assertEqual(run.call_args.kwargs["timeout"], 15)
         self.assertFalse(run.call_args.kwargs["shell"])
 

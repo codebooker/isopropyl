@@ -20,19 +20,19 @@ Status meanings:
 
 | Rufus capability | Status | ISOpropyl evidence and remaining work |
 |---|---:|---|
-| Raw `.img`/DD writing | **Done** | Identity-bound whole-device writing, cancellation, progress, optional byte read-back verification, and power-off. |
+| Raw `.img`/DD writing | **Done** | Selection-to-consent image identity binding includes ctime; one no-follow descriptor is streamed through privileged DD without a pathname reopen. Target identity binding, cancellation, progress, optional byte read-back verification, and power-off ship. A validated image/target logical-sector mismatch—or a selected target with unknown sector size—leaves structured DD available only as an explicit warned choice. Plain MBR uses the conventional assumed 512-byte interpretation. |
 | Bootable hybrid ISO writing | **Done** | DD mode preserves the supplied disk layout; non-hybrid optical ISOs receive a warning. |
 | Rufus-style ISO extraction mode | **Partial** | Reachable UEFI-only GPT/FAT32 and GPT/NTFS+UEFI:NTFS paths safely stage, format, copy, and SHA-256 read-back verify every file; the raw helper receives a separate full read-back check. BIOS, dual firmware, links, and embedded El Torito images remain. |
-| Restore USB as ordinary storage | **Done** | MBR/GPT plus FAT12, FAT16, FAT32, exFAT, NTFS, UDF 2.01, ext2, ext3, or ext4 with filesystem-specific label validation, logical-sector binding where required, and identity rechecks. |
-| FAT/FAT32 formatting | **Partial** | Explicit FAT12/FAT16/FAT32 creation ships with conservative size and geometry envelopes; expert cluster-size controls remain. |
-| NTFS and exFAT formatting | **Done** | Available in the separate restore workflow through trusted system mkfs tools. |
-| ext2/ext3/ext4 formatting | **Done** | All three are exposed in the separate restore workflow through their exact trusted `mkfs.ext*` tools, with MBR/GPT Linux partition types and 16-byte label validation. |
+| Restore USB as ordinary storage | **Done** | MBR/GPT plus FAT12, FAT16, FAT32, exFAT, NTFS, UDF 2.01, ext2, ext3, or ext4 with filesystem-specific label validation, logical-sector binding, exact safe allocation/block-size controls where supported, and identity rechecks. Full-capacity MBR is filtered by its 32-bit sector fields; GPT becomes the default when reported geometry proves MBR cannot represent the target. Unknown-sector discovery remains provisional until the pre-unmount check. |
+| FAT/FAT32 formatting | **Done** | Explicit FAT12/FAT16/FAT32 creation ships with conservative size and geometry envelopes plus exact sector-aligned allocation-unit choices. The FAT32 whole-device cap is 2 TiB, leaving its aligned partition below that boundary. |
+| NTFS and exFAT formatting | **Done** | Available in the separate restore workflow through trusted system mkfs tools, with geometry-filtered allocation-unit choices. Automatic is offered only when the modeled exfatprogs/mkntfs default is safe; otherwise the UI requires an explicit valid size. |
+| ext2/ext3/ext4 formatting | **Done** | All three are exposed in the separate restore workflow through their exact trusted `mkfs.ext*` tools, with MBR/GPT Linux partition types, 16-byte label validation, and portable 1/2/4 KiB block-size choices. Automatic uses a conservative cross-profile envelope because host `mke2fs.conf` can alter defaults. |
 | UDF formatting | **Done** | Single-partition UDF 2.01 restore uses trusted `mkudffs`, bounded label/size/sector validation, and repeated geometry checks. Partitioned UDF is generally not auto-mounted by macOS. |
 | ReFS formatting | **Inapplicable** | No mature supported native Linux creation stack. |
 | Super-floppy layout | **Research** | Whole-device filesystem compatibility needs an explicit hardware matrix. |
 | Removable USB/SD/card readers | **Partial** | USB/MMC removable devices are recognized; broad reader/SDXC certification is not claimed. |
 | USB HDD/SSD targets | **Done** | Hidden by default, explicitly revealable, second warning; internal and root disks remain forbidden. |
-| Compressed images | **Done** | Streaming gzip, bzip2, xz/lzma, zstd, legacy `.Z`, and single-file ZIP/ZIP64. Expansion is bounded. |
+| Compressed images | **Done** | Streaming gzip, bzip2, xz/lzma, zstd, legacy `.Z`, and single-file ZIP/ZIP64 through one no-follow, descriptor-bound source. Inspection has cooperative reselection/close cancellation, a five-minute limit checked between in-process decoder reads and while waiting for external decoder output, a 64 TiB expanded-size ceiling, bounded prefix/tail capture, and a pre-parse ZIP catalog bound; destructive writer expansion is target-bounded. Decoder-library working memory and the duration of one in-process decoder call are not claimed to be globally bounded. Legal tables outside the bounded metadata capture are reported as incomplete and never auto-recommended rather than mislabeled malformed. |
 | Raw `.usb`/`.wic` aliases | **Done** | Both extensions are explicit raw-disk aliases in inspection and the image chooser, with fixtures covering case-insensitive admission; structured apply formats remain rejected. |
 | VHD/VHDX/QCOW/QCOW2 input | **Done** | Identity-bound `qemu-img` inspection/conversion; backing files, encryption, corruption metadata, and unsafe output are rejected. |
 | Compressed virtual containers | **Planned** | Explicitly rejected until decode→inspect→convert can be safely chained. |
@@ -59,8 +59,8 @@ Status meanings:
 
 | Rufus behavior | Status | ISOpropyl evidence and remaining work |
 |---|---:|---|
-| MBR marker/boot-code analysis | **Partial** | Reads `0x55AA`; does not yet classify/validate MBR boot code. |
-| GPT detection | **Partial** | Detects the primary signature at sector 1; complete header/partition validation is not performed during image inspection. |
+| MBR marker/boot-code analysis | **Done** | Under the conventional 512-byte-LBA interpretation, validates primary entries, overlaps, bounds, boot flags, mandatory protective fields, hybrid rules, and bounded EBR chains; classifies empty, Windows, GRUB, Syslinux, and unrecognized boot code. |
+| GPT detection | **Done** | Validates 512/4096-byte-sector primary and backup headers, exact revision/reserved fields, reciprocal locations, header and array CRC32, matching arrays, GUIDs, entry size/attributes, 16 KiB reservations, usable ranges, entry bounds/overlaps, and exact protective/hybrid MBR mirroring. |
 | ISO 9660 and volume label | **Done** | Primary volume descriptor and label inspection. |
 | Joliet/Rock Ridge/UDF contents | **Partial** | 7-Zip catalogs/extracts the tested ISO/UDF media safely; ISO mode rejects links rather than materializing them, and expert toggles are absent. |
 | El Torito catalogs | **Done** | Strict bounded validation entry, sections, platforms, emulation, boot flags, LBAs, extents, overlap, and identity checks. Embedded filesystems are not parsed. |
@@ -114,7 +114,7 @@ Status meanings:
 | Partition scheme selector | **Partial** | MBR/GPT available for restore; current ISO profile fixes GPT. |
 | Target firmware selector | **Partial** | Planner models automatic/BIOS/UEFI/both; GUI executes explicit UEFI-only. |
 | Filesystem selector | **Partial** | Restore offers FAT12/FAT16/FAT32/exFAT/NTFS/UDF/ext2/ext3/ext4; ISO mode automatically selects FAT32 or NTFS+UEFI:NTFS from image constraints rather than exposing an unsafe arbitrary choice. |
-| Cluster-size selector | **Planned** | Must be constrained by filesystem and boot profile. |
+| Cluster-size selector | **Partial** | Restore exposes exact geometry-filtered allocation-unit choices for FAT12/16/32, exFAT, and NTFS plus portable ext2/3/4 block sizes. UDF deliberately follows the logical sector, and ISO mode retains profile-selected automatic sizing. Physical-media compatibility testing remains. |
 | Volume label | **Done** | Filesystem-specific validation in restore; ISO mode uses `ISOPROPYL`. |
 | Quick format | **Done** | Restore and ISO construction use quick mkfs; full zero is separate. |
 | Persistence-size slider | **Partial** | The capacity-bounded aligned control and transaction wiring ship, but it appears only for a candidate remastered Ubuntu profile with an exposed recognized UEFI GRUB config path; final private staging validates its contents. Current official Ubuntu desktop media correctly remain ineligible pending embedded-config support. |
@@ -194,7 +194,7 @@ Status meanings:
 8. Add signed opt-in downloaders, FreeDOS, UEFI Shell, and audited GRUB/Syslinux
    payload catalogs.
 9. Finish localization, conflict diagnostics, signed reproducible packaging, and
-   safe expert format controls.
+   physical certification of safe expert format controls.
 
 ## Primary Rufus sources reviewed
 

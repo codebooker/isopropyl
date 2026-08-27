@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from isopropyl.app import Bridge, looks_like_windows_image
 from isopropyl.devices import Device
@@ -290,6 +290,22 @@ class WriterTests(unittest.TestCase):
                 writer.write(image, harness.device, lambda _d, _t: None)
         self.assertEqual(harness.processes, [])
 
+    def test_logical_sector_change_stops_before_unmount_or_write(self):
+        selected = removable_device(logical_sector_size=512)
+        harness = WriterHarness(selected)
+        harness.current = removable_device(logical_sector_size=4096)
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.img"
+            image.write_bytes(b"hello world!")
+
+            with self.assertRaisesRegex(WriterSafetyError, "logical sector size changed"):
+                harness.writer().write(
+                    image, selected, lambda _d, _t: None,
+                )
+
+        self.assertEqual(harness.run_calls, [])
+        self.assertEqual(harness.processes, [])
+
     def test_source_change_during_unmount_stops_before_privileged_write(self):
         harness = WriterHarness()
         with tempfile.TemporaryDirectory() as directory:
@@ -306,6 +322,58 @@ class WriterTests(unittest.TestCase):
             with self.assertRaisesRegex(WriterSafetyError, "image changed"):
                 harness.writer().write(image, harness.device, lambda _d, _t: None)
         self.assertEqual(harness.processes, [])
+
+    def test_expected_source_identity_includes_ctime_and_fails_before_unmount(self):
+        harness = WriterHarness()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.img"
+            image.write_bytes(b"A" * 4096)
+            before = image.stat()
+            expected = (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            )
+            image.write_bytes(b"B" * 4096)
+            os.utime(image, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+            with self.assertRaisesRegex(WriterSafetyError, "after confirmation"):
+                harness.writer().write(
+                    image, harness.device, lambda _d, _t: None,
+                    expected_identity=expected,
+                )
+
+        self.assertEqual(harness.run_calls, [])
+        self.assertEqual(harness.processes, [])
+
+    def test_writer_closes_source_when_measurement_fails(self):
+        harness = WriterHarness()
+        source = Mock()
+        source.identity = SimpleNamespace(
+            device=1, inode=2, size=3, modified_ns=4, changed_ns=5,
+        )
+        source.measure.side_effect = RuntimeError("measurement failed")
+
+        with (
+            patch("isopropyl.writer.open_image_source", return_value=source),
+            self.assertRaisesRegex(RuntimeError, "measurement failed"),
+        ):
+            harness.writer().write(
+                Path("image.img"), harness.device, lambda _d, _t: None,
+            )
+
+        source.close.assert_called_once()
+
+    def test_verification_closes_source_when_target_probe_fails(self):
+        source = Mock()
+        writer = ImageWriter(block_stat=Mock(side_effect=OSError("gone")))
+
+        with (
+            patch("isopropyl.writer.open_image_source", return_value=source),
+            self.assertRaisesRegex(WriterSafetyError, "target is unavailable"),
+        ):
+            writer.verify(Path("image.img"), "target", lambda _d, _t: None)
+
+        source.close.assert_called_once()
 
     def test_source_change_during_raw_write_is_reported(self):
         harness = WriterHarness()

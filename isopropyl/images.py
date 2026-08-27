@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import re
 import shutil
+import stat
 import subprocess
+import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .sources import open_image_source
+from .sources import ExpandedImageTooLarge, ImageSource, open_image_source
+from .partition_tables import (
+    PARTITION_TABLE_CAPTURE_BYTES, PartitionTableInspection,
+    inspect_partition_tables_capture,
+    inspect_partition_tables_fd,
+)
 from .boot_identity import BootloaderAnalysis, analyze_iso_bootloaders
 from .eltorito import (
     BootPlatform, ElToritoError, ElToritoInspection, ElToritoNotFound,
@@ -30,6 +39,16 @@ COMPRESSION_SUFFIXES = frozenset({
     ".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".lzma", ".zst", ".zstd",
     ".z", ".zip",
 })
+MAX_INSPECTION_EXPANDED_BYTES = 64 * 1024**4
+INSPECTION_TIMEOUT_SECONDS = 5 * 60.0
+
+
+class ImageInspectionCancelled(Exception):
+    pass
+
+
+class ImageInspectionTimedOut(OSError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -67,18 +86,48 @@ class ImageInspection:
     eltorito_issues: tuple[str, ...] = ()
     virtual_format: str = ""
     container_size: int = 0
+    partition_table_valid: bool | None = None
+    partition_table_kind: str = ""
+    partition_table_sector_size: int = 0
+    partition_table_issues: tuple[str, ...] = ()
+    mbr_kind: str = ""
+    mbr_boot_code: str = ""
+    partition_table_inspection_complete: bool = True
+
+    @property
+    def partition_table_incomplete(self) -> bool:
+        return bool(
+            (self.has_mbr or self.has_gpt)
+            and not self.partition_table_inspection_complete
+        )
+
+    @property
+    def partition_table_malformed(self) -> bool:
+        return bool(
+            (self.has_mbr or self.has_gpt)
+            and self.partition_table_inspection_complete
+            and self.partition_table_valid is False
+        )
 
     @property
     def raw_compatible(self) -> bool:
         # Raw disk images are inherently intended to represent a disk. Optical
         # ISOs need an MBR/GPT wrapper (commonly called an ISOHybrid image) to
         # be a reliable USB raw-write candidate.
+        if self.partition_table_malformed or self.partition_table_incomplete:
+            return False
         return self.kind != "Optical ISO" or self.has_mbr or self.has_gpt
 
     @property
     def layout(self) -> str:
         if self.virtual_format:
             return f"Virtual {self.virtual_format} disk"
+        if self.partition_table_incomplete:
+            return "Disk image with an incompletely inspected partition table"
+        if self.partition_table_malformed:
+            return "Malformed MBR/GPT disk image"
+        if self.partition_table_kind == "hybrid-gpt":
+            return "Hybrid MBR/GPT disk image"
         if self.has_gpt:
             return "GPT disk image"
         if self.has_mbr:
@@ -213,9 +262,100 @@ def scan_image_contents(path: Path) -> tuple[list[ImageMember], bool]:
     return parse_7z_listing(result.stdout), True
 
 
-def inspect_image(path: Path) -> ImageInspection:
-    if not path.is_file():
+def _read_partition_evidence(
+    source: ImageSource,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+    maximum_expanded_bytes: int | None = MAX_INSPECTION_EXPANDED_BYTES,
+) -> tuple[int, bytes, bytes, PartitionTableInspection]:
+    """Read bounded image headers and partition metadata from one bound source."""
+
+    if source.compressed:
+        needed = max(17 * 2048, PARTITION_TABLE_CAPTURE_BYTES)
+        prefix = bytearray()
+        tail_chunks: deque[bytes] = deque()
+        tail_size = 0
+        size = 0
+        for block in source.chunks(cancel_check=cancel_check):
+            size += len(block)
+            if (
+                maximum_expanded_bytes is not None
+                and size > maximum_expanded_bytes
+            ):
+                raise ExpandedImageTooLarge(
+                    "The decompressed image exceeds ISOpropyl's "
+                    f"{maximum_expanded_bytes:,}-byte inspection limit"
+                )
+            if len(prefix) < needed:
+                prefix.extend(block[:needed - len(prefix)])
+            tail_chunks.append(block)
+            tail_size += len(block)
+            while tail_size > PARTITION_TABLE_CAPTURE_BYTES:
+                excess = tail_size - PARTITION_TABLE_CAPTURE_BYTES
+                first = tail_chunks[0]
+                if len(first) <= excess:
+                    tail_chunks.popleft()
+                    tail_size -= len(first)
+                else:
+                    tail_chunks[0] = first[excess:]
+                    tail_size -= excess
+        header = bytes(prefix[:4096])
+        descriptor = bytes(prefix[16 * 2048:17 * 2048])
+        partition_tables = inspect_partition_tables_capture(
+            bytes(prefix), b"".join(tail_chunks), size,
+        )
+        return size, header, descriptor, partition_tables
+
+    descriptor_fd = source.fileno()
+    expected_identity = (
+        source.identity.device, source.identity.inode,
+        source.identity.size, source.identity.modified_ns,
+    )
+    status = os.fstat(descriptor_fd)
+    if (
+        status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,
+    ) != expected_identity:
+        raise OSError("The selected image changed before it could be inspected")
+    size = status.st_size
+    header = os.pread(descriptor_fd, 4096, 0)
+    descriptor = os.pread(descriptor_fd, 2048, 16 * 2048)
+    partition_tables = inspect_partition_tables_fd(
+        descriptor_fd, expected_identity=expected_identity,
+    )
+    return size, header, descriptor, partition_tables
+
+
+def inspect_image(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    maximum_expanded_bytes: int | None = MAX_INSPECTION_EXPANDED_BYTES,
+    timeout_seconds: float | None = INSPECTION_TIMEOUT_SECONDS,
+) -> ImageInspection:
+    started = time.monotonic()
+
+    def check_inspection() -> None:
+        if cancel_check is not None:
+            cancel_check()
+        if (
+            timeout_seconds is not None
+            and time.monotonic() - started > timeout_seconds
+        ):
+            raise ImageInspectionTimedOut(
+                "Image inspection exceeded its time limit"
+            )
+
+    check_inspection()
+    status = path.stat()
+    if not stat.S_ISREG(status.st_mode):
         raise OSError("The selected image is not a regular file")
+    observed_identity = (
+        status.st_dev, status.st_ino, status.st_size,
+        status.st_mtime_ns, status.st_ctime_ns,
+    )
+    if expected_identity is not None and observed_identity != expected_identity:
+        raise OSError("The selected image changed before inspection began")
     suffix = path.suffix.casefold()
     if suffix in NON_RAW_SUFFIXES:
         raise OSError(
@@ -230,7 +370,21 @@ def inspect_image(path: Path) -> ImageInspection:
                 "accepted until a chained decode-and-apply workflow is available"
             )
     if suffix in VIRTUAL_SUFFIXES:
+        check_inspection()
         virtual = inspect_virtual_disk(path)
+        check_inspection()
+        virtual_identity = (
+            virtual.identity.device, virtual.identity.inode,
+            virtual.identity.size, virtual.identity.modified_ns,
+            virtual.identity.changed_ns,
+        )
+        final = path.stat()
+        final_identity = (
+            final.st_dev, final.st_ino, final.st_size,
+            final.st_mtime_ns, final.st_ctime_ns,
+        )
+        if virtual_identity != observed_identity or final_identity != observed_identity:
+            raise OSError("The selected virtual disk changed before inspection")
         return ImageInspection(
             size=virtual.virtual_size,
             kind=f"Virtual disk ({virtual.display_format})",
@@ -248,25 +402,24 @@ def inspect_image(path: Path) -> ImageInspection:
             container_size=virtual.identity.size,
         )
     source = open_image_source(path)
-    if source.compressed:
-        needed = 17 * 2048
-        prefix = bytearray()
-        size = 0
-        for block in source.chunks():
-            size += len(block)
-            if len(prefix) < needed:
-                prefix.extend(block[:needed - len(prefix)])
-        header = bytes(prefix[:4096])
-        descriptor = bytes(prefix[16 * 2048:17 * 2048])
-    else:
-        size = path.stat().st_size
-        with path.open("rb", buffering=0) as stream:
-            header = stream.read(4096)
-            stream.seek(16 * 2048)
-            descriptor = stream.read(2048)
+    try:
+        source_identity = (
+            source.identity.device, source.identity.inode,
+            source.identity.size, source.identity.modified_ns,
+            source.identity.changed_ns,
+        )
+        if source_identity != observed_identity:
+            raise OSError("The selected image changed before it could be opened")
+        size, header, descriptor, partition_tables = _read_partition_evidence(
+            source,
+            cancel_check=check_inspection,
+            maximum_expanded_bytes=maximum_expanded_bytes,
+        )
+    finally:
+        source.close()
 
-    has_mbr = len(header) >= 512 and header[510:512] == b"\x55\xaa"
-    has_gpt = len(header) >= 520 and header[512:520] == b"EFI PART"
+    has_mbr = partition_tables.has_mbr
+    has_gpt = partition_tables.has_gpt
     is_iso9660 = len(descriptor) >= 6 and descriptor[1:6] == b"CD001"
     volume_label = ""
     if is_iso9660 and len(descriptor) >= 72:
@@ -323,7 +476,7 @@ def inspect_image(path: Path) -> ImageInspection:
         )
         uefi_payloads = uefi_analysis.payloads
         uefi_issues = uefi_analysis.issues
-    return ImageInspection(
+    result = ImageInspection(
         size=size, kind=kind, volume_label=volume_label, has_mbr=has_mbr,
         has_gpt=has_gpt, is_iso9660=is_iso9660,
         looks_windows=_looks_like_windows(path, volume_label),
@@ -338,7 +491,26 @@ def inspect_image(path: Path) -> ImageInspection:
         uefi_analysis_issues=uefi_issues,
         eltorito=eltorito,
         eltorito_issues=eltorito_issues,
+        partition_table_valid=(
+            partition_tables.valid
+            if (has_mbr or has_gpt) and partition_tables.complete else None
+        ),
+        partition_table_kind=partition_tables.kind,
+        partition_table_sector_size=partition_tables.sector_size,
+        partition_table_issues=partition_tables.issues,
+        mbr_kind=partition_tables.mbr_kind,
+        mbr_boot_code=partition_tables.mbr_boot_code,
+        partition_table_inspection_complete=partition_tables.complete,
     )
+    check_inspection()
+    final = path.stat()
+    final_identity = (
+        final.st_dev, final.st_ino, final.st_size,
+        final.st_mtime_ns, final.st_ctime_ns,
+    )
+    if final_identity != observed_identity:
+        raise OSError("The selected image changed while it was being inspected")
+    return result
 
 
 def calculate_checksums(path: Path, progress: Progress | None = None) -> dict[str, str]:

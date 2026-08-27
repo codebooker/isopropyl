@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -36,7 +37,7 @@ from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 def device(size: int = 8 * 1024**3) -> Device:
     return Device(
         "/dev/sdz", size, "Test Drive", "ISOpropyl", "usb", "SERIAL",
-        "", "65:144", True, True, False, (), (),
+        "", "65:144", True, True, False, (), (), 512,
     )
 
 
@@ -160,7 +161,7 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
             observed.extend(combo.itemData(index) for index in range(combo.count()))
             tables = next(
                 candidate for candidate in dialog.findChildren(QComboBox)
-                if candidate.findData(FormatFilesystem.FAT32) < 0
+                if candidate.findData(FormatPartitionTable.MBR) >= 0
             )
             defaults.extend((combo.currentData(), tables.currentData()))
             notes.extend(label.text() for label in dialog.findChildren(QLabel))
@@ -191,7 +192,11 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
                 {FormatFilesystem.FAT12, FormatFilesystem.FAT16},
                 set(),
             ),
-            (3 * 1024**4, set(), {FormatFilesystem.UDF}),
+            (
+                3 * 1024**4,
+                set(),
+                {FormatFilesystem.FAT32, FormatFilesystem.UDF},
+            ),
         )
         for size, present, absent in cases:
             with self.subTest(size=size):
@@ -201,7 +206,7 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
                 def inspect_dialog(dialog) -> int:
                     combo = next(
                         candidate for candidate in dialog.findChildren(QComboBox)
-                        if candidate.findData(FormatFilesystem.FAT32) >= 0
+                        if candidate.findData(FormatFilesystem.EXT4) >= 0
                     )
                     observed.update(
                         combo.itemData(index) for index in range(combo.count())
@@ -212,6 +217,186 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
                     self.window.format_drive()
                 self.assertTrue(present <= observed)
                 self.assertFalse(absent & observed)
+
+    def test_restore_selector_filters_known_sector_and_formatter_dead_ends(self):
+        cases = (
+            (
+                replace(device(200 * 1024**2), logical_sector_size=1024),
+                {FormatFilesystem.FAT32, FormatFilesystem.EXT4},
+                {FormatFilesystem.FAT12, FormatFilesystem.FAT16},
+            ),
+            (
+                replace(device(64 * 1024**2), logical_sector_size=4096),
+                {FormatFilesystem.FAT12, FormatFilesystem.EXT4},
+                {FormatFilesystem.FAT16, FormatFilesystem.FAT32},
+            ),
+            (
+                replace(device(20 * 1024**4), logical_sector_size=512),
+                {FormatFilesystem.EXT4},
+                {
+                    FormatFilesystem.FAT32,
+                    FormatFilesystem.UDF,
+                    FormatFilesystem.EXT2,
+                    FormatFilesystem.EXT3,
+                },
+            ),
+        )
+        for target, present, absent in cases:
+            with self.subTest(size=target.size, sector=target.logical_sector_size):
+                self.window.devices = [target]
+                observed = set()
+
+                def inspect_dialog(dialog) -> int:
+                    combo = dialog.findChild(QComboBox, "restoreFilesystem")
+                    self.assertIsNotNone(combo)
+                    observed.update(
+                        combo.itemData(index) for index in range(combo.count())
+                    )
+                    return QDialog.DialogCode.Rejected
+
+                with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
+                    self.window.format_drive()
+                self.assertTrue(present <= observed)
+                self.assertFalse(absent & observed)
+
+    def test_restore_selector_disables_review_when_sector_is_unsupported(self):
+        self.window.devices = [
+            replace(device(), logical_sector_size=8192),
+        ]
+        observed = {}
+
+        def inspect_dialog(dialog) -> int:
+            filesystem = dialog.findChild(QComboBox, "restoreFilesystem")
+            buttons = dialog.findChild(QDialogButtonBox)
+            self.assertIsNotNone(filesystem)
+            self.assertIsNotNone(buttons)
+            observed["count"] = filesystem.count()
+            observed["review"] = buttons.button(
+                QDialogButtonBox.StandardButton.Ok
+            ).isEnabled()
+            observed["text"] = " ".join(
+                label.text() for label in dialog.findChildren(QLabel)
+            )
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
+            self.window.format_drive()
+
+        self.assertEqual(observed["count"], 0)
+        self.assertFalse(observed["review"])
+        self.assertIn("will not repartition", observed["text"])
+
+    def test_restore_selector_refilters_when_partition_table_changes(self):
+        self.window.devices = [
+            replace(device(36_170_240), logical_sector_size=512),
+        ]
+        observed: dict[str, object] = {}
+
+        def inspect_dialog(dialog) -> int:
+            filesystem = dialog.findChild(QComboBox, "restoreFilesystem")
+            table = dialog.findChild(QComboBox, "restorePartitionTable")
+            buttons = dialog.findChild(QDialogButtonBox)
+            self.assertIsNotNone(filesystem)
+            self.assertIsNotNone(table)
+            self.assertIsNotNone(buttons)
+            observed["mbr_fat32"] = filesystem.findData(
+                FormatFilesystem.FAT32,
+            ) >= 0
+            table.setCurrentIndex(table.findData(FormatPartitionTable.GPT))
+            observed["gpt_fat32"] = filesystem.findData(
+                FormatFilesystem.FAT32,
+            ) >= 0
+            observed["selected"] = filesystem.currentData()
+            observed["review"] = buttons.button(
+                QDialogButtonBox.StandardButton.Ok,
+            ).isEnabled()
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
+            self.window.format_drive()
+
+        self.assertTrue(observed["mbr_fat32"])
+        self.assertFalse(observed["gpt_fat32"])
+        self.assertIsNot(observed["selected"], FormatFilesystem.FAT32)
+        self.assertTrue(observed["review"])
+
+    def test_restore_selector_defaults_to_gpt_beyond_mbr_addressability(self):
+        self.window.devices = [
+            replace(device(3 * 1024**4), logical_sector_size=512),
+        ]
+        observed: dict[str, object] = {}
+
+        def inspect_dialog(dialog) -> int:
+            filesystem = dialog.findChild(QComboBox, "restoreFilesystem")
+            table = dialog.findChild(QComboBox, "restorePartitionTable")
+            buttons = dialog.findChild(QDialogButtonBox)
+            observed["table"] = table.currentData()
+            observed["filesystems"] = filesystem.count()
+            observed["review"] = buttons.button(
+                QDialogButtonBox.StandardButton.Ok,
+            ).isEnabled()
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
+            self.window.format_drive()
+
+        self.assertIs(observed["table"], FormatPartitionTable.GPT)
+        self.assertGreater(observed["filesystems"], 0)
+        self.assertTrue(observed["review"])
+
+    def test_restore_selector_filters_and_labels_allocation_units(self):
+        observed: dict[str, object] = {}
+
+        def inspect_dialog(dialog) -> int:
+            combos = dialog.findChildren(QComboBox)
+            filesystem = next(
+                candidate for candidate in combos
+                if candidate.findData(FormatFilesystem.EXT4) >= 0
+            )
+            allocation = next(
+                candidate for candidate in combos
+                if any(
+                    isinstance(candidate.itemData(index), int)
+                    and not isinstance(candidate.itemData(index), bool)
+                    for index in range(candidate.count())
+                )
+            )
+
+            filesystem.setCurrentIndex(filesystem.findData(FormatFilesystem.NTFS))
+            observed["ntfs"] = tuple(
+                allocation.itemData(index) for index in range(allocation.count())
+            )
+            observed["ntfs_note"] = " ".join(
+                label.text() for label in dialog.findChildren(QLabel)
+            )
+
+            filesystem.setCurrentIndex(filesystem.findData(FormatFilesystem.UDF))
+            observed["udf"] = tuple(
+                allocation.itemData(index) for index in range(allocation.count())
+            )
+            observed["udf_enabled"] = allocation.isEnabled()
+
+            filesystem.setCurrentIndex(filesystem.findData(FormatFilesystem.EXT4))
+            observed["ext"] = tuple(
+                allocation.itemData(index) for index in range(allocation.count())
+            )
+            observed["labels"] = tuple(
+                label.text() for label in dialog.findChildren(QLabel)
+            )
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
+            self.window.format_drive()
+
+        self.assertEqual(observed["ntfs"][0], None)
+        self.assertIn(4096, observed["ntfs"])
+        self.assertIn(65536, observed["ntfs"])
+        self.assertIn(2 * 1024**2, observed["ntfs"])
+        self.assertIn("above 64 KiB", observed["ntfs_note"])
+        self.assertEqual(observed["udf"], (None,))
+        self.assertFalse(observed["udf_enabled"])
+        self.assertEqual(observed["ext"], (None, 1024, 2048, 4096))
+        self.assertIn("Filesystem block size", observed["labels"])
 
 
 class BootloaderCacheDialogTests(unittest.TestCase):
@@ -374,6 +559,81 @@ class WindowWriteMethodTests(unittest.TestCase):
         )
         self.assertIn("fixture inspection failure", self.window.image_detail.text())
         warning.assert_called_once()
+
+    def test_stale_inspection_generation_cannot_replace_current_state(self):
+        current = self.window.inspection
+        self.window.inspection_generation = 3
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+
+        self.window.on_inspection_finished(
+            identity, optical_windows_inspection(hybrid=True), 2,
+        )
+
+        self.assertIs(self.window.inspection, current)
+
+    def test_selecting_an_image_cancels_the_previous_inspection(self):
+        image = Path(self.settings_home.name) / "replacement.iso"
+        image.write_bytes(b"fixture")
+        previous = self.window.inspection_cancel_event
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                pass
+
+        with patch("isopropyl.app.threading.Thread", DeferredThread):
+            self.window.load_image(image)
+
+        self.assertTrue(previous.is_set())
+        self.assertFalse(self.window.inspection_cancel_event.is_set())
+        self.assertTrue(self.window.inspection_busy)
+
+        self.window.cancel()
+
+        self.assertTrue(self.window.inspection_cancel_event.is_set())
+        self.assertFalse(self.window.inspection_busy)
+        self.assertEqual(self.window.image_detail.text(), "Image inspection cancelled")
+
+    def test_image_tooltip_surfaces_partition_structure_and_issues(self):
+        inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            partition_table_valid=False,
+            partition_table_kind="malformed",
+            partition_table_issues=("primary: GPT header CRC32 is invalid.",),
+            mbr_kind="protective",
+            mbr_boot_code="grub",
+        )
+
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_inspection_finished((1, 2, 3, 4), inspection)
+
+        tooltip = self.window.image_detail.toolTip()
+        self.assertIn("Partition structure: Malformed", tooltip)
+        self.assertIn("MBR boot code: GRUB", tooltip)
+        self.assertIn("primary: GPT header CRC32 is invalid.", tooltip)
+
+    def test_image_tooltip_marks_plain_mbr_sector_size_as_assumed(self):
+        inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            partition_table_valid=True,
+            partition_table_kind="mbr",
+            partition_table_sector_size=512,
+            mbr_kind="mbr",
+            mbr_boot_code="syslinux",
+        )
+
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_inspection_finished((1, 2, 3, 4), inspection)
+
+        tooltip = self.window.image_detail.toolTip()
+        self.assertIn("MBR · valid · 512-byte sectors assumed", tooltip)
+        self.assertIn("MBR boot code: Syslinux", tooltip)
 
     def test_settings_persist_binary_units_and_refresh_device_label(self):
         self.window.size_unit_mode = SizeUnitMode.SI
@@ -550,6 +810,272 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertEqual(self.window.selected_write_mode(), WriteMode.DD)
         self.assertTrue(self.window.verify.isEnabled())
         self.assertEqual(self.window.write_button.text(), "Write in DD mode")
+
+    def test_malformed_raw_layout_requires_explicit_dd_selection_and_warning(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            kind="Raw disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            partition_table_valid=False,
+            partition_table_kind="malformed",
+            partition_table_issues=("primary: GPT header CRC32 is invalid.",),
+        )
+
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+        self.assertEqual(self.window.write_method.currentIndex(), -1)
+        self.assertEqual(self.window.write_button.text(), "Choose write method")
+        self.assertFalse(self.window.write_button.isEnabled())
+
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        self.assertTrue(self.window.write_button.isEnabled())
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        start_write.assert_not_called()
+        self.assertEqual(warning.call_args.args[1], "Image may not be USB bootable")
+        self.assertIn("malformed MBR or GPT", warning.call_args.args[2])
+
+    def test_incomplete_compressed_layout_requires_explicit_dd_and_clear_warning(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            kind="Raw disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            compression="gzip",
+            partition_table_valid=None,
+            partition_table_kind="incomplete",
+            partition_table_inspection_complete=False,
+            partition_table_issues=("Partition metadata is outside the capture.",),
+        )
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        self.assertEqual(self.window.write_method.currentIndex(), -1)
+
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        start_write.assert_not_called()
+        self.assertIn("not known to be damaged", warning.call_args.args[2])
+
+    def test_dd_confirmation_rejects_an_image_changed_after_inspection(self):
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        with (
+            patch("isopropyl.app.image_identity", return_value=(9, 9, 9, 9)),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        start_write.assert_not_called()
+        warning.assert_called_once()
+        self.assertEqual(warning.call_args.args[1], "Image changed")
+
+    def test_sector_mismatch_keeps_dd_explicit_and_warned(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            kind="Raw disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            partition_table_valid=True,
+            partition_table_kind="gpt",
+            partition_table_sector_size=4096,
+        )
+
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+        self.assertEqual(self.window.write_method.currentIndex(), -1)
+        self.assertIn("different logical sector sizes", self.window.write_method_reason.text())
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        start_write.assert_not_called()
+        self.assertIn("wrong target LBAs", warning.call_args.args[2])
+
+    def test_target_change_clears_preserved_dd_when_it_becomes_explicit_only(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            kind="Raw disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            partition_table_valid=True,
+            partition_table_kind="gpt",
+            partition_table_sector_size=512,
+        )
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        self.assertEqual(self.window.selected_write_mode(), WriteMode.DD)
+
+        self.window.devices = [replace(device(), logical_sector_size=4096)]
+        self.window.on_device_changed()
+
+        self.assertIsNone(self.window.selected_write_mode())
+        self.assertFalse(self.window.write_button.isEnabled())
+        self.assertIn("No method is recommended", self.window.write_method_reason.text())
+        self.assertIn("different logical sector sizes", self.window.write_method_reason.text())
+
+    def test_unknown_target_sector_keeps_structured_dd_explicit_and_warned(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            kind="Raw disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            partition_table_valid=True,
+            partition_table_kind="gpt",
+            partition_table_sector_size=4096,
+        )
+        self.window.devices = [replace(device(), logical_sector_size=0)]
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        self.assertIsNone(self.window.selected_write_mode())
+        self.assertIn("did not report", self.window.write_method_reason.text())
+
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        start_write.assert_not_called()
+        self.assertIn("did not report", warning.call_args.args[2])
+
+    def test_confirmation_rechecks_image_after_final_consent(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            kind="Raw disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+        )
+        status = self.window.image.stat()
+        selected_identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        self.window.inspection_identity = selected_identity
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        changed = False
+
+        def consent(*args, **kwargs):
+            nonlocal changed
+            if args[1] == "Erase removable drive?":
+                self.window.image.write_bytes(b"changed")
+                os.utime(
+                    self.window.image,
+                    ns=(status.st_atime_ns, status.st_mtime_ns),
+                )
+                changed = True
+                return QMessageBox.StandardButton.Yes
+            return QMessageBox.StandardButton.Cancel
+
+        with (
+            patch("isopropyl.app.QMessageBox.warning", side_effect=consent) as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        self.assertTrue(changed)
+        start_write.assert_not_called()
+        self.assertEqual(warning.call_args.args[1], "Image changed")
+
+    def test_start_write_rejects_fresh_target_sector_change(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        backend = Mock()
+        backend.cancelled = False
+        refreshed = replace(device(), logical_sector_size=4096)
+        with (
+            patch("isopropyl.app.ImageWriter", return_value=backend),
+            patch("isopropyl.app.list_devices", return_value=[refreshed]),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window.logger, "exception"),
+        ):
+            self.window.start_write(
+                self.window.image, device(), False, identity,
+            )
+
+        backend.write.assert_not_called()
+        self.assertTrue(critical.called)
+        self.assertIn("logical sector size changed", critical.call_args.args[2])
+
+    def test_virtual_write_binds_reopened_container_to_consent_identity(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        self.window.inspection = replace(
+            optical_windows_inspection(), virtual_format="VHDX",
+        )
+        backend = Mock()
+        backend.cancelled = False
+        virtual_info = Mock()
+        virtual_info.identity.device = identity[0]
+        virtual_info.identity.inode = identity[1] + 1
+        virtual_info.identity.size = identity[2]
+        virtual_info.identity.modified_ns = identity[3]
+        virtual_info.identity.changed_ns = identity[4]
+        with (
+            patch("isopropyl.app.ImageWriter", return_value=backend),
+            patch("isopropyl.app.list_devices", return_value=[device()]),
+            patch("isopropyl.app.inspect_virtual_disk", return_value=virtual_info),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window.logger, "exception"),
+        ):
+            self.window.start_write(
+                self.window.image, device(), False, identity,
+            )
+
+        backend.write.assert_not_called()
+        self.assertTrue(critical.called)
+        self.assertIn("virtual disk changed", critical.call_args.args[2])
 
     def test_iso_dispatch_rebuilds_a_fresh_target_sized_plan(self):
         self.window.rebuild_write_recommendation(preserve_selection=False)

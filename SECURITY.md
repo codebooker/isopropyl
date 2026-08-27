@@ -19,7 +19,34 @@ issue requesting a private contact channel without disclosing the vulnerability.
   identity are bound and revalidated around unmounting and before privileged
   reads, writes, verification, and power-off. Exact UEFI:NTFS layouts also bind
   a freshly observed 512-byte logical-sector size before destructive consent
-  and recheck it before partitioning; 4Kn media fail closed.
+  and recheck it before partitioning; 4Kn media fail closed. Restore formatting
+  binds and repeatedly rechecks a supported 512/1024/2048/4096-byte logical
+  sector size before unmounting and filesystem creation (FAT12/16 narrow that
+  set to 512/4096), and validates any explicit allocation size against the exact
+  resulting partition geometry. A full-capacity MBR plan must also fit its
+  32-bit start/count sector fields; otherwise it is rejected before unmounting
+  and the restore dialog selects GPT when reported geometry makes that conclusion
+  possible. Missing sector metadata remains provisional until the pre-unmount
+  discovery check.
+- The image pathname selected in the UI is bound by device, inode, size, mtime,
+  and ctime to the completed inspection, rechecked after final DD consent, and
+  passed as an expected identity into the writer's one `O_NOFOLLOW` descriptor.
+  Raw and compressed bytes are streamed from that descriptor, never reopened by
+  privileged `dd`; external decoders receive only a passed `/proc/self/fd`
+  handle. Descriptor metadata is checked after every read and before its bytes
+  are yielded. Compressed inspection has cooperative cancellation, a five-minute
+  limit checked between in-process decoder reads and while waiting for external
+  decoder output, a 64 TiB expanded-size ceiling, bounded prefix/tail capture,
+  and a pre-parse ZIP central-directory bound. Decoder-library working memory and
+  the duration of one in-process decoder call are not represented as globally
+  bounded. Destructive decompression is bounded by the selected target. Legal
+  middle metadata outside the capture is reported as incomplete and is never
+  automatically recommended for DD.
+- A structurally valid MBR/GPT image whose logical-sector interpretation differs
+  from the discovered target is not automatically recommended for DD; neither is
+  structured DD when the target omits logical-sector metadata. An expert exact
+  copy remains available only after a specific compatibility warning. Plain MBR
+  comparisons are explicitly the conventional assumed 512-byte interpretation.
 - Privileged commands use fixed argument arrays; ISOpropyl does not build shell
   text or run downloaded scripts.
 - Destructive tools take a nonblocking BSD lock on the whole target for each

@@ -41,6 +41,9 @@ class Device:
     read_only: bool
     mountpoints: tuple[str, ...]
     partitions: tuple[str, ...]
+    # Discovery-time hint for filtering non-destructive UI choices. Every
+    # formatter re-probes and binds this value before it touches the drive.
+    logical_sector_size: int = 0
 
     @property
     def label(self) -> str:
@@ -151,6 +154,7 @@ def parse_lsblk(payload: str, include_usb_hdds: bool = False) -> list[Device]:
             major_minor=str(node.get("maj:min") or "").strip(),
             removable=removable, hotplug=hotplug, read_only=bool(node.get("ro")),
             mountpoints=tuple(mounts), partitions=partitions,
+            logical_sector_size=int(node.get("log-sec") or 0),
         ))
     return devices
 
@@ -160,7 +164,10 @@ def list_devices(
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> list[Device]:
-    fields = "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,MAJ:MIN,MOUNTPOINTS,RO"
+    fields = (
+        "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,MAJ:MIN,"
+        "MOUNTPOINTS,RO,LOG-SEC"
+    )
     execute = runner or subprocess.run
     try:
         result = execute(

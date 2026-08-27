@@ -66,8 +66,10 @@ evidence.
   discovery to any future host probes that could delay the UI.
 - Localization, system/high-contrast appearance, keyboard and screen-reader QA.
 - Conflicting-process diagnostics and narrowly bounded I/O retries.
-- Cluster size, additional filesystem, partition-layout, and volume-label controls
-  where the selected boot profile can support them safely.
+- Physically certify the implemented geometry-filtered restore allocation/block
+  sizes, then consider exposing profile-safe sizing in ISO construction.
+- Additional filesystem, partition-layout, and volume-label controls where the
+  selected boot profile can support them safely.
 - Flatpak/AppImage feasibility work, native distro packages, portable settings,
   release signatures, SBOMs, and reproducibility attestations.
 

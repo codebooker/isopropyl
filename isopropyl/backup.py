@@ -686,7 +686,10 @@ def _private_file_identity(path: Path, expected_size: int, label: str) -> FileId
         raise VirtualBackupError(
             f"{label} has {status.st_size} bytes; expected exactly {expected_size}"
         )
-    return FileIdentity(status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
+    return FileIdentity(
+        status.st_dev, status.st_ino, status.st_size,
+        status.st_mtime_ns, status.st_ctime_ns,
+    )
 
 
 def _require_unchanged_private_file(
@@ -994,6 +997,7 @@ class VirtualDriveImager:
         final_identity = FileIdentity(
             final_status.st_dev, final_status.st_ino,
             final_status.st_size, final_status.st_mtime_ns,
+            final_status.st_ctime_ns,
         )
         if (
             not stat.S_ISREG(final_status.st_mode)
@@ -1029,7 +1033,8 @@ class VirtualDriveImager:
         self._require_tool(tool)
         before = output.lstat()
         before_identity = FileIdentity(
-            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
         )
         if (
             not stat.S_ISREG(before.st_mode)
@@ -1050,7 +1055,8 @@ class VirtualDriveImager:
         self._require_tool(tool)
         after = output.lstat()
         after_identity = FileIdentity(
-            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
         )
         if (
             not stat.S_ISREG(after.st_mode)
@@ -1178,6 +1184,7 @@ class VirtualDriveImager:
                 current_output_identity = FileIdentity(
                     output_status.st_dev, output_status.st_ino,
                     output_status.st_size, output_status.st_mtime_ns,
+                    output_status.st_ctime_ns,
                 )
                 if (
                     not stat.S_ISREG(output_status.st_mode)

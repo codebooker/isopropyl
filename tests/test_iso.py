@@ -280,6 +280,37 @@ class PlanTests(unittest.TestCase):
         plan = build_write_plan(image, requested_mode=WriteMode.DD)
         self.assertTrue(plan.warnings)
 
+    def test_explicit_dd_allows_malformed_partition_metadata_with_warning(self):
+        image = inspection()
+        image = ImageInspection(**{
+            **image.__dict__,
+            "partition_table_valid": False,
+            "partition_table_kind": "malformed",
+            "partition_table_issues": ("The MBR partition is out of bounds.",),
+        })
+        plan = build_write_plan(image, requested_mode=WriteMode.DD)
+        self.assertTrue(plan.executable)
+        self.assertTrue(any("malformed" in item for item in plan.warnings))
+
+    def test_explicit_dd_warns_when_target_sector_size_differs(self):
+        image = inspection(iso=False)
+        image = ImageInspection(**{
+            **image.__dict__,
+            "has_mbr": True,
+            "partition_table_valid": True,
+            "partition_table_kind": "gpt",
+            "partition_table_sector_size": 4096,
+        })
+
+        plan = build_write_plan(
+            image,
+            requested_mode=WriteMode.DD,
+            target_logical_sector_size=512,
+        )
+
+        self.assertTrue(plan.executable)
+        self.assertTrue(any("different logical" in item for item in plan.warnings))
+
     def test_target_capacity_is_checked_without_touching_target(self):
         with self.assertRaisesRegex(PlanError, "smaller"):
             build_write_plan(inspection(iso=False), target_size=100)
@@ -350,6 +381,108 @@ class WriteMethodRecommendationTests(unittest.TestCase):
         self.assertEqual(result.available_modes, (WriteMode.DD,))
         self.assertEqual(result.recommended_mode, WriteMode.DD)
         self.assertIn("fallback loader", result.iso_unavailable_reason)
+
+    def test_malformed_table_keeps_dd_available_without_recommending_it(self):
+        image = inspection()
+        image = ImageInspection(**{
+            **image.__dict__,
+            "partition_table_valid": False,
+            "partition_table_kind": "malformed",
+            "partition_table_issues": ("The GPT header CRC32 does not match.",),
+        })
+        blocked_iso = recommend_write_method(image, ())
+        self.assertEqual(blocked_iso.available_modes, (WriteMode.DD,))
+        self.assertIsNone(blocked_iso.recommended_mode)
+        self.assertIn("explicit", blocked_iso.reason)
+        self.assertTrue(blocked_iso.dd_plan.warnings)
+
+        executable_iso = recommend_write_method(image, self.uefi_entries())
+        self.assertEqual(
+            executable_iso.recommended_mode, WriteMode.EXTRACTED_ISO,
+        )
+        self.assertEqual(
+            executable_iso.available_modes,
+            (WriteMode.DD, WriteMode.EXTRACTED_ISO),
+        )
+
+    def test_malformed_raw_image_keeps_only_explicit_dd_available(self):
+        image = inspection(iso=False)
+        image = ImageInspection(**{
+            **image.__dict__, "has_mbr": True,
+            "partition_table_valid": False,
+            "partition_table_kind": "malformed",
+        })
+        result = recommend_write_method(image)
+        self.assertEqual(result.available_modes, (WriteMode.DD,))
+        self.assertIsNone(result.recommended_mode)
+        self.assertIn("not recommended", result.reason)
+
+    def test_incomplete_compressed_table_is_unverified_not_malformed(self):
+        image = inspection(iso=False)
+        image = ImageInspection(**{
+            **image.__dict__,
+            "has_mbr": True,
+            "compression": "gzip",
+            "partition_table_valid": None,
+            "partition_table_kind": "incomplete",
+            "partition_table_inspection_complete": False,
+        })
+
+        result = recommend_write_method(image)
+
+        self.assertEqual(result.available_modes, (WriteMode.DD,))
+        self.assertIsNone(result.recommended_mode)
+        self.assertIn("could not be fully inspected", result.reason)
+        self.assertTrue(any("fully inspected" in item for item in result.dd_plan.warnings))
+
+    def test_sector_mismatch_is_never_silently_recommended_for_dd(self):
+        raw = inspection(iso=False)
+        raw = ImageInspection(**{
+            **raw.__dict__,
+            "has_mbr": True,
+            "partition_table_valid": True,
+            "partition_table_kind": "gpt",
+            "partition_table_sector_size": 4096,
+        })
+        raw_result = recommend_write_method(
+            raw, target_logical_sector_size=512,
+        )
+        self.assertEqual(raw_result.available_modes, (WriteMode.DD,))
+        self.assertIsNone(raw_result.recommended_mode)
+        self.assertIn("different logical sector sizes", raw_result.reason)
+
+        hybrid = inspection(boot_modes=("UEFI",))
+        hybrid = ImageInspection(**{
+            **hybrid.__dict__,
+            "partition_table_valid": True,
+            "partition_table_kind": "gpt",
+            "partition_table_sector_size": 4096,
+        })
+        iso_result = recommend_write_method(
+            hybrid,
+            self.uefi_entries(),
+            target_logical_sector_size=512,
+        )
+        self.assertEqual(iso_result.recommended_mode, WriteMode.EXTRACTED_ISO)
+        self.assertIn("different logical sector sizes", iso_result.reason)
+
+    def test_unknown_selected_target_sector_keeps_structured_dd_explicit(self):
+        raw = inspection(iso=False)
+        raw = ImageInspection(**{
+            **raw.__dict__,
+            "has_mbr": True,
+            "partition_table_valid": True,
+            "partition_table_kind": "gpt",
+            "partition_table_sector_size": 4096,
+        })
+
+        provisional = recommend_write_method(raw)
+        selected = recommend_write_method(raw, target_logical_sector_size=0)
+
+        self.assertEqual(provisional.recommended_mode, WriteMode.DD)
+        self.assertIsNone(selected.recommended_mode)
+        self.assertIn("did not report", selected.reason)
+        self.assertTrue(any("did not report" in item for item in selected.dd_plan.warnings))
 
     def test_target_capacity_is_method_specific(self):
         result = recommend_write_method(

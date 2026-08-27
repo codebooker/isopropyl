@@ -86,6 +86,7 @@ class FormatPlan:
     filesystem: Filesystem
     partition_table: PartitionTable
     label: str = ""
+    allocation_unit_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,10 @@ MIB_BYTES = 1024 * 1024
 _FAT12_MAX_DEVICE_SIZE = 256 * MIB_BYTES
 _FAT16_MIN_DEVICE_SIZE = 128 * MIB_BYTES
 _FAT16_MAX_DEVICE_SIZE = 4096 * MIB_BYTES
+# FAT32's total-sector field is 32-bit.  Capping the whole drive at 2 TiB
+# means the smaller aligned partition remains below UINT32_MAX sectors even
+# with the smallest supported 512-byte logical sector.
+_FAT32_MAX_DEVICE_SIZE = 2 * 1024**4
 # UDF 2.01 addresses at most 2**32 logical blocks.  Capping at the 512-byte
 # case is conservative for every logical block size accepted below.
 _UDF_MAX_DEVICE_SIZE = 2 * 1024**4
@@ -248,6 +253,36 @@ _TRUSTED_TOOL_DIRECTORIES = frozenset(_TRUSTED_TOOL_PATH.split(":"))
 _MKUDFFS_VERSION_LINE = re.compile(
     rb"(?m)^mkudffs from udftools ([0-9]+)\.([0-9]+)(?:\.[0-9]+)?\r?$"
 )
+_FAT_ALLOCATION_UNITS = tuple(1 << power for power in range(9, 17))
+_EXFAT_ALLOCATION_UNITS = tuple(1 << power for power in range(9, 26))
+_NTFS_ALLOCATION_UNITS = tuple(1 << power for power in range(9, 22))
+_EXT_ALLOCATION_UNITS = (1024, 2048, 4096)
+_ALLOCATION_UNIT_CHOICES: Mapping[Filesystem, tuple[int, ...]] = {
+    Filesystem.FAT12: _FAT_ALLOCATION_UNITS,
+    Filesystem.FAT16: _FAT_ALLOCATION_UNITS,
+    Filesystem.FAT32: _FAT_ALLOCATION_UNITS,
+    Filesystem.EXFAT: _EXFAT_ALLOCATION_UNITS,
+    Filesystem.NTFS: _NTFS_ALLOCATION_UNITS,
+    Filesystem.EXT2: _EXT_ALLOCATION_UNITS,
+    Filesystem.EXT3: _EXT_ALLOCATION_UNITS,
+    Filesystem.EXT4: _EXT_ALLOCATION_UNITS,
+}
+_SUPPORTED_ALLOCATION_LOGICAL_SECTORS = frozenset({512, 1024, 2048, 4096})
+_FAT_CLUSTER_LIMITS: Mapping[Filesystem, tuple[int, int]] = {
+    Filesystem.FAT12: (16, 4084),
+    Filesystem.FAT16: (4087, 65524),
+    Filesystem.FAT32: (65525, 268435446),
+}
+_FAT_ENTRY_BYTES_FOR_TWO_TABLES: Mapping[Filesystem, int] = {
+    Filesystem.FAT12: 3,
+    Filesystem.FAT16: 4,
+    Filesystem.FAT32: 8,
+}
+_EXFAT_MAX_CLUSTERS = 0xFFFFFFF5
+_NTFS_MAX_CLUSTERS = 0xFFFFFFFF
+_NTFS_MAX_CLUSTER_SIZE = 2 * MIB_BYTES
+_EXT2_3_MAX_BLOCKS = 0xFFFFFFFF
+_MBR_MAX_PARTITION_SECTORS = 0xFFFFFFFF
 
 
 def _partition_belongs_to_device(device_path: str, partition_path: str) -> bool:
@@ -377,6 +412,10 @@ def _validate_restore_filesystem_size(filesystem: Filesystem, size: object) -> N
         raise FormatValidationError(
             "FAT16 restore formatting requires a drive from 128 MiB through 4 GiB"
         )
+    if filesystem is Filesystem.FAT32 and size > _FAT32_MAX_DEVICE_SIZE:
+        raise FormatValidationError(
+            "FAT32 restore formatting is conservatively limited to 2 TiB drives"
+        )
     if filesystem is Filesystem.UDF and size > _UDF_MAX_DEVICE_SIZE:
         raise FormatValidationError(
             "UDF 2.01 restore formatting is conservatively limited to 2 TiB drives"
@@ -401,17 +440,332 @@ def restore_filesystem_size_supported(
     return True
 
 
+def _validate_allocation_unit_size(
+    filesystem: Filesystem,
+    allocation_unit_size: object,
+) -> None:
+    if allocation_unit_size is None:
+        return
+    if (
+        isinstance(allocation_unit_size, bool)
+        or not isinstance(allocation_unit_size, int)
+        or allocation_unit_size <= 0
+    ):
+        raise FormatValidationError(
+            "The allocation-unit size must be a positive whole number of bytes"
+        )
+    choices = _ALLOCATION_UNIT_CHOICES.get(filesystem)
+    if choices is None:
+        if filesystem is Filesystem.UDF:
+            raise FormatValidationError(
+                "UDF block size is fixed to the target logical sector size"
+            )
+        raise FormatValidationError(
+            f"Explicit allocation-unit sizing is not supported for {filesystem.value}"
+        )
+    if allocation_unit_size not in choices:
+        minimum, maximum = choices[0], choices[-1]
+        raise FormatValidationError(
+            f"{filesystem.value.upper()} allocation units must be a supported "
+            f"power of two from {minimum} through {maximum} bytes"
+        )
+
+
+def _single_partition_capacity_bytes(
+    device_size: object,
+    partition_table: PartitionTable,
+    logical_sector_size: object,
+) -> int:
+    if (
+        isinstance(device_size, bool)
+        or not isinstance(device_size, int)
+        or device_size <= 0
+        or isinstance(logical_sector_size, bool)
+        or not isinstance(logical_sector_size, int)
+        or logical_sector_size not in _SUPPORTED_ALLOCATION_LOGICAL_SECTORS
+        or device_size % logical_sector_size
+    ):
+        return 0
+    total_sectors = device_size // logical_sector_size
+    trailing_sectors = (
+        1 + (_GPT_PARTITION_ENTRY_BYTES + logical_sector_size - 1)
+        // logical_sector_size
+        if partition_table is PartitionTable.GPT else 0
+    )
+    partition_sectors = total_sectors - 2048 - trailing_sectors
+    if (
+        partition_table is PartitionTable.MBR
+        and partition_sectors > _MBR_MAX_PARTITION_SECTORS
+    ):
+        return 0
+    return max(0, partition_sectors) * logical_sector_size
+
+
+def _allocation_unit_geometry_supported(
+    filesystem: Filesystem,
+    allocation_unit_size: int,
+    partition_capacity: int,
+    logical_sector_size: int,
+) -> bool:
+    if (
+        logical_sector_size not in _SUPPORTED_ALLOCATION_LOGICAL_SECTORS
+        or allocation_unit_size < logical_sector_size
+        or allocation_unit_size % logical_sector_size
+        or partition_capacity <= 0
+    ):
+        return False
+    if filesystem in _FAT_CLUSTER_LIMITS:
+        sectors_per_cluster = allocation_unit_size // logical_sector_size
+        if sectors_per_cluster < 1 or sectors_per_cluster > 128:
+            return False
+        if filesystem in {Filesystem.FAT12, Filesystem.FAT16} and (
+            logical_sector_size not in {512, 4096}
+        ):
+            return False
+        minimum, maximum = _FAT_CLUSTER_LIMITS[filesystem]
+        raw_cluster_count = partition_capacity // allocation_unit_size
+        # Two FATs consume the encoded entry bytes below.  Reserving a further
+        # MiB covers boot/reserved sectors, the FAT alignment round-up, and the
+        # fixed FAT12/16 root directory, so the lower bound fails conservatively.
+        conservative_data_clusters = max(0, partition_capacity - MIB_BYTES) // (
+            allocation_unit_size + _FAT_ENTRY_BYTES_FOR_TWO_TABLES[filesystem]
+        )
+        return (
+            raw_cluster_count <= maximum
+            and conservative_data_clusters >= minimum
+        )
+    if filesystem is Filesystem.EXFAT:
+        raw_cluster_count = partition_capacity // allocation_unit_size
+        conservative_data_clusters = max(
+            0, partition_capacity - 2 * MIB_BYTES,
+        ) // allocation_unit_size
+        return (
+            raw_cluster_count <= _EXFAT_MAX_CLUSTERS
+            and conservative_data_clusters >= 16
+        )
+    if filesystem is Filesystem.NTFS:
+        raw_cluster_count = partition_capacity // allocation_unit_size
+        conservative_data_clusters = max(
+            0, partition_capacity - MIB_BYTES,
+        ) // allocation_unit_size
+        return (
+            raw_cluster_count <= _NTFS_MAX_CLUSTERS
+            and conservative_data_clusters >= 16
+        )
+    if filesystem in {Filesystem.EXT2, Filesystem.EXT3, Filesystem.EXT4}:
+        blocks = partition_capacity // allocation_unit_size
+        # mke2fs rejects a geometry whose block-group descriptor count would
+        # overflow 32 bits.  With the normal eight-block-size blocks per
+        # group, its source expresses this as 2**(log2(block size) + 35) - 1
+        # filesystem blocks.
+        descriptor_limit = (
+            1 << (allocation_unit_size.bit_length() - 1 + 35)
+        ) - 1
+        return (
+            blocks >= 1024
+            and blocks <= descriptor_limit
+            and (
+                filesystem is Filesystem.EXT4
+                or blocks <= _EXT2_3_MAX_BLOCKS
+            )
+        )
+    return False
+
+
+def _automatic_allocation_geometry_supported(
+    filesystem: Filesystem,
+    partition_capacity: int,
+    logical_sector_size: int,
+) -> bool:
+    """Conservatively validate the formatter-selected default geometry."""
+
+    if filesystem in {Filesystem.FAT12, Filesystem.FAT16, Filesystem.FAT32}:
+        return any(
+            _allocation_unit_geometry_supported(
+                filesystem, choice, partition_capacity, logical_sector_size,
+            )
+            for choice in _ALLOCATION_UNIT_CHOICES[filesystem]
+        )
+    if filesystem is Filesystem.EXFAT:
+        # exfatprogs selects one of four exact defaults from the partition
+        # capacity and does not continue growing it above 128 KiB.
+        default = (
+            512 if partition_capacity < 7 * MIB_BYTES else
+            4096 if partition_capacity <= 256 * MIB_BYTES else
+            32 * 1024 if partition_capacity <= 32 * 1024**3 else
+            128 * 1024
+        )
+        return _allocation_unit_geometry_supported(
+            filesystem, default, partition_capacity, logical_sector_size,
+        )
+    if filesystem is Filesystem.NTFS:
+        # Current mkntfs starts at max(4 KiB, sector size), then doubles until
+        # the cluster count fits in 32 bits.  Reaching its 2 MiB ceiling in
+        # that loop is an error even though an explicit 2 MiB cluster remains
+        # legal, so Automatic and explicit geometry must be treated separately.
+        default = max(4096, logical_sector_size)
+        while partition_capacity >> (default.bit_length() - 1 + 32):
+            default <<= 1
+            if default >= _NTFS_MAX_CLUSTER_SIZE:
+                return False
+        return _allocation_unit_geometry_supported(
+            filesystem, default, partition_capacity, logical_sector_size,
+        )
+    if filesystem in {Filesystem.EXT2, Filesystem.EXT3, Filesystem.EXT4}:
+        # Distribution mke2fs profiles can influence the automatic block size.
+        # Validate against the smallest portable size compatible with the
+        # reported sector so every permitted default remains inside both the
+        # legacy block-count and block-group descriptor ceilings.
+        default = next(
+            (
+                size for size in _EXT_ALLOCATION_UNITS
+                if size >= logical_sector_size and size % logical_sector_size == 0
+            ),
+            0,
+        )
+        return bool(
+            default
+            and _allocation_unit_geometry_supported(
+                filesystem, default, partition_capacity, logical_sector_size,
+            )
+        )
+    return filesystem is Filesystem.UDF
+
+
+def restore_filesystem_geometry_supported(
+    filesystem: Filesystem | str,
+    device_size: object,
+    logical_sector_size: object,
+    partition_table: PartitionTable | str = PartitionTable.MBR,
+) -> bool:
+    """Return whether an automatic restore can safely format this geometry.
+
+    A zero logical-sector hint means discovery did not report one; execution
+    still performs the same check before unmounting.  Invalid nonzero values
+    fail closed so a GUI can hide choices it already knows cannot execute.
+    """
+
+    try:
+        fs = _coerce_filesystem(filesystem)
+        table = _coerce_table(partition_table)
+        _validate_restore_filesystem_size(fs, device_size)
+    except (TypeError, ValueError):
+        return False
+    if logical_sector_size == 0:
+        return True
+    if (
+        isinstance(logical_sector_size, bool)
+        or not isinstance(logical_sector_size, int)
+        or logical_sector_size not in _SUPPORTED_ALLOCATION_LOGICAL_SECTORS
+        or (
+            fs in {Filesystem.FAT12, Filesystem.FAT16}
+            and logical_sector_size not in {512, 4096}
+        )
+    ):
+        return False
+    capacity = _single_partition_capacity_bytes(
+        device_size, table, logical_sector_size,
+    )
+    return bool(
+        capacity
+        and _automatic_allocation_geometry_supported(
+            fs, capacity, logical_sector_size,
+        )
+    )
+
+
+def restore_allocation_unit_sizes(
+    filesystem: Filesystem | str,
+    device_size: object,
+    logical_sector_size: object,
+    partition_table: PartitionTable | str = PartitionTable.MBR,
+) -> tuple[int, ...]:
+    """Return safe explicit byte sizes for one restore geometry, or ``()``.
+
+    ``None`` remains the normal formatter-selected default.  This helper is
+    intentionally non-throwing so a presentation layer can omit incompatible
+    expert choices without duplicating filesystem limits.
+    """
+
+    try:
+        fs = _coerce_filesystem(filesystem)
+        table = _coerce_table(partition_table)
+        _validate_restore_filesystem_size(fs, device_size)
+    except (TypeError, ValueError):
+        return ()
+    choices = _ALLOCATION_UNIT_CHOICES.get(fs, ())
+    if not choices:
+        return ()
+    capacity = _single_partition_capacity_bytes(
+        device_size, table, logical_sector_size,
+    )
+    if not capacity or not isinstance(logical_sector_size, int):
+        return ()
+    return tuple(
+        choice for choice in choices
+        if _allocation_unit_geometry_supported(
+            fs, choice, capacity, logical_sector_size,
+        )
+    )
+
+
+def _validate_plan_allocation_geometry(
+    plan: FormatPlan,
+    logical_sector_size: int,
+) -> None:
+    allocation_unit_size = plan.allocation_unit_size
+    capacity = _single_partition_capacity_bytes(
+        plan.device_identity[1], plan.partition_table, logical_sector_size,
+    )
+    if capacity <= 0:
+        if (
+            plan.partition_table is PartitionTable.MBR
+            and plan.device_identity[1] // logical_sector_size - 2048
+            > _MBR_MAX_PARTITION_SECTORS
+        ):
+            raise FormatValidationError(
+                "MBR cannot represent one full-capacity partition on this drive; "
+                "choose GPT"
+            )
+        raise FormatValidationError(
+            "The selected partition table cannot represent a safe full-capacity "
+            "partition on this drive"
+        )
+    if allocation_unit_size is None:
+        if not _automatic_allocation_geometry_supported(
+            plan.filesystem, capacity, logical_sector_size,
+        ):
+            raise FormatValidationError(
+                f"{plan.filesystem.value.upper()} formatter defaults are "
+                "incompatible with this drive's capacity or logical sector size"
+            )
+        return
+    if not _allocation_unit_geometry_supported(
+        plan.filesystem, allocation_unit_size, capacity, logical_sector_size,
+    ):
+        raise FormatValidationError(
+            f"{plan.filesystem.value.upper()} allocation unit "
+            f"{allocation_unit_size} bytes is incompatible with this drive's "
+            "capacity or logical sector size"
+        )
+
+
 def create_format_plan(
     device: Device,
     filesystem: Filesystem | str,
     partition_table: PartitionTable | str,
     label: str = "",
+    allocation_unit_size: int | None = None,
 ) -> FormatPlan:
     validate_device(device)
     fs = _coerce_filesystem(filesystem)
     table = _coerce_table(partition_table)
     _validate_restore_filesystem_size(fs, device.size)
-    return FormatPlan(device.path, device.identity, fs, table, validate_label(fs, label))
+    _validate_allocation_unit_size(fs, allocation_unit_size)
+    return FormatPlan(
+        device.path, device.identity, fs, table, validate_label(fs, label),
+        allocation_unit_size,
+    )
 
 
 def _validate_partition_spec(
@@ -678,6 +1032,7 @@ def validate_plan(plan: FormatPlan) -> None:
         raise FormatValidationError("The format plan contains an invalid device identity")
     _validate_restore_filesystem_size(plan.filesystem, plan.device_identity[1])
     validate_label(plan.filesystem, plan.label)
+    _validate_allocation_unit_size(plan.filesystem, plan.allocation_unit_size)
 
 
 def required_tool_names(plan: FormatPlan) -> tuple[str, ...]:
@@ -839,6 +1194,8 @@ def _format_command(
     label: str,
     mkfs: str,
     partition: str,
+    allocation_unit_size: int | None = None,
+    logical_sector_size: int | None = None,
 ) -> list[str]:
     command = [mkfs]
     if filesystem in {Filesystem.FAT12, Filesystem.FAT16, Filesystem.FAT32}:
@@ -848,13 +1205,25 @@ def _format_command(
             Filesystem.FAT32: "32",
         }[filesystem]
         command.extend(["-F", fat_bits])
+        if allocation_unit_size is not None:
+            if logical_sector_size is None:
+                raise FormatValidationError(
+                    "FAT allocation-unit sizing requires a bound logical sector size"
+                )
+            command.extend([
+                "-s", str(allocation_unit_size // logical_sector_size),
+            ])
         if label:
             command.extend(["-n", label])
     elif filesystem is Filesystem.EXFAT:
+        if allocation_unit_size is not None:
+            command.extend(["-c", str(allocation_unit_size)])
         if label:
             command.extend(["-L", label])
     elif filesystem is Filesystem.NTFS:
         command.append("-f")
+        if allocation_unit_size is not None:
+            command.extend(["-c", str(allocation_unit_size)])
         if label:
             command.extend(["-L", label])
     elif filesystem is Filesystem.UDF:
@@ -867,20 +1236,35 @@ def _format_command(
         ])
     else:
         command.append("-F")
+        if allocation_unit_size is not None:
+            command.extend(["-b", str(allocation_unit_size)])
         if label:
             command.extend(["-L", label])
     command.append(partition)
     return command
 
 
-def format_command(plan: FormatPlan, tools: FormatTools, partition: str) -> list[str]:
+def format_command(
+    plan: FormatPlan,
+    tools: FormatTools,
+    partition: str,
+    logical_sector_size: int | None = None,
+) -> list[str]:
+    validate_plan(plan)
     if (
         not _BLOCK_PATH.fullmatch(partition)
         or not _partition_belongs_to_device(plan.device_path, partition)
     ):
         raise FormatValidationError(f"Unsafe partition path: {partition!r}")
+    if plan.allocation_unit_size is not None:
+        if logical_sector_size is None:
+            raise FormatValidationError(
+                "An explicit allocation unit requires a bound logical sector size"
+            )
+        _validate_plan_allocation_geometry(plan, logical_sector_size)
     return [tools.pkexec, *_format_command(
         plan.filesystem, plan.label, tools.mkfs, partition,
+        plan.allocation_unit_size, logical_sector_size,
     )]
 
 
@@ -1460,10 +1844,8 @@ class FormatExecutor:
         plan: FormatPlan,
         tools: FormatTools,
         expected_logical_sector_size: int | None = None,
-    ) -> int | None:
-        """Bind geometry needed by the validated FAT12/16 and UDF plans."""
-        if plan.filesystem not in _RESTORE_ONLY_FILESYSTEMS:
-            return None
+    ) -> int:
+        """Bind geometry needed by constrained restore filesystem plans."""
         self._check_cancelled()
         result = self._run_probe(
             [
@@ -1490,11 +1872,18 @@ class FormatExecutor:
                     "FAT12/16 restore formatting supports only 512- or "
                     "4096-byte logical sectors"
                 )
-        elif observed not in {512, 1024, 2048, 4096}:
+        elif observed not in _SUPPORTED_ALLOCATION_LOGICAL_SECTORS:
+            if plan.filesystem is Filesystem.UDF:
+                raise FormatValidationError(
+                    "UDF requires a power-of-two logical sector size from 512 "
+                    "through 4096 bytes"
+                )
             raise FormatValidationError(
-                "UDF requires a power-of-two logical sector size from 512 "
-                "through 4096 bytes"
+                f"{plan.filesystem.value.upper()} restore formatting supports "
+                "logical sector sizes "
+                "from 512 through 4096 bytes"
             )
+        _validate_plan_allocation_geometry(plan, observed)
         return observed
 
     def _preflight_udf_formatter(
@@ -1762,7 +2151,9 @@ class FormatExecutor:
             plan, tools, (partition,), partition_identities,
         )
         self._run_process(self._locked_format_command(
-            format_command(plan, tools, partition), tools, flock, plan.device_path,
+            format_command(
+                plan, tools, partition, bound_table_sector_size,
+            ), tools, flock, plan.device_path,
         ))
         self._run_process([tools.udevadm, "settle"])
         self._assert_identity(plan, tools)

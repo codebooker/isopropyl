@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -164,6 +165,20 @@ class VirtualDiskTests(unittest.TestCase):
         with self.assertRaises(VirtualDiskChanged):
             inspect_virtual_disk(self.source, qemu_img=self.tool, runner=runner)
 
+    def test_source_ctime_change_during_inspection_is_rejected(self):
+        before = self.source.stat()
+
+        def runner(*_args: object, **_kwargs: object):
+            self.source.write_bytes(b"X" * before.st_size)
+            os.utime(
+                self.source,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            return json_result({"format": "vhdx", "virtual-size": 4096})
+
+        with self.assertRaises(VirtualDiskChanged):
+            inspect_virtual_disk(self.source, qemu_img=self.tool, runner=runner)
+
     def test_conversion_is_explicit_raw_sparse_private_and_exact(self):
         info, _ = self.inspect()
         commands: list[list[str]] = []
@@ -259,6 +274,24 @@ class VirtualDiskTests(unittest.TestCase):
         with self.assertRaises(VirtualDiskChanged):
             VirtualDiskStager(factory).stage(info, temporary_root=self.root)
         self.assertEqual(set(self.root.iterdir()), before)
+
+    def test_source_ctime_change_during_conversion_rejects_and_cleans_stage(self):
+        info, _ = self.inspect()
+        before_entries = set(self.root.iterdir())
+        before = self.source.stat()
+
+        def factory(command: list[str], **_kwargs: object):
+            process = FinishedProcess(command, info.virtual_size)
+            self.source.write_bytes(b"Y" * before.st_size)
+            os.utime(
+                self.source,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            return process
+
+        with self.assertRaises(VirtualDiskChanged):
+            VirtualDiskStager(factory).stage(info, temporary_root=self.root)
+        self.assertEqual(set(self.root.iterdir()), before_entries)
 
 
 if __name__ == "__main__":

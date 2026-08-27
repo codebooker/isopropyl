@@ -39,6 +39,8 @@ from isopropyl.formatting import (
     partition_script,
     resolve_multi_tools,
     resolve_tools,
+    restore_allocation_unit_sizes,
+    restore_filesystem_geometry_supported,
     restore_filesystem_size_supported,
     validate_label,
     validate_explicit_partition_metadata,
@@ -254,11 +256,12 @@ class FormatPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(FormatValidationError, "Basic Multilingual Plane"):
             validate_label("udf", "USB😀")
 
-    def test_fat12_fat16_and_udf_size_bounds_fail_closed(self):
+    def test_fat_and_udf_size_bounds_fail_closed(self):
         for filesystem, size, message in (
             ("fat12", 256 * 1024 * 1024 + 1, "256 MiB"),
             ("fat16", 128 * 1024 * 1024 - 1, "128 MiB"),
             ("fat16", 4 * 1024**3 + 1, "4 GiB"),
+            ("fat32", 2 * 1024**4 + 1, "2 TiB"),
             ("udf", 2 * 1024**4 + 1, "2 TiB"),
         ):
             with self.subTest(filesystem=filesystem, size=size):
@@ -285,6 +288,12 @@ class FormatPlanTests(unittest.TestCase):
             ).filesystem,
             Filesystem.UDF,
         )
+        self.assertEqual(
+            create_format_plan(
+                test_device(size=2 * 1024**4), "fat32", "gpt",
+            ).filesystem,
+            Filesystem.FAT32,
+        )
 
     def test_restore_size_support_helper_shares_exact_plan_boundaries(self):
         cases = (
@@ -294,6 +303,8 @@ class FormatPlanTests(unittest.TestCase):
             ("fat16", 128 * 1024**2 - 1, False),
             ("fat16", 4 * 1024**3, True),
             ("fat16", 4 * 1024**3 + 1, False),
+            ("fat32", 2 * 1024**4, True),
+            ("fat32", 2 * 1024**4 + 1, False),
             ("udf", 2 * 1024**4, True),
             ("udf", 2 * 1024**4 + 1, False),
             ("fat32", test_device().size, True),
@@ -306,6 +317,168 @@ class FormatPlanTests(unittest.TestCase):
         for filesystem, size in (("bogus", 1), ("fat12", 0), ([], 128 * 1024**2)):
             with self.subTest(filesystem=filesystem, size=size):
                 self.assertFalse(restore_filesystem_size_supported(filesystem, size))
+
+    def test_allocation_unit_validation_preserves_formatter_defaults(self):
+        default_plan = create_format_plan(test_device(), "ext4", "gpt", "USB")
+        self.assertIsNone(default_plan.allocation_unit_size)
+
+        for filesystem, size, allocation_unit in (
+            ("fat12", 256 * 1024**2, 65536),
+            ("fat16", 128 * 1024**2, 4096),
+            ("fat32", test_device().size, 32768),
+            ("exfat", test_device().size, 32 * 1024**2),
+            ("ntfs", test_device().size, 2 * 1024**2),
+            ("ext2", test_device().size, 1024),
+            ("ext3", test_device().size, 2048),
+            ("ext4", test_device().size, 4096),
+        ):
+            with self.subTest(filesystem=filesystem):
+                plan = create_format_plan(
+                    test_device(size=size), filesystem, "gpt", "USB",
+                    allocation_unit,
+                )
+                self.assertEqual(plan.allocation_unit_size, allocation_unit)
+
+        for filesystem, allocation_unit in (
+            ("udf", 2048),
+            ("fat32", True),
+            ("fat32", 0),
+            ("fat32", 1000),
+            ("fat32", 131072),
+            ("exfat", 64 * 1024**2),
+            ("ntfs", 4 * 1024**2),
+            ("ext4", 8192),
+        ):
+            with self.subTest(filesystem=filesystem, unit=allocation_unit):
+                with self.assertRaises(FormatValidationError):
+                    create_format_plan(
+                        test_device(), filesystem, "gpt", "USB",
+                        allocation_unit,
+                    )
+
+    def test_allocation_unit_helper_binds_exact_partition_capacity_and_sector(self):
+        mib = 1024**2
+        gib = 1024**3
+        self.assertEqual(
+            restore_allocation_unit_sizes("fat12", 256 * mib, 512),
+            (65536,),
+        )
+        self.assertEqual(
+            restore_allocation_unit_sizes("fat16", 128 * mib, 512),
+            (2048, 4096, 8192, 16384),
+        )
+        self.assertEqual(
+            restore_allocation_unit_sizes("fat16", 4 * gib, 512),
+            (65536,),
+        )
+        for sector_size in (512, 4096):
+            with self.subTest(filesystem="fat32", sector_size=sector_size):
+                self.assertEqual(
+                    restore_allocation_unit_sizes(
+                        "fat32", 2 * 1024**4, sector_size,
+                    ),
+                    (8192, 16384, 32768, 65536),
+                )
+                self.assertEqual(
+                    restore_allocation_unit_sizes(
+                        "fat32", 2 * 1024**4 + sector_size, sector_size,
+                    ),
+                    (),
+                )
+        self.assertEqual(
+            restore_allocation_unit_sizes("ext4", test_device().size, 4096),
+            (4096,),
+        )
+        self.assertNotIn(
+            4096,
+            restore_allocation_unit_sizes("ntfs", 32 * 1024**4, 512, "gpt"),
+        )
+        self.assertIn(
+            8192,
+            restore_allocation_unit_sizes("ntfs", 32 * 1024**4, 512, "gpt"),
+        )
+        self.assertEqual(restore_allocation_unit_sizes("udf", 16 * mib, 512), ())
+        for args in (
+            ("bogus", 16 * mib, 512),
+            ("fat32", 16 * mib, 1000),
+            ("fat32", 0, 512),
+            ([], 16 * mib, 512),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(restore_allocation_unit_sizes(*args), ())
+
+    def test_automatic_restore_geometry_rejects_known_formatter_dead_ends(self):
+        mib = 1024**2
+        tib = 1024**4
+        pib = 1024**5
+        self.assertTrue(
+            restore_filesystem_geometry_supported("fat32", 64 * mib, 512)
+        )
+        self.assertFalse(
+            restore_filesystem_geometry_supported("fat32", 64 * mib, 4096)
+        )
+        self.assertFalse(
+            restore_filesystem_geometry_supported("fat12", 128 * mib, 1024)
+        )
+        self.assertFalse(
+            restore_filesystem_geometry_supported("ext3", 20 * tib, 512, "gpt")
+        )
+        self.assertTrue(
+            restore_filesystem_geometry_supported("ext4", 20 * tib, 512, "gpt")
+        )
+        self.assertFalse(
+            restore_filesystem_geometry_supported("ext4", 8 * 1024**3, 8192)
+        )
+        self.assertTrue(
+            restore_filesystem_geometry_supported("ext4", 8 * 1024**3, 0)
+        )
+        mbr_limit = (0xFFFFFFFF + 2048) * 512
+        self.assertTrue(
+            restore_filesystem_geometry_supported(
+                "ext4", mbr_limit, 512, "mbr",
+            )
+        )
+        self.assertFalse(
+            restore_filesystem_geometry_supported(
+                "ext4", mbr_limit + 512, 512, "mbr",
+            )
+        )
+        self.assertTrue(
+            restore_filesystem_geometry_supported(
+                "ext4", mbr_limit + 512, 512, "gpt",
+            )
+        )
+        for filesystem, size, explicit in (
+            ("exfat", 600 * tib, 256 * 1024),
+            ("ntfs", 5 * pib, 2 * mib),
+            ("ext4", 40 * pib, 2048),
+        ):
+            with self.subTest(filesystem=filesystem, size=size):
+                self.assertFalse(
+                    restore_filesystem_geometry_supported(
+                        filesystem, size, 512, "gpt",
+                    )
+                )
+                self.assertIn(
+                    explicit,
+                    restore_allocation_unit_sizes(
+                        filesystem, size, 512, "gpt",
+                    ),
+                )
+        for filesystem in ("ext2", "ext3"):
+            with self.subTest(filesystem=filesystem):
+                self.assertEqual(
+                    restore_allocation_unit_sizes(
+                        filesystem, 10 * tib, 512, "gpt",
+                    ),
+                    (4096,),
+                )
+                self.assertEqual(
+                    restore_allocation_unit_sizes(
+                        filesystem, 20 * tib, 512, "gpt",
+                    ),
+                    (),
+                )
 
     def test_partition_scripts_have_explicit_table_alignment_and_type(self):
         fat_mbr = create_format_plan(test_device(), "fat32", "mbr")
@@ -420,6 +593,49 @@ class FormatPlanTests(unittest.TestCase):
         self.assertIn(
             "--label=", format_command(empty, udf_tools, "/dev/sdz1"),
         )
+
+    def test_explicit_allocation_unit_commands_are_exact_and_geometry_bound(self):
+        cases = (
+            (
+                "fat16", 128 * 1024**2, 4096, "/usr/sbin/mkfs.vfat",
+                ["-F", "16", "-s", "8", "-n", "USB"],
+            ),
+            (
+                "exfat", test_device().size, 65536, "/usr/sbin/mkfs.exfat",
+                ["-c", "65536", "-L", "USB"],
+            ),
+            (
+                "ntfs", test_device().size, 65536, "/usr/sbin/mkfs.ntfs",
+                ["-f", "-c", "65536", "-L", "USB"],
+            ),
+            (
+                "ext4", test_device().size, 2048, "/usr/sbin/mkfs.ext4",
+                ["-F", "-b", "2048", "-L", "USB"],
+            ),
+        )
+        for filesystem, size, unit, mkfs, expected_options in cases:
+            with self.subTest(filesystem=filesystem):
+                plan = create_format_plan(
+                    test_device(size=size), filesystem, "mbr", "USB", unit,
+                )
+                tools = FormatTools(
+                    TOOLS.pkexec, TOOLS.udisksctl, TOOLS.sfdisk,
+                    TOOLS.partprobe, TOOLS.udevadm, TOOLS.lsblk, mkfs,
+                )
+                self.assertEqual(
+                    format_command(plan, tools, "/dev/sdz1", 512),
+                    [TOOLS.pkexec, mkfs, *expected_options, "/dev/sdz1"],
+                )
+                with self.assertRaisesRegex(
+                    FormatValidationError, "bound logical sector",
+                ):
+                    format_command(plan, tools, "/dev/sdz1")
+
+        incompatible = create_format_plan(
+            test_device(size=128 * 1024**2), "fat16", "mbr", "USB", 32768,
+        )
+        with self.assertRaisesRegex(FormatValidationError, "incompatible"):
+            format_command(incompatible, TOOLS, "/dev/sdz1", 512)
 
     def test_nvme_and_mmc_partition_child_naming_is_supported(self):
         for device_path, partition_path in (
@@ -883,6 +1099,10 @@ class FormatExecutorTests(unittest.TestCase):
                 argument.endswith("/sfdisk") for argument in argv
             ):
                 return completed(single_metadata_payload(self.plan))
+            if "lsblk" in argv[0] and "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
@@ -903,7 +1123,10 @@ class FormatExecutorTests(unittest.TestCase):
         partition = self.executor.execute(self.device, self.plan, stages.append)
         self.assertEqual(partition, "/dev/sdz1")
         self.assertEqual(
-            self.run_calls[0][0],
+            next(
+                argv for argv, _kwargs in self.run_calls
+                if argv[0].endswith("/udisksctl")
+            ),
             ["/usr/bin/udisksctl", "unmount", "--block-device", "/dev/sdz1"],
         )
         self.assertTrue(all(call[1]["shell"] is False for call in self.run_calls))
@@ -998,6 +1221,137 @@ class FormatExecutorTests(unittest.TestCase):
                 ])
                 self.assertEqual(mkfs[8], f"/usr/bin/{formatter}")
 
+    def test_explicit_allocation_units_revalidate_geometry_and_reach_mkfs(self):
+        for filesystem, size, unit, formatter, expected_tail in (
+            (
+                "fat16", 128 * 1024**2, 4096, "mkfs.vfat",
+                ["-F", "16", "-s", "8", "-n", "USB", "/dev/sdz1"],
+            ),
+            (
+                "fat32", self.device.size, 32768, "mkfs.vfat",
+                ["-F", "32", "-s", "64", "-n", "USB", "/dev/sdz1"],
+            ),
+            (
+                "exfat", self.device.size, 65536, "mkfs.exfat",
+                ["-c", "65536", "-L", "USB", "/dev/sdz1"],
+            ),
+            (
+                "ntfs", self.device.size, 65536, "mkfs.ntfs",
+                ["-f", "-c", "65536", "-L", "USB", "/dev/sdz1"],
+            ),
+            (
+                "ext4", self.device.size, 2048, "mkfs.ext4",
+                ["-F", "-b", "2048", "-L", "USB", "/dev/sdz1"],
+            ),
+        ):
+            with self.subTest(filesystem=filesystem):
+                device = test_device(size=size)
+                plan = create_format_plan(
+                    device, filesystem, "mbr", "USB", unit,
+                )
+                processes = []
+                geometry_probes = []
+
+                def popen(argv, **kwargs):
+                    process = FakeProcess(argv, **kwargs)
+                    processes.append(process)
+                    return process
+
+                def runner(argv, **_kwargs):
+                    if "--json" in argv and any(
+                        argument.endswith("/sfdisk") for argument in argv
+                    ):
+                        return completed(single_metadata_payload(plan))
+                    if "lsblk" in argv[0] and "PATH,TYPE,LOG-SEC" in argv:
+                        geometry_probes.append(argv)
+                        return completed(json.dumps({"blockdevices": [{
+                            "path": device.path, "type": "disk", "log-sec": 512,
+                        }]}))
+                    if "lsblk" in argv[0]:
+                        return completed(json.dumps({"blockdevices": [{
+                            "path": device.path, "type": "disk", "children": [{
+                                "path": "/dev/sdz1", "type": "part",
+                                "pkname": device.path, "maj:min": "65:145",
+                            }],
+                        }]}))
+                    return completed()
+
+                executor = FormatExecutor(
+                    device_lookup=lambda _path: device,
+                    which=lambda name: f"/usr/bin/{name}",
+                    popen=popen, runner=runner, lstat_func=partition_lstat,
+                    sleep=lambda _seconds: None,
+                )
+                self.assertEqual(executor.execute(device, plan), "/dev/sdz1")
+                self.assertEqual(len(geometry_probes), 4)
+                mkfs = next(
+                    process.argv for process in processes
+                    if any(argument.endswith(f"/{formatter}") for argument in process.argv)
+                )
+                self.assertEqual(mkfs[8], f"/usr/bin/{formatter}")
+                self.assertEqual(mkfs[9:], expected_tail)
+
+    def test_incompatible_allocation_unit_stops_before_unmount_or_spawn(self):
+        device = test_device(size=128 * 1024**2)
+        plan = create_format_plan(
+            device, "fat16", "mbr", "USB", 32768,
+        )
+        calls = []
+        popen = Mock()
+
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            return completed(json.dumps({"blockdevices": [{
+                "path": device.path, "type": "disk", "log-sec": 512,
+            }]}))
+
+        executor = FormatExecutor(
+            device_lookup=lambda _path: device,
+            which=lambda name: f"/usr/bin/{name}",
+            runner=runner, popen=popen,
+        )
+        with self.assertRaisesRegex(FormatValidationError, "incompatible"):
+            executor.execute(device, plan)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("PATH,TYPE,LOG-SEC", calls[0])
+        popen.assert_not_called()
+
+    def test_incompatible_automatic_geometry_stops_before_unmount_or_spawn(self):
+        for filesystem, size, sector_size in (
+            ("fat32", 64 * 1024**2, 4096),
+            ("ext2", 20 * 1024**4, 512),
+            ("ext3", 20 * 1024**4, 512),
+        ):
+            with self.subTest(filesystem=filesystem):
+                device = test_device(size=size)
+                table = "gpt" if filesystem in {"ext2", "ext3"} else "mbr"
+                plan = create_format_plan(device, filesystem, table, "USB")
+                calls = []
+                popen = Mock()
+
+                def runner(argv, **_kwargs):
+                    calls.append(argv)
+                    return completed(json.dumps({"blockdevices": [{
+                        "path": device.path,
+                        "type": "disk",
+                        "log-sec": sector_size,
+                    }]}))
+
+                executor = FormatExecutor(
+                    device_lookup=lambda _path: device,
+                    which=lambda name: f"/usr/bin/{name}",
+                    runner=runner,
+                    popen=popen,
+                )
+                with self.assertRaisesRegex(
+                    FormatValidationError, "formatter defaults are incompatible",
+                ):
+                    executor.execute(device, plan)
+
+                self.assertEqual(len(calls), 1)
+                self.assertIn("PATH,TYPE,LOG-SEC", calls[0])
+                popen.assert_not_called()
+
     def test_restore_geometry_failure_occurs_before_unmount_or_spawn(self):
         for filesystem, size, sector_size, error_type, message in (
             (
@@ -1007,6 +1361,26 @@ class FormatExecutorTests(unittest.TestCase):
             (
                 "udf", self.device.size, 8192,
                 FormatValidationError, "512 through 4096",
+            ),
+            (
+                "fat32", self.device.size, 8192,
+                FormatValidationError, "512 through 4096",
+            ),
+            (
+                "exfat", self.device.size, 8192,
+                FormatValidationError, "512 through 4096",
+            ),
+            (
+                "ntfs", self.device.size, 8192,
+                FormatValidationError, "512 through 4096",
+            ),
+            (
+                "ext4", self.device.size, 8192,
+                FormatValidationError, "512 through 4096",
+            ),
+            (
+                "ext4", 3 * 1024**4, 512,
+                FormatValidationError, "MBR cannot represent",
             ),
             (
                 "udf", self.device.size, 1000,
@@ -1037,21 +1411,35 @@ class FormatExecutorTests(unittest.TestCase):
                 self.assertIn("PATH,TYPE,LOG-SEC", calls[0])
                 popen.assert_not_called()
 
-    def test_udf_accepts_supported_baseline_logical_sector_boundaries(self):
-        device = self.device
-        plan = create_format_plan(device, "udf", "gpt", "USB")
-        tools = resolve_tools(plan, lambda name: f"/usr/bin/{name}")
-        for sector_size in (512, 4096):
-            with self.subTest(sector_size=sector_size):
-                executor = FormatExecutor(runner=lambda _argv, **_kwargs: completed(
-                    json.dumps({"blockdevices": [{
-                        "path": device.path, "type": "disk", "log-sec": sector_size,
-                    }]}),
-                ))
-                self.assertEqual(
-                    executor._assert_restore_filesystem_geometry(plan, tools),
-                    sector_size,
-                )
+    def test_auto_restore_accepts_supported_logical_sector_boundaries(self):
+        for filesystem, size in (
+            ("fat12", 128 * 1024**2),
+            ("fat16", 128 * 1024**2),
+            ("fat32", self.device.size),
+            ("exfat", self.device.size),
+            ("ntfs", self.device.size),
+            ("ext2", self.device.size),
+            ("ext3", self.device.size),
+            ("ext4", self.device.size),
+            ("udf", self.device.size),
+        ):
+            device = test_device(size=size)
+            plan = create_format_plan(device, filesystem, "gpt", "USB")
+            tools = resolve_tools(plan, lambda name: f"/usr/bin/{name}")
+            for sector_size in (512, 4096):
+                with self.subTest(filesystem=filesystem, sector_size=sector_size):
+                    executor = FormatExecutor(
+                        runner=lambda _argv, **_kwargs: completed(json.dumps({
+                            "blockdevices": [{
+                                "path": device.path, "type": "disk",
+                                "log-sec": sector_size,
+                            }],
+                        })),
+                    )
+                    self.assertEqual(
+                        executor._assert_restore_filesystem_geometry(plan, tools),
+                        sector_size,
+                    )
 
     def test_changed_restore_geometry_is_rejected_before_partitioning(self):
         device = test_device(size=128 * 1024 * 1024)
@@ -1312,10 +1700,17 @@ class FormatExecutorTests(unittest.TestCase):
             processes.append(process)
             return process
 
+        def runner(argv, **_kwargs):
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
+            return completed()
+
         executor = FormatExecutor(
             device_lookup=lambda _path: self.device,
             which=lambda name: f"/usr/bin/{name}", popen=popen,
-            runner=lambda _argv, **_kwargs: completed(),
+            runner=runner,
         )
         holder["executor"] = executor
         with self.assertRaises(FormatCancelled):
@@ -1393,10 +1788,17 @@ class FormatExecutorTests(unittest.TestCase):
             processes.append(process)
             return process
 
+        def runner(argv, **_kwargs):
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
+            return completed()
+
         executor = FormatExecutor(
             device_lookup=lambda _path: self.device,
             which=lambda name: f"/usr/bin/{name}", popen=popen,
-            runner=lambda _argv, **_kwargs: completed(),
+            runner=runner,
             process_timeout=0.01, stop_grace=0.01,
         )
         with self.assertRaisesRegex(FormattingError, "timed out"):
@@ -1406,6 +1808,10 @@ class FormatExecutorTests(unittest.TestCase):
 
     def test_unmount_failure_stops_before_partitioning(self):
         def runner(argv, **_kwargs):
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
             return completed(stderr="device is busy", code=1)
 
         executor = FormatExecutor(
@@ -1421,6 +1827,10 @@ class FormatExecutorTests(unittest.TestCase):
 
         def runner(argv, **kwargs):
             calls.append((argv, kwargs))
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
 
         popen = Mock()
@@ -1430,7 +1840,8 @@ class FormatExecutorTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(FormattingError, "Unmounting .* timed out"):
             executor.execute(self.device, self.plan)
-        self.assertEqual(calls[0][1]["timeout"], 30)
+        self.assertEqual(calls[0][1]["timeout"], 15)
+        self.assertEqual(calls[1][1]["timeout"], 30)
         popen.assert_not_called()
 
     def test_single_partition_node_replacement_stops_before_mkfs(self):
@@ -1447,6 +1858,10 @@ class FormatExecutorTests(unittest.TestCase):
                 argument.endswith("/sfdisk") for argument in argv
             ):
                 return completed(single_metadata_payload(self.plan))
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
             return completed(json.dumps({"blockdevices": [{
                 "path": self.device.path, "type": "disk", "children": [{
                     "path": "/dev/sdz1", "type": "part",
@@ -1492,6 +1907,10 @@ class FormatExecutorTests(unittest.TestCase):
                 return completed(single_metadata_payload(
                     self.plan, size=None if geometry_calls == 1 else 1,
                 ))
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
             return completed(json.dumps({"blockdevices": [{
                 "path": self.device.path, "type": "disk", "children": [{
                     "path": "/dev/sdz1", "type": "part",
@@ -1514,6 +1933,10 @@ class FormatExecutorTests(unittest.TestCase):
 
     def test_multiple_discovered_partitions_are_not_guessed(self):
         def runner(argv, **_kwargs):
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
