@@ -38,9 +38,11 @@ evidence.
   upstream-provenanced payloads, signed release metadata, exact sizes and hashes;
   preserve the same consent and pre-use checks already used by UEFI:NTFS.
 - Add cache inspection/deletion UI for verified boot artifacts.
-- Integrate the executable Ubuntu amd64 LTS 20.04/22.04/24.04 Casper persistence
-  backend with initial media layout and a size control, then expand only through
-  release-specific fixtures and hardware results.
+- Add bounded support for the embedded UEFI GRUB configuration used by current
+  official Ubuntu media, rather than assuming a synthetic extracted path. Then
+  hardware-certify the immutable Casper workflow across 512- and 4096-byte
+  logical-sector media and expand profiles only through release-specific
+  fixtures and hardware results.
 - Add distro-specific DD-only rules and tested BIOS/UEFI construction profiles.
 
 ### Trust, formats, and advanced media

@@ -735,6 +735,19 @@ class ConstructedMediaExecutor:
                     "The staging tree is stored on the target drive and would be destroyed"
                 )
 
+    def verify_pre_destructive(self, plan: ConstructedMediaPlan) -> None:
+        """Revalidate the complete source tree and target before media is changed.
+
+        Higher-level multi-partition executors must call this immediately before
+        their first destructive operation.  Population rechecks the same
+        invariants later so a source or target swap is also caught before copy.
+        """
+        self._check_cancelled()
+        validate_constructed_media_plan(plan)
+        self._verify_staging(plan)
+        current = self._verify_device(plan)
+        self._verify_staging_not_on_target(plan, current)
+
     def _validate_partition(self, plan: ConstructedMediaPlan, partition: str) -> None:
         if (
             not _BLOCK_PATH.fullmatch(partition)
@@ -1165,11 +1178,7 @@ class ConstructedMediaExecutor:
         if self._started:
             raise ConstructedMediaSafetyError("A constructed-media executor cannot be reused")
         self._started = True
-        self._check_cancelled()
-        validate_constructed_media_plan(plan)
-        self._verify_staging(plan)
-        current = self._verify_device(plan)
-        self._verify_staging_not_on_target(plan, current)
+        self.verify_pre_destructive(plan)
         return self._populate_partition(
             plan, partition, progress, power_off=power_off,
         )
@@ -1182,13 +1191,8 @@ class ConstructedMediaExecutor:
         if self._started:
             raise ConstructedMediaSafetyError("A constructed-media executor cannot be reused")
         self._started = True
-        self._check_cancelled()
-        validate_constructed_media_plan(plan)
-
         # Both source and target are checked before the first destructive call.
-        self._verify_staging(plan)
-        current = self._verify_device(plan)
-        self._verify_staging_not_on_target(plan, current)
+        self.verify_pre_destructive(plan)
         progress(ConstructedProgress("Formatting", "", 0, plan.total_bytes))
         try:
             partition = self._formatter.execute(

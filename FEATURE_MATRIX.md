@@ -43,7 +43,7 @@ Status meanings:
 | Save drive as VHD/VHDX/FFU | **Planned** | Raw capture plus verified conversion/metadata policy remains. |
 | Save optical disc as ISO | **Done** | Read-only sector capture with source identity, size/free-space checks, cancellation, and atomic publication. |
 | Save USB/VHD as UDF ISO | **Planned** | Separate authoring workflow not implemented. |
-| Linux persistence | **Partial** | A narrow executable backend exists for Ubuntu amd64 LTS 20.04/22.04/24.04 Casper media with a pre-reserved contiguous tail: it adds an ext4 `writable` partition, mutates recognized GRUB/Syslinux kernel lines conservatively, and performs verified best-effort rollback. If boot-config rollback is incomplete it retains the partition and surfaces recovery instructions instead of claiming success. It is not exposed in the GUI or integrated with initial media layout; broader recognition remains planning-only. |
+| Linux persistence | **Partial** | A hardened executor transforms a recognized UEFI GRUB line only in private staging, creates an exact up-front GPT/FAT32 + ext4 `writable` layout on 512- or 4096-byte logical sectors, formats both filesystems before copying, revalidates complete source/target/partition identities around every destructive boundary, and read-back verifies data files. Guarded GUI plumbing exists for candidate remasters whose catalog exposes a recognized GRUB config path; private staging performs the final eligible-line check before any target change. Current official Ubuntu 20.04.6/22.04.5/24.04.3 desktop catalogs do not expose that path (24.04 also changed squashfs layout), so they correctly receive no persistence control. Embedded-config support, broader profiles, and physical certification remain. |
 | MD5/SHA-1/SHA-256/SHA-512 | **Done** | One-pass calculation plus strict pasted-provider comparison. |
 | Bad-block passes | **Done** | Separate destructive `badblocks` workflow with 1–4 patterns, typed confirmation, progress, and identity rechecks. |
 | Fake-capacity detection | **Done** | Separate destructive `f3probe` workflow; availability depends on the system F3 package. |
@@ -117,7 +117,7 @@ Status meanings:
 | Cluster-size selector | **Planned** | Must be constrained by filesystem and boot profile. |
 | Volume label | **Done** | Filesystem-specific validation in restore; ISO mode uses `ISOPROPYL`. |
 | Quick format | **Done** | Restore and ISO construction use quick mkfs; full zero is separate. |
-| Persistence-size slider | **Planned** | Show only for recognized executable distro profiles. |
+| Persistence-size slider | **Partial** | The capacity-bounded aligned control and transaction wiring ship, but it appears only for a candidate remastered Ubuntu profile with an exposed recognized UEFI GRUB config path; final private staging validates its contents. Current official Ubuntu desktop media correctly remain ineligible pending embedded-config support. |
 | ISO mode versus DD mode | **Done** | The main screen exposes both executable choices, recommends from inspected image evidence, names compatibility limits, resets on a new image, re-plans against the selected target at dispatch, and never silently falls back. ISO mode forces verification. |
 | Image checksums | **Done** | Dedicated dialog with copy and strict compare. |
 | Save-drive action | **Done** | Separate read-only source workflow. |
@@ -186,16 +186,15 @@ Status meanings:
 
 1. Add privileged exclusive target ownership across every destructive transaction.
 2. Hardware-certify current UEFI/FAT32 and UEFI:NTFS modes and failure cleanup.
-3. Move bounded device enumeration off the Qt thread and suppress stale refreshes.
-4. Implement BIOS and dual-firmware construction with exact payload handling.
-5. Integrate the narrow Casper persistence backend into initial layout and GUI.
-6. Add Windows To Go through wimlib and offline boot configuration.
-7. Add cryptographic Secure Boot trust and authenticated revocation data.
-8. Complete FFU/VTSI/direct WIM/ESD and image-output formats.
-9. Add signed opt-in downloaders, FreeDOS, UEFI Shell, and audited GRUB/Syslinux
+3. Implement BIOS and dual-firmware construction with exact payload handling.
+4. Hardware-certify the narrow immutable Casper layout and add only fixture-backed profiles.
+5. Add Windows To Go through wimlib and offline boot configuration.
+6. Add cryptographic Secure Boot trust and authenticated revocation data.
+7. Complete FFU/VTSI/direct WIM/ESD and image-output formats.
+8. Add signed opt-in downloaders, FreeDOS, UEFI Shell, and audited GRUB/Syslinux
    payload catalogs.
-10. Finish localization, conflict diagnostics, signed reproducible packaging, and
-    safe expert format controls.
+9. Finish localization, conflict diagnostics, signed reproducible packaging, and
+   safe expert format controls.
 
 ## Primary Rufus sources reviewed
 
@@ -207,6 +206,9 @@ Status meanings:
 - [ISO/DD selection](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/rufus.c#L1550-L1590)
 - [GRUB/Syslinux dependency workflow](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/rufus.c#L1782-L2000)
 - [Persistence mutation](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/iso.c#L494-L553)
+- [Ubuntu 20.04.6 desktop ISO file list](https://releases.ubuntu.com/20.04/ubuntu-20.04.6-desktop-amd64.list)
+- [Ubuntu 22.04.5 desktop ISO file list](https://releases.ubuntu.com/22.04/ubuntu-22.04.5-desktop-amd64.list)
+- [Ubuntu 24.04.3 desktop ISO file list](https://releases.ubuntu.com/24.04/ubuntu-24.04.3-desktop-amd64.list)
 - [UEFI:NTFS layout](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/drive.c#L2284-L2512)
 - [Windows customization](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/wue.c#L140-L540)
 - [Windows To Go](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/wue.c#L930-L1115)

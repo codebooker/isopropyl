@@ -119,7 +119,7 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and security invariants.
 | VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; backing files and encrypted containers are rejected. |
 
 Unsupported formats fail closed instead of being guessed. FFU, VTSI, Windows To
-Go, dual BIOS+UEFI construction, persistence UI integration, and broader
+Go, dual BIOS+UEFI construction, broader persistence profiles, and broader
 architecture/firmware profiles are tracked in the
 [feature audit](FEATURE_MATRIX.md).
 
@@ -140,6 +140,7 @@ Optional tools unlock additional workflows:
 |---|---|
 | VHD/VHDX/QCOW/QCOW2 | `qemu-img` |
 | NTFS ISO mode and NTFS/exFAT/ext4 restore | `mkfs.ntfs`, `mkfs.exfat`, `mkfs.ext4` |
+| Experimental matched Ubuntu persistence profile | `mkfs.ext4` |
 | Surface and fake-capacity tests | `badblocks`, `f3probe` |
 | Additional ISO inspection | `xorriso` |
 
@@ -172,8 +173,8 @@ You can also launch the working tree directly:
 
 Install required host tools through your distribution's package manager. On
 Debian/Ubuntu-family systems, the relevant package names commonly include
-`p7zip-full`, `udisks2`, `fdisk`, `dosfstools`, `ntfs-3g`, `wimtools`, and
-`qemu-utils`.
+`p7zip-full`, `udisks2`, `fdisk`, `dosfstools`, `e2fsprogs`, `ntfs-3g`,
+`wimtools`, and `qemu-utils`.
 
 The first UEFI:NTFS use asks permission to download a 1 MiB helper from its
 release-pinned Rufus source URL. ISOpropyl verifies the exact byte count and
@@ -190,22 +191,32 @@ revalidates the cache on every use.
 
 1. Choose or drop an image.
 2. Select the removable destination and review its identity.
-3. Leave **Verify after writing** enabled.
-4. Select **Write image**, review the final erase warning, and confirm.
+3. Choose **DD mode — exact byte-for-byte copy** in the visible method selector.
+4. Leave **Verify after writing** enabled, select **Write in DD mode**, review
+   the final erase warning, and confirm.
 
 ### ISO mode
 
 1. Select an ISO and a destination drive.
-2. Open **ISO mode…** to inspect the selected FAT32 or UEFI:NTFS plan and its
-   blockers.
-3. Select **Write USB in ISO mode…** and choose a disk with enough temporary
-   working space.
-4. Review the target and transformation summary, then confirm.
+2. Choose **ISO mode — filesystem-aware, UEFI-only**. ISOpropyl shows why it
+   recommends ISO or DD mode and never switches methods silently.
+3. Optionally open **Plan details…**, then select **Write in ISO mode** and
+   choose a disk with enough temporary working space.
+4. Review the exact filesystem, firmware limitation, transformations, target
+   path, and serial number, then confirm.
+
+An experimental **Persistent storage** control exists only for candidate
+remastered Ubuntu amd64 images whose catalog exposes a recognized UEFI GRUB
+config path and legacy Casper file layout. Private staging then validates that
+the file really contains an eligible kernel line before any target change.
+Current official Ubuntu 20.04.6, 22.04.5, and 24.04.3 desktop catalogs do not
+meet even the candidate gate, so ISOpropyl deliberately hides the option for
+them instead of producing media that only appears persistent.
 
 For supported Windows media, configure **Windows options…** before starting ISO
-mode. You can choose a specific WIM/ESD edition or let Windows Setup ask. The main
-**Write image** button remains DD mode and warns when a Windows installer is
-likely to need the filesystem-aware path.
+mode. You can choose a specific WIM/ESD edition or let Windows Setup ask. Windows
+customization is applied only in ISO mode; choosing DD mode produces an explicit
+warning instead of silently discarding the profile.
 
 Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
 <kbd>Ctrl</kbd>+<kbd>R</kbd> refreshes targets,
@@ -220,7 +231,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 350 tests. Device-facing tests mock block
+The suite currently contains more than 400 tests. Device-facing tests mock block
 devices and privileged commands; the automated suite never writes a real drive.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
 path.
@@ -230,9 +241,11 @@ path.
 ISOpropyl is an ambitious alpha, not yet a feature-for-feature Rufus replacement.
 The FAT32 and UEFI:NTFS ISO paths are real but have only mocked block-device
 coverage; they still need broad distro, firmware, Secure Boot, card-reader, and
-physical-media testing. BIOS/dual-firmware construction, persistence UI
-integration, Windows To Go, broader verified-download catalogs, localization,
-and release packaging remain active work.
+physical-media testing. Persistence has a hardened layout backend and guarded
+GUI plumbing, but current official Ubuntu images need embedded UEFI GRUB-config
+support before the option can be offered. BIOS/dual-firmware construction,
+broader persistence profiles, Windows To Go, broader verified-download catalogs,
+localization, and release packaging remain active work.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
 and [ROADMAP.md](ROADMAP.md).

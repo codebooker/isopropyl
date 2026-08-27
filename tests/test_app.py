@@ -12,10 +12,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from isopropyl.app import Window
+from isopropyl.app import PendingIsoWrite, Window
+from isopropyl.casper_media import supported_casper_profile
 from isopropyl.devices import Device
 from isopropyl.images import ImageInspection, ImageMember
 from isopropyl.iso import WriteMode
+from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 
 
@@ -54,6 +56,51 @@ def optical_windows_inspection(*, hybrid: bool = False) -> ImageInspection:
             ImageMember("sources/install.esd", 16, "file"),
         ),
     )
+
+
+def ubuntu_casper_inspection() -> ImageInspection:
+    members = tuple(
+        ImageMember(path, size, "file") for path, size in (
+            (".disk/info", 32),
+            ("casper/vmlinuz", 16),
+            ("casper/initrd", 16),
+            ("casper/filesystem.squashfs", 1024),
+            ("EFI/BOOT/BOOTX64.EFI", 8),
+            ("boot/grub/grub.cfg", 128),
+        )
+    )
+    return ImageInspection(
+        size=2048,
+        kind="Optical ISO",
+        volume_label="Ubuntu 24.04.3 LTS amd64",
+        has_mbr=True,
+        has_gpt=False,
+        is_iso9660=True,
+        looks_windows=False,
+        boot_modes=("BIOS", "UEFI"),
+        architectures=("x64",),
+        bootloader="GRUB",
+        has_windows_installer=False,
+        contents_scanned=True,
+        members=members,
+        uefi_payloads=(
+            ImageUefiPayload(
+                "EFI/BOOT/BOOTX64.EFI", "x64", "EFI application", True,
+                SignatureTableState.ABSENT, SbatState.ABSENT, (),
+            ),
+        ),
+    )
+
+
+class ImmediateThread:
+    """Run a Window background closure synchronously in headless tests."""
+
+    def __init__(self, *, target, daemon: bool = False) -> None:
+        self.target = target
+        self.daemon = daemon
+
+    def start(self) -> None:
+        self.target()
 
 
 class WindowWriteMethodTests(unittest.TestCase):
@@ -154,6 +201,248 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.device_refresh_busy)
         self.assertTrue(self.window.device_combo.isEnabled())
         self.assertEqual(self.window.selected_device(), replacement)
+
+
+class WindowPersistenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_home = tempfile.TemporaryDirectory()
+        with patch("isopropyl.app.list_devices", return_value=[]):
+            self.window = Window()
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.image = Path(self.settings_home.name) / "ubuntu.iso"
+        self.window.image.write_bytes(b"fixture")
+        self.window.inspection_identity = (1, 2, 3, 4)
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+        self.window.show()
+        self.application.processEvents()
+        inspection = ubuntu_casper_inspection()
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_inspection_finished((1, 2, 3, 4), inspection)
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.EXTRACTED_ISO.value)
+        )
+        self.application.processEvents()
+        self.assertIsNotNone(self.window.persistence_profile)
+
+    def tearDown(self) -> None:
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+        self.settings_home.cleanup()
+
+    def replace_target(self, size: int) -> Device:
+        target = device(size)
+        self.window.device_combo.blockSignals(True)
+        self.window.devices = [target]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(target.label)
+        self.window.device_combo.blockSignals(False)
+        self.window.on_device_changed()
+        self.application.processEvents()
+        return target
+
+    def pending_write(self) -> tuple[PendingIsoWrite, Mock]:
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        pending = PendingIsoWrite(
+            image=self.window.image,
+            inspection=self.window.inspection,
+            device=self.window.devices[0],
+            write_plan=recommendation.iso_plan,
+            workspace=workspace,
+            staging_plan=Mock(),
+            persistence_profile=self.window.persistence_profile,
+            persistence_bytes=MIN_PERSISTENCE_BYTES,
+        )
+        return pending, workspace
+
+    def test_detected_profile_controls_are_visible_only_in_iso_mode(self):
+        self.assertEqual(
+            self.window.persistence_profile,
+            supported_casper_profile(ubuntu_casper_inspection()),
+        )
+        self.assertEqual(self.window.selected_write_mode(), WriteMode.EXTRACTED_ISO)
+        self.assertTrue(self.window.persistence_controls.isVisible())
+
+        self.window.persistence_checkbox.setChecked(True)
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        self.assertFalse(self.window.persistence_controls.isVisible())
+        self.assertFalse(self.window.persistence_checkbox.isChecked())
+
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.EXTRACTED_ISO.value)
+        )
+        self.assertTrue(self.window.persistence_controls.isVisible())
+
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_inspection_finished(
+                (1, 2, 3, 4), optical_windows_inspection(),
+            )
+        self.assertIsNone(self.window.persistence_profile)
+        self.assertFalse(self.window.persistence_controls.isVisible())
+
+    def test_target_capacity_bounds_and_disables_persistence(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        minimum = recommendation.iso_plan.minimum_target_bytes
+        too_small = minimum + MIN_PERSISTENCE_BYTES + 2 * ALIGNMENT_BYTES - 1
+
+        self.replace_target(too_small)
+
+        self.assertTrue(self.window.persistence_controls.isVisible())
+        self.assertFalse(self.window.persistence_checkbox.isEnabled())
+        self.assertFalse(self.window.persistence_checkbox.isChecked())
+        self.assertEqual(
+            self.window.persistence_slider.maximum(),
+            MIN_PERSISTENCE_BYTES // ALIGNMENT_BYTES,
+        )
+
+        requested_mib = 512
+        self.replace_target(
+            minimum + requested_mib * ALIGNMENT_BYTES + 2 * ALIGNMENT_BYTES
+        )
+        self.assertTrue(self.window.persistence_checkbox.isEnabled())
+        self.assertEqual(self.window.persistence_slider.maximum(), requested_mib)
+
+    def test_selected_persistence_size_contributes_to_readiness(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        minimum = recommendation.iso_plan.minimum_target_bytes
+        self.replace_target(minimum + 514 * ALIGNMENT_BYTES)
+        self.window.persistence_slider.setValue(512)
+        self.window.persistence_checkbox.setChecked(True)
+        selected = 512 * ALIGNMENT_BYTES
+
+        self.assertEqual(self.window.selected_persistence_bytes(), selected)
+        self.assertTrue(self.window.write_button.isEnabled())
+
+        # Keep the already-bound plan but make the selected target one byte too
+        # small for the extra partition.  update_ready must include the slider.
+        self.window.devices[0] = device(minimum + selected - 1)
+        self.window.update_ready()
+        self.assertFalse(self.window.write_button.isEnabled())
+        self.assertIn("too small", self.window.status.text())
+
+        self.window.persistence_checkbox.setChecked(False)
+        self.assertEqual(self.window.selected_persistence_bytes(), 0)
+        self.assertTrue(self.window.write_button.isEnabled())
+
+    def test_preconsent_casper_probe_dispatches_fresh_sector_size(self):
+        pending, workspace = self.pending_write()
+        confirmer = Mock()
+        self.window.confirm_and_start_iso_write = confirmer
+
+        with (
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch(
+                "isopropyl.app.probe_casper_logical_sector_size",
+                return_value=4096,
+            ) as probe,
+        ):
+            self.window.start_casper_preparation(pending)
+
+        probe.assert_called_once_with(pending.device)
+        confirmer.assert_called_once_with(pending, None, 4096)
+        workspace.cleanup.assert_not_called()
+        self.assertIsNone(self.window.pending_iso_write)
+        self.assertIsNone(self.window.casper_preparer)
+
+    def test_preconsent_casper_probe_cancellation_discards_workspace(self):
+        pending, workspace = self.pending_write()
+        confirmer = Mock()
+        self.window.confirm_and_start_iso_write = confirmer
+
+        def cancel_during_probe(_target: Device) -> int:
+            assert self.window.casper_preparer is not None
+            self.window.casper_preparer.cancel()
+            return 512
+
+        with (
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch(
+                "isopropyl.app.probe_casper_logical_sector_size",
+                side_effect=cancel_during_probe,
+            ),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_casper_preparation(pending)
+
+        workspace.cleanup.assert_called_once_with()
+        confirmer.assert_not_called()
+        warning.assert_not_called()
+        self.assertIn("cancelled", self.window.status.text().casefold())
+        self.assertFalse(self.window.operation_active)
+
+    def test_preconsent_casper_probe_rejects_invalid_sector_result(self):
+        pending, workspace = self.pending_write()
+        confirmer = Mock()
+        self.window.confirm_and_start_iso_write = confirmer
+
+        with (
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch(
+                "isopropyl.app.probe_casper_logical_sector_size",
+                return_value=2048,
+            ),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_casper_preparation(pending)
+
+        workspace.cleanup.assert_called_once_with()
+        confirmer.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn("unsupported logical sector size", warning.call_args.args[2])
+        self.assertFalse(self.window.operation_active)
+
+    def test_constructed_iso_dispatch_snapshots_persistence_request(self):
+        self.window.persistence_slider.setValue(
+            MIN_PERSISTENCE_BYTES // ALIGNMENT_BYTES
+        )
+        self.window.persistence_checkbox.setChecked(True)
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        workspace.name = str(Path(self.settings_home.name) / "private-workspace")
+        staging_plan = Mock()
+        starter = Mock()
+        self.window.start_casper_preparation = starter
+
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch("isopropyl.app.tempfile.TemporaryDirectory", return_value=workspace),
+            patch("isopropyl.app.build_iso_staging_plan", return_value=staging_plan),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), recommendation.iso_plan,
+            )
+
+        warning.assert_not_called()
+        starter.assert_called_once()
+        pending = starter.call_args.args[0]
+        self.assertIsInstance(pending, PendingIsoWrite)
+        self.assertEqual(pending.image, self.window.image)
+        self.assertEqual(pending.inspection, self.window.inspection)
+        self.assertEqual(pending.device, self.window.devices[0])
+        self.assertIs(pending.write_plan, recommendation.iso_plan)
+        self.assertIs(pending.workspace, workspace)
+        self.assertIs(pending.staging_plan, staging_plan)
+        self.assertEqual(pending.persistence_profile, self.window.persistence_profile)
+        self.assertEqual(pending.persistence_bytes, MIN_PERSISTENCE_BYTES)
 
 
 if __name__ == "__main__":

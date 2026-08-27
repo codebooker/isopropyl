@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QSettings, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QShortcut,
     QTextCursor,
@@ -19,10 +19,16 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QProgressBar, QPushButton, QSlider, QTabWidget, QVBoxLayout,
+    QWidget,
 )
 
 from .backup import DriveImager
+from .casper_media import (
+    CasperMediaCancelled, CasperMediaExecutor, CasperStagingExecutor,
+    build_casper_media_plan, build_casper_staging_plan,
+    probe_casper_logical_sector_size, supported_casper_profile,
+)
 from .constructed import (
     ConstructedMediaCancelled, ConstructedMediaExecutor,
     build_constructed_media_plan,
@@ -60,6 +66,9 @@ from .optical import (
     list_optical_devices,
 )
 from .progress import ProgressEstimator, format_duration
+from .persistence import (
+    ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES, CasperCompatibilityProfile,
+)
 from .writer import ImageWriter, WriteCancelled
 from .virtual import VirtualConversionCancelled, VirtualDiskStager, inspect_virtual_disk
 from .uefi_ntfs import (
@@ -96,6 +105,8 @@ class PendingIsoWrite:
     workspace: tempfile.TemporaryDirectory[str]
     staging_plan: IsoStagingPlan
     allow_unsigned_payloads: bool = False
+    persistence_profile: CasperCompatibilityProfile | None = None
+    persistence_bytes: int = 0
 
 
 class Bridge(QObject):
@@ -110,6 +121,7 @@ class Bridge(QObject):
     media_finished = pyqtSignal(object)
     windows_metadata_finished = pyqtSignal(object, object, object)
     uefi_preparation_finished = pyqtSignal(object, object, object)
+    casper_preparation_finished = pyqtSignal(object, object, object)
     device_refresh_finished = pyqtSignal(object, object)
 
 
@@ -122,6 +134,7 @@ class Window(QMainWindow):
         self.write_recommendation: WriteMethodRecommendation | None = None
         self.device_refresh_generation = 0
         self.device_refresh_busy = False
+        self.persistence_profile: CasperCompatibilityProfile | None = None
         self.checksum_busy = False
         self.devices: list[Device] = []
         self.writer: ImageWriter | None = None
@@ -137,6 +150,9 @@ class Window(QMainWindow):
         self.constructed_writer: ConstructedMediaExecutor | None = None
         self.uefi_ntfs_writer: UefiNtfsExecutor | None = None
         self.uefi_preparer: BackgroundPreparation | None = None
+        self.casper_preparer: BackgroundPreparation | None = None
+        self.casper_stager: CasperStagingExecutor | None = None
+        self.casper_writer: CasperMediaExecutor | None = None
         self.pending_iso_write: PendingIsoWrite | None = None
         self.iso_workspace: tempfile.TemporaryDirectory[str] | None = None
         self.windows_options = WindowsCustomization()
@@ -163,6 +179,9 @@ class Window(QMainWindow):
         )
         self.bridge.uefi_preparation_finished.connect(
             self.on_uefi_preparation_finished
+        )
+        self.bridge.casper_preparation_finished.connect(
+            self.on_casper_preparation_finished
         )
         self.bridge.device_refresh_finished.connect(self.on_devices_refreshed)
         QShortcut(QKeySequence.StandardKey.Open, self, activated=self.choose_image)
@@ -217,6 +236,30 @@ class Window(QMainWindow):
         self.write_method_reason.setObjectName("muted")
         self.write_method_reason.setWordWrap(True)
         self.source_card.layout().addWidget(self.write_method_reason)
+        self.persistence_controls = QWidget()
+        persistence_layout = QHBoxLayout(self.persistence_controls)
+        persistence_layout.setContentsMargins(0, 0, 0, 0)
+        self.persistence_checkbox = QCheckBox("Persistent storage")
+        self.persistence_checkbox.setToolTip(
+            "Reserve ext4 writable storage for a candidate Ubuntu remaster; "
+            "private staging must still validate an eligible UEFI GRUB boot line."
+        )
+        self.persistence_slider = QSlider(Qt.Orientation.Horizontal)
+        self.persistence_slider.setMinimum(MIN_PERSISTENCE_BYTES // ALIGNMENT_BYTES)
+        self.persistence_slider.setMaximum(4 * 1024)
+        self.persistence_slider.setValue(4 * 1024)
+        self.persistence_slider.setSingleStep(256)
+        self.persistence_slider.setPageStep(1024)
+        self.persistence_size_label = QLabel("4.0 GiB")
+        self.persistence_size_label.setObjectName("muted")
+        self.persistence_size_label.setMinimumWidth(72)
+        persistence_layout.addWidget(self.persistence_checkbox)
+        persistence_layout.addWidget(self.persistence_slider, 1)
+        persistence_layout.addWidget(self.persistence_size_label)
+        self.persistence_controls.setVisible(False)
+        self.persistence_checkbox.toggled.connect(self.on_persistence_changed)
+        self.persistence_slider.valueChanged.connect(self.on_persistence_changed)
+        self.source_card.layout().addWidget(self.persistence_controls)
         self.checksum_button = QPushButton("Checksums…")
         self.checksum_button.setEnabled(False)
         self.checksum_button.clicked.connect(self.calculate_image_checksums)
@@ -333,6 +376,11 @@ class Window(QMainWindow):
         self.inspection = None
         self.inspection_identity = None
         self.write_recommendation = None
+        self.persistence_profile = None
+        self.persistence_checkbox.blockSignals(True)
+        self.persistence_checkbox.setChecked(False)
+        self.persistence_checkbox.blockSignals(False)
+        self.persistence_controls.setVisible(False)
         self.windows_options = WindowsCustomization()
         self.windows_wim_member = None
         self.windows_wim_editions = ()
@@ -472,6 +520,74 @@ class Window(QMainWindow):
         except ValueError:
             return None
 
+    def selected_persistence_bytes(self) -> int:
+        if (
+            self.persistence_profile is not None
+            and not self.persistence_controls.isHidden()
+            and self.persistence_checkbox.isChecked()
+            and self.selected_write_mode() is WriteMode.EXTRACTED_ISO
+        ):
+            return self.persistence_slider.value() * ALIGNMENT_BYTES
+        return 0
+
+    def update_persistence_controls(self) -> None:
+        recommendation = self.write_recommendation
+        iso_plan = recommendation.iso_plan if recommendation is not None else None
+        eligible = bool(
+            self.persistence_profile is not None
+            and self.selected_write_mode() is WriteMode.EXTRACTED_ISO
+            and iso_plan is not None
+            and iso_plan.executable
+            and iso_plan.layout is not None
+            and iso_plan.layout.main_filesystem.value == "fat32"
+        )
+        self.persistence_controls.setVisible(eligible)
+        if not eligible:
+            self.persistence_checkbox.blockSignals(True)
+            self.persistence_checkbox.setChecked(False)
+            self.persistence_checkbox.blockSignals(False)
+            return
+        device = self.selected_device()
+        maximum_mib = 0
+        if device is not None and iso_plan is not None:
+            remaining = max(
+                0,
+                device.size - iso_plan.minimum_target_bytes - 2 * ALIGNMENT_BYTES,
+            )
+            maximum_mib = remaining // ALIGNMENT_BYTES
+        minimum_mib = MIN_PERSISTENCE_BYTES // ALIGNMENT_BYTES
+        available = maximum_mib >= minimum_mib
+        self.persistence_checkbox.setEnabled(available and not self.operation_active)
+        self.persistence_slider.blockSignals(True)
+        self.persistence_slider.setMinimum(minimum_mib)
+        self.persistence_slider.setMaximum(max(minimum_mib, maximum_mib))
+        if self.persistence_slider.value() < minimum_mib:
+            self.persistence_slider.setValue(minimum_mib)
+        self.persistence_slider.blockSignals(False)
+        if not available:
+            self.persistence_checkbox.blockSignals(True)
+            self.persistence_checkbox.setChecked(False)
+            self.persistence_checkbox.blockSignals(False)
+        self.persistence_slider.setEnabled(
+            available and self.persistence_checkbox.isChecked()
+            and not self.operation_active
+        )
+        self.on_persistence_changed()
+
+    def on_persistence_changed(self, _value: object = None) -> None:
+        value_mib = self.persistence_slider.value()
+        self.persistence_size_label.setText(
+            f"{value_mib / 1024:.1f} GiB"
+            if value_mib >= 1024 else f"{value_mib} MiB"
+        )
+        self.persistence_slider.setEnabled(
+            not self.persistence_controls.isHidden()
+            and self.persistence_checkbox.isEnabled()
+            and self.persistence_checkbox.isChecked()
+            and not self.operation_active
+        )
+        self.update_ready()
+
     def rebuild_write_recommendation(self, *, preserve_selection: bool = True) -> None:
         inspection = self.inspection
         if inspection is None:
@@ -547,6 +663,7 @@ class Window(QMainWindow):
         self.write_button.setText(
             "Write in ISO mode" if iso_mode else "Write in DD mode"
         )
+        self.update_persistence_controls()
         self.update_ready()
 
     def update_ready(self) -> None:
@@ -564,7 +681,8 @@ class Window(QMainWindow):
         enough_space = bool(
             self.image and device and plan
             and mode in recommendation.available_modes  # type: ignore[union-attr]
-            and plan.minimum_target_bytes <= device.size
+            and plan.minimum_target_bytes + self.selected_persistence_bytes()
+            <= device.size
         )
         self.write_button.setEnabled(
             enough_space and not self.operation_active and self.inspection is not None
@@ -600,6 +718,9 @@ class Window(QMainWindow):
             self.constructed_writer,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
+            self.casper_preparer,
+            self.casper_stager,
+            self.casper_writer,
         ))
 
     def confirm_write(self) -> None:
@@ -817,6 +938,9 @@ class Window(QMainWindow):
         self.constructed_writer = None
         self.uefi_ntfs_writer = None
         self.uefi_preparer = None
+        self.casper_preparer = None
+        self.casper_stager = None
+        self.casper_writer = None
         self.pending_iso_write = None
         if self.iso_workspace is not None:
             try:
@@ -856,6 +980,9 @@ class Window(QMainWindow):
         self.write_button.setEnabled(not busy)
         self.cancel_button.setVisible(busy)
         self.cancel_button.setEnabled(busy)
+        if not busy:
+            self.update_persistence_controls()
+            self.update_ready()
 
     def cancel(self) -> None:
         active = tuple(filter(None, (
@@ -864,6 +991,7 @@ class Window(QMainWindow):
             self.iso_stager, self.constructed_writer,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
+            self.casper_preparer, self.casper_stager, self.casper_writer,
             self.windows_wim_extractor,
         )))
         if active:
@@ -1495,9 +1623,12 @@ class Window(QMainWindow):
             self.write_method.setEnabled(False)
             self.write_method_reason.setText("Image inspection did not complete.")
             self.image_detail.setText(f"Could not inspect image: {result}")
+            self.persistence_profile = None
+            self.persistence_controls.setVisible(False)
         else:
             self.inspection = result  # type: ignore[assignment]
             self.inspection_identity = identity
+            self.persistence_profile = supported_casper_profile(self.inspection)
             self.logger.info("Image inspection: %s", self.inspection.summary)
             if self.inspection.compression != "none":
                 self.image_label.setText(
@@ -1575,6 +1706,12 @@ class Window(QMainWindow):
                 )
             if not self.inspection.contents_scanned:
                 detail_lines.append("Install 7-Zip for deeper content inspection")
+            if self.persistence_profile is not None:
+                detail_lines.append(
+                    "Persistent live storage candidate: Ubuntu "
+                    f"{self.persistence_profile.ubuntu_release} LTS amd64; "
+                    "private staging performs final GRUB validation"
+                )
             self.image_detail.setToolTip("\n".join(detail_lines))
             self.windows_button.setEnabled(self.inspection.has_windows_installer)
             self.iso_plan_button.setEnabled(self.inspection.is_iso9660)
@@ -1951,9 +2088,41 @@ class Window(QMainWindow):
 
         assert write_plan.layout is not None
         strategy = write_plan.layout.boot_strategy
-        pending = PendingIsoWrite(
-            image, inspection, device, write_plan, workspace, staging_plan,
+        persistence_bytes = self.selected_persistence_bytes()
+        persistence_profile = (
+            supported_casper_profile(inspection) if persistence_bytes else None
         )
+        if persistence_bytes and (
+            persistence_profile is None
+            or strategy is not BootStrategy.IMAGE_NATIVE
+            or write_plan.layout.main_filesystem.value != "fat32"
+            or write_plan.minimum_target_bytes + persistence_bytes > device.size
+        ):
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            QMessageBox.warning(
+                self,
+                "Persistent storage unavailable",
+                "The image, write plan, or selected target no longer supports the "
+                "requested persistent-storage layout. Review the image and target "
+                "selection before trying again.",
+            )
+            return
+        pending = PendingIsoWrite(
+            image=image,
+            inspection=inspection,
+            device=device,
+            write_plan=write_plan,
+            workspace=workspace,
+            staging_plan=staging_plan,
+            persistence_profile=persistence_profile,
+            persistence_bytes=persistence_bytes,
+        )
+        if persistence_profile is not None:
+            self.start_casper_preparation(pending)
+            return
         if strategy is BootStrategy.UEFI_NTFS:
             unsigned_architectures = tuple(
                 architecture for architecture in inspection.architectures
@@ -2035,6 +2204,89 @@ class Window(QMainWindow):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def start_casper_preparation(self, pending: PendingIsoWrite) -> None:
+        preparer = BackgroundPreparation()
+        self.pending_iso_write = pending
+        self.casper_preparer = preparer
+        self.set_busy(True)
+        self.progress.setRange(0, 0)
+        self.status.setText(
+            "Revalidating the target and reading its logical sector size…"
+        )
+
+        def work() -> None:
+            try:
+                logical_sector_size = probe_casper_logical_sector_size(
+                    pending.device
+                )
+                if preparer.cancelled:
+                    raise CasperMediaCancelled(
+                        "Persistent-media preparation was cancelled"
+                    )
+                self.bridge.casper_preparation_finished.emit(
+                    preparer, logical_sector_size, None,
+                )
+            except Exception as error:
+                self.bridge.casper_preparation_finished.emit(
+                    preparer, None, error,
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_casper_preparation_finished(
+        self,
+        preparer: BackgroundPreparation,
+        result: object,
+        error: object,
+    ) -> None:
+        if preparer is not self.casper_preparer:
+            return
+        pending = self.pending_iso_write
+        self.casper_preparer = None
+        self.pending_iso_write = None
+        self.progress.setRange(0, 1000)
+        if pending is None:
+            self.set_busy(False)
+            return
+        if error is not None or preparer.cancelled:
+            try:
+                pending.workspace.cleanup()
+            except OSError as cleanup_error:
+                self.logger.warning(
+                    "Could not remove cancelled ISO workspace: %s", cleanup_error,
+                )
+            self.set_busy(False)
+            if preparer.cancelled:
+                message = "Persistent-media preparation was cancelled"
+                self.logger.info(message)
+                self.status.setText(message)
+            else:
+                message = str(error)
+                self.logger.warning("Persistent-media preparation failed: %s", message)
+                self.status.setText("ISO mode is not active")
+                QMessageBox.warning(
+                    self, "Persistent storage unavailable", message,
+                )
+            return
+        if type(result) is not int or result not in (512, 4096):
+            try:
+                pending.workspace.cleanup()
+            except OSError as cleanup_error:
+                self.logger.warning(
+                    "Could not remove rejected ISO workspace: %s", cleanup_error,
+                )
+            self.set_busy(False)
+            self.status.setText("ISO mode is not active")
+            QMessageBox.warning(
+                self,
+                "Persistent storage unavailable",
+                "The background target check returned an unsupported logical "
+                "sector size.",
+            )
+            return
+        self.status.setText("Persistent-media target geometry is ready")
+        self.confirm_and_start_iso_write(pending, None, result)
+
     def on_uefi_preparation_finished(
         self,
         preparer: BackgroundPreparation,
@@ -2110,6 +2362,7 @@ class Window(QMainWindow):
         staging_plan = pending.staging_plan
         assert write_plan.layout is not None
         strategy = write_plan.layout.boot_strategy
+        persistence_enabled = pending.persistence_profile is not None
         if strategy is BootStrategy.UEFI_NTFS and (
             artifact is None or logical_sector_size != 512
         ):
@@ -2125,6 +2378,27 @@ class Window(QMainWindow):
                 "512-byte logical sector size.",
             )
             return
+        if persistence_enabled and (
+            pending.persistence_profile != supported_casper_profile(inspection)
+            or strategy is not BootStrategy.IMAGE_NATIVE
+            or write_plan.layout.main_filesystem.value != "fat32"
+            or type(logical_sector_size) is not int
+            or logical_sector_size not in (512, 4096)
+            or pending.persistence_bytes < MIN_PERSISTENCE_BYTES
+            or pending.persistence_bytes % ALIGNMENT_BYTES
+        ):
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "Persistent storage unavailable",
+                "The persistent-media profile or freshly observed target geometry "
+                "is no longer valid.",
+            )
+            return
 
         customization = (
             "\nWindows customization: autounattend.xml will be added."
@@ -2135,7 +2409,18 @@ class Window(QMainWindow):
                 "\nWindows image: "
                 f"{self.windows_options.install_image.display_label}."
             )
-        if strategy is BootStrategy.UEFI_NTFS:
+        if persistence_enabled:
+            assert pending.persistence_profile is not None
+            mode_description = (
+                "UEFI-only · GPT · FAT32 + ext4 writable persistence · "
+                "full file read-back verification"
+            )
+            customization += (
+                "\nPersistent storage: "
+                f"{format_size(pending.persistence_bytes)} for Ubuntu "
+                f"{pending.persistence_profile.ubuntu_release} LTS amd64."
+            )
+        elif strategy is BootStrategy.UEFI_NTFS:
             mode_description = (
                 "UEFI-only · GPT · NTFS + verified UEFI:NTFS bridge · "
                 "full file and bridge read-back verification"
@@ -2177,7 +2462,10 @@ class Window(QMainWindow):
 
         self.iso_workspace = workspace
         self.iso_stager = IsoStagingExecutor()
-        if strategy is BootStrategy.UEFI_NTFS:
+        if persistence_enabled:
+            self.casper_stager = CasperStagingExecutor()
+            self.casper_writer = CasperMediaExecutor()
+        elif strategy is BootStrategy.UEFI_NTFS:
             self.uefi_ntfs_writer = UefiNtfsExecutor()
         else:
             self.constructed_writer = ConstructedMediaExecutor()
@@ -2200,12 +2488,45 @@ class Window(QMainWindow):
                         update.bytes_done, update.total_bytes, update.stage,
                     ),
                 )
-                partition_table = FormatPartitionTable(
-                    write_plan.layout.partition_table.value  # type: ignore[union-attr]
-                )
-                if strategy is BootStrategy.UEFI_NTFS:
+                if persistence_enabled:
+                    assert pending.persistence_profile is not None
+                    assert self.casper_stager is not None
+                    assert self.casper_writer is not None
+                    self.bridge.progress.emit(
+                        staged.bytes_staged,
+                        staged.bytes_staged,
+                        "Enabling verified persistent boot configuration",
+                    )
+                    casper_staging_plan = build_casper_staging_plan(
+                        staged.destination, pending.persistence_profile,
+                    )
+                    casper_staging = self.casper_stager.execute(
+                        casper_staging_plan
+                    )
+                    target_plan = build_casper_media_plan(
+                        staged.destination,
+                        casper_staging,
+                        device,
+                        pending.persistence_bytes,
+                        logical_sector_size,
+                    )
+                    result = self.casper_writer.execute(
+                        target_plan,
+                        lambda update: self.bridge.progress.emit(
+                            update.bytes_done,
+                            update.total_bytes,
+                            update.stage + (
+                                f" · {update.relative_path}"
+                                if update.relative_path else ""
+                            ),
+                        ),
+                    )
+                elif strategy is BootStrategy.UEFI_NTFS:
                     assert artifact is not None
                     assert self.uefi_ntfs_writer is not None
+                    partition_table = FormatPartitionTable(
+                        write_plan.layout.partition_table.value
+                    )
                     target_plan = build_uefi_ntfs_media_plan(
                         staged.destination,
                         device,
@@ -2228,6 +2549,9 @@ class Window(QMainWindow):
                     )
                 else:
                     assert self.constructed_writer is not None
+                    partition_table = FormatPartitionTable(
+                        write_plan.layout.partition_table.value
+                    )
                     target_plan = build_constructed_media_plan(
                         staged.destination,
                         device,
@@ -2254,6 +2578,7 @@ class Window(QMainWindow):
                 success = True
             except (
                 IsoStagingCancelled, ConstructedMediaCancelled, UefiNtfsCancelled,
+                CasperMediaCancelled,
             ) as error:
                 self.logger.info("ISO-mode operation cancelled: %s", error)
                 message = str(error)
