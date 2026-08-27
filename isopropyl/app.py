@@ -88,7 +88,10 @@ from .persistence import (
     ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES, CasperCompatibilityProfile,
 )
 from .writer import ImageWriter, WriteCancelled
-from .virtual import VirtualConversionCancelled, VirtualDiskStager, inspect_virtual_disk
+from .virtual import (
+    CompressedVirtualDiskPreparer, VirtualConversionCancelled,
+    VirtualDiskStager, inspect_virtual_disk,
+)
 from .uefi import SignatureTableState
 from .uefi_ntfs import (
     UEFI_NTFS_SIZE, BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
@@ -205,6 +208,7 @@ class Bridge(QObject):
     progress = pyqtSignal(object, object, str)
     finished = pyqtSignal(bool, str)
     inspection_finished = pyqtSignal(object, object, object)
+    inspection_worker_finished = pyqtSignal()
     checksum_progress = pyqtSignal(object, object, object)
     checksums_finished = pyqtSignal(object, object)
     zip_overlay_finished = pyqtSignal(object, object)
@@ -229,6 +233,8 @@ class Window(QMainWindow):
         self.inspection_cancel_event = threading.Event()
         self.inspection_generation = 0
         self.inspection_busy = False
+        self.inspection_worker_count = 0
+        self.close_after_inspection = False
         self.write_recommendation: WriteMethodRecommendation | None = None
         self.device_refresh_generation = 0
         self.device_refresh_busy = False
@@ -253,6 +259,7 @@ class Window(QMainWindow):
         self.optical_runner: OpticalCaptureRunner | None = None
         self.extractor: SafeIsoExtractor | None = None
         self.virtual_stager: VirtualDiskStager | None = None
+        self.compressed_virtual_preparer: CompressedVirtualDiskPreparer | None = None
         self.iso_stager: IsoStagingExecutor | None = None
         self.windows_wim_extractor: SafeIsoExtractor | None = None
         self.constructed_writer: ConstructedMediaExecutor | None = None
@@ -286,6 +293,9 @@ class Window(QMainWindow):
         self.bridge.progress.connect(self.on_progress)
         self.bridge.finished.connect(self.on_finished)
         self.bridge.inspection_finished.connect(self.on_inspection_finished)
+        self.bridge.inspection_worker_finished.connect(
+            self.on_inspection_worker_finished
+        )
         self.bridge.checksum_progress.connect(self.on_checksum_progress)
         self.bridge.checksums_finished.connect(self.on_checksums_finished)
         self.bridge.zip_overlay_finished.connect(self.on_zip_overlay_finished)
@@ -340,6 +350,18 @@ class Window(QMainWindow):
                         f"{self.image.name}  ·  "
                         f"{self.display_size(self.inspection.size)} expanded disk "
                         f"({self.display_size(self.inspection.container_size)} sparse file)"
+                    )
+                elif (
+                    self.inspection is not None
+                    and self.inspection.virtual_format
+                    and self.inspection.compression != "none"
+                ):
+                    text = (
+                        f"{self.image.name}  ·  "
+                        f"{self.display_size(self.inspection.size)} virtual disk "
+                        f"({self.display_size(self.inspection.decoded_container_size)} "
+                        f"decoded · {self.display_size(self.inspection.container_size)} "
+                        f"{self.inspection.compression.upper()})"
                     )
                 elif self.inspection is not None and self.inspection.compression != "none":
                     text = (
@@ -633,21 +655,25 @@ class Window(QMainWindow):
                     raise ImageInspectionCancelled("Image inspection was cancelled")
 
             try:
-                result: object = inspect_image(
-                    path,
-                    expected_identity=identity,
-                    cancel_check=check_cancelled,
+                try:
+                    result: object = inspect_image(
+                        path,
+                        expected_identity=identity,
+                        cancel_check=check_cancelled,
+                    )
+                except ImageInspectionCancelled:
+                    return
+                except Exception as error:
+                    result = error
+                if inspection_cancel_event.is_set():
+                    return
+                self.bridge.inspection_finished.emit(
+                    identity, result, inspection_generation,
                 )
-            except ImageInspectionCancelled:
-                return
-            except Exception as error:
-                result = error
-            if inspection_cancel_event.is_set():
-                return
-            self.bridge.inspection_finished.emit(
-                identity, result, inspection_generation,
-            )
+            finally:
+                self.bridge.inspection_worker_finished.emit()
 
+        self.inspection_worker_count += 1
         threading.Thread(target=work, daemon=True).start()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -1103,6 +1129,8 @@ class Window(QMainWindow):
             WriteMode.DD: (
                 "VTSI restore — expand sparse disk image"
                 if inspection.sparse_format == "VTSI" else
+                "Virtual disk restore — decode/convert to raw disk"
+                if inspection.virtual_format else
                 "DD mode — exact byte-for-byte copy"
             ),
             WriteMode.EXTRACTED_ISO: "ISO mode — filesystem-aware, UEFI-only",
@@ -1123,6 +1151,11 @@ class Window(QMainWindow):
         prefix = (
             "Recommended: ISO mode. "
             if recommendation.recommended_mode is WriteMode.EXTRACTED_ISO else
+            "Recommended: virtual disk restore. "
+            if (
+                recommendation.recommended_mode is WriteMode.DD
+                and bool(inspection.virtual_format)
+            ) else
             "Recommended: DD mode. "
             if recommendation.recommended_mode is WriteMode.DD else
             "No method is recommended. "
@@ -1150,6 +1183,10 @@ class Window(QMainWindow):
                     mode is WriteMode.DD
                     and self.inspection.sparse_format == "VTSI"
                 ) else
+                "Virtual disk restore" if (
+                    mode is WriteMode.DD
+                    and bool(self.inspection.virtual_format)
+                ) else
                 "DD mode" if mode is WriteMode.DD else
                 "Choose a write method"
             )
@@ -1159,6 +1196,11 @@ class Window(QMainWindow):
             mode is WriteMode.DD
             and self.inspection is not None
             and self.inspection.sparse_format == "VTSI"
+        )
+        virtual_mode = bool(
+            mode is WriteMode.DD
+            and self.inspection is not None
+            and self.inspection.virtual_format
         )
         mandatory_verification = self.verification_is_mandatory()
         self.verify.setChecked(
@@ -1170,6 +1212,7 @@ class Window(QMainWindow):
         self.write_button.setText(
             "Write in ISO mode" if iso_mode else
             "Restore VTSI image" if vtsi_mode else
+            "Restore virtual disk" if virtual_mode else
             "Write in DD mode (ZIP omitted)"
             if mode is WriteMode.DD and self.zip_overlay_plan is not None else
             "Write in DD mode" if mode is WriteMode.DD else
@@ -1265,6 +1308,7 @@ class Window(QMainWindow):
             self.optical_runner,
             self.extractor,
             self.virtual_stager,
+            self.compressed_virtual_preparer,
             self.iso_stager,
             self.windows_wim_extractor,
             self.constructed_writer,
@@ -1398,12 +1442,36 @@ class Window(QMainWindow):
         method_description = (
             "Ventoy sparse image restore · expanded zero/data stream"
             if self.inspection.sparse_format == "VTSI"
+            else (
+                "Compressed virtual disk restore · decode and convert "
+                "guest-visible bytes to raw disk"
+                if self.inspection.compression != "none"
+                else "Virtual disk restore · convert guest-visible bytes to raw disk"
+            )
+            if self.inspection.virtual_format
             else "DD mode · exact byte-for-byte copy"
         )
+        virtual_size_details = ""
+        if self.inspection.virtual_format:
+            if self.inspection.compression != "none":
+                virtual_size_details = (
+                    f"Compressed file: "
+                    f"{self.display_size(self.inspection.container_size)}\n"
+                    f"Decoded container: "
+                    f"{self.display_size(self.inspection.decoded_container_size)}\n"
+                )
+            else:
+                virtual_size_details = (
+                    f"Container: {self.display_size(self.inspection.container_size)}\n"
+                )
+            virtual_size_details += (
+                f"Guest-visible disk: {self.display_size(self.inspection.size)}\n"
+            )
         answer = QMessageBox.warning(
             self, "Erase removable drive?",
             f"Everything on {self.display_device(device)} will be permanently erased.\n\n"
             f"Image: {self.image.name}\nMethod: {method_description}\n"
+            f"{virtual_size_details}"
             f"Layout: {self.inspection.layout}\n"
             f"Target: {device.path}\nSerial: {device.serial or device.wwn or 'not reported'}\n\n"
             "Check the target carefully before continuing.",
@@ -1496,7 +1564,17 @@ class Window(QMainWindow):
             )
             return
         self.writer = ImageWriter()
-        self.virtual_stager = VirtualDiskStager() if self.inspection and self.inspection.virtual_format else None
+        inspection = self.inspection
+        virtual_format = inspection.virtual_format if inspection is not None else ""
+        compressed_virtual = bool(
+            virtual_format
+            and inspection is not None
+            and inspection.compression != "none"
+        )
+        self.virtual_stager = VirtualDiskStager() if virtual_format else None
+        self.compressed_virtual_preparer = (
+            CompressedVirtualDiskPreparer() if compressed_virtual else None
+        )
         self.set_busy(True)
         self.progress.setValue(0)
         self.status.setText("Preparing drive…")
@@ -1521,25 +1599,80 @@ class Window(QMainWindow):
                     )
                 if image_identity(image) != source_identity:
                     raise RuntimeError("The selected image changed after confirmation. Choose it again before writing.")
+                if self.virtual_stager is not None:
+                    try:
+                        stage_root_on_target = path_is_on_device(
+                            tempfile.gettempdir(), device,
+                        )
+                    except OSError:
+                        stage_root_on_target = True
+                    if stage_root_on_target:
+                        raise RuntimeError(
+                            "ISOpropyl's temporary staging directory is on the "
+                            "selected target drive. Configure temporary storage "
+                            "on another disk before writing."
+                        )
                 staged = None
+                prepared_container = None
                 write_source = image
                 if self.virtual_stager is not None:
-                    info = inspect_virtual_disk(image)
-                    virtual_identity = (
-                        info.identity.device, info.identity.inode,
-                        info.identity.size, info.identity.modified_ns,
-                        info.identity.changed_ns,
-                    )
-                    if virtual_identity != expected_source_identity:
-                        raise RuntimeError(
-                            "The selected virtual disk changed after confirmation. "
-                            "Choose it again before writing."
+                    if self.compressed_virtual_preparer is not None:
+                        expected_format = {
+                            "VHD": "vpc",
+                            "VHDX": "vhdx",
+                            "QCOW": "qcow",
+                            "QCOW2": "qcow2",
+                        }.get(virtual_format)
+                        if expected_format is None or inspection is None:
+                            raise RuntimeError(
+                                "The confirmed virtual disk format is unsupported"
+                            )
+                        self.bridge.status_changed.emit(
+                            "Decoding compressed virtual disk…"
                         )
-                    staged = self.virtual_stager.stage(
-                        info,
-                        lambda d, t: self.bridge.progress.emit(d, t, "Converting virtual disk"),
-                    )
+                        prepared_container = self.compressed_virtual_preparer.prepare(
+                            image,
+                            expected_identity=expected_source_identity,
+                            expected_format=expected_format,
+                            expected_virtual_size=inspection.size,
+                        )
+                        info = prepared_container.info
+                    else:
+                        info = inspect_virtual_disk(image)
+                        virtual_identity = (
+                            info.identity.device, info.identity.inode,
+                            info.identity.size, info.identity.modified_ns,
+                            info.identity.changed_ns,
+                        )
+                        if virtual_identity != expected_source_identity:
+                            raise RuntimeError(
+                                "The selected virtual disk changed after confirmation. "
+                                "Choose it again before writing."
+                            )
+                    try:
+                        staged = self.virtual_stager.stage(
+                            info,
+                            lambda d, t: self.bridge.progress.emit(
+                                d, t, "Converting virtual disk",
+                            ),
+                        )
+                    except BaseException:
+                        if prepared_container is not None:
+                            prepared_container.close()
+                            prepared_container = None
+                        raise
                     write_source = staged.path
+                    if image_is_on_device(str(write_source), device):
+                        staged.close()
+                        staged = None
+                        if prepared_container is not None:
+                            prepared_container.close()
+                            prepared_container = None
+                        raise RuntimeError(
+                            "The private virtual-disk stage was created on the "
+                            "target drive. Configure temporary storage on another "
+                            "disk before writing."
+                        )
                 try:
                     self.writer.write(
                         write_source, device,
@@ -1560,6 +1693,8 @@ class Window(QMainWindow):
                 finally:
                     if staged is not None:
                         staged.close()
+                    if prepared_container is not None:
+                        prepared_container.close()
                 if self.writer.cancelled:
                     raise WriteCancelled("Writing was cancelled")
                 if self.writer.power_off(device):
@@ -1601,6 +1736,7 @@ class Window(QMainWindow):
         self.optical_runner = None
         self.extractor = None
         self.virtual_stager = None
+        self.compressed_virtual_preparer = None
         self.iso_stager = None
         self.iso_staging_preparer = None
         self.iso_staging_token = None
@@ -1686,6 +1822,7 @@ class Window(QMainWindow):
         active = tuple(filter(None, (
             self.writer, self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner, self.extractor, self.virtual_stager,
+            self.compressed_virtual_preparer,
             self.iso_stager, self.constructed_writer,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
@@ -1711,7 +1848,8 @@ class Window(QMainWindow):
             self.update_ready()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self.operation_active:
+        inspection_active = self.inspection_worker_count > 0
+        if not self.operation_active and not inspection_active:
             self.inspection_cancel_event.set()
             if self.zip_overlay_preparer is not None:
                 self.zip_overlay_preparer.cancel()
@@ -1725,6 +1863,8 @@ class Window(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         )
         if answer == QMessageBox.StandardButton.Yes:
+            if inspection_active and not self.operation_active:
+                self.close_after_inspection = True
             self.cancel()
         event.ignore()
 
@@ -2883,6 +3023,17 @@ class Window(QMainWindow):
                     f"{self.display_size(self.inspection.size)} expanded disk "
                     f"({self.display_size(self.inspection.container_size)} sparse file)"
                 )
+            elif (
+                self.inspection.virtual_format
+                and self.inspection.compression != "none"
+            ):
+                self.image_label.setText(
+                    f"{self.image.name}  ·  "
+                    f"{self.display_size(self.inspection.size)} virtual disk "
+                    f"({self.display_size(self.inspection.decoded_container_size)} "
+                    f"decoded · {self.display_size(self.inspection.container_size)} "
+                    f"{self.inspection.compression.upper()})"
+                )
             elif self.inspection.compression != "none":
                 self.image_label.setText(
                     f"{self.image.name}  ·  "
@@ -3086,8 +3237,15 @@ class Window(QMainWindow):
             self.windows_button.setEnabled(self.inspection.has_windows_installer)
             self.iso_plan_button.setEnabled(self.inspection.is_iso9660)
             self.checksum_button.setEnabled(True)
-            self.rebuild_write_recommendation(preserve_selection=False)
+        self.rebuild_write_recommendation(preserve_selection=False)
         self.update_ready()
+
+    def on_inspection_worker_finished(self) -> None:
+        if self.inspection_worker_count > 0:
+            self.inspection_worker_count -= 1
+        if self.inspection_worker_count == 0 and self.close_after_inspection:
+            self.close_after_inspection = False
+            self.close()
 
     def select_windows_wim_source(self, member: ArchiveEntry | None) -> None:
         if member is not None and member not in self.windows_wim_candidates:

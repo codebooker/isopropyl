@@ -492,6 +492,59 @@ class ImageSource:
                 "The ZIP central-directory entry count is inconsistent"
             )
 
+    @staticmethod
+    def _single_zip_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+        members = [item for item in archive.infolist() if not item.is_dir()]
+        if len(members) != 1:
+            raise ImageSourceError(
+                "ZIP sources must contain exactly one disk image file"
+            )
+        member = members[0]
+        if member.flag_bits & 0x1:
+            raise ImageSourceError("Encrypted ZIP disk images are not supported")
+        mode = (member.external_attr >> 16) & 0xFFFF
+        file_type = stat.S_IFMT(mode)
+        if file_type and not stat.S_ISREG(mode):
+            raise ImageSourceError(
+                "A ZIP disk image member must be a regular file"
+            )
+        return member
+
+    def decoded_name(
+        self,
+        *,
+        cancel_check: CancelCheck | None = None,
+    ) -> str:
+        """Return the single logical filename produced by this source.
+
+        For ZIP this comes from the validated sole member. Other compression
+        wrappers remove exactly one suffix from the selected filename. The name
+        is metadata only; extraction remains bound to the already-open source
+        descriptor.
+        """
+
+        self._ensure_unchanged()
+        if cancel_check is not None:
+            cancel_check()
+        if self.compression != "zip":
+            name = (
+                self.path.name
+                if self.compression == "none"
+                else self.path.name[:-len(self.path.suffix)]
+            )
+        else:
+            self._validate_zip_directory_bounds(cancel_check=cancel_check)
+            with self._open_bound_stream(cancel_check=cancel_check) as compressed:
+                with zipfile.ZipFile(compressed) as archive:
+                    member = self._single_zip_member(archive)
+                    name = member.filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if not name or name in {".", ".."} or "\x00" in name:
+            raise ImageSourceError("The decoded disk image filename is invalid")
+        if cancel_check is not None:
+            cancel_check()
+        self._ensure_unchanged()
+        return name
+
     @contextmanager
     def _open_bound_stream(
         self,
@@ -723,15 +776,7 @@ class ImageSource:
             self._validate_zip_directory_bounds(cancel_check=cancel_check)
             with self._open_bound_stream(cancel_check=cancel_check) as compressed:
                 with zipfile.ZipFile(compressed) as archive:
-                    members = [item for item in archive.infolist() if not item.is_dir()]
-                    if len(members) != 1:
-                        raise ImageSourceError(
-                            "ZIP sources must contain exactly one disk image file"
-                        )
-                    member = members[0]
-                    mode = member.external_attr >> 16
-                    if mode and stat.S_ISLNK(mode):
-                        raise ImageSourceError("A ZIP disk image cannot be a symbolic link")
+                    member = self._single_zip_member(archive)
                     with archive.open(member, "r") as stream:
                         yield stream
             return

@@ -23,12 +23,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .sources import (
+    ImageSourceError, SourceChanged, SourceIdentity, open_image_source,
+)
+
 SUPPORTED_FORMATS = frozenset({"vpc", "vhdx", "qcow", "qcow2"})
 MAX_INFO_JSON = 256 * 1024
 MAX_DIAGNOSTIC = 64 * 1024
 MAX_VIRTUAL_SIZE = 64 * 1024**4
+MAX_COMPRESSED_VIRTUAL_BYTES = 64 * 1024**3
+COMPRESSED_VIRTUAL_FREE_RESERVE_BYTES = 64 * 1024**2
+VIRTUAL_STAGING_FREE_RESERVE_BYTES = 64 * 1024**2
 DEFAULT_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 PROGRESS_PATTERN = re.compile(rb"\(([0-9]+(?:\.[0-9]+)?)/100%\)")
+VIRTUAL_SUFFIX_FORMATS = {
+    ".vhd": "vpc",
+    ".vhdx": "vhdx",
+    ".qcow": "qcow",
+    ".qcow2": "qcow2",
+}
 
 Progress = Callable[[int, int], None]
 RunCommand = Callable[..., subprocess.CompletedProcess[bytes]]
@@ -115,17 +128,94 @@ class StagedVirtualDisk:
         self.close()
 
 
-def _file_identity(path: Path, label: str) -> FileIdentity:
-    try:
-        status = path.stat()
-    except OSError as error:
-        raise VirtualDiskError(f"{label} is not available: {error}") from error
+@dataclass
+class PreparedCompressedVirtualDisk:
+    """A private decoded virtual container bound to its original source."""
+
+    path: Path
+    info: VirtualDiskInfo
+    original_identity: SourceIdentity
+    compression: str
+    decoded_size: int
+    _directory: Path
+    _descriptor: int
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            os.close(self._descriptor)
+        finally:
+            _cleanup_stage(self._directory, self.path)
+            self._closed = True
+
+    def __enter__(self) -> PreparedCompressedVirtualDisk:
+        if self._closed:
+            raise VirtualDiskError(
+                "The prepared compressed virtual disk has already been cleaned up"
+            )
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+
+def _identity_from_status(status: os.stat_result, label: str) -> FileIdentity:
     if not stat.S_ISREG(status.st_mode):
         raise VirtualDiskError(f"{label} must be a regular file")
     return FileIdentity(
         status.st_dev, status.st_ino, status.st_size,
         status.st_mtime_ns, status.st_ctime_ns,
     )
+
+
+def _file_identity(path: Path, label: str) -> FileIdentity:
+    try:
+        status = path.stat()
+    except OSError as error:
+        raise VirtualDiskError(f"{label} is not available: {error}") from error
+    return _identity_from_status(status, label)
+
+
+def _descriptor_identity(descriptor: int, label: str) -> FileIdentity:
+    try:
+        status = os.fstat(descriptor)
+    except OSError as error:
+        raise VirtualDiskChanged(f"{label} descriptor is unavailable") from error
+    return _identity_from_status(status, label)
+
+
+def _require_descriptor_identity(
+    descriptor: int,
+    expected: FileIdentity,
+    label: str,
+) -> None:
+    if _descriptor_identity(descriptor, label) != expected:
+        raise VirtualDiskChanged(f"{label} changed while it was being prepared")
+
+
+def _open_bound_source(path: Path, label: str) -> tuple[Path, int, FileIdentity]:
+    try:
+        normalized = Path(os.path.abspath(os.fspath(path)))
+    except (TypeError, ValueError, OSError) as error:
+        raise VirtualDiskError(f"{label} path is invalid") from error
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(normalized, flags)
+    except OSError as error:
+        raise VirtualDiskError(f"{label} could not be opened safely: {error}") from error
+    try:
+        identity = _descriptor_identity(descriptor, label)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return normalized, descriptor, identity
 
 
 def resolve_qemu_img(path: Path | None = None) -> ToolIdentity:
@@ -190,12 +280,37 @@ def _required_int(payload: dict[str, object], key: str) -> int:
     return value
 
 
-def _run_info_limited(command: list[str]) -> subprocess.CompletedProcess[bytes]:
+def _stop_process(process: ProcessLike) -> None:
+    """Best-effort bounded termination followed by reaping."""
+
+    try:
+        if process.poll() is None:
+            process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _run_info_limited(
+    command: list[str],
+    descriptor: int,
+    cancel_check: Callable[[], None] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     """Run trusted qemu-img while bounding both output retained and runtime."""
 
     process = subprocess.Popen(
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, shell=False,
+        stderr=subprocess.PIPE, shell=False, pass_fds=(descriptor,),
     )
     assert process.stdout is not None and process.stderr is not None
     stdout = bytearray()
@@ -233,19 +348,16 @@ def _run_info_limited(command: list[str]) -> subprocess.CompletedProcess[bytes]:
     deadline = time.monotonic() + 20
     try:
         while process.poll() is None:
+            if cancel_check is not None:
+                cancel_check()
             if time.monotonic() >= deadline:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                _stop_process(process)
                 raise subprocess.TimeoutExpired(command, 20)
             time.sleep(0.02)
         code = process.wait()
     finally:
         if process.poll() is None:
-            process.kill()
-            process.wait()
+            _stop_process(process)
         for thread in threads:
             thread.join(timeout=2)
     if any(thread.is_alive() for thread in threads):
@@ -259,42 +371,13 @@ def _run_info_limited(command: list[str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.CompletedProcess(command, code, bytes(stdout), bytes(stderr))
 
 
-def inspect_virtual_disk(
+def _parse_virtual_info(
     path: Path,
-    *,
-    qemu_img: Path | None = None,
-    runner: RunCommand | None = None,
-    maximum_virtual_size: int = MAX_VIRTUAL_SIZE,
+    identity: FileIdentity,
+    tool: ToolIdentity,
+    result: subprocess.CompletedProcess[bytes],
+    maximum_virtual_size: int,
 ) -> VirtualDiskInfo:
-    """Inspect a virtual disk and bind the result to its regular-file identity."""
-
-    if not 0 < maximum_virtual_size <= MAX_VIRTUAL_SIZE:
-        raise ValueError(
-            f"maximum_virtual_size must be between 1 and {MAX_VIRTUAL_SIZE}"
-        )
-    try:
-        resolved_path = path.resolve(strict=True)
-    except OSError as error:
-        raise VirtualDiskError(f"The selected virtual disk is not available: {error}") from error
-    identity = _file_identity(resolved_path, "The selected virtual disk")
-    if identity.size == 0:
-        raise VirtualDiskError("The selected virtual disk is empty")
-    tool = resolve_qemu_img(qemu_img)
-    command = [
-        str(tool.path), "info", "--output=json", str(resolved_path),
-    ]
-    try:
-        if runner is None:
-            result = _run_info_limited(command)
-        else:
-            result = runner(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, timeout=20, check=False, shell=False,
-            )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise VirtualDiskError(f"Could not inspect the virtual disk: {error}") from error
-    _unchanged(resolved_path, identity, "The selected virtual disk")
-    _unchanged(tool.path, tool.identity, "qemu-img")
     stdout = result.stdout if isinstance(result.stdout, bytes) else str(result.stdout).encode()
     stderr = result.stderr if isinstance(result.stderr, bytes) else str(result.stderr).encode()
     if len(stdout) > MAX_INFO_JSON:
@@ -344,9 +427,100 @@ def inspect_virtual_disk(
             f"Virtual disks with {kind} metadata are not accepted ({field})"
         )
     return VirtualDiskInfo(
-        resolved_path, identity, tool, image_format, virtual_size,
+        path, identity, tool, image_format, virtual_size,
         actual_size, bool(snapshots),
     )
+
+
+def _inspect_virtual_disk_descriptor(
+    descriptor: int,
+    path: Path,
+    identity: FileIdentity,
+    tool: ToolIdentity,
+    *,
+    runner: RunCommand | None,
+    maximum_virtual_size: int,
+    cancel_check: Callable[[], None] | None,
+) -> VirtualDiskInfo:
+    cancel_failure: BaseException | None = None
+
+    def check_cancelled() -> None:
+        nonlocal cancel_failure
+        if cancel_check is None:
+            return
+        try:
+            cancel_check()
+        except BaseException as error:
+            cancel_failure = error
+            raise
+
+    check_cancelled()
+    _require_descriptor_identity(descriptor, identity, "The selected virtual disk")
+    _unchanged(path, identity, "The selected virtual disk")
+    _unchanged(tool.path, tool.identity, "qemu-img")
+    source = f"/proc/self/fd/{descriptor}"
+    try:
+        if _file_identity(Path(source), "The selected virtual disk") != identity:
+            raise VirtualDiskChanged(
+                "The inherited virtual-disk descriptor identity is inconsistent"
+            )
+        command = [str(tool.path), "info", "--output=json", source]
+        if runner is None:
+            result = _run_info_limited(command, descriptor, check_cancelled)
+        else:
+            result = runner(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=20, check=False, shell=False,
+                pass_fds=(descriptor,),
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        if error is cancel_failure:
+            raise
+        raise VirtualDiskError(f"Could not inspect the virtual disk: {error}") from error
+    check_cancelled()
+    _require_descriptor_identity(descriptor, identity, "The selected virtual disk")
+    _unchanged(path, identity, "The selected virtual disk")
+    _unchanged(tool.path, tool.identity, "qemu-img")
+    info = _parse_virtual_info(
+        path, identity, tool, result, maximum_virtual_size,
+    )
+    check_cancelled()
+    _require_descriptor_identity(descriptor, identity, "The selected virtual disk")
+    _unchanged(path, identity, "The selected virtual disk")
+    _unchanged(tool.path, tool.identity, "qemu-img")
+    return info
+
+
+def inspect_virtual_disk(
+    path: Path,
+    *,
+    qemu_img: Path | None = None,
+    runner: RunCommand | None = None,
+    maximum_virtual_size: int = MAX_VIRTUAL_SIZE,
+    cancel_check: Callable[[], None] | None = None,
+) -> VirtualDiskInfo:
+    """Inspect one no-follow descriptor and never give qemu its pathname."""
+
+    if not 0 < maximum_virtual_size <= MAX_VIRTUAL_SIZE:
+        raise ValueError(
+            f"maximum_virtual_size must be between 1 and {MAX_VIRTUAL_SIZE}"
+        )
+    if cancel_check is not None:
+        cancel_check()
+    normalized, descriptor, identity = _open_bound_source(
+        path, "The selected virtual disk",
+    )
+    try:
+        if identity.size == 0:
+            raise VirtualDiskError("The selected virtual disk is empty")
+        tool = resolve_qemu_img(qemu_img)
+        return _inspect_virtual_disk_descriptor(
+            descriptor, normalized, identity, tool, runner=runner,
+            maximum_virtual_size=maximum_virtual_size,
+            cancel_check=cancel_check,
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _append_bounded(buffer: bytearray, block: bytes) -> None:
@@ -369,6 +543,324 @@ def _cleanup_stage(directory: Path, output: Path) -> None:
         # directory. Leaving an anomalous private directory is safer than
         # broadening cleanup after an external process behaved unexpectedly.
         pass
+
+
+def _source_identity_values(identity: SourceIdentity) -> tuple[int, int, int, int, int]:
+    return (
+        identity.device,
+        identity.inode,
+        identity.size,
+        identity.modified_ns,
+        identity.changed_ns,
+    )
+
+
+def _expected_source_identity_values(
+    expected: SourceIdentity | tuple[int, int, int, int, int],
+) -> tuple[int, int, int, int, int]:
+    if type(expected) is SourceIdentity:
+        values = _source_identity_values(expected)
+    elif type(expected) is tuple and len(expected) == 5:
+        values = expected
+    else:
+        raise ValueError(
+            "expected_identity must be a SourceIdentity or exact five-integer tuple"
+        )
+    if any(type(value) is not int for value in values):
+        raise ValueError(
+            "expected_identity must be a SourceIdentity or exact five-integer tuple"
+        )
+    return values
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    position = 0
+    while position < len(payload):
+        try:
+            written = os.write(descriptor, payload[position:])
+        except OSError as error:
+            raise VirtualDiskError(
+                f"Could not stage the decoded virtual container: {error}"
+            ) from error
+        if written <= 0:
+            raise VirtualDiskError("Could not stage the decoded virtual container")
+        position += written
+
+
+class CompressedVirtualDiskPreparer:
+    """Decode one compression wrapper into a private, inspected container."""
+
+    def __init__(
+        self,
+        *,
+        qemu_img: Path | None = None,
+        info_runner: RunCommand | None = None,
+    ) -> None:
+        self._qemu_img = qemu_img
+        self._info_runner = info_runner
+        self._cancelled = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def _check_cancelled(
+        self,
+        cancel_check: Callable[[], None] | None,
+    ) -> None:
+        if self.cancelled:
+            raise VirtualConversionCancelled(
+                "Compressed virtual-disk preparation was cancelled"
+            )
+        if cancel_check is not None:
+            cancel_check()
+
+    def prepare(
+        self,
+        path: Path,
+        *,
+        expected_identity: SourceIdentity | tuple[int, int, int, int, int] | None = None,
+        expected_format: str | None = None,
+        expected_virtual_size: int | None = None,
+        temporary_root: Path | None = None,
+        maximum_decoded_size: int = MAX_COMPRESSED_VIRTUAL_BYTES,
+        maximum_virtual_size: int = MAX_VIRTUAL_SIZE,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> PreparedCompressedVirtualDisk:
+        """Decode, fsync, inspect, and return one closeable private stage."""
+
+        if (
+            type(maximum_decoded_size) is not int
+            or not 1 <= maximum_decoded_size <= MAX_COMPRESSED_VIRTUAL_BYTES
+        ):
+            raise ValueError(
+                "maximum_decoded_size must be between 1 and "
+                f"{MAX_COMPRESSED_VIRTUAL_BYTES}"
+            )
+        if (
+            type(maximum_virtual_size) is not int
+            or not 1 <= maximum_virtual_size <= MAX_VIRTUAL_SIZE
+        ):
+            raise ValueError(
+                f"maximum_virtual_size must be between 1 and {MAX_VIRTUAL_SIZE}"
+            )
+        if expected_format is not None and (
+            type(expected_format) is not str or expected_format not in SUPPORTED_FORMATS
+        ):
+            raise ValueError("expected_format is not a supported qemu format code")
+        if expected_virtual_size is not None and (
+            type(expected_virtual_size) is not int
+            or expected_virtual_size <= 0
+            or expected_virtual_size > MAX_VIRTUAL_SIZE
+            or expected_virtual_size % 512
+        ):
+            raise ValueError("expected_virtual_size is invalid")
+        expected_values = (
+            _expected_source_identity_values(expected_identity)
+            if expected_identity is not None else None
+        )
+        cancel_failure: BaseException | None = None
+
+        def check_cancelled() -> None:
+            nonlocal cancel_failure
+            if self.cancelled:
+                raise VirtualConversionCancelled(
+                    "Compressed virtual-disk preparation was cancelled"
+                )
+            if cancel_check is None:
+                return
+            try:
+                cancel_check()
+            except BaseException as error:
+                cancel_failure = error
+                raise
+
+        check_cancelled()
+
+        root = temporary_root or Path(tempfile.gettempdir())
+        try:
+            root = root.resolve(strict=True)
+        except OSError as error:
+            raise VirtualDiskError(
+                f"The staging directory is unavailable: {error}"
+            ) from error
+        if not root.is_dir():
+            raise VirtualDiskError("The staging root must be a directory")
+        if shutil.disk_usage(root).free <= COMPRESSED_VIRTUAL_FREE_RESERVE_BYTES:
+            raise VirtualDiskError(
+                "There is not enough free space to preserve the compressed-virtual "
+                "staging reserve"
+            )
+
+        source = None
+        directory: Path | None = None
+        output: Path | None = None
+        descriptor = -1
+        try:
+            source = open_image_source(path, cancel_check=check_cancelled)
+            if not source.compressed:
+                raise VirtualDiskError(
+                    "Compressed virtual-disk preparation requires exactly one wrapper"
+                )
+            original_identity = source.identity
+            if (
+                expected_values is not None
+                and _source_identity_values(original_identity) != expected_values
+            ):
+                raise VirtualDiskChanged(
+                    "The compressed virtual disk changed after confirmation"
+                )
+            decoded_name = source.decoded_name(
+                cancel_check=check_cancelled,
+            )
+            if type(decoded_name) is not str or not decoded_name or "\x00" in decoded_name:
+                raise VirtualDiskError("The decoded virtual-disk name is invalid")
+            suffix = Path(decoded_name).suffix.casefold()
+            required_format = VIRTUAL_SUFFIX_FORMATS.get(suffix)
+            if required_format is None:
+                raise VirtualDiskError(
+                    "The compressed source does not contain a supported virtual disk"
+                )
+
+            directory = Path(tempfile.mkdtemp(
+                prefix="isopropyl-compressed-virtual-", dir=root,
+            ))
+            directory.chmod(0o700)
+            output = directory / f"decoded{suffix}"
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(output, flags, 0o600)
+            os.fchmod(descriptor, 0o600)
+            decoded_size = 0
+            for block in source.chunks(
+                cancel_check=check_cancelled,
+            ):
+                check_cancelled()
+                if len(block) > maximum_decoded_size - decoded_size:
+                    raise VirtualDiskError(
+                        "The decoded virtual container exceeds the configured "
+                        "safety cap (at most 64 GiB)"
+                    )
+                if (
+                    shutil.disk_usage(root).free
+                    < len(block) + COMPRESSED_VIRTUAL_FREE_RESERVE_BYTES
+                ):
+                    raise VirtualDiskError(
+                        "Decoding would consume the compressed-virtual free-space reserve"
+                    )
+                _write_all(descriptor, block)
+                decoded_size += len(block)
+                check_cancelled()
+            if decoded_size == 0:
+                raise VirtualDiskError("The decoded virtual container is empty")
+            os.fsync(descriptor)
+            check_cancelled()
+            status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_nlink != 1
+                or stat.S_IMODE(status.st_mode) != 0o600
+                or status.st_size != decoded_size
+            ):
+                raise VirtualDiskError(
+                    "The decoded virtual container is not a private exact regular file"
+                )
+            decoded_identity = _identity_from_status(
+                status, "The decoded virtual container",
+            )
+            os.close(descriptor)
+            descriptor = -1
+            descriptor = os.open(
+                output,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            _require_descriptor_identity(
+                descriptor, decoded_identity, "The decoded virtual container",
+            )
+            tool = resolve_qemu_img(self._qemu_img)
+            info = _inspect_virtual_disk_descriptor(
+                descriptor, output, decoded_identity, tool,
+                runner=self._info_runner,
+                maximum_virtual_size=maximum_virtual_size,
+                cancel_check=check_cancelled,
+            )
+            final_status = os.fstat(descriptor)
+            try:
+                final_path_status = output.lstat()
+            except OSError as error:
+                raise VirtualDiskChanged(
+                    "The decoded virtual container disappeared during inspection"
+                ) from error
+            if (
+                _identity_from_status(
+                    final_status, "The decoded virtual container",
+                ) != decoded_identity
+                or final_status.st_nlink != 1
+                or stat.S_IMODE(final_status.st_mode) != 0o600
+                or final_status.st_size != decoded_size
+                or final_path_status.st_dev != final_status.st_dev
+                or final_path_status.st_ino != final_status.st_ino
+                or final_path_status.st_nlink != 1
+            ):
+                raise VirtualDiskChanged(
+                    "The decoded virtual container changed during inspection"
+                )
+            source.fileno()
+            if info.format != required_format:
+                raise VirtualDiskError(
+                    f"The decoded {suffix} name does not match qemu format {info.format}"
+                )
+            if expected_format is not None and info.format != expected_format:
+                raise VirtualDiskChanged(
+                    "The decoded virtual-disk format changed after confirmation"
+                )
+            if (
+                expected_virtual_size is not None
+                and info.virtual_size != expected_virtual_size
+            ):
+                raise VirtualDiskChanged(
+                    "The decoded virtual-disk size changed after confirmation"
+                )
+            check_cancelled()
+            prepared = PreparedCompressedVirtualDisk(
+                output,
+                info,
+                original_identity,
+                source.compression,
+                decoded_size,
+                directory,
+                descriptor,
+            )
+            descriptor = -1
+            directory = None
+            output = None
+            return prepared
+        except SourceChanged as error:
+            if error is cancel_failure:
+                raise
+            raise VirtualDiskChanged(str(error)) from error
+        except ImageSourceError as error:
+            if error is cancel_failure:
+                raise
+            raise VirtualDiskError(str(error)) from error
+        finally:
+            if source is not None:
+                source.close()
+            if descriptor >= 0:
+                os.close(descriptor)
+            if directory is not None and output is not None:
+                _cleanup_stage(directory, output)
 
 
 class VirtualDiskStager:
@@ -417,10 +909,17 @@ class VirtualDiskStager:
             raise VirtualDiskError(f"The staging directory is unavailable: {error}") from error
         if not root.is_dir():
             raise VirtualDiskError("The staging root must be a directory")
-        if require_full_free_space and shutil.disk_usage(root).free < info.virtual_size:
-            raise VirtualDiskError(
-                "There is not enough free space to safely stage the full virtual disk"
-            )
+        if require_full_free_space:
+            free = shutil.disk_usage(root).free
+            if (
+                free <= VIRTUAL_STAGING_FREE_RESERVE_BYTES
+                or info.virtual_size
+                > free - VIRTUAL_STAGING_FREE_RESERVE_BYTES
+            ):
+                raise VirtualDiskError(
+                    "There is not enough free space to stage the full virtual "
+                    "disk while preserving the safety reserve"
+                )
 
         directory = Path(tempfile.mkdtemp(prefix="isopropyl-virtual-", dir=root))
         directory.chmod(0o700)
@@ -430,6 +929,7 @@ class VirtualDiskStager:
         reader_errors: list[BaseException] = []
         latest_done = 0
         progress_lock = threading.Lock()
+        source_descriptor = -1
 
         def read_stdout(stream: Any) -> None:
             nonlocal latest_done
@@ -457,15 +957,32 @@ class VirtualDiskStager:
                 reader_errors.append(error)
 
         try:
+            bound_path, source_descriptor, current_identity = _open_bound_source(
+                info.path, "The selected virtual disk",
+            )
+            if bound_path != info.path or current_identity != info.identity:
+                raise VirtualDiskChanged(
+                    "The selected virtual disk changed before conversion"
+                )
+            _require_descriptor_identity(
+                source_descriptor, info.identity, "The selected virtual disk",
+            )
+            _unchanged(info.qemu_img.path, info.qemu_img.identity, "qemu-img")
+            source = f"/proc/self/fd/{source_descriptor}"
+            if _file_identity(Path(source), "The selected virtual disk") != info.identity:
+                raise VirtualDiskChanged(
+                    "The inherited virtual-disk descriptor identity is inconsistent"
+                )
             command = [
                 str(info.qemu_img.path), "convert", "--progress", "--source-format",
                 info.format, "--source-cache", "none", "--target-format", "raw",
                 "--sparse-size", "4k",
-                str(info.path), str(output),
+                source, str(output),
             ]
             self._process = self._process_factory(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, shell=False,
+                pass_fds=(source_descriptor,),
             )
             if self._process.stdout is None or self._process.stderr is None:
                 raise VirtualDiskError("qemu-img conversion pipes were not available")
@@ -497,6 +1014,17 @@ class VirtualDiskStager:
             if code:
                 message = bytes(stderr_tail).decode(errors="replace").strip()
                 raise VirtualDiskError(message or "qemu-img could not convert the virtual disk")
+            if (
+                require_full_free_space
+                and shutil.disk_usage(root).free
+                < VIRTUAL_STAGING_FREE_RESERVE_BYTES
+            ):
+                raise VirtualDiskError(
+                    "Virtual-disk conversion consumed the staging safety reserve"
+                )
+            _require_descriptor_identity(
+                source_descriptor, info.identity, "The selected virtual disk",
+            )
             _unchanged(info.path, info.identity, "The selected virtual disk")
             _unchanged(info.qemu_img.path, info.qemu_img.identity, "qemu-img")
             try:
@@ -531,3 +1059,5 @@ class VirtualDiskStager:
             raise
         finally:
             self._process = None
+            if source_descriptor >= 0:
+                os.close(source_descriptor)

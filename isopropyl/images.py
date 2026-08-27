@@ -33,7 +33,7 @@ from .eltorito import (
     inspect_eltorito_file,
 )
 from .uefi import ImageUefiPayload, inspect_iso_uefi_payloads
-from .virtual import inspect_virtual_disk
+from .virtual import CompressedVirtualDiskPreparer, inspect_virtual_disk
 from .windows_paths import validate_install_image_member_path
 
 Progress = Callable[[int, int], None]
@@ -132,6 +132,7 @@ class ImageInspection:
     mbr_boot_code: str = ""
     partition_table_inspection_complete: bool = True
     sparse_format: str = ""
+    decoded_container_size: int = 0
 
     @property
     def partition_table_incomplete(self) -> bool:
@@ -645,16 +646,68 @@ def inspect_image(
             "workflow and cannot be written as raw disk bytes"
         )
     if suffix in COMPRESSION_SUFFIXES:
-        inner_suffix = Path(path.stem).suffix.casefold()
-        if (
-            inner_suffix in VIRTUAL_SUFFIXES
-            or inner_suffix in NON_RAW_SUFFIXES
-            or inner_suffix in SPARSE_SUFFIXES
-        ):
-            raise OSError(
-                "Compressed virtual, WIM/ESD, FFU, and VTSI containers are not "
-                "accepted until a chained decode-and-apply workflow is available"
+        with open_image_source(path, cancel_check=check_inspection) as probe:
+            decoded_name = probe.decoded_name(cancel_check=check_inspection)
+            probe_identity = (
+                probe.identity.device, probe.identity.inode, probe.identity.size,
+                probe.identity.modified_ns, probe.identity.changed_ns,
             )
+        if probe_identity != observed_identity:
+            raise OSError("The selected compressed image changed before inspection")
+        decoded_suffix = Path(decoded_name).suffix.casefold()
+        if decoded_suffix in NON_RAW_SUFFIXES or decoded_suffix in SPARSE_SUFFIXES:
+            raise OSError(
+                "Compressed WIM/ESD, FFU, and VTSI containers are not accepted "
+                "until a chained decode-and-apply workflow is available"
+            )
+        if decoded_suffix in COMPRESSION_SUFFIXES:
+            raise OSError("Nested compressed disk images are not supported")
+        if decoded_suffix in VIRTUAL_SUFFIXES:
+            check_inspection()
+            prepared = CompressedVirtualDiskPreparer().prepare(
+                path,
+                expected_identity=observed_identity,
+                cancel_check=check_inspection,
+            )
+            try:
+                virtual = prepared.info
+                if (
+                    maximum_expanded_bytes is not None
+                    and virtual.virtual_size > maximum_expanded_bytes
+                ):
+                    raise ExpandedImageTooLarge(
+                        "The virtual disk exceeds ISOpropyl's expanded-image limit"
+                    )
+                check_inspection()
+                final = path.stat()
+                final_identity = (
+                    final.st_dev, final.st_ino, final.st_size,
+                    final.st_mtime_ns, final.st_ctime_ns,
+                )
+                if final_identity != observed_identity:
+                    raise OSError(
+                        "The selected compressed virtual disk changed before inspection"
+                    )
+                return ImageInspection(
+                    size=virtual.virtual_size,
+                    kind=f"Virtual disk ({virtual.display_format})",
+                    volume_label="",
+                    has_mbr=False,
+                    has_gpt=False,
+                    is_iso9660=False,
+                    looks_windows=_looks_like_windows(path, ""),
+                    boot_modes=(),
+                    architectures=(),
+                    bootloader="Unknown",
+                    has_windows_installer=False,
+                    contents_scanned=False,
+                    compression=prepared.compression,
+                    virtual_format=virtual.display_format,
+                    container_size=observed_identity[2],
+                    decoded_container_size=prepared.decoded_size,
+                )
+            finally:
+                prepared.close()
     if suffix in VIRTUAL_SUFFIXES:
         check_inspection()
         virtual = inspect_virtual_disk(path)

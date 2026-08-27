@@ -42,6 +42,20 @@ issue requesting a private contact channel without disclosing the vulnerability.
   bounded. Destructive decompression is bounded by the selected target. Legal
   middle metadata outside the capture is reported as incomplete and is never
   automatically recommended for DD.
+- A compressed VHD/VHDX/QCOW/QCOW2 source retains that bound outer descriptor
+  while exactly one wrapper is decoded into an `O_EXCL`, mode-0600 regular file
+  inside a mode-0700 private directory. The decoded container is limited to
+  64 GiB; decoding and raw conversion each preserve a 64 MiB staging-filesystem
+  reserve. The decoded file is fsynced and must
+  remain single-linked with an exact descriptor/path identity. `qemu-img`
+  inspection and raw conversion receive only inherited `/proc/self/fd` handles;
+  the confirmed outer identity, filename-implied format, detected qemu format,
+  and guest-visible size are rebound before writing. Backing, encryption,
+  corruption, nested compression, multiple ZIP members, and suffix/format
+  disagreement fail closed. Cancellation terminates and reaps qemu inspection
+  or conversion, and cleanup removes only the exact private files and
+  directories allocated by the operation. Closing the window during inspection
+  is deferred until the worker acknowledges that cancellation cleanup finished.
 - VTSI v1.0 sources use the same single, no-follow descriptor and add link
   count to their immutable identity. The parser accepts only the exact 512-byte
   footer/table layout, zero reserved bytes and padding, valid footer and table

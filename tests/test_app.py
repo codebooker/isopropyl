@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 import zipfile
 from dataclasses import replace
@@ -678,6 +679,43 @@ class WindowWriteMethodTests(unittest.TestCase):
                 self.assertEqual(self.window.write_method.count(), 0)
                 self.assertFalse(self.window.write_button.isEnabled())
 
+    def test_compressed_virtual_uses_truthful_restore_labels_and_confirmation(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            size=4096,
+            kind="Virtual disk (VHDX)",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            compression="gzip",
+            virtual_format="VHDX",
+            container_size=512,
+            decoded_container_size=2048,
+        )
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+        self.assertEqual(
+            self.window.write_method.currentText(),
+            "Virtual disk restore — decode/convert to raw disk",
+        )
+        self.assertEqual(self.window.write_button.text(), "Restore virtual disk")
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        start_write.assert_called_once()
+        self.assertIn("Compressed virtual disk restore", warning.call_args.args[2])
+        self.assertIn("guest-visible bytes", warning.call_args.args[2])
+        self.assertIn("Compressed file:", warning.call_args.args[2])
+        self.assertIn("Decoded container:", warning.call_args.args[2])
+        self.assertIn("Guest-visible disk:", warning.call_args.args[2])
+
     def test_catalog_times_reach_execution_and_plan_preview_entries(self):
         modified_ns = 1_709_210_096_123_456_789
         members = tuple(
@@ -772,6 +810,67 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertTrue(self.window.inspection_cancel_event.is_set())
         self.assertFalse(self.window.inspection_busy)
         self.assertEqual(self.window.image_detail.text(), "Image inspection cancelled")
+        self.window.on_inspection_worker_finished()
+
+    def test_close_waits_for_inspection_worker_cleanup_acknowledgement(self):
+        self.window.inspection_worker_count = 1
+        self.window.inspection_busy = True
+        event = Mock()
+
+        with patch(
+            "isopropyl.app.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.closeEvent(event)
+
+        event.ignore.assert_called_once()
+        event.accept.assert_not_called()
+        self.assertTrue(self.window.inspection_cancel_event.is_set())
+        self.assertTrue(self.window.close_after_inspection)
+        with patch.object(Window, "close") as close:
+            self.window.on_inspection_worker_finished()
+        close.assert_called_once()
+        self.assertEqual(self.window.inspection_worker_count, 0)
+        self.assertFalse(self.window.close_after_inspection)
+
+    def test_close_during_blocking_inspection_waits_for_worker_cleanup(self):
+        image = Path(self.settings_home.name) / "compressed.qcow2.gz"
+        image.write_bytes(b"fixture")
+        started = threading.Event()
+        cleaned = threading.Event()
+
+        def blocking_inspection(_path, *, cancel_check, **_kwargs):
+            started.set()
+            try:
+                while True:
+                    cancel_check()
+                    cleaned.wait(0.005)
+            finally:
+                cleaned.set()
+
+        with patch("isopropyl.app.inspect_image", side_effect=blocking_inspection):
+            self.window.load_image(image)
+            self.assertTrue(started.wait(2))
+            event = Mock()
+            with (
+                patch(
+                    "isopropyl.app.QMessageBox.warning",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch.object(Window, "close") as close,
+            ):
+                self.window.closeEvent(event)
+                close.assert_not_called()
+                self.assertTrue(cleaned.wait(2))
+                for _ in range(20):
+                    self.application.processEvents()
+                    if self.window.inspection_worker_count == 0:
+                        break
+                    threading.Event().wait(0.005)
+
+            close.assert_called_once()
+        event.ignore.assert_called_once()
+        self.assertEqual(self.window.inspection_worker_count, 0)
 
     def test_selecting_an_image_cancels_and_invalidates_checksum_worker(self):
         image = Path(self.settings_home.name) / "replacement.iso"
@@ -795,6 +894,7 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIsNone(self.window.checksum_preparer)
         self.assertEqual(self.window.checksum_generation, 5)
         self.assertFalse(self.window.checksum_busy)
+        self.window.on_inspection_worker_finished()
 
     def test_stale_checksum_completion_cannot_clear_a_newer_operation(self):
         old = BackgroundPreparation()
@@ -1786,6 +1886,173 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertTrue(critical.called)
         self.assertIn("virtual disk changed", critical.call_args.args[2])
 
+    def test_compressed_virtual_write_rebinds_decodes_converts_and_verifies_raw(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        self.window.inspection = replace(
+            optical_windows_inspection(),
+            size=4096,
+            virtual_format="VHDX",
+            compression="gzip",
+            container_size=status.st_size,
+            decoded_container_size=1024,
+        )
+        raw = Path(self.settings_home.name) / "prepared.raw"
+        raw.write_bytes(b"R" * 4096)
+        info = Mock()
+        prepared = Mock(info=info)
+        prepared.info = info
+        converted = Mock(path=raw)
+        converted.path = raw
+        preparer = Mock()
+        preparer.prepare.return_value = prepared
+        converter = Mock()
+        converter.stage.return_value = converted
+        backend = Mock()
+        backend.cancelled = False
+        backend.verify.return_value = True
+        backend.power_off.return_value = False
+
+        with (
+            patch("isopropyl.app.ImageWriter", return_value=backend),
+            patch(
+                "isopropyl.app.CompressedVirtualDiskPreparer",
+                return_value=preparer,
+            ),
+            patch("isopropyl.app.VirtualDiskStager", return_value=converter),
+            patch("isopropyl.app.list_devices", return_value=[device()]),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.information") as information,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_write(
+                self.window.image, device(), True, identity,
+            )
+
+        kwargs = preparer.prepare.call_args.kwargs
+        self.assertEqual(kwargs["expected_identity"], identity)
+        self.assertEqual(kwargs["expected_format"], "vhdx")
+        self.assertEqual(kwargs["expected_virtual_size"], 4096)
+        converter.stage.assert_called_once()
+        self.assertIs(converter.stage.call_args.args[0], info)
+        self.assertEqual(backend.write.call_args.args[0], raw)
+        self.assertIsNone(backend.write.call_args.kwargs["expected_identity"])
+        backend.verify.assert_called_once()
+        self.assertEqual(backend.verify.call_args.args[:2], (raw, "/dev/sdz"))
+        converted.close.assert_called_once()
+        prepared.close.assert_called_once()
+        information.assert_called_once()
+
+    def test_virtual_write_rejects_target_resident_temporary_root_before_staging(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        for compression in ("none", "gzip"):
+            with self.subTest(compression=compression):
+                self.window.inspection = replace(
+                    optical_windows_inspection(),
+                    size=4096,
+                    virtual_format="VHDX",
+                    compression=compression,
+                )
+                backend = Mock(cancelled=False)
+                preparer = Mock()
+                converter = Mock()
+                with (
+                    patch("isopropyl.app.ImageWriter", return_value=backend),
+                    patch(
+                        "isopropyl.app.CompressedVirtualDiskPreparer",
+                        return_value=preparer,
+                    ),
+                    patch("isopropyl.app.VirtualDiskStager", return_value=converter),
+                    patch("isopropyl.app.list_devices", return_value=[device()]),
+                    patch("isopropyl.app.image_is_on_device", return_value=False),
+                    patch("isopropyl.app.path_is_on_device", return_value=True),
+                    patch("isopropyl.app.threading.Thread", ImmediateThread),
+                    patch("isopropyl.app.QMessageBox.critical") as critical,
+                    patch.object(self.window, "refresh_devices"),
+                    patch.object(self.window.logger, "exception"),
+                ):
+                    self.window.start_write(
+                        self.window.image, device(), False, identity,
+                    )
+
+                preparer.prepare.assert_not_called()
+                converter.stage.assert_not_called()
+                backend.write.assert_not_called()
+                self.assertIn(
+                    "temporary staging directory", critical.call_args.args[2],
+                )
+
+    def test_virtual_write_rechecks_private_stage_location_and_cleans_it(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        raw = Path(self.settings_home.name) / "target-resident.raw"
+        raw.write_bytes(b"R" * 4096)
+        for compression in ("none", "gzip"):
+            with self.subTest(compression=compression):
+                self.window.inspection = replace(
+                    optical_windows_inspection(),
+                    size=4096,
+                    virtual_format="VHDX",
+                    compression=compression,
+                )
+                info = Mock()
+                for field, value in zip(
+                    ("device", "inode", "size", "modified_ns", "changed_ns"),
+                    identity,
+                ):
+                    setattr(info.identity, field, value)
+                prepared = Mock(info=info)
+                prepared.info = info
+                converted = Mock(path=raw)
+                converted.path = raw
+                preparer = Mock()
+                preparer.prepare.return_value = prepared
+                converter = Mock()
+                converter.stage.return_value = converted
+                backend = Mock(cancelled=False)
+                with (
+                    patch("isopropyl.app.ImageWriter", return_value=backend),
+                    patch(
+                        "isopropyl.app.CompressedVirtualDiskPreparer",
+                        return_value=preparer,
+                    ),
+                    patch("isopropyl.app.VirtualDiskStager", return_value=converter),
+                    patch("isopropyl.app.inspect_virtual_disk", return_value=info),
+                    patch("isopropyl.app.list_devices", return_value=[device()]),
+                    patch(
+                        "isopropyl.app.image_is_on_device",
+                        side_effect=(False, True),
+                    ),
+                    patch("isopropyl.app.path_is_on_device", return_value=False),
+                    patch("isopropyl.app.threading.Thread", ImmediateThread),
+                    patch("isopropyl.app.QMessageBox.critical") as critical,
+                    patch.object(self.window, "refresh_devices"),
+                    patch.object(self.window.logger, "exception"),
+                ):
+                    self.window.start_write(
+                        self.window.image, device(), False, identity,
+                    )
+
+                backend.write.assert_not_called()
+                converted.close.assert_called_once()
+                if compression == "gzip":
+                    prepared.close.assert_called_once()
+                self.assertIn(
+                    "private virtual-disk stage", critical.call_args.args[2],
+                )
+
     def test_iso_dispatch_rebuilds_a_fresh_target_sized_plan(self):
         self.window.rebuild_write_recommendation(preserve_selection=False)
         starter = Mock()
@@ -1981,6 +2248,7 @@ class WindowZipOverlayTests(unittest.TestCase):
         self.assertIsNone(self.window.zip_overlay_plan)
         self.assertIsNone(self.window.zip_overlay_merge)
         self.assertIn("No ZIP overlay", self.window.zip_overlay_label.text())
+        self.window.on_inspection_worker_finished()
 
     def test_stale_overlay_token_cannot_replace_current_plan(self):
         current_operation = BackgroundPreparation()

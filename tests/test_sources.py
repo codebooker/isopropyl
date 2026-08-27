@@ -144,6 +144,51 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(source.compression, "bz2")
             self.assertEqual(b"".join(source.chunks()), payload)
 
+    def test_decoded_name_removes_one_wrapper_or_uses_validated_zip_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for wrapper in (
+                ".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".lzma",
+                ".zst", ".zstd", ".Z", ".z",
+            ):
+                with self.subTest(wrapper=wrapper):
+                    wrapped = root / f"disk.qcow2{wrapper}"
+                    wrapped.write_bytes(b"wrapper metadata fixture")
+                    with open_image_source(wrapped) as source:
+                        self.assertEqual(source.decoded_name(), "disk.qcow2")
+
+            zip_path = root / "download.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("nested/DISK.VHDX", PAYLOAD)
+            with open_image_source(zip_path) as source:
+                self.assertEqual(source.decoded_name(), "DISK.VHDX")
+
+    def test_decoded_zip_name_rejects_non_regular_and_encrypted_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            special = root / "special.zip"
+            info = zipfile.ZipInfo("disk.qcow2")
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            with zipfile.ZipFile(special, "w") as archive:
+                archive.writestr(info, "target")
+            with open_image_source(special) as source:
+                with self.assertRaisesRegex(ImageSourceError, "regular file"):
+                    source.decoded_name()
+
+            encrypted = root / "encrypted.zip"
+            with zipfile.ZipFile(encrypted, "w") as archive:
+                archive.writestr("disk.qcow2", PAYLOAD)
+            payload = bytearray(encrypted.read_bytes())
+            for signature, flag_offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+                position = payload.index(signature)
+                flags = int.from_bytes(payload[position + flag_offset:position + flag_offset + 2], "little")
+                payload[position + flag_offset:position + flag_offset + 2] = (flags | 1).to_bytes(2, "little")
+            encrypted.write_bytes(payload)
+            with open_image_source(encrypted) as source:
+                with self.assertRaisesRegex(ImageSourceError, "Encrypted ZIP"):
+                    source.decoded_name()
+
     def test_legacy_compress_suffix_is_recognized_without_guessing_zstd(self):
         with tempfile.TemporaryDirectory() as directory:
             upper = Path(directory) / "disk.img.Z"

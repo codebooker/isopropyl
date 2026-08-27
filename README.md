@@ -84,8 +84,10 @@ launchers are also available:
    supported virtual disk, or VTSI sparse image, and follow the write-method
    recommendation.
 2. Select a removable target and review its model, capacity, path, and serial.
-3. Choose **VTSI restore — expand sparse disk image** for `.vtsi`; otherwise,
-   choose **DD mode — exact byte-for-byte copy**.
+3. Choose the matching path: **VTSI restore — expand sparse disk image** for
+   `.vtsi`, **Virtual disk restore — decode/convert to raw disk** for virtual
+   containers, or **DD mode — exact byte-for-byte copy** for raw-compatible
+   images.
 4. Keep verification enabled, review the final erase warning, and confirm.
 
 ### Filesystem-aware ISO write
@@ -120,8 +122,10 @@ Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
   install WIM/ESD/SWM payloads are rejected. The digest binds the selected bytes
   but does not authenticate their author.
 - Compressed `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, legacy `.Z`, and single-file
-  ZIP images stream without an expanded copy. VHD, VHDX, QCOW, and QCOW2 inputs
-  use an identity-checked `qemu-img` staging step.
+  ZIP raw images stream without an expanded copy. VHD, VHDX, QCOW, and QCOW2
+  inputs—including one supported compression wrapper—use private,
+  identity-checked decode and `qemu-img` staging steps. Nested compression,
+  encrypted containers, and backing files are rejected.
 - **VTSI v1.0 restore** validates a Ventoy sparse-image footer and segment table,
   then streams the complete expanded disk—including verified zero-filled gaps—to
   an exact-capacity drive with 512-byte logical sectors. Full read-back
@@ -178,6 +182,7 @@ For the implementation-level capability audit and Rufus comparison, see
 | `.img`, `.raw`, `.usb`, `.wic` | DD mode | Treated as raw disk images, not structured installers. |
 | Compressed raw image | Streaming DD | ZIP must contain exactly one regular image. |
 | VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; encrypted containers and backing files are rejected. |
+| Compressed VHD/VHDX/QCOW/QCOW2 | Decode, convert, then DD | Exactly one supported wrapper; decoded containers are capped at 64 GiB and staged privately. |
 | `.vtsi` v1.0 | Sparse restore | Target capacity must exactly match the expanded disk and report 512-byte logical sectors. |
 
 Unsupported formats fail closed. FFU, Windows To Go, dual BIOS+UEFI

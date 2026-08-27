@@ -6,6 +6,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -517,6 +518,56 @@ Folder = -
             ):
                 inspect_image(path, maximum_expanded_bytes=4096)
 
+    def test_compressed_virtual_dispatch_reports_outer_decoded_and_guest_sizes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                (root / "disk.qcow2.gz", None, "gzip", "QCOW2"),
+                (root / "download.zip", "nested/disk.vhdx", "zip", "VHDX"),
+            )
+            for path, zip_member, compression, display_format in cases:
+                with self.subTest(path=path.name):
+                    if zip_member is None:
+                        path.write_bytes(b"compressed fixture")
+                    else:
+                        with zipfile.ZipFile(path, "w") as archive:
+                            archive.writestr(zip_member, b"virtual fixture")
+                    status = path.stat()
+                    info = SimpleNamespace(
+                        virtual_size=8192,
+                        display_format=display_format,
+                    )
+                    prepared = SimpleNamespace(
+                        info=info,
+                        compression=compression,
+                        decoded_size=3072,
+                        close=Mock(),
+                    )
+                    preparer = Mock()
+                    preparer.prepare.return_value = prepared
+                    with patch(
+                        "isopropyl.images.CompressedVirtualDiskPreparer",
+                        return_value=preparer,
+                    ):
+                        result = inspect_image(path)
+
+                    self.assertEqual(result.size, 8192)
+                    self.assertEqual(result.virtual_format, display_format)
+                    self.assertEqual(result.compression, compression)
+                    self.assertEqual(result.container_size, status.st_size)
+                    self.assertEqual(result.decoded_container_size, 3072)
+                    self.assertEqual(result.layout, f"Virtual {display_format} disk")
+                    self.assertFalse(result.contents_scanned)
+                    expected_identity = (
+                        status.st_dev, status.st_ino, status.st_size,
+                        status.st_mtime_ns, status.st_ctime_ns,
+                    )
+                    self.assertEqual(
+                        preparer.prepare.call_args.kwargs["expected_identity"],
+                        expected_identity,
+                    )
+                    prepared.close.assert_called_once()
+
     def test_compressed_inspection_is_cooperatively_cancelled(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "disk.img.gz"
@@ -578,7 +629,7 @@ Folder = -
             root = Path(directory)
             for name in (
                 "install.wim", "install.esd", "capture.ffu",
-                "disk.vhdx.gz", "disk.qcow2.xz", "install.wim.zst",
+                "install.wim.zst",
             ):
                 with self.subTest(name=name):
                     path = root / name
