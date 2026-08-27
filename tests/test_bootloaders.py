@@ -49,8 +49,8 @@ def resource(
 class BootloaderTests(unittest.TestCase):
     def test_bundled_catalog_is_valid_and_network_inactive(self):
         catalog = load_catalog()
-        self.assertEqual(len(catalog.resources), 10)
-        self.assertEqual(len(catalog.bundles), 8)
+        self.assertEqual(len(catalog.resources), 15)
+        self.assertEqual(len(catalog.bundles), 9)
         image = catalog.find(
             "uefi-ntfs", "2.8-rufus-2368e49a", "uefi-ntfs.img",
         )
@@ -71,6 +71,29 @@ class BootloaderTests(unittest.TestCase):
         grub = catalog.find_bundle("grub", "2.14", "blank-bios-core-image")
         self.assertIsNotNone(grub)
         self.assertIsNone(bundle_for_dependency("grub:2.14", catalog=catalog))
+        shell = catalog.find_bundle("uefi-shell", "26H1", "blank-uefi-shell")
+        self.assertIsNotNone(shell)
+        assert shell is not None
+        self.assertEqual(
+            shell.artifact_names,
+            (
+                "shellaa64.efi", "shellia32.efi", "shellloongarch64.efi",
+                "shellriscv64.efi", "shellx64.efi",
+            ),
+        )
+        self.assertEqual(shell.license, "BSD-2-Clause-Patent")
+        x64 = catalog.find("uefi-shell", "26H1", "shellx64.efi")
+        self.assertIsNotNone(x64)
+        assert x64 is not None
+        self.assertEqual(x64.size, 1_137_728)
+        self.assertEqual(
+            x64.sha256,
+            "4ea080ddd576117cd04f5c02d16712ea5d9249c0752214d8e4055e460d7b11e0",
+        )
+        self.assertEqual(
+            x64.allowed_hosts,
+            ("github.com", "release-assets.githubusercontent.com"),
+        )
 
     def test_dependency_bundle_matching_never_truncates_versions(self):
         catalog = load_catalog()

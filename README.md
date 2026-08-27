@@ -120,6 +120,14 @@ ISOpropyl warns before enabling this option, and S-mode media should not use it.
   backups are made from a private exact capture, checked for exact virtual size,
   and content-compared before publication.
 - Capture readable optical media to ISO without modifying the disc.
+- Preserve portable file and explicit-directory modification times cataloged by
+  ISO/UDF media through safe extraction and FAT32/NTFS construction, subject to
+  the temporary workspace and destination filesystem timestamp resolutions.
+  Workspace normalization is accepted only below FAT's two-second granularity,
+  and that first observed value is carried through later transformations. The
+  constructed plan rejects non-portable staging times before touching a target;
+  after destination normalization, read-back must match the observed value
+  exactly. Image ownership and permission metadata are never applied.
 - Restore a drive as FAT12, FAT16, FAT32, exFAT, NTFS, UDF 2.01, ext2, ext3,
   or ext4 using MBR or GPT. Exact, geometry-safe allocation-unit choices are
   available for FAT/exFAT/NTFS and portable block-size choices for ext. Automatic
@@ -251,6 +259,15 @@ regular files—including corrupt or incomplete copies. Unknown paths, links,
 hard-linked files, and entries that change during inspection are deliberately
 left untouched.
 
+**Create UEFI Shell…** makes a GPT/FAT32 recovery drive containing the exact
+upstream 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 applications. ISOpropyl
+asks before networking, pins every file's size and SHA-256, verifies its PE
+architecture and EFI application subsystem, stages canonical fallback paths,
+then applies the same target binding, typed erase confirmation, and full file
+read-back as other constructed media. The downloaded applications are never
+executed on Linux. They are unsigned, so Secure Boot must be disabled on the
+computer that boots this USB.
+
 > [!IMPORTANT]
 > Run ISOpropyl as your normal desktop user. It requests narrowly scoped
 > elevation through `pkexec` only when a block-device operation begins.
@@ -264,6 +281,13 @@ left untouched.
 3. Choose **DD mode — exact byte-for-byte copy** in the visible method selector.
 4. Leave **Verify after writing** enabled, select **Write in DD mode**, review
    the final erase warning, and confirm.
+
+### UEFI Shell recovery media
+
+1. Select a removable destination; no ISO is required.
+2. Choose **Create UEFI Shell…** and approve the release-pinned download.
+3. Review the exact drive identity, GPT/FAT32 layout, and five architectures.
+4. Type the displayed `WRITE /dev/…` phrase to authorize the erase and write.
 
 ### ISO mode
 
@@ -303,7 +327,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 640 tests. Device-facing tests mock block
+The suite currently contains more than 700 tests. Device-facing tests mock block
 devices and privileged commands; the automated suite never writes a real drive.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
 path.
@@ -317,7 +341,8 @@ physical-media testing. Persistence has a hardened layout backend and guarded
 GUI plumbing, but current official Ubuntu images need embedded UEFI GRUB-config
 support before the option can be offered. BIOS/dual-firmware construction,
 broader persistence profiles, Windows To Go, broader verified-download catalogs,
-localization, and release packaging remain active work.
+localization, and release packaging remain active work. The UEFI Shell path is
+implemented but still needs physical firmware certification across architectures.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
 and [ROADMAP.md](ROADMAP.md).
@@ -329,6 +354,8 @@ ISOpropyl is inspired by the clarity and capability of
 Linux-native implementation. The optional UEFI:NTFS runtime helper is an
 unmodified, hash-pinned upstream artifact with separate licensing documented in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The UEFI Shell workflow likewise uses unmodified, hash-pinned upstream files
+under their separate BSD-2-Clause-Patent license.
 
 The official symbol, repository banner, palette, and naming guidance live in
 [BRANDING.md](BRANDING.md).

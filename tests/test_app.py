@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,12 +15,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
-    QLabel, QPlainTextEdit, QPushButton,
+    QLabel, QLineEdit, QPlainTextEdit, QPushButton,
 )
 
 from isopropyl.app import (
-    BackgroundPreparation, ChecksumToken, PendingIsoWrite, Window,
-    WindowsMetadataToken,
+    BackgroundPreparation, ChecksumToken, PendingIsoWrite, PendingUefiShell,
+    UefiShellPreparationToken, Window, WindowsMetadataToken,
 )
 from isopropyl.backup import VHD_MAX_SIZE
 from isopropyl.bootloaders import (
@@ -27,15 +28,17 @@ from isopropyl.bootloaders import (
     CachedBootloaderArtifact,
 )
 from isopropyl.casper_media import supported_casper_profile
+from isopropyl.constructed import ConstructedMediaPlan
 from isopropyl.devices import Device, SizeUnitMode
 from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
 )
 from isopropyl.images import ChecksumCancelled, ImageInspection, ImageMember
-from isopropyl.iso import ArchiveEntry, WriteMode
+from isopropyl.iso import ArchiveEntry, WriteMode, build_write_plan
 from isopropyl.extraction import SafeIsoExtractor
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
+from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
 from isopropyl.wim import WimEdition, WimInfo, WimSelection
 from isopropyl.windows import WindowsCustomization
 
@@ -541,6 +544,37 @@ class WindowWriteMethodTests(unittest.TestCase):
             self.assertIn(pattern, image_filter)
         for pattern in ("*.wim", "*.esd", "*.ffu", "*.vtsi"):
             self.assertNotIn(pattern, image_filter)
+
+    def test_catalog_times_reach_execution_and_plan_preview_entries(self):
+        modified_ns = 1_709_210_096_123_456_789
+        members = tuple(
+            replace(member, modified_ns=modified_ns)
+            if member.path == "EFI/BOOT/BOOTX64.EFI" else member
+            for member in self.window.inspection.members
+        )
+        self.window.inspection = replace(self.window.inspection, members=members)
+
+        entries = self.window.archive_entries()
+        loader = next(
+            entry for entry in entries
+            if entry.path == "EFI/BOOT/BOOTX64.EFI"
+        )
+        self.assertEqual(loader.modified_ns, modified_ns)
+
+        with (
+            patch("isopropyl.app.build_write_plan", wraps=build_write_plan) as builder,
+            patch(
+                "isopropyl.app.QDialog.exec",
+                return_value=QDialog.DialogCode.Rejected,
+            ),
+        ):
+            self.window.preview_iso_plan()
+        preview_entries = builder.call_args.args[1]
+        preview_loader = next(
+            entry for entry in preview_entries
+            if entry.path == "EFI/BOOT/BOOTX64.EFI"
+        )
+        self.assertEqual(preview_loader.modified_ns, modified_ns)
 
     def test_image_inspection_oserror_leaves_the_window_ready(self):
         failed_image = Path(self.settings_home.name) / "unreadable.iso"
@@ -1854,6 +1888,259 @@ class WindowPersistenceTests(unittest.TestCase):
         self.assertIs(pending.staging_plan, staging_plan)
         self.assertEqual(pending.persistence_profile, self.window.persistence_profile)
         self.assertEqual(pending.persistence_bytes, MIN_PERSISTENCE_BYTES)
+
+
+class UefiShellWindowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
+            self.window = Window()
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+
+    def tearDown(self) -> None:
+        self.window.uefi_shell_preparer = None
+        self.window.uefi_shell_token = None
+        self.window.constructed_writer = None
+        self.window.uefi_shell_workspace = None
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+        self.settings_home.cleanup()
+
+    def shell_stage(self, root: Path) -> UefiShellStage:
+        return UefiShellStage(
+            root=root,
+            root_identity=(1, 2),
+            version="26H1",
+            architectures=("ARM64", "x86", "LoongArch64", "RISC-V64", "x64"),
+            files=(),
+            license="BSD-2-Clause-Patent",
+            provenance_url="https://github.com/pbatard/UEFI-Shell/releases/tag/26H1",
+        )
+
+    def media_plan(self, root: Path) -> ConstructedMediaPlan:
+        return ConstructedMediaPlan(
+            device=self.window.devices[0],
+            staging_root=root,
+            directories=(),
+            files=(),
+            fallback_loaders=(
+                "EFI/BOOT/BOOTAA64.EFI",
+                "EFI/BOOT/BOOTIA32.EFI",
+                "EFI/BOOT/BOOTLOONGARCH64.EFI",
+                "EFI/BOOT/BOOTRISCV64.EFI",
+                "EFI/BOOT/BOOTX64.EFI",
+            ),
+            total_bytes=1,
+            required_capacity=1,
+            partition_table=FormatPartitionTable.GPT,
+            volume_label="UEFI_SHELL",
+            filesystem=FormatFilesystem.FAT32,
+            format_plan=Mock(),
+            tools=Mock(),
+        )
+
+    def test_network_decline_never_starts_shell_preparation(self):
+        with (
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ),
+            patch("isopropyl.app.prepare_uefi_shell") as prepare,
+            patch("isopropyl.app.threading.Thread") as thread,
+        ):
+            self.window.create_uefi_shell_media()
+
+        prepare.assert_not_called()
+        thread.assert_not_called()
+        self.assertIsNone(self.window.uefi_shell_preparer)
+        self.assertFalse(self.window.operation_active)
+
+    def test_preparation_cancellation_discards_private_workspace(self):
+        workspace = Mock()
+        workspace.name = str(Path(self.settings_home.name) / "shell-workspace")
+
+        def cancel_preparation(**_kwargs):
+            assert self.window.uefi_shell_preparer is not None
+            self.window.uefi_shell_preparer.cancel()
+            raise UefiShellCancelled("fixture cancellation")
+
+        with (
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.tempfile.TemporaryDirectory", return_value=workspace),
+            patch("isopropyl.app.prepare_uefi_shell", side_effect=cancel_preparation),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.create_uefi_shell_media()
+
+        workspace.cleanup.assert_called_once_with()
+        warning.assert_not_called()
+        self.assertIsNone(self.window.uefi_shell_preparer)
+        self.assertIsNone(self.window.uefi_shell_token)
+        self.assertIn("cancelled", self.window.status.text().casefold())
+        self.assertFalse(self.window.operation_active)
+
+    def test_complete_preparation_binds_stage_plan_and_selected_target(self):
+        workspace = Mock()
+        root = Path(self.settings_home.name) / "shell-workspace" / "ready-media"
+        workspace.name = str(root.parent)
+        stage = self.shell_stage(root)
+        plan = self.media_plan(root)
+        confirmer = Mock()
+        self.window._confirm_and_write_uefi_shell = confirmer
+
+        with (
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.tempfile.TemporaryDirectory", return_value=workspace),
+            patch("isopropyl.app.prepare_uefi_shell", return_value=object()) as prepare,
+            patch("isopropyl.app.stage_uefi_shell", return_value=stage) as stage_builder,
+            patch("isopropyl.app.validate_uefi_shell_stage") as validate_stage,
+            patch("isopropyl.app.build_constructed_media_plan", return_value=plan) as build,
+            patch("isopropyl.app.validate_constructed_media_plan") as validate_plan,
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.create_uefi_shell_media()
+
+        prepare.assert_called_once()
+        self.assertFalse(prepare.call_args.kwargs["cancel_event"].is_set())
+        stage_builder.assert_called_once()
+        self.assertEqual(stage_builder.call_args.args[1], root)
+        build.assert_called_once_with(
+            root,
+            self.window.devices[0],
+            FormatPartitionTable.GPT,
+            volume_label="UEFI_SHELL",
+        )
+        validate_stage.assert_called()
+        validate_plan.assert_called_once_with(plan)
+        confirmer.assert_called_once()
+        pending, confirmed_stage, confirmed_plan = confirmer.call_args.args
+        self.assertIs(pending.workspace, workspace)
+        self.assertEqual(pending.device, self.window.devices[0])
+        self.assertIs(confirmed_stage, stage)
+        self.assertIs(confirmed_plan, plan)
+        workspace.cleanup.assert_not_called()
+        self.window.set_busy(False)
+
+    def test_stale_preparation_only_discards_its_own_workspace(self):
+        stale_workspace = Mock()
+        current_workspace = Mock()
+        stale = UefiShellPreparationToken(
+            BackgroundPreparation(),
+            PendingUefiShell(self.window.devices[0], stale_workspace),
+        )
+        current = UefiShellPreparationToken(
+            BackgroundPreparation(),
+            PendingUefiShell(self.window.devices[0], current_workspace),
+        )
+        self.window.uefi_shell_preparer = current.operation
+        self.window.uefi_shell_token = current
+
+        self.window.on_uefi_shell_preparation_finished(
+            stale, (Mock(), Mock()), None,
+        )
+
+        stale_workspace.cleanup.assert_called_once_with()
+        current_workspace.cleanup.assert_not_called()
+        self.assertIs(self.window.uefi_shell_preparer, current.operation)
+        self.assertIs(self.window.uefi_shell_token, current)
+
+    def test_completion_rejects_stage_outside_token_owned_workspace(self):
+        workspace = Mock()
+        workspace.name = str(Path(self.settings_home.name) / "owned-workspace")
+        external_root = Path(self.settings_home.name) / "unowned" / "ready-media"
+        stage = self.shell_stage(external_root)
+        plan = self.media_plan(external_root)
+        operation = BackgroundPreparation()
+        token = UefiShellPreparationToken(
+            operation, PendingUefiShell(self.window.devices[0], workspace),
+        )
+        self.window.uefi_shell_preparer = operation
+        self.window.uefi_shell_token = token
+        confirmer = Mock()
+        self.window._confirm_and_write_uefi_shell = confirmer
+
+        with (
+            patch("isopropyl.app.validate_uefi_shell_stage"),
+            patch("isopropyl.app.validate_constructed_media_plan"),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.on_uefi_shell_preparation_finished(
+                token, (stage, plan), None,
+            )
+
+        workspace.cleanup.assert_called_once_with()
+        confirmer.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn("no longer matches", warning.call_args.args[2])
+        self.assertIsNone(self.window.uefi_shell_preparer)
+        self.assertIsNone(self.window.uefi_shell_token)
+
+    def test_exact_confirmation_phrase_is_required_before_writer_runs(self):
+        workspace = Mock()
+        root = Path(self.settings_home.name) / "ready-media"
+        pending = PendingUefiShell(self.window.devices[0], workspace)
+        stage = self.shell_stage(root)
+        plan = self.media_plan(root)
+        executor = Mock()
+        executor.execute.return_value = SimpleNamespace(
+            powered_off=True,
+            unmounted=True,
+            cleanup_diagnostic="",
+        )
+        finished = Mock()
+        self.window.bridge.finished.disconnect()
+        self.window.bridge.finished.connect(finished)
+
+        def confirm(dialog: QDialog) -> int:
+            phrase = dialog.findChild(QLineEdit, "uefiShellConfirmationPhrase")
+            button = dialog.findChild(QPushButton, "uefiShellWriteButton")
+            self.assertIsNotNone(phrase)
+            self.assertIsNotNone(button)
+            assert phrase is not None and button is not None
+            self.assertFalse(button.isEnabled())
+            phrase.setText("WRITE /dev/sda")
+            self.assertFalse(button.isEnabled())
+            phrase.setText("WRITE /dev/sdz")
+            self.assertTrue(button.isEnabled())
+            return QDialog.DialogCode.Accepted
+
+        with (
+            patch("isopropyl.app.QDialog.exec", new=confirm),
+            patch("isopropyl.app.ConstructedMediaExecutor", return_value=executor),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window._confirm_and_write_uefi_shell(pending, stage, plan)
+
+        executor.execute.assert_called_once()
+        self.assertIs(executor.execute.call_args.args[0], plan)
+        self.assertTrue(callable(executor.execute.call_args.args[1]))
+        self.assertIs(self.window.uefi_shell_workspace, workspace)
+        finished.assert_called_once()
+        self.assertTrue(finished.call_args.args[0])
+        self.assertIn("powered off", finished.call_args.args[1])
 
 
 if __name__ == "__main__":

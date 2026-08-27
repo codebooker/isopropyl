@@ -23,6 +23,11 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 from .iso import ArchiveEntry, EntryKind, validate_extraction_entries
+from .timestamps import (
+    STAGING_MTIME_TOLERANCE_NS,
+    TimestampPreservationError,
+    apply_descriptor_mtime,
+)
 
 CHUNK_SIZE = 1024 * 1024
 OUTPUT_SPACE_RESERVE = 64 * 1024 * 1024
@@ -172,6 +177,21 @@ def _parent_fd(root_fd: int, path: PurePosixPath) -> int:
         raise
 
 
+def _apply_mtime(descriptor: int, modified_ns: int, member: str) -> int:
+    """Apply one validated timestamp and return any bounded normalization."""
+
+    try:
+        return apply_descriptor_mtime(
+            descriptor,
+            modified_ns,
+            tolerance_ns=STAGING_MTIME_TOLERANCE_NS,
+        )
+    except TimestampPreservationError as error:
+        raise ExtractionError(
+            f"Could not preserve the modification time for {member!r}: {error}"
+        ) from error
+
+
 class SafeIsoExtractor:
     def __init__(
         self,
@@ -294,6 +314,7 @@ class SafeIsoExtractor:
         )
         done = 0
         files = directories = links = 0
+        directory_mtimes: list[tuple[PurePosixPath, int]] = []
         try:
             for entry in plan.entries:
                 self._check_cancelled()
@@ -304,6 +325,8 @@ class SafeIsoExtractor:
                     if entry.kind is EntryKind.DIRECTORY:
                         directory_fd = _open_directory(parent_fd, name, True)
                         os.close(directory_fd)
+                        if entry.modified_ns is not None:
+                            directory_mtimes.append((path, entry.modified_ns))
                         directories += 1
                         continue
                     if entry.kind is EntryKind.SYMLINK:
@@ -331,6 +354,10 @@ class SafeIsoExtractor:
                         )
                         output.flush()
                         os.fsync(output.fileno())
+                        if entry.modified_ns is not None:
+                            _apply_mtime(
+                                output.fileno(), entry.modified_ns, entry.path,
+                            )
                     if member_written != entry.size:
                         raise ExtractionError(
                             f"{entry.path} produced {member_written} bytes; expected {entry.size}"
@@ -340,6 +367,19 @@ class SafeIsoExtractor:
                     progress(ExtractionProgress(
                         entry.path, member_written, entry.size, done, plan.content_bytes,
                     ))
+                finally:
+                    os.close(parent_fd)
+            for path, modified_ns in sorted(
+                directory_mtimes, key=lambda item: len(item[0].parts), reverse=True,
+            ):
+                self._check_cancelled()
+                parent_fd = _parent_fd(root_fd, path)
+                try:
+                    directory_fd = _open_directory(parent_fd, path.name, False)
+                    try:
+                        _apply_mtime(directory_fd, modified_ns, path.as_posix())
+                    finally:
+                        os.close(directory_fd)
                 finally:
                     os.close(parent_fd)
             self._check_cancelled()

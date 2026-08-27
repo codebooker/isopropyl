@@ -34,6 +34,11 @@ from isopropyl.formatting import (
     FormattingError,
     PartitionTable,
 )
+from isopropyl.timestamps import (
+    FAT_MTIME_TOLERANCE_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
+    NTFS_MTIME_TOLERANCE_NS,
+    apply_descriptor_mtime, mtime_matches,
+)
 
 
 def removable_device(**changes: object) -> Device:
@@ -154,6 +159,22 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(all(item.inode > 0 and item.device > 0 for item in plan.files))
         with self.assertRaises(FrozenInstanceError):
             plan.total_bytes = 1  # type: ignore[misc]
+
+    def test_plan_rejects_nonportable_staging_timestamp_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = make_staging(Path(directory))
+            loader = staging / "EFI/BOOT/BOOTX64.EFI"
+            os.utime(
+                loader,
+                ns=(
+                    MIN_PORTABLE_ARCHIVE_MTIME_NS - 1,
+                    MIN_PORTABLE_ARCHIVE_MTIME_NS - 1,
+                ),
+            )
+            with self.assertRaisesRegex(
+                ConstructedMediaSafetyError, "outside the portable range",
+            ):
+                build_plan(staging)
 
     def test_accepts_multiple_architecture_fallback_loaders_case_insensitively(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -377,6 +398,110 @@ class ExecutorTests(unittest.TestCase):
             self.assertEqual(byte_updates, sorted(byte_updates))
             self.assertEqual(updates[-1].stage, "Complete")
             self.assertEqual(updates[-1].fraction, 1.0)
+
+    def test_preserves_staged_file_and_directory_times_at_fat_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            staging = make_staging(base)
+            modified_ns = 1_709_210_096_123_456_789
+            for item in staging.rglob("*"):
+                if item.is_file():
+                    os.utime(item, ns=(modified_ns, modified_ns))
+            for item in sorted(
+                (staging, *(
+                    path for path in staging.rglob("*") if path.is_dir()
+                )),
+                key=lambda path: len(path.parts), reverse=True,
+            ):
+                os.utime(item, ns=(modified_ns, modified_ns))
+
+            mountpoint = base / "mount"
+            mountpoint.mkdir()
+            plan = build_plan(staging)
+            self.make_executor(
+                mountpoint, FakeFormatExecutor(), [],
+            ).execute(plan)
+
+            for source in (staging, *staging.rglob("*")):
+                target = mountpoint / source.relative_to(staging)
+                self.assertLessEqual(
+                    abs(target.stat().st_mtime_ns - source.stat().st_mtime_ns),
+                    2_000_000_000,
+                )
+
+    def test_timestamp_normalization_excludes_an_adjacent_filesystem_tick(self):
+        expected = 1_709_210_096_000_000_000
+        self.assertTrue(mtime_matches(
+            expected, expected + FAT_MTIME_TOLERANCE_NS - 1,
+            FAT_MTIME_TOLERANCE_NS,
+        ))
+        self.assertFalse(mtime_matches(
+            expected, expected + FAT_MTIME_TOLERANCE_NS,
+            FAT_MTIME_TOLERANCE_NS,
+        ))
+        self.assertTrue(mtime_matches(
+            expected, expected + NTFS_MTIME_TOLERANCE_NS - 1,
+            NTFS_MTIME_TOLERANCE_NS,
+        ))
+        self.assertFalse(mtime_matches(
+            expected, expected + NTFS_MTIME_TOLERANCE_NS,
+            NTFS_MTIME_TOLERANCE_NS,
+        ))
+
+    def test_readback_requires_the_exact_timestamp_observed_after_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            staging = make_staging(base)
+            mountpoint = base / "mount"
+            mountpoint.mkdir()
+            plan = build_plan(staging)
+
+            def change_after_application(descriptor, modified_ns, *, tolerance_ns):
+                observed = apply_descriptor_mtime(
+                    descriptor, modified_ns, tolerance_ns=tolerance_ns,
+                )
+                info = os.fstat(descriptor)
+                os.utime(
+                    descriptor,
+                    ns=(info.st_atime_ns, observed + 1),
+                )
+                return observed
+
+            with (
+                patch(
+                    "isopropyl.constructed.apply_descriptor_mtime",
+                    side_effect=change_after_application,
+                ),
+                self.assertRaisesRegex(ConstructedMediaError, "timestamp"),
+            ):
+                self.make_executor(
+                    mountpoint, FakeFormatExecutor(), [],
+                ).execute(plan)
+
+    def test_destination_timestamp_mismatch_fails_readback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            staging = make_staging(base)
+            mountpoint = base / "mount"
+            mountpoint.mkdir()
+            plan = build_plan(staging)
+            real_utime = os.utime
+
+            def skew_timestamp(path_or_fd, *, ns):
+                real_utime(
+                    path_or_fd, ns=(ns[0], ns[1] + 3_000_000_000),
+                )
+
+            with (
+                patch(
+                    "isopropyl.constructed.os.utime",
+                    side_effect=skew_timestamp,
+                ),
+                self.assertRaisesRegex(ConstructedMediaError, "timestamp"),
+            ):
+                self.make_executor(
+                    mountpoint, FakeFormatExecutor(), [],
+                ).execute(plan)
 
     def test_populates_preformatted_ntfs_without_reformat_or_poweroff(self):
         with tempfile.TemporaryDirectory() as directory:

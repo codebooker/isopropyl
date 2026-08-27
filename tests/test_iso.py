@@ -22,6 +22,9 @@ from isopropyl.iso import (
     recommend_write_method,
     validate_extraction_entries,
 )
+from isopropyl.timestamps import (
+    MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
+)
 
 
 def inspection(
@@ -571,12 +574,33 @@ class ExtractionSafetyTests(unittest.TestCase):
             validate_extraction_entries(entries)
 
     def test_normalizes_safe_paths(self):
+        modified_ns = 1_709_210_096_123_456_789
         result = validate_extraction_entries([
-            ArchiveEntry("EFI\\BOOT\\BOOTX64.EFI"),
+            ArchiveEntry("EFI\\BOOT\\BOOTX64.EFI", modified_ns=modified_ns),
             ArchiveEntry("boot", kind=EntryKind.DIRECTORY),
             ArchiveEntry("boot/current", kind=EntryKind.SYMLINK, link_target="grub"),
         ])
         self.assertEqual(result[0].path, "EFI/BOOT/BOOTX64.EFI")
+        self.assertEqual(result[0].modified_ns, modified_ns)
+
+    def test_rejects_invalid_or_link_modification_times(self):
+        for value in (
+            True, 1.5, -1, 0,
+            MIN_PORTABLE_ARCHIVE_MTIME_NS - 1,
+            MAX_PORTABLE_ARCHIVE_MTIME_NS + 1,
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ArchiveEntry("file", modified_ns=value)  # type: ignore[arg-type]
+        for value in (
+            MIN_PORTABLE_ARCHIVE_MTIME_NS,
+            MAX_PORTABLE_ARCHIVE_MTIME_NS,
+        ):
+            self.assertEqual(ArchiveEntry("file", modified_ns=value).modified_ns, value)
+        with self.assertRaisesRegex(ValueError, "files and directories"):
+            ArchiveEntry(
+                "link", kind=EntryKind.SYMLINK, link_target="file",
+                modified_ns=1_709_210_096_000_000_000,
+            )
 
     def test_rejects_absolute_unc_drive_and_parent_paths(self):
         for path in ("/etc/passwd", "C:\\Windows\\file", "\\\\server\\share", "a/../b"):

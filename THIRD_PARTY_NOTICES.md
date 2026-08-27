@@ -6,6 +6,27 @@ only pinned catalog metadata. UEFI:NTFS is obtained only after explicit user
 consent. The GRUB and Syslinux entries are dormant preparation inputs: normal
 writes do not download them and no BIOS executor consumes them yet.
 
+## UEFI Shell release payloads
+
+- Upstream release: [UEFI Shell 26H1](https://github.com/pbatard/UEFI-Shell/releases/tag/26H1)
+- License: BSD-2-Clause-Patent
+- `shellaa64.efi`: 1,093,632 bytes, SHA-256
+  `1569b6db4e391c3c59194aa3319a3945efb800fb25349eb9d36ff3d258517ea6`
+- `shellia32.efi`: 1,009,408 bytes, SHA-256
+  `54ae3a8f58b6fe7123fd948d0773c88e8c26834e39acd3874732c96cbe7c0dd5`
+- `shellloongarch64.efi`: 1,230,272 bytes, SHA-256
+  `d6c97ae52707ebbad4eda063cb0aefc467ec942b07461a6d6d1119cad0ac3e9c`
+- `shellriscv64.efi`: 1,522,752 bytes, SHA-256
+  `ccdb9523276d470277f7676d6534916534cd70218ea5c4cc5ac302e149f65196`
+- `shellx64.efi`: 1,137,728 bytes, SHA-256
+  `4ea080ddd576117cd04f5c02d16712ea5d9249c0752214d8e4055e460d7b11e0`
+
+The Python package includes metadata only; the optional executables are acquired
+when the user explicitly starts and confirms **Create UEFI Shell…**. Normal image
+writes never acquire them. The unmodified executables are not Secure Boot signed
+and require Secure Boot disabled; ISOpropyl does not claim Authenticode or
+certificate-chain validation for them.
+
 ## UEFI:NTFS boot helper
 
 - Artifact: `uefi-ntfs.img`

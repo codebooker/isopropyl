@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from isopropyl.extraction import (
     ExtractionCancelled, ExtractionError, ExtractionSafetyError, SafeIsoExtractor,
@@ -52,6 +53,100 @@ class ExtractionTests(unittest.TestCase):
             self.assertEqual((root / "media/EFI/BOOT/BOOTX64.EFI").read_bytes(), b"BOOT")
             self.assertEqual((root / "media/README.txt").read_text(), "hello")
             self.assertEqual(updates[-1].fraction, 1.0)
+            self.assertEqual(list(root.glob(".media.*.partial")), [])
+
+    def test_preserves_cataloged_file_and_directory_times(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent_time = 1_704_067_200_000_000_000
+            child_time = 1_709_210_096_123_456_789
+            file_time = 1_725_192_000_987_654_321
+            entries = (
+                ArchiveEntry(
+                    "EFI", kind=EntryKind.DIRECTORY, modified_ns=parent_time,
+                ),
+                ArchiveEntry(
+                    "EFI/BOOT", kind=EntryKind.DIRECTORY,
+                    modified_ns=child_time,
+                ),
+                ArchiveEntry(
+                    "EFI/BOOT/BOOTX64.EFI", 4, modified_ns=file_time,
+                ),
+            )
+            plan = self.plan(root, entries)
+            SafeIsoExtractor(streamer=payload_streamer({
+                "EFI/BOOT/BOOTX64.EFI": b"BOOT",
+            })).execute(plan)
+
+            self.assertEqual((root / "media/EFI").stat().st_mtime_ns, parent_time)
+            self.assertEqual((root / "media/EFI/BOOT").stat().st_mtime_ns, child_time)
+            self.assertEqual(
+                (root / "media/EFI/BOOT/BOOTX64.EFI").stat().st_mtime_ns,
+                file_time,
+            )
+
+    def test_timestamp_failure_cleans_private_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.plan(root, (
+                ArchiveEntry("file", 1, modified_ns=1_709_210_096_000_000_000),
+            ))
+            with (
+                patch(
+                    "isopropyl.timestamps.os.utime",
+                    side_effect=OSError("timestamp fixture"),
+                ),
+                self.assertRaisesRegex(ExtractionError, "modification time"),
+            ):
+                SafeIsoExtractor(
+                    streamer=payload_streamer({"file": b"x"}),
+                ).execute(plan)
+            self.assertFalse((root / "media").exists())
+            self.assertEqual(list(root.glob(".media.*.partial")), [])
+
+    def test_accepts_and_carries_bounded_workspace_timestamp_normalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requested = 1_709_210_096_987_654_321
+            normalized = requested - 1_500_000_000
+            plan = self.plan(root, (
+                ArchiveEntry("file", 1, modified_ns=requested),
+            ))
+            real_utime = os.utime
+
+            def normalize(path_or_fd, *, ns):
+                real_utime(path_or_fd, ns=(ns[0], normalized))
+
+            with patch("isopropyl.timestamps.os.utime", side_effect=normalize):
+                SafeIsoExtractor(
+                    streamer=payload_streamer({"file": b"x"}),
+                ).execute(plan)
+
+            self.assertEqual((root / "media/file").stat().st_mtime_ns, normalized)
+
+    def test_rejects_workspace_timestamp_normalization_beyond_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requested = 1_709_210_096_000_000_000
+            plan = self.plan(root, (
+                ArchiveEntry("file", 1, modified_ns=requested),
+            ))
+            real_utime = os.utime
+
+            def over_normalize(path_or_fd, *, ns):
+                real_utime(path_or_fd, ns=(ns[0], ns[1] + 2_000_000_000))
+
+            with (
+                patch(
+                    "isopropyl.timestamps.os.utime",
+                    side_effect=over_normalize,
+                ),
+                self.assertRaisesRegex(ExtractionError, "normalized"),
+            ):
+                SafeIsoExtractor(
+                    streamer=payload_streamer({"file": b"x"}),
+                ).execute(plan)
+            self.assertFalse((root / "media").exists())
             self.assertEqual(list(root.glob(".media.*.partial")), [])
 
     def test_safe_relative_symlink_is_recreated_without_following_it(self):

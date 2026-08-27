@@ -59,8 +59,9 @@ evidence.
 - Add FFU/VTSI/direct WIM/ESD input and FFU/UDF-image authoring output only after
   format parsers and size/platform checks fail closed. Continue hardening and
   physically certifying the implemented VHD/VHDX drive-backup path.
-- Add FreeDOS, UEFI Shell, and advanced blank bootloader workflows with lawful,
-  verified payload sources.
+- Firmware-test the implemented explicit-consent five-architecture UEFI Shell
+  workflow and every fallback path with Secure Boot disabled. Add FreeDOS and
+  advanced blank bootloader workflows with lawful, verified payload sources.
 - Add signed opt-in Microsoft ISO and curated Linux distribution downloads; never
   execute remotely supplied scripts.
 

@@ -22,6 +22,9 @@ from isopropyl.images import (
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.partition_tables import PartitionTableInspection
 from isopropyl.sources import ExpandedImageTooLarge
+from isopropyl.timestamps import (
+    MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
+)
 from isopropyl.eltorito import (
     BootEntry, BootPlatform, ElToritoError, ElToritoInspection,
     ElToritoNotFound, EmulationType, ValidationEntry,
@@ -187,20 +190,57 @@ class ImageTests(unittest.TestCase):
 Path = EFI
 Folder = +
 Size =
+Modified = 2024-02-29 12:34:56
 
 Path = EFI/BOOT/BOOTX64.EFI
 Folder = -
 Size = 1234
+Modified = 2024-02-29 12:34:56.123456789
 
 Path = current
 Folder = -
 Size = 0
 Symbolic Link = boot/grub
+Modified = 2024-02-29 12:34:56
 """)
         self.assertEqual(
             [(item.path, item.size, item.kind) for item in members],
             [("EFI", 0, "directory"), ("EFI/BOOT/BOOTX64.EFI", 1234, "file"),
              ("current", 0, "symlink")],
+        )
+        self.assertEqual(members[0].modified_ns, 1_709_210_096_000_000_000)
+        self.assertEqual(members[1].modified_ns, 1_709_210_096_123_456_789)
+        self.assertIsNone(members[2].modified_ns)
+
+    def test_7z_member_times_fail_closed_when_blank_malformed_or_unportable(self):
+        listing = "header\n----------\n" + "\n\n".join(
+            f"Path = item-{index}\nFolder = -\nSize = 1\nModified = {value}"
+            for index, value in enumerate((
+                "", "not-a-time", "2023-02-29 00:00:00",
+                "1980-01-01 00:00:00", "2107-12-31 23:59:58",
+                "2024-01-01 00:00:00.1234567890",
+            ))
+        )
+        self.assertTrue(all(
+            member.modified_ns is None for member in parse_7z_listing(listing)
+        ))
+
+    def test_7z_member_times_accept_timezone_safe_portable_boundaries(self):
+        members = parse_7z_listing("""header
+----------
+Path = earliest
+Folder = -
+Size = 1
+Modified = 1980-01-02 00:00:00
+
+Path = latest
+Folder = -
+Size = 1
+Modified = 2107-12-30 23:59:58.999999999
+""")
+        self.assertEqual(
+            [member.modified_ns for member in members],
+            [MIN_PORTABLE_ARCHIVE_MTIME_NS, MAX_PORTABLE_ARCHIVE_MTIME_NS],
         )
 
     def test_archive_catalog_never_uses_an_untrusted_path_7z(self):
@@ -294,6 +334,13 @@ Folder = -
                 )
                 self.assertEqual(
                     popen.call_args.args[0][-1], f"/proc/self/fd/{image.fileno()}",
+                )
+                self.assertEqual(
+                    popen.call_args.kwargs["env"],
+                    {
+                        "LC_ALL": "C", "LANG": "C", "TZ": "UTC",
+                        "PATH": "/usr/bin:/bin",
+                    },
                 )
 
     def test_detects_hybrid_iso_and_volume_label(self):

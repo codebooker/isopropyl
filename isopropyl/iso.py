@@ -10,6 +10,9 @@ from pathlib import PurePosixPath
 from typing import Iterable
 
 from isopropyl.images import ImageInspection
+from isopropyl.timestamps import (
+    MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
+)
 
 
 # FAT stores a file's size in an unsigned 32-bit field.  The largest valid
@@ -90,6 +93,7 @@ class ArchiveEntry:
     size: int = 0
     kind: EntryKind = EntryKind.FILE
     link_target: str | None = None
+    modified_ns: int | None = None
 
     def __post_init__(self) -> None:
         if self.size < 0:
@@ -99,6 +103,19 @@ class ArchiveEntry:
                 raise ValueError(f"{self.kind.value} entries require a link target")
         elif self.link_target is not None:
             raise ValueError("Only link entries may have a link target")
+        if self.modified_ns is not None:
+            if (
+                isinstance(self.modified_ns, bool)
+                or not isinstance(self.modified_ns, int)
+                or not (
+                    MIN_PORTABLE_ARCHIVE_MTIME_NS
+                    <= self.modified_ns
+                    <= MAX_PORTABLE_ARCHIVE_MTIME_NS
+                )
+            ):
+                raise ValueError("Archive modification times are outside the portable range")
+            if self.kind not in {EntryKind.FILE, EntryKind.DIRECTORY}:
+                raise ValueError("Only files and directories may carry modification times")
 
 
 @dataclass(frozen=True)
@@ -264,6 +281,7 @@ def validate_extraction_entries(entries: Iterable[ArchiveEntry]) -> tuple[Archiv
         normalized = ArchiveEntry(
             path=PurePosixPath(*parts).as_posix(), size=entry.size,
             kind=entry.kind, link_target=link_target,
+            modified_ns=entry.modified_ns,
         )
         by_key[key] = normalized
         parts_by_key[key] = parts

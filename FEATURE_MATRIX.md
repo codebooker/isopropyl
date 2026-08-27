@@ -52,7 +52,7 @@ Status meanings:
 | FreeDOS boot media | **Planned** | Prefer lawful FreeDOS payloads before considering MS-DOS. |
 | MS-DOS boot media | **Research** | Microsoft binary acquisition/licensing constraints apply. |
 | Microsoft ISO downloader | **Planned** | Must use official metadata without executing remote Fido-style scripts. |
-| UEFI Shell downloader | **Planned** | Official releases, architecture selection, checksum/signature validation. |
+| UEFI Shell downloader | **Partial** | An explicit-consent GUI acquires the exact upstream 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 release files as one no-partial-return bundle, rechecks independently pinned size/SHA-256 and PE architecture/subsystem, stages canonical fallback paths, and writes target-bound GPT/FAT32 media after typed confirmation with complete file read-back. The executables are unsigned and require Secure Boot disabled. Physical firmware certification remains. |
 | Curated Linux downloader | **Planned** | Distribution-owned URLs, signed metadata, resumability, and explicit consent. |
 
 ## Boot, filesystem, and trust analysis
@@ -134,7 +134,7 @@ Status meanings:
 | Update checks | **Research** | Prefer package-manager channels; portable builds need signed opt-in metadata. |
 | Portable settings | **Planned** | Needed for AppImage-style distribution. |
 | ZIP overlay | **Planned** | Must reuse no-traversal/collision validation. |
-| Preserve extracted timestamps | **Planned** | Not guaranteed by the current per-member safe extractor. |
+| Preserve extracted timestamps | **Done** | A conservative timezone-safe FAT-compatible UTC range from the bounded 7-Zip catalog is carried through private extraction and the final FAT32/NTFS copy. Files and explicit directories are updated through already-open no-follow descriptors, transformed directories are restored deepest-first from their first observed workspace value, and staging representability is checked before any target change. Normalization must be smaller than one workspace/destination filesystem tick; subsequent read-back must exactly match that observed value. Malformed/out-of-range times and all link times are ignored or rejected; permissions and ownership are never imported. |
 | Decimal/binary unit preference | **Done** | Settings switches dynamic capacities, progress, rates, estimates, confirmations, and device labels between SI MB/GB/TB and IEC MiB/GiB/TiB. |
 | Old-BIOS fixes | **Research** | Requires precise Linux equivalents and real hardware fixtures. |
 
@@ -142,7 +142,7 @@ Status meanings:
 
 | Rufus advanced behavior | Status | ISOpropyl position |
 |---|---:|---|
-| Blank Syslinux/GRUB/Grub4DOS/ReactOS/UEFI:NTFS media | **Planned** | After verified payload catalog and construction profiles. |
+| Blank Syslinux/GRUB/Grub4DOS/ReactOS/UEFI:NTFS media | **Partial** | Five-architecture UEFI Shell recovery media ships as a separate, verified GPT/FAT32 profile. Syslinux, GRUB, Grub4DOS, ReactOS, and blank UEFI:NTFS profiles remain planned behind audited consumers and lawful payload catalogs. |
 | Rufus MBR / “press any key” toggles | **Planned** | Belongs to Windows BIOS construction. |
 | Cycle/reset selected USB port | **Research** | Only if UDisks/sysfs semantics are safe and portable. |
 | Delete downloaded boot files | **Done** | Settings inventories only exact catalog-known cache paths and deletes explicitly confirmed, filesystem-safe regular files through no-follow directory descriptors. Unknown, linked, or changed entries remain untouched; corrupt or incomplete copies can be safely cleared. |
@@ -171,9 +171,9 @@ Status meanings:
 | Bind partition-node identity | **Done** | Multi-partition workflows bind every direct child path to kernel parent and major:minor identity, verify the block node with `lstat`, and repeat exact geometry and identity checks before each filesystem creation. |
 | Exclusive target ownership | **Partial** | Every destructive child command now fails fast behind a whole-device cooperative `flock`; `sfdisk` uses its native nonblocking lock. This coordinates lock-aware tools but remains advisory and per-command. A privileged transaction broker/private namespace is still required for stronger end-to-end ownership, and no unsafe bypass will be exposed. |
 | Fixed privileged argv/no shell | **Done** | Absolute trusted tools and bounded child processes. |
-| Verified boot components | **Partial** | A release-bundled catalog pins UEFI:NTFS plus selected Syslinux/GRUB bundles by immutable source commit, exact size, SHA-256, license, and provenance. UEFI:NTFS has explicit consent, identity-safe cache binding, in-memory privileged transfer, and full read-back. Generic bundles bind singly linked no-follow files into immutable bytes, but have no privileged consumer. Project-owned signed ISOpropyl release metadata remains. |
+| Verified boot components | **Partial** | A release-bundled catalog pins UEFI:NTFS, selected Syslinux/GRUB bundles, and the five-architecture UEFI Shell 26H1 set by immutable source release/commit, exact size, SHA-256, license, and provenance. UEFI:NTFS has explicit consent, identity-safe cache binding, in-memory privileged transfer, and full read-back. UEFI Shell additionally enforces exact PE architecture, EFI-application subsystem, unchanged unsigned state, descriptor-safe private staging, target-bound construction, typed erase confirmation, and full file read-back. Other generic bundles bind singly linked no-follow files into immutable bytes but have no privileged consumer. Project-owned signed ISOpropyl release metadata remains. |
 | No unsigned remote scripts | **Policy** | ISOpropyl will never execute a downloaded installer/downloader script. |
-| Opt-in network use | **Policy** | UEFI:NTFS acquisition requires explicit confirmation; no remote code or script is executed. Future downloads require the same explicit action and pinned provenance. |
+| Opt-in network use | **Policy** | UEFI:NTFS and UEFI Shell acquisition each require an explicit user action and confirmation. Downloads are release-pinned and no remote executable or script is run on Linux; normal image writes never trigger either network path. |
 | Reproducible builds | **Partial** | Standard package metadata and CI exist; locked inputs and reproduction attestations remain. |
 | Signed releases | **Planned** | Sigstore/minisign and package-native signatures. |
 | Desktop/AppStream metadata | **Done** | Validated application, icon, and metainfo files. |
@@ -192,8 +192,9 @@ Status meanings:
 6. Add cryptographic Secure Boot trust and authenticated revocation data.
 7. Complete FFU/VTSI/direct WIM/ESD and image-output formats.
 8. Add project-owned signed manifests and corresponding-source-compliant hosting,
-   then audited BIOS consumers for the dormant GRUB/Syslinux payloads; add
-   signed opt-in FreeDOS and UEFI Shell acquisition.
+   then audited BIOS consumers for the dormant GRUB/Syslinux payloads; physically
+   certify the explicit-consent UEFI Shell workflow and add signed opt-in FreeDOS
+   acquisition.
 9. Finish localization, conflict diagnostics, signed reproducible packaging, and
    physical certification of safe expert format controls.
 

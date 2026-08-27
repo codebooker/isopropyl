@@ -146,6 +146,13 @@ _DEPENDENCY_PURPOSES = {
 }
 _BUNDLE_ARTIFACTS = {
     ("uefi-ntfs", "uefi-ntfs-bridge"): ("uefi-ntfs.img",),
+    ("uefi-shell", "blank-uefi-shell"): (
+        "shellaa64.efi",
+        "shellia32.efi",
+        "shellloongarch64.efi",
+        "shellriscv64.efi",
+        "shellx64.efi",
+    ),
     ("syslinux", "matched-bios-payloads"): ("ldlinux.bss", "ldlinux.sys"),
     ("syslinux", "blank-bios-module"): ("ldlinux.c32",),
     ("grub", "blank-bios-core-image"): ("core.img",),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import calendar
 import hashlib
 import hmac
 import os
@@ -14,9 +15,13 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .sources import ExpandedImageTooLarge, ImageSource, open_image_source
+from .timestamps import (
+    MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
+)
 from .partition_tables import (
     PARTITION_TABLE_CAPTURE_BYTES, PartitionTableInspection,
     inspect_partition_tables_capture,
@@ -48,6 +53,9 @@ _TRUSTED_7Z_DIRECTORIES = frozenset(_TRUSTED_7Z_PATH.split(":"))
 MAX_7Z_CATALOG_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_MEMBERS = 65_536
 MAX_WINDOWS_WIM_CANDIDATES = 4
+_SEVEN_ZIP_MODIFIED = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?"
+)
 
 
 class ImageInspectionCancelled(Exception):
@@ -68,6 +76,7 @@ class ImageMember:
     size: int
     kind: str
     link_target: str = ""
+    modified_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -334,6 +343,27 @@ def parse_7z_listing(
     parsed: list[ImageMember] = []
     current: dict[str, str] = {}
 
+    def modified_ns(value: str) -> int | None:
+        match = _SEVEN_ZIP_MODIFIED.fullmatch(value)
+        if match is None:
+            return None
+        try:
+            value_datetime = datetime(*map(int, match.groups()[:6]))
+        except ValueError:
+            return None
+        fraction = (match.group(7) or "").ljust(9, "0")
+        value_ns = (
+            calendar.timegm(value_datetime.timetuple()) * 1_000_000_000
+            + (int(fraction) if fraction else 0)
+        )
+        if not (
+            MIN_PORTABLE_ARCHIVE_MTIME_NS
+            <= value_ns
+            <= MAX_PORTABLE_ARCHIVE_MTIME_NS
+        ):
+            return None
+        return value_ns
+
     def finish() -> None:
         if not current.get("Path"):
             current.clear()
@@ -346,7 +376,13 @@ def parse_7z_listing(
             size = 0
         link = current.get("Symbolic Link", "")
         kind = "symlink" if link else ("directory" if current.get("Folder") == "+" else "file")
-        parsed.append(ImageMember(current["Path"], size, kind, link))
+        parsed.append(ImageMember(
+            current["Path"], size, kind, link,
+            (
+                modified_ns(current.get("Modified", ""))
+                if kind in {"file", "directory"} else None
+            ),
+        ))
         current.clear()
 
     for line in records.splitlines():
@@ -387,6 +423,10 @@ def scan_image_contents(
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             pass_fds=(() if image_fd is None else (image_fd,)),
+            env={
+                "LC_ALL": "C", "LANG": "C", "TZ": "UTC",
+                "PATH": _TRUSTED_7Z_PATH,
+            },
         )
     except (OSError, subprocess.SubprocessError):
         return [], False

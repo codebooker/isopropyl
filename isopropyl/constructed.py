@@ -39,6 +39,14 @@ from .formatting import (
     resolve_tools as resolve_format_tools,
     validate_device,
 )
+from .timestamps import (
+    FAT_MTIME_TOLERANCE_NS,
+    MAX_PORTABLE_ARCHIVE_MTIME_NS,
+    MIN_PORTABLE_ARCHIVE_MTIME_NS,
+    NTFS_MTIME_TOLERANCE_NS,
+    TimestampPreservationError,
+    apply_descriptor_mtime,
+)
 
 COPY_BLOCK_BYTES = 4 * 1024 * 1024
 FAT32_MAX_FILE_BYTES = (4 * 1024 * 1024 * 1024) - 1
@@ -233,12 +241,30 @@ def _case_key(parts: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _directory_from_stat(parts: tuple[str, ...], info: os.stat_result) -> StagedDirectory:
+    path = PurePosixPath(*parts).as_posix() if parts else "."
+    if not (
+        MIN_PORTABLE_ARCHIVE_MTIME_NS
+        <= info.st_mtime_ns
+        <= MAX_PORTABLE_ARCHIVE_MTIME_NS
+    ):
+        raise ConstructedMediaSafetyError(
+            f"Staged directory has a modification time outside the portable range: {path!r}"
+        )
     return StagedDirectory(
         parts, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns,
     )
 
 
 def _file_from_stat(parts: tuple[str, ...], info: os.stat_result) -> StagedFile:
+    path = PurePosixPath(*parts).as_posix()
+    if not (
+        MIN_PORTABLE_ARCHIVE_MTIME_NS
+        <= info.st_mtime_ns
+        <= MAX_PORTABLE_ARCHIVE_MTIME_NS
+    ):
+        raise ConstructedMediaSafetyError(
+            f"Staged file has a modification time outside the portable range: {path!r}"
+        )
     return StagedFile(
         parts, info.st_dev, info.st_ino, info.st_size,
         info.st_mtime_ns, info.st_ctime_ns, info.st_nlink,
@@ -485,6 +511,14 @@ def validate_constructed_media_plan(plan: ConstructedMediaPlan) -> None:
             for value in (item.device, item.inode, item.modified_ns, item.changed_ns)
         ):
             raise ConstructedMediaSafetyError("The plan contains an invalid directory identity")
+        if not (
+            MIN_PORTABLE_ARCHIVE_MTIME_NS
+            <= item.modified_ns
+            <= MAX_PORTABLE_ARCHIVE_MTIME_NS
+        ):
+            raise ConstructedMediaSafetyError(
+                "The plan contains a directory timestamp outside the portable range"
+            )
         for length, component in enumerate(item.parts, start=1):
             _validate_component(component, item.path)
             if length < len(item.parts) and item.parts[:length] not in directory_parts:
@@ -514,6 +548,14 @@ def validate_constructed_media_plan(plan: ConstructedMediaPlan) -> None:
             )
         ):
             raise ConstructedMediaSafetyError("The plan contains an invalid file identity")
+        if not (
+            MIN_PORTABLE_ARCHIVE_MTIME_NS
+            <= item.modified_ns
+            <= MAX_PORTABLE_ARCHIVE_MTIME_NS
+        ):
+            raise ConstructedMediaSafetyError(
+                "The plan contains a file timestamp outside the portable range"
+            )
         key = _case_key(item.parts)
         if key in occupied:
             raise ConstructedMediaSafetyError("The plan contains colliding staged paths")
@@ -962,7 +1004,21 @@ class ConstructedMediaExecutor:
                 raise ConstructedMediaSafetyError(
                     f"Staged file changed while copying: {item.path!r}"
                 )
-            os.fsync(destination_fd)
+            try:
+                applied_mtime_ns = apply_descriptor_mtime(
+                    destination_fd,
+                    item.modified_ns,
+                    tolerance_ns=(
+                        FAT_MTIME_TOLERANCE_NS
+                        if plan.filesystem is Filesystem.FAT32
+                        else NTFS_MTIME_TOLERANCE_NS
+                    ),
+                )
+            except TimestampPreservationError as error:
+                raise ConstructedMediaError(
+                    f"Could not preserve destination file timestamp "
+                    f"{item.path!r}: {error}"
+                ) from error
             os.close(destination_fd)
             destination_fd = -1
 
@@ -973,9 +1029,10 @@ class ConstructedMediaExecutor:
                     not stat.S_ISREG(verify_info.st_mode)
                     or verify_info.st_dev != destination_device
                     or verify_info.st_size != item.size
+                    or verify_info.st_mtime_ns != applied_mtime_ns
                 ):
                     raise ConstructedMediaError(
-                        f"Destination file has the wrong identity or size: {item.path!r}"
+                        f"Destination file has the wrong identity, size, or timestamp: {item.path!r}"
                     )
                 destination_hash = hashlib.sha256()
                 verified = 0
@@ -1010,6 +1067,44 @@ class ConstructedMediaExecutor:
                 os.close(destination_fd)
             os.close(source_parent)
             os.close(destination_parent)
+
+    def _apply_directory_mtimes(
+        self,
+        plan: ConstructedMediaPlan,
+        destination_root_fd: int,
+        destination_device: int,
+    ) -> None:
+        for directory in sorted(
+            plan.directories, key=lambda item: len(item.parts), reverse=True,
+        ):
+            self._check_cancelled()
+            descriptor = _open_directory_chain(
+                destination_root_fd, directory.parts,
+                destination_device=destination_device,
+            )
+            try:
+                applied_mtime_ns = apply_descriptor_mtime(
+                    descriptor,
+                    directory.modified_ns,
+                    tolerance_ns=(
+                        FAT_MTIME_TOLERANCE_NS
+                        if plan.filesystem is Filesystem.FAT32
+                        else NTFS_MTIME_TOLERANCE_NS
+                    ),
+                )
+                after = os.fstat(descriptor)
+                if after.st_mtime_ns != applied_mtime_ns:
+                    raise ConstructedMediaError(
+                        f"Destination directory timestamp was not preserved: {directory.path!r}"
+                    )
+            except (OSError, TimestampPreservationError) as error:
+                raise ConstructedMediaError(
+                    f"Could not preserve destination directory timestamp "
+                    f"{directory.path!r}: "
+                    + _bounded_message(error, "unknown timestamp error")
+                ) from error
+            finally:
+                os.close(descriptor)
 
     def _copy_tree(
         self,
@@ -1070,6 +1165,9 @@ class ConstructedMediaExecutor:
                     destination_device, directory_map, item, completed, progress,
                 )
                 completed += item.size
+            self._apply_directory_mtimes(
+                plan, destination_root_fd, destination_device,
+            )
             os.fsync(destination_root_fd)
         except OSError as error:
             raise ConstructedMediaError(

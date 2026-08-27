@@ -53,6 +53,12 @@ from .iso import (
     WritePlan,
     validate_extraction_entries,
 )
+from .timestamps import (
+    STAGING_MTIME_TOLERANCE_NS,
+    TimestampPreservationError,
+    apply_descriptor_mtime,
+    mtime_matches,
+)
 from .wim import (
     FileIdentity as WimFileIdentity,
     WimCancelled,
@@ -210,6 +216,7 @@ def _catalog_digest(entries: Sequence[ArchiveEntry]) -> str:
                 "size": entry.size,
                 "kind": entry.kind.value,
                 "link_target": entry.link_target,
+                "modified_ns": entry.modified_ns,
             }
             for entry in entries
         ],
@@ -811,6 +818,156 @@ def _verify_extracted_catalog(root: Path, entries: Sequence[ArchiveEntry]) -> No
         raise IsoStagingSafetyError("The extracted files do not match the ISO catalog")
 
 
+def _open_staged_directory(
+    root_fd: int,
+    parts: tuple[str, ...],
+    root_device: int,
+) -> int:
+    current = os.dup(root_fd)
+    try:
+        for component in parts:
+            following = os.open(component, _DIR_FLAGS, dir_fd=current)
+            os.close(current)
+            current = following
+            info = os.fstat(current)
+            if not stat.S_ISDIR(info.st_mode) or info.st_dev != root_device:
+                raise IsoStagingSafetyError(
+                    "A timestamped staging directory changed or escaped the private tree"
+                )
+        return current
+    except OSError as error:
+        os.close(current)
+        raise IsoStagingSafetyError(
+            "Could not safely open a timestamped staging directory"
+        ) from error
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _bind_catalog_directory_mtimes(
+    root: Path,
+    entries: Sequence[ArchiveEntry],
+    cancel_check: Callable[[], None],
+) -> tuple[tuple[tuple[str, ...], int], ...]:
+    """Bind the workspace-normalized values of explicit catalog directories."""
+
+    timestamped = tuple(
+        entry for entry in entries
+        if entry.kind is EntryKind.DIRECTORY and entry.modified_ns is not None
+    )
+    if not timestamped:
+        return ()
+    try:
+        initial = os.lstat(root)
+    except OSError as error:
+        raise IsoStagingSafetyError(
+            "The transformed staging tree is unavailable"
+        ) from error
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISDIR(initial.st_mode):
+        raise IsoStagingSafetyError("The transformed staging tree is not a real directory")
+    try:
+        root_fd = os.open(root, _DIR_FLAGS)
+    except OSError as error:
+        raise IsoStagingSafetyError(
+            "Could not safely open the transformed staging tree"
+        ) from error
+    try:
+        try:
+            opened = os.fstat(root_fd)
+        except OSError as error:
+            raise IsoStagingSafetyError(
+                "Could not bind the transformed staging tree"
+            ) from error
+        if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
+            raise IsoStagingSafetyError("The transformed staging root changed while opening")
+        bound: list[tuple[tuple[str, ...], int]] = []
+        for entry in sorted(
+            timestamped,
+            key=lambda item: len(PurePosixPath(item.path).parts),
+            reverse=True,
+        ):
+            cancel_check()
+            parts = PurePosixPath(entry.path).parts
+            descriptor = _open_staged_directory(
+                root_fd, parts, opened.st_dev,
+            )
+            try:
+                modified_ns = entry.modified_ns
+                assert modified_ns is not None
+                observed_ns = os.fstat(descriptor).st_mtime_ns
+                if not mtime_matches(
+                    modified_ns, observed_ns, STAGING_MTIME_TOLERANCE_NS,
+                ):
+                    raise IsoStagingSafetyError(
+                        f"The extracted directory time for {entry.path!r} was "
+                        "normalized beyond the supported workspace resolution"
+                    )
+                bound.append((parts, observed_ns))
+            finally:
+                os.close(descriptor)
+        return tuple(bound)
+    finally:
+        os.close(root_fd)
+
+
+def _reapply_bound_directory_mtimes(
+    root: Path,
+    bound_mtimes: Sequence[tuple[tuple[str, ...], int]],
+    cancel_check: Callable[[], None],
+) -> None:
+    """Restore first-observed directory times after private transformations."""
+
+    if not bound_mtimes:
+        return
+    try:
+        initial = os.lstat(root)
+    except OSError as error:
+        raise IsoStagingSafetyError(
+            "The transformed staging tree is unavailable"
+        ) from error
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISDIR(initial.st_mode):
+        raise IsoStagingSafetyError("The transformed staging tree is not a real directory")
+    try:
+        root_fd = os.open(root, _DIR_FLAGS)
+    except OSError as error:
+        raise IsoStagingSafetyError(
+            "Could not safely open the transformed staging tree"
+        ) from error
+    try:
+        opened = os.fstat(root_fd)
+        if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
+            raise IsoStagingSafetyError("The transformed staging root changed while opening")
+        for parts, bound_ns in sorted(
+            bound_mtimes, key=lambda item: len(item[0]), reverse=True,
+        ):
+            cancel_check()
+            descriptor = _open_staged_directory(
+                root_fd, parts, opened.st_dev,
+            )
+            try:
+                try:
+                    observed_ns = apply_descriptor_mtime(
+                        descriptor,
+                        bound_ns,
+                        tolerance_ns=STAGING_MTIME_TOLERANCE_NS,
+                    )
+                except TimestampPreservationError as error:
+                    raise IsoStagingSafetyError(
+                        f"Could not restore the bound directory time for "
+                        f"{PurePosixPath(*parts).as_posix()!r}: {error}"
+                    ) from error
+                if observed_ns != bound_ns:
+                    raise IsoStagingSafetyError(
+                        f"The workspace changed its normalized directory time for "
+                        f"{PurePosixPath(*parts).as_posix()!r}"
+                    )
+            finally:
+                os.close(descriptor)
+    finally:
+        os.close(root_fd)
+
+
 def _validate_split_result(
     result: WimSplitResult,
     split_directory: Path,
@@ -997,6 +1154,9 @@ class IsoStagingExecutor:
             if _identity(plan.image) != plan.image_identity:
                 raise IsoStagingSafetyError("The ISO source changed during extraction")
             _verify_extracted_catalog(tree, plan.entries)
+            bound_directory_mtimes = _bind_catalog_directory_mtimes(
+                tree, plan.entries, self._check_cancelled,
+            )
 
             selected_wim_path: Path | None = None
             selected_wim_identity: WimFileIdentity | None = None
@@ -1120,6 +1280,10 @@ class IsoStagingExecutor:
                 )
                 answer_added = True
 
+            self._check_cancelled()
+            _reapply_bound_directory_mtimes(
+                tree, bound_directory_mtimes, self._check_cancelled,
+            )
             self._check_cancelled()
             progress(IsoStagingProgress("Validating staging tree", "", 0, plan.content_bytes))
             try:

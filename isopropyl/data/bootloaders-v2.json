@@ -90,6 +90,51 @@
       "sha256": "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809",
       "size": 42742,
       "allowed_hosts": []
+    },
+    {
+      "family": "uefi-shell",
+      "version": "26H1",
+      "name": "shellaa64.efi",
+      "url": "https://github.com/pbatard/UEFI-Shell/releases/download/26H1/shellaa64.efi",
+      "sha256": "1569b6db4e391c3c59194aa3319a3945efb800fb25349eb9d36ff3d258517ea6",
+      "size": 1093632,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-shell",
+      "version": "26H1",
+      "name": "shellia32.efi",
+      "url": "https://github.com/pbatard/UEFI-Shell/releases/download/26H1/shellia32.efi",
+      "sha256": "54ae3a8f58b6fe7123fd948d0773c88e8c26834e39acd3874732c96cbe7c0dd5",
+      "size": 1009408,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-shell",
+      "version": "26H1",
+      "name": "shellloongarch64.efi",
+      "url": "https://github.com/pbatard/UEFI-Shell/releases/download/26H1/shellloongarch64.efi",
+      "sha256": "d6c97ae52707ebbad4eda063cb0aefc467ec942b07461a6d6d1119cad0ac3e9c",
+      "size": 1230272,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-shell",
+      "version": "26H1",
+      "name": "shellriscv64.efi",
+      "url": "https://github.com/pbatard/UEFI-Shell/releases/download/26H1/shellriscv64.efi",
+      "sha256": "ccdb9523276d470277f7676d6534916534cd70218ea5c4cc5ac302e149f65196",
+      "size": 1522752,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-shell",
+      "version": "26H1",
+      "name": "shellx64.efi",
+      "url": "https://github.com/pbatard/UEFI-Shell/releases/download/26H1/shellx64.efi",
+      "sha256": "4ea080ddd576117cd04f5c02d16712ea5d9249c0752214d8e4055e460d7b11e0",
+      "size": 1137728,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
     }
   ],
   "bundles": [
@@ -156,6 +201,14 @@
       "artifacts": ["core.img"],
       "license": "GPL-3.0-or-later",
       "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.14"
+    },
+    {
+      "family": "uefi-shell",
+      "version": "26H1",
+      "purpose": "blank-uefi-shell",
+      "artifacts": ["shellaa64.efi", "shellia32.efi", "shellloongarch64.efi", "shellriscv64.efi", "shellx64.efi"],
+      "license": "BSD-2-Clause-Patent",
+      "provenance_url": "https://github.com/pbatard/UEFI-Shell/releases/tag/26H1"
     }
   ]
 }

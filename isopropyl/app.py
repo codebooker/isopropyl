@@ -37,8 +37,8 @@ from .casper_media import (
     probe_casper_logical_sector_size, supported_casper_profile,
 )
 from .constructed import (
-    ConstructedMediaCancelled, ConstructedMediaExecutor,
-    build_constructed_media_plan,
+    ConstructedMediaCancelled, ConstructedMediaExecutor, ConstructedMediaPlan,
+    build_constructed_media_plan, validate_constructed_media_plan,
 )
 from .devices import (
     Device, SizeUnitMode, format_size, image_is_on_device, list_devices,
@@ -91,6 +91,11 @@ from .uefi_ntfs import (
     build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
     probe_uefi_ntfs_logical_sector_size,
 )
+from .uefi_shell import (
+    UEFI_SHELL_PROVENANCE_URL, UEFI_SHELL_VERSION,
+    UefiShellCancelled, UefiShellStage, prepare_uefi_shell,
+    stage_uefi_shell, validate_uefi_shell_stage,
+)
 from .wim import (
     WimEdition, WimInfo, WimSelection, inspect_wim, validate_wim_editions,
 )
@@ -142,6 +147,18 @@ class ChecksumToken:
     operation: BackgroundPreparation
 
 
+@dataclass(frozen=True)
+class PendingUefiShell:
+    device: Device
+    workspace: tempfile.TemporaryDirectory[str]
+
+
+@dataclass(frozen=True)
+class UefiShellPreparationToken:
+    operation: BackgroundPreparation
+    pending: PendingUefiShell
+
+
 class Bridge(QObject):
     # PyQt's plain `int` maps to a signed 32-bit C++ int. Disk images routinely
     # exceed that, so keep byte counters as Python objects across threads.
@@ -156,6 +173,7 @@ class Bridge(QObject):
     windows_metadata_progress = pyqtSignal(object, object, object)
     windows_metadata_finished = pyqtSignal(object, object, object)
     uefi_preparation_finished = pyqtSignal(object, object, object)
+    uefi_shell_preparation_finished = pyqtSignal(object, object, object)
     casper_preparation_finished = pyqtSignal(object, object, object)
     device_refresh_finished = pyqtSignal(object, object)
 
@@ -190,6 +208,9 @@ class Window(QMainWindow):
         self.constructed_writer: ConstructedMediaExecutor | None = None
         self.uefi_ntfs_writer: UefiNtfsExecutor | None = None
         self.uefi_preparer: BackgroundPreparation | None = None
+        self.uefi_shell_preparer: BackgroundPreparation | None = None
+        self.uefi_shell_token: UefiShellPreparationToken | None = None
+        self.uefi_shell_workspace: tempfile.TemporaryDirectory[str] | None = None
         self.casper_preparer: BackgroundPreparation | None = None
         self.casper_stager: CasperStagingExecutor | None = None
         self.casper_writer: CasperMediaExecutor | None = None
@@ -232,6 +253,9 @@ class Window(QMainWindow):
         )
         self.bridge.uefi_preparation_finished.connect(
             self.on_uefi_preparation_finished
+        )
+        self.bridge.uefi_shell_preparation_finished.connect(
+            self.on_uefi_shell_preparation_finished
         )
         self.bridge.casper_preparation_finished.connect(
             self.on_casper_preparation_finished
@@ -392,6 +416,13 @@ class Window(QMainWindow):
         utility_options.addStretch()
         log_button = QPushButton("View log")
         log_button.clicked.connect(self.show_log)
+        self.uefi_shell_button = QPushButton("Create UEFI Shell…")
+        self.uefi_shell_button.setToolTip(
+            "Download hash-pinned upstream UEFI Shell applications and create "
+            "multi-architecture GPT/FAT32 boot media."
+        )
+        self.uefi_shell_button.clicked.connect(self.create_uefi_shell_media)
+        utility_options.addWidget(self.uefi_shell_button)
         self.tools_button = QPushButton("Drive tools…")
         self.tools_button.clicked.connect(self.show_drive_tools)
         utility_options.addWidget(self.tools_button)
@@ -627,6 +658,7 @@ class Window(QMainWindow):
                 member.size,
                 kinds.get(member.kind, EntryKind.FILE),
                 member.link_target or None,
+                member.modified_ns,
             )
             for member in self.inspection.members
         )
@@ -824,6 +856,9 @@ class Window(QMainWindow):
         self.tools_button.setEnabled(
             bool(device) and not self.operation_active and not self.device_refresh_busy
         )
+        self.uefi_shell_button.setEnabled(
+            bool(device) and not self.operation_active and not self.device_refresh_busy
+        )
         if device:
             serial = device.serial or device.wwn or "not reported"
             media_type = "Removable media" if device.removable else "External fixed disk"
@@ -851,6 +886,7 @@ class Window(QMainWindow):
             self.constructed_writer,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
+            self.uefi_shell_preparer,
             self.casper_preparer,
             self.casper_stager,
             self.casper_writer,
@@ -1167,6 +1203,8 @@ class Window(QMainWindow):
         self.constructed_writer = None
         self.uefi_ntfs_writer = None
         self.uefi_preparer = None
+        self.uefi_shell_preparer = None
+        self.uefi_shell_token = None
         self.casper_preparer = None
         self.casper_stager = None
         self.casper_writer = None
@@ -1178,6 +1216,15 @@ class Window(QMainWindow):
                 self.logger.warning("Could not remove ISO workspace: %s", error)
                 message += " Temporary workspace cleanup was incomplete."
             self.iso_workspace = None
+        if self.uefi_shell_workspace is not None:
+            try:
+                self.uefi_shell_workspace.cleanup()
+            except OSError as error:
+                self.logger.warning(
+                    "Could not remove UEFI Shell workspace: %s", error,
+                )
+                message += " Temporary UEFI Shell workspace cleanup was incomplete."
+            self.uefi_shell_workspace = None
         self.progress.setRange(0, 1000)
         self.set_busy(False)
         self.status.setText(message)
@@ -1198,6 +1245,10 @@ class Window(QMainWindow):
         )
         self.show_external.setEnabled(not busy)
         self.tools_button.setEnabled(not busy and self.selected_device() is not None)
+        self.uefi_shell_button.setEnabled(
+            not busy and self.selected_device() is not None
+            and not self.device_refresh_busy
+        )
         self.optical_button.setEnabled(not busy)
         self.settings_button.setEnabled(not busy)
         self.checksum_button.setEnabled(not busy and self.inspection is not None)
@@ -1224,6 +1275,7 @@ class Window(QMainWindow):
             self.iso_stager, self.constructed_writer,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
+            self.uefi_shell_preparer,
             self.casper_preparer, self.casper_stager, self.casper_writer,
             self.windows_wim_extractor,
             self.checksum_preparer,
@@ -1437,6 +1489,277 @@ class Window(QMainWindow):
         media_test.clicked.connect(lambda: choose(self.test_media))
         ignore.clicked.connect(lambda: choose(lambda: self.ignore_drive(device)))
         dialog.exec()
+
+    @staticmethod
+    def _cleanup_uefi_shell_pending(pending: PendingUefiShell) -> None:
+        try:
+            pending.workspace.cleanup()
+        except OSError:
+            logging.getLogger("isopropyl").warning(
+                "Could not remove rejected UEFI Shell workspace",
+                exc_info=True,
+            )
+
+    def create_uefi_shell_media(self) -> None:
+        device = self.selected_device()
+        if device is None or self.operation_active or self.device_refresh_busy:
+            return
+        if not device.removable:
+            fixed = QMessageBox.warning(
+                self,
+                "External hard drive or SSD selected",
+                "This target reports itself as a fixed disk. Confirm that it is not "
+                "a backup drive or another disk containing important data.\n\nContinue?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if fixed != QMessageBox.StandardButton.Yes:
+                return
+        consent = QMessageBox.question(
+            self,
+            "Download verified UEFI Shell applications?",
+            f"ISOpropyl will obtain the five upstream UEFI Shell {UEFI_SHELL_VERSION} "
+            "applications for x86, x64, ARM64, RISC-V64, and LoongArch64 from:\n"
+            f"{UEFI_SHELL_PROVENANCE_URL}\n\n"
+            "Every file is pinned by exact size and SHA-256, validated as the "
+            "expected EFI application, and cached only after verification. The "
+            "downloaded firmware programs are never executed on Linux.\n\n"
+            "These applications are unsigned. Secure Boot must be disabled on the "
+            "computer that boots this USB. Continue with the network request?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if consent != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            workspace = tempfile.TemporaryDirectory(prefix=".isopropyl-uefi-shell-")
+        except OSError as error:
+            QMessageBox.warning(
+                self, "UEFI Shell preparation unavailable", str(error),
+            )
+            return
+        preparer = BackgroundPreparation()
+        pending = PendingUefiShell(device, workspace)
+        token = UefiShellPreparationToken(preparer, pending)
+        self.uefi_shell_preparer = preparer
+        self.uefi_shell_token = token
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Obtaining and validating UEFI Shell applications…")
+
+        def work() -> None:
+            try:
+                prepared = prepare_uefi_shell(
+                    cancel_event=preparer.cancel_event,
+                    progress=lambda done, total: self.bridge.progress.emit(
+                        done, total, "Downloading verified UEFI Shell applications",
+                    ),
+                )
+                if preparer.cancelled:
+                    raise UefiShellCancelled("UEFI Shell preparation was cancelled")
+                stage = stage_uefi_shell(
+                    prepared,
+                    Path(workspace.name) / "ready-media",
+                    cancel_event=preparer.cancel_event,
+                )
+                validate_uefi_shell_stage(stage)
+                if preparer.cancelled:
+                    raise UefiShellCancelled("UEFI Shell preparation was cancelled")
+                plan = build_constructed_media_plan(
+                    stage.root,
+                    device,
+                    FormatPartitionTable.GPT,
+                    volume_label="UEFI_SHELL",
+                )
+                self.bridge.uefi_shell_preparation_finished.emit(
+                    token, (stage, plan), None,
+                )
+            except Exception as error:
+                self.bridge.uefi_shell_preparation_finished.emit(
+                    token, None, error,
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_uefi_shell_preparation_finished(
+        self,
+        token_object: object,
+        result: object,
+        error: object,
+    ) -> None:
+        if not isinstance(token_object, UefiShellPreparationToken):
+            return
+        token = token_object
+        if token is not self.uefi_shell_token:
+            self._cleanup_uefi_shell_pending(token.pending)
+            return
+        preparer = token.operation
+        pending = token.pending
+        self.uefi_shell_preparer = None
+        self.uefi_shell_token = None
+        self.progress.setRange(0, 1000)
+        if error is not None or preparer.cancelled:
+            self._cleanup_uefi_shell_pending(pending)
+            self.set_busy(False)
+            if preparer.cancelled:
+                message = "UEFI Shell preparation was cancelled"
+                self.logger.info(message)
+                self.status.setText(message)
+            else:
+                message = str(error)
+                self.logger.warning("UEFI Shell preparation failed: %s", message)
+                self.status.setText("UEFI Shell media is not active")
+                QMessageBox.warning(
+                    self, "UEFI Shell preparation unavailable", message,
+                )
+            return
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], UefiShellStage)
+            or not isinstance(result[1], ConstructedMediaPlan)
+        ):
+            self._cleanup_uefi_shell_pending(pending)
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "UEFI Shell preparation unavailable",
+                "The background safety check returned an invalid result.",
+            )
+            return
+        stage, plan = result
+        try:
+            validate_uefi_shell_stage(stage)
+            validate_constructed_media_plan(plan)
+        except Exception as validation_error:
+            self._cleanup_uefi_shell_pending(pending)
+            self.set_busy(False)
+            QMessageBox.warning(
+                self, "UEFI Shell preparation unavailable", str(validation_error),
+            )
+            return
+        if (
+            stage.root != Path(pending.workspace.name) / "ready-media"
+            or stage.root != plan.staging_root
+            or plan.device.identity != pending.device.identity
+            or plan.partition_table is not FormatPartitionTable.GPT
+            or plan.filesystem is not FormatFilesystem.FAT32
+            or plan.volume_label != "UEFI_SHELL"
+        ):
+            self._cleanup_uefi_shell_pending(pending)
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "UEFI Shell preparation unavailable",
+                "The prepared media plan no longer matches the selected target.",
+            )
+            return
+        self._confirm_and_write_uefi_shell(pending, stage, plan)
+
+    def _confirm_and_write_uefi_shell(
+        self,
+        pending: PendingUefiShell,
+        stage: UefiShellStage,
+        plan: ConstructedMediaPlan,
+    ) -> None:
+        device = pending.device
+        confirmation = QDialog(self)
+        confirmation.setObjectName("uefiShellConfirmationDialog")
+        confirmation.setWindowTitle("Final UEFI Shell media confirmation")
+        confirmation.setMinimumWidth(680)
+        layout = QVBoxLayout(confirmation)
+        warning = QLabel(
+            "ALL DATA ON THIS TARGET WILL BE ERASED\n\n"
+            f"{self.display_device(device)}\n"
+            f"Path: {device.path}\n"
+            f"Serial: {device.serial or device.wwn or 'not reported'}\n\n"
+            f"Layout: GPT / FAT32 / UEFI_SHELL\n"
+            f"Payloads: {', '.join(stage.architectures)}\n"
+            "Read-back verification: every copied file\n"
+            "Secure Boot: must be disabled; these upstream applications are unsigned."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
+        layout.addWidget(warning)
+        phrase_text = f"WRITE {device.path}"
+        instruction = QLabel(f"Type {phrase_text} to enable the write button.")
+        layout.addWidget(instruction)
+        phrase = QLineEdit()
+        phrase.setObjectName("uefiShellConfirmationPhrase")
+        phrase.setPlaceholderText(phrase_text)
+        layout.addWidget(phrase)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        start = buttons.addButton(
+            "Write UEFI Shell", QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        start.setObjectName("uefiShellWriteButton")
+        start.setEnabled(False)
+        phrase.textChanged.connect(
+            lambda value: start.setEnabled(value == phrase_text)
+        )
+        start.clicked.connect(confirmation.accept)
+        buttons.rejected.connect(confirmation.reject)
+        layout.addWidget(buttons)
+        if confirmation.exec() != QDialog.DialogCode.Accepted:
+            self._cleanup_uefi_shell_pending(pending)
+            self.set_busy(False)
+            self.status.setText("UEFI Shell media is not active")
+            return
+
+        self.uefi_shell_workspace = pending.workspace
+        self.constructed_writer = ConstructedMediaExecutor()
+        self.set_busy(True)
+        self.progress.setValue(0)
+        self.status.setText("Writing verified UEFI Shell media…")
+        self.logger.info(
+            "Confirmed UEFI Shell write: target=%s identity=%s architectures=%s",
+            device.path, device.identity, stage.architectures,
+        )
+
+        def work() -> None:
+            try:
+                assert self.constructed_writer is not None
+                result = self.constructed_writer.execute(
+                    plan,
+                    lambda update: self.bridge.progress.emit(
+                        update.bytes_done,
+                        update.total_bytes,
+                        update.stage + (
+                            f" · {update.relative_path}"
+                            if update.relative_path else ""
+                        ),
+                    ),
+                )
+                if result.powered_off:
+                    message = (
+                        "The multi-architecture UEFI Shell USB is ready and safely "
+                        "powered off. Disable Secure Boot before using it."
+                    )
+                elif not result.unmounted:
+                    detail = (
+                        result.cleanup_diagnostic + " "
+                        if result.cleanup_diagnostic else ""
+                    )
+                    message = (
+                        "UEFI Shell media was written but could not be cleanly "
+                        f"unmounted. {detail}Eject it with your desktop before removal."
+                    )
+                else:
+                    message = (
+                        "The multi-architecture UEFI Shell USB is ready. Eject it "
+                        "with your desktop before removal and disable Secure Boot "
+                        "before using it."
+                    )
+                self.bridge.finished.emit(True, message)
+            except ConstructedMediaCancelled as operation_error:
+                self.logger.info("UEFI Shell write cancelled: %s", operation_error)
+                self.bridge.finished.emit(False, str(operation_error))
+            except Exception as operation_error:
+                self.logger.exception("UEFI Shell write failed")
+                self.bridge.finished.emit(False, str(operation_error))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def save_optical_disc(self) -> None:
         if self.operation_active:
@@ -2699,6 +3022,7 @@ class Window(QMainWindow):
             ArchiveEntry(
                 member.path, member.size, kind.get(member.kind, EntryKind.FILE),
                 member.link_target or None,
+                member.modified_ns,
             )
             for member in self.inspection.members
         ]

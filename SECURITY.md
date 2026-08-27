@@ -76,6 +76,17 @@ issue requesting a private contact channel without disclosing the vulnerability.
   copies through an independently identity-bound plan. It supports either one
   FAT32 partition or an exact NTFS plus raw UEFI:NTFS helper layout on
   512-byte-logical-sector media.
+- ISO/UDF modification times are untrusted metadata. ISOpropyl accepts only a
+  conservative timezone-safe FAT-compatible UTC range from the bounded catalog,
+  carries the value in the catalog digest, and applies file and explicit-directory
+  times only through already-open no-follow descriptors. Directories are applied
+  after their descendants and restored after private WIM/customization mutations.
+  A coarse temporary workspace may normalize by less than FAT's two-second tick;
+  the first observed value is then identity-bound and carried forward. Every
+  staging time is checked for portable representability before a target changes.
+  The destination may normalize by less than its FAT32 or NTFS tick, after which
+  read-back must match the observed value exactly. Link times, ownership,
+  permissions, and other archive attributes are never imported.
 - DD, constructed-media, backup, optical-capture, formatting, erasure, and media
   test workers bound retained diagnostic output. Newly audited formatting,
   UEFI:NTFS, WIM, and persistence paths time-bound their local command wrappers
@@ -83,7 +94,9 @@ issue requesting a private contact channel without disclosing the vulnerability.
   helper remains the stronger process-control boundary.
 - The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
   dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
-  2.06/2.12/2.14 blank-media research bundles. It records immutable upstream
+  2.06/2.12/2.14 blank-media research bundles, plus the exact upstream UEFI
+  Shell 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 release set. It records
+  immutable upstream
   URLs, exact length, SHA-256, purpose-specific bundle membership, license, and
   provenance. Generic bundle preparation has cancellation, aggregate progress,
   a shared connection/download/cache-read/binding deadline, exact-version
@@ -91,8 +104,17 @@ issue requesting a private contact channel without disclosing the vulnerability.
   no-follow, the parent pathname is revalidated against its bound descriptor,
   and every stable singly linked regular file is rehashed and frozen as immutable
   bytes. GRUB entries never satisfy a detected-image dependency. No production
-  BIOS executor consumes these bundles,
-  no downloaded executable or script runs, and version-prefix fallback is
+  BIOS executor consumes these bundles. The UEFI Shell backend independently
+  rechecks the five exact hashes and sizes, PE architecture, EFI application
+  subsystem, and unchanged unsigned state before it can create a new mode-0700
+  private staging tree. It writes canonical fallback names through no-follow,
+  exclusive descriptors, handles short writes, and returns a manifest only
+  after an exact descriptor-based hash/identity pass. Its GUI requires explicit
+  network consent, hands only the bound private tree and selected target to the
+  constructed-media planner, and requires the exact displayed `WRITE /dev/…`
+  phrase before its GPT/FAT32 write. Every copied file is read back. The upstream
+  Shell files are unsigned and require Secure Boot disabled. No downloaded
+  executable or script runs on Linux, and version-prefix fallback is
   forbidden. The working UEFI:NTFS path separately requires explicit consent;
   its resolver restricts HTTPS origins and redirects, checks exact length and
   SHA-256, publishes the cache atomically, and verifies it again before every

@@ -8,6 +8,7 @@ import threading
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import isopropyl.iso_staging as iso_staging
 from isopropyl.extraction import (
@@ -36,6 +37,7 @@ from isopropyl.iso_staging import (
     build_iso_staging_plan,
     validate_iso_staging_plan,
 )
+from isopropyl.timestamps import TimestampPreservationError
 from isopropyl.wim import (
     DEFAULT_SPLIT_PART_MIB,
     WimCancelled,
@@ -158,10 +160,13 @@ class FakeExtractor:
             raise self.error
         plan.destination.mkdir()
         files = directories = done = 0
+        directory_mtimes = []
         for entry in plan.entries:
             path = plan.destination.joinpath(*Path(entry.path).parts)
             if entry.kind is EntryKind.DIRECTORY:
                 path.mkdir(parents=True, exist_ok=True)
+                if entry.modified_ns is not None:
+                    directory_mtimes.append((path, entry.modified_ns))
                 directories += 1
             elif entry.kind is EntryKind.FILE:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,8 +177,14 @@ class FakeExtractor:
                 progress(ExtractionProgress(
                     entry.path, entry.size, entry.size, done, plan.content_bytes,
                 ))
+                if entry.modified_ns is not None:
+                    os.utime(path, ns=(entry.modified_ns, entry.modified_ns))
             else:
                 raise AssertionError("test extractor only supports regular catalogs")
+        for path, modified_ns in sorted(
+            directory_mtimes, key=lambda item: len(item[0].parts), reverse=True,
+        ):
+            os.utime(path, ns=(modified_ns, modified_ns))
         if self.mutate:
             self.mutate(plan.destination, plan.image)
         return ExtractionResult(plan.destination, files, directories, 0, done)
@@ -285,6 +296,13 @@ class IsoStagingTests(unittest.TestCase):
             self.assertIsNone(plan.autounattend_xml)
             with self.assertRaises(FrozenInstanceError):
                 plan.catalog_digest = "0" * 64  # type: ignore[misc]
+            forged_entries = tuple(
+                replace(entry, modified_ns=1_709_210_096_000_000_000)
+                if entry.path == "README.txt" else entry
+                for entry in plan.entries
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "catalog binding"):
+                validate_iso_staging_plan(replace(plan, entries=forged_entries))
 
     def test_success_atomically_publishes_constructed_media_staging(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -389,7 +407,12 @@ class IsoStagingTests(unittest.TestCase):
     def test_splits_install_wim_privately_and_publishes_only_verified_swm_parts(self):
         with tempfile.TemporaryDirectory(dir=LARGE_TEMP_PARENT) as directory:
             root = Path(directory)
-            entries = windows_entries()
+            source_directory_time = 1_709_210_096_123_456_789
+            entries = tuple(
+                replace(entry, modified_ns=source_directory_time)
+                if entry.path == "sources" else entry
+                for entry in windows_entries()
+            )
             plan = self.make_plan(
                 root, entries,
                 wimlib_resolver=lambda: WIMLIB,
@@ -408,7 +431,66 @@ class IsoStagingTests(unittest.TestCase):
             self.assertFalse((result.destination / "sources/install.wim").exists())
             self.assertTrue((result.destination / "sources/install.swm").is_file())
             self.assertTrue((result.destination / "sources/install2.swm").is_file())
+            self.assertEqual(
+                (result.destination / "sources").stat().st_mtime_ns,
+                source_directory_time,
+            )
             self.assertEqual(len(splitter.calls), 1)
+            self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_wim_transform_restores_first_observed_normalized_directory_time(self):
+        with tempfile.TemporaryDirectory(dir=LARGE_TEMP_PARENT) as directory:
+            root = Path(directory)
+            requested = 1_709_210_096_987_654_321
+            normalized = requested - 1_500_000_000
+            entries = tuple(
+                replace(entry, modified_ns=requested)
+                if entry.path == "sources" else entry
+                for entry in windows_entries()
+            )
+            plan = self.make_plan(
+                root, entries, wimlib_resolver=lambda: WIMLIB,
+            )
+
+            def normalize_directory(tree: Path, _image: Path) -> None:
+                sources = tree / "sources"
+                os.utime(sources, ns=(normalized, normalized))
+
+            result = IsoStagingExecutor(
+                extractor=FakeExtractor(mutate=normalize_directory),
+                wim_splitter=FakeSplitter(),
+                split_plan_builder=fake_split_plan,
+            ).execute(plan)
+
+            self.assertEqual(
+                (result.destination / "sources").stat().st_mtime_ns,
+                normalized,
+            )
+
+    def test_post_transform_directory_timestamp_failure_cleans_private_work(self):
+        with tempfile.TemporaryDirectory(dir=LARGE_TEMP_PARENT) as directory:
+            root = Path(directory)
+            entries = tuple(
+                replace(entry, modified_ns=1_709_210_096_000_000_000)
+                if entry.path == "sources" else entry
+                for entry in windows_entries()
+            )
+            plan = self.make_plan(
+                root, entries, wimlib_resolver=lambda: WIMLIB,
+            )
+            with (
+                patch(
+                    "isopropyl.iso_staging.apply_descriptor_mtime",
+                    side_effect=TimestampPreservationError("timestamp fixture"),
+                ),
+                self.assertRaisesRegex(IsoStagingSafetyError, "directory time"),
+            ):
+                IsoStagingExecutor(
+                    extractor=FakeExtractor(),
+                    wim_splitter=FakeSplitter(),
+                    split_plan_builder=fake_split_plan,
+                ).execute(plan)
+            self.assertFalse(plan.destination.exists())
             self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
 
     def test_rejects_existing_split_part_collision_before_extraction(self):
