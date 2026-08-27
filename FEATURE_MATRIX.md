@@ -23,11 +23,11 @@ Status meanings:
 | Raw `.img`/DD writing | **Done** | Identity-bound whole-device writing, cancellation, progress, optional byte read-back verification, and power-off. |
 | Bootable hybrid ISO writing | **Done** | DD mode preserves the supplied disk layout; non-hybrid optical ISOs receive a warning. |
 | Rufus-style ISO extraction mode | **Partial** | Reachable UEFI-only GPT/FAT32 and GPT/NTFS+UEFI:NTFS paths safely stage, format, copy, and SHA-256 read-back verify every file; the raw helper receives a separate full read-back check. BIOS, dual firmware, links, and embedded El Torito images remain. |
-| Restore USB as ordinary storage | **Done** | MBR/GPT plus FAT32, exFAT, NTFS, ext2, ext3, or ext4 with label validation and identity rechecks. |
-| FAT/FAT32 formatting | **Partial** | FAT32 ships; FAT12/FAT16 and expert cluster-size controls do not. |
+| Restore USB as ordinary storage | **Done** | MBR/GPT plus FAT12, FAT16, FAT32, exFAT, NTFS, UDF 2.01, ext2, ext3, or ext4 with filesystem-specific label validation, logical-sector binding where required, and identity rechecks. |
+| FAT/FAT32 formatting | **Partial** | Explicit FAT12/FAT16/FAT32 creation ships with conservative size and geometry envelopes; expert cluster-size controls remain. |
 | NTFS and exFAT formatting | **Done** | Available in the separate restore workflow through trusted system mkfs tools. |
 | ext2/ext3/ext4 formatting | **Done** | All three are exposed in the separate restore workflow through their exact trusted `mkfs.ext*` tools, with MBR/GPT Linux partition types and 16-byte label validation. |
-| UDF formatting | **Planned** | Useful for UDF image/export workflows; not present. |
+| UDF formatting | **Done** | Single-partition UDF 2.01 restore uses trusted `mkudffs`, bounded label/size/sector validation, and repeated geometry checks. Partitioned UDF is generally not auto-mounted by macOS. |
 | ReFS formatting | **Inapplicable** | No mature supported native Linux creation stack. |
 | Super-floppy layout | **Research** | Whole-device filesystem compatibility needs an explicit hardware matrix. |
 | Removable USB/SD/card readers | **Partial** | USB/MMC removable devices are recognized; broad reader/SDXC certification is not claimed. |
@@ -40,7 +40,7 @@ Status meanings:
 | Direct WIM/ESD input | **Planned** | Explicitly rejected; belongs to Windows To Go/apply, never raw DD. |
 | Windows installer ISO | **Partial** | UEFI/FAT32 and UEFI:NTFS construction, WIM split, WIM/ESD edition/index selection, and answer-file injection ship; BIOS/dual construction and hardware certification remain. |
 | Save drive as raw image | **Done** | Exact-length privileged read to a new, atomically published user file with cancellation and free-space checks. |
-| Save drive as VHD/VHDX/FFU | **Planned** | Raw capture plus verified conversion/metadata policy remains. |
+| Save drive as VHD/VHDX/FFU | **Partial** | VHD and VHDX ship: a private exact raw capture is converted by identity-bound `qemu-img`, exact virtual size and safe metadata are checked, guest-visible contents are compared, and the result is atomically published without overwrite. FFU remains planned. |
 | Save optical disc as ISO | **Done** | Read-only sector capture with source identity, size/free-space checks, cancellation, and atomic publication. |
 | Save USB/VHD as UDF ISO | **Planned** | Separate authoring workflow not implemented. |
 | Linux persistence | **Partial** | A hardened executor transforms a recognized UEFI GRUB line only in private staging, creates an exact up-front GPT/FAT32 + ext4 `writable` layout on 512- or 4096-byte logical sectors, formats both filesystems before copying, revalidates complete source/target/partition identities around every destructive boundary, and read-back verifies data files. Guarded GUI plumbing exists for candidate remasters whose catalog exposes a recognized GRUB config path; private staging performs the final eligible-line check before any target change. Current official Ubuntu 20.04.6/22.04.5/24.04.3 desktop catalogs do not expose that path (24.04 also changed squashfs layout), so they correctly receive no persistence control. Embedded-config support, broader profiles, and physical certification remain. |
@@ -113,20 +113,20 @@ Status meanings:
 | Show USB hard drives/SSDs | **Done** | Visible explicit opt-in; root/internal disks remain excluded. |
 | Partition scheme selector | **Partial** | MBR/GPT available for restore; current ISO profile fixes GPT. |
 | Target firmware selector | **Partial** | Planner models automatic/BIOS/UEFI/both; GUI executes explicit UEFI-only. |
-| Filesystem selector | **Partial** | Restore offers FAT32/exFAT/NTFS/ext2/ext3/ext4; ISO mode automatically selects FAT32 or NTFS+UEFI:NTFS from image constraints rather than exposing an unsafe arbitrary choice. |
+| Filesystem selector | **Partial** | Restore offers FAT12/FAT16/FAT32/exFAT/NTFS/UDF/ext2/ext3/ext4; ISO mode automatically selects FAT32 or NTFS+UEFI:NTFS from image constraints rather than exposing an unsafe arbitrary choice. |
 | Cluster-size selector | **Planned** | Must be constrained by filesystem and boot profile. |
 | Volume label | **Done** | Filesystem-specific validation in restore; ISO mode uses `ISOPROPYL`. |
 | Quick format | **Done** | Restore and ISO construction use quick mkfs; full zero is separate. |
 | Persistence-size slider | **Partial** | The capacity-bounded aligned control and transaction wiring ship, but it appears only for a candidate remastered Ubuntu profile with an exposed recognized UEFI GRUB config path; final private staging validates its contents. Current official Ubuntu desktop media correctly remain ineligible pending embedded-config support. |
 | ISO mode versus DD mode | **Done** | The main screen exposes both executable choices, recommends from inspected image evidence, names compatibility limits, resets on a new image, re-plans against the selected target at dispatch, and never silently falls back. ISO mode forces verification. |
 | Image checksums | **Done** | Dedicated dialog with copy and strict compare. |
-| Save-drive action | **Done** | Separate read-only source workflow. |
+| Save-drive action | **Done** | Separate read-only raw/VHD/VHDX workflow with conservative free-space checks and no-overwrite publication. |
 | Progress, speed, ETA, cancellation | **Done** | 64-bit counters, stage-aware rolling rate/ETA, cross-thread cancellation. |
 | Recoverable I/O retries | **Planned** | Never retry identity changes or ambiguous device failures. |
 | Activity log | **Done** | Rotating local log with copy and diagnostics export. |
 | Privacy-conscious diagnostics | **Done** | Sensitive identifiers, mount paths, member lists, and log require explicit opt-in. |
 | Dark/light appearance | **Done** | Persistent palettes. System/high-contrast following remains polish. |
-| Settings persistence/reset | **Done** | Appearance and denylist persist; risky visibility/confirmations reset; full reset ships. |
+| Settings persistence/reset | **Done** | Appearance, display-unit family, and denylist persist; risky visibility/confirmations reset; full reset ships. |
 | Keyboard shortcuts | **Done** | Open, refresh, log, cancel. |
 | Command-line image argument | **Done** | Installed entry point and working-tree launcher accept one path. |
 | Drag-and-drop | **Done** | One local regular image while idle. |
@@ -135,7 +135,7 @@ Status meanings:
 | Portable settings | **Planned** | Needed for AppImage-style distribution. |
 | ZIP overlay | **Planned** | Must reuse no-traversal/collision validation. |
 | Preserve extracted timestamps | **Planned** | Not guaranteed by the current per-member safe extractor. |
-| Decimal/binary unit preference | **Planned** | Current display is fixed. |
+| Decimal/binary unit preference | **Done** | Settings switches dynamic capacities, progress, rates, estimates, confirmations, and device labels between SI MB/GB/TB and IEC MiB/GiB/TiB. |
 | Old-BIOS fixes | **Research** | Requires precise Linux equivalents and real hardware fixtures. |
 
 ## Advanced modes and platform decisions

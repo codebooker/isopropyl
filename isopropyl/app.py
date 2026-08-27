@@ -23,7 +23,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .backup import DriveImager
+from .backup import (
+    DriveImager, VirtualDriveImager, validate_virtual_backup_destination,
+    virtual_backup_required_space,
+)
 from .bootloaders import delete_cached_artifacts, inventory_cache
 from .casper_media import (
     CasperMediaCancelled, CasperMediaExecutor, CasperStagingExecutor,
@@ -35,16 +38,21 @@ from .constructed import (
     build_constructed_media_plan,
 )
 from .devices import (
-    Device, format_size, image_is_on_device, list_devices, path_is_on_device,
+    Device, SizeUnitMode, format_size, image_is_on_device, list_devices,
+    path_is_on_device,
 )
 from .diagnostics import build_diagnostics, write_diagnostics
-from .erase import EraseCancelled, EraseMode, EraseRunner, build_erase_plan
+from .erase import (
+    QUICK_BOUNDARY_BYTES, EraseCancelled, EraseMode, EraseRunner,
+    build_erase_plan,
+)
 from .extraction import (
     ExtractionCancelled, SafeIsoExtractor, build_extraction_plan,
 )
 from .formatting import (
     Filesystem as FormatFilesystem, FormatCancelled, FormatExecutor,
     PartitionTable as FormatPartitionTable, create_format_plan,
+    restore_filesystem_size_supported,
 )
 from .images import (
     ImageInspection, calculate_checksums, compare_expected_checksum, inspect_image,
@@ -73,7 +81,7 @@ from .persistence import (
 from .writer import ImageWriter, WriteCancelled
 from .virtual import VirtualConversionCancelled, VirtualDiskStager, inspect_virtual_disk
 from .uefi_ntfs import (
-    BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
+    UEFI_NTFS_SIZE, BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
     build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
     probe_uefi_ntfs_logical_sector_size,
 )
@@ -139,7 +147,7 @@ class Window(QMainWindow):
         self.checksum_busy = False
         self.devices: list[Device] = []
         self.writer: ImageWriter | None = None
-        self.imager: DriveImager | None = None
+        self.imager: DriveImager | VirtualDriveImager | None = None
         self.formatter: FormatExecutor | None = None
         self.media_runner: MediaTestRunner | None = None
         self.eraser: EraseRunner | None = None
@@ -161,6 +169,12 @@ class Window(QMainWindow):
         self.windows_wim_editions: tuple[WimEdition, ...] = ()
         self.windows_wim_error = ""
         self.settings = QSettings("codebooker", "ISOpropyl")
+        try:
+            self.size_unit_mode = SizeUnitMode(
+                str(self.settings.value("size_units", SizeUnitMode.SI.value))
+            )
+        except ValueError:
+            self.size_unit_mode = SizeUnitMode.SI
         self.progress_estimator = ProgressEstimator()
         self.logger = logging.getLogger("isopropyl")
         self.bridge = Bridge()
@@ -190,6 +204,35 @@ class Window(QMainWindow):
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.show_log)
         QShortcut(QKeySequence.StandardKey.Cancel, self, activated=self.cancel)
         self.refresh_devices()
+
+    def display_size(self, size: int | float) -> str:
+        return format_size(size, self.size_unit_mode)
+
+    def display_device(self, device: Device) -> str:
+        return device.display_label(self.size_unit_mode)
+
+    def refresh_size_labels(self) -> None:
+        for index, device in enumerate(self.devices):
+            self.device_combo.setItemText(index, self.display_device(device))
+        if self.image is not None:
+            try:
+                if self.inspection is not None and self.inspection.compression != "none":
+                    text = (
+                        f"{self.image.name}  ·  "
+                        f"{self.display_size(self.inspection.size)} expanded"
+                    )
+                elif self.inspection is not None and self.inspection.virtual_format:
+                    text = (
+                        f"{self.image.name}  ·  "
+                        f"{self.display_size(self.inspection.size)} virtual "
+                        f"({self.display_size(self.inspection.container_size)} container)"
+                    )
+                else:
+                    text = f"{self.image.name}  ·  {self.display_size(self.image.stat().st_size)}"
+                self.image_label.setText(text)
+            except OSError:
+                pass
+        self.on_persistence_changed()
 
     def build_ui(self) -> None:
         root = QWidget(objectName="root")
@@ -251,7 +294,7 @@ class Window(QMainWindow):
         self.persistence_slider.setValue(4 * 1024)
         self.persistence_slider.setSingleStep(256)
         self.persistence_slider.setPageStep(1024)
-        self.persistence_size_label = QLabel("4.0 GiB")
+        self.persistence_size_label = QLabel(self.display_size(4 * 1024**3))
         self.persistence_size_label.setObjectName("muted")
         self.persistence_size_label.setMinimumWidth(72)
         persistence_layout.addWidget(self.persistence_checkbox)
@@ -317,9 +360,9 @@ class Window(QMainWindow):
         self.optical_button = QPushButton("Save optical disc…")
         self.optical_button.clicked.connect(self.save_optical_disc)
         utility_options.addWidget(self.optical_button)
-        settings_button = QPushButton("Settings…")
-        settings_button.clicked.connect(self.show_settings)
-        utility_options.addWidget(settings_button)
+        self.settings_button = QPushButton("Settings…")
+        self.settings_button.clicked.connect(self.show_settings)
+        utility_options.addWidget(self.settings_button)
         utility_options.addWidget(log_button)
         options.addLayout(utility_options)
         layout.addLayout(options)
@@ -397,7 +440,9 @@ class Window(QMainWindow):
         self.write_method_reason.setText(
             "ISOpropyl will recommend a method after inspecting the image."
         )
-        self.image_label.setText(f"{path.name}  ·  {format_size(path.stat().st_size)}")
+        self.image_label.setText(
+            f"{path.name}  ·  {self.display_size(path.stat().st_size)}"
+        )
         self.image_label.setToolTip(str(path))
         self.image_detail.setText("DD mode · Inspecting image layout…")
         self.checksum_button.setEnabled(False)
@@ -472,7 +517,7 @@ class Window(QMainWindow):
                 ", ".join(device.path for device in self.devices) or "none",
             )
             for device in self.devices:
-                self.device_combo.addItem(device.label)
+                self.device_combo.addItem(self.display_device(device))
             if not self.devices:
                 self.device_combo.addItem("No removable drives found")
             elif previous_key is not None:
@@ -578,8 +623,7 @@ class Window(QMainWindow):
     def on_persistence_changed(self, _value: object = None) -> None:
         value_mib = self.persistence_slider.value()
         self.persistence_size_label.setText(
-            f"{value_mib / 1024:.1f} GiB"
-            if value_mib >= 1024 else f"{value_mib} MiB"
+            self.display_size(value_mib * ALIGNMENT_BYTES)
         )
         self.persistence_slider.setEnabled(
             not self.persistence_controls.isHidden()
@@ -783,7 +827,7 @@ class Window(QMainWindow):
                 return
         answer = QMessageBox.warning(
             self, "Erase removable drive?",
-            f"Everything on {device.label} will be permanently erased.\n\n"
+            f"Everything on {self.display_device(device)} will be permanently erased.\n\n"
             f"Image: {self.image.name}\nMethod: DD mode · exact byte-for-byte copy\n"
             f"Layout: {self.inspection.layout}\n"
             f"Target: {device.path}\nSerial: {device.serial or device.wwn or 'not reported'}\n\n"
@@ -917,10 +961,10 @@ class Window(QMainWindow):
         self.progress.setValue(round(snapshot.fraction * 1000))
         details = (
             f"{stage}… {snapshot.fraction:.0%}  ·  "
-            f"{format_size(snapshot.done)} of {format_size(snapshot.total)}"
+            f"{self.display_size(snapshot.done)} of {self.display_size(snapshot.total)}"
         )
         if snapshot.bytes_per_second:
-            details += f"  ·  {format_size(snapshot.bytes_per_second)}/s"
+            details += f"  ·  {self.display_size(snapshot.bytes_per_second)}/s"
         if snapshot.eta_seconds is not None:
             details += f"  ·  {format_duration(snapshot.eta_seconds)} remaining"
         self.status.setText(details)
@@ -971,6 +1015,7 @@ class Window(QMainWindow):
         self.show_external.setEnabled(not busy)
         self.tools_button.setEnabled(not busy and self.selected_device() is not None)
         self.optical_button.setEnabled(not busy)
+        self.settings_button.setEnabled(not busy)
         self.checksum_button.setEnabled(not busy and self.inspection is not None)
         self.windows_button.setEnabled(
             not busy and bool(self.inspection and self.inspection.has_windows_installer)
@@ -1020,13 +1065,41 @@ class Window(QMainWindow):
         device = self.selected_device()
         if not device or self.operation_active:
             return
-        filename, _ = QFileDialog.getSaveFileName(
+        raw_filter = "Raw disk image (*.img)"
+        vhd_filter = "Virtual PC disk (*.vhd)"
+        vhdx_filter = "Hyper-V virtual disk (*.vhdx)"
+        filename, selected_filter = QFileDialog.getSaveFileName(
             self, "Save removable drive as an image", f"{Path.home() / 'drive-backup.img'}",
-            "Raw disk image (*.img);;All files (*)",
+            ";;".join((raw_filter, vhd_filter, vhdx_filter)),
         )
         if not filename:
             return
         destination = Path(filename)
+        expected_suffix = {
+            raw_filter: ".img", vhd_filter: ".vhd", vhdx_filter: ".vhdx",
+        }.get(selected_filter)
+        recognized_suffixes = {".img", ".vhd", ".vhdx"}
+        if expected_suffix is None:
+            expected_suffix = (
+                destination.suffix.casefold()
+                if destination.suffix.casefold() in recognized_suffixes
+                else ".img"
+            )
+        if destination.suffix.casefold() in recognized_suffixes:
+            if destination.suffix.casefold() != expected_suffix:
+                destination = destination.with_suffix(expected_suffix)
+        else:
+            destination = destination.with_name(destination.name + expected_suffix)
+        virtual = expected_suffix in {".vhd", ".vhdx"}
+        output_name = {
+            ".img": "raw disk image", ".vhd": "VHD", ".vhdx": "VHDX",
+        }[expected_suffix]
+        if virtual:
+            try:
+                validate_virtual_backup_destination(device.size, destination)
+            except Exception as error:
+                QMessageBox.warning(self, "Virtual backup unavailable", str(error))
+                return
         if path_is_on_device(str(destination), device):
             QMessageBox.critical(
                 self, "Choose another destination",
@@ -1039,25 +1112,38 @@ class Window(QMainWindow):
         except OSError as error:
             QMessageBox.critical(self, "Destination unavailable", str(error))
             return
-        if free < device.size:
+        required_space = (
+            virtual_backup_required_space(device.size) if virtual else device.size
+        )
+        if free < required_space:
             QMessageBox.critical(
                 self, "Not enough free space",
-                f"A complete image needs {format_size(device.size)}, but the destination "
-                f"has only {format_size(free)} available.",
+                f"A safe {output_name} backup needs "
+                f"{self.display_size(required_space)}, but the "
+                f"destination has only {self.display_size(free)} available.",
             )
             return
+        if virtual:
+            workflow = (
+                "ISOpropyl will first make a private exact raw capture, convert it, "
+                "verify the virtual disk's complete guest-visible contents, and only "
+                "then publish the result. The temporary capture and conversion can "
+                f"need up to {self.display_size(required_space)} of free space."
+            )
+        else:
+            workflow = "ISOpropyl will save an exact raw, sector-for-sector image."
         answer = QMessageBox.question(
             self, "Save complete drive image?",
-            f"ISOpropyl will unmount and read all {format_size(device.size)} from:\n"
-            f"{device.label}\n\nand save a raw image to:\n{destination}\n\n"
-            "The source drive will not be modified.",
+            f"ISOpropyl will unmount and read all {self.display_size(device.size)} from:\n"
+            f"{self.display_device(device)}\n\nand save a {output_name} to:\n"
+            f"{destination}\n\n{workflow}\n\nThe source drive will not be modified.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         identity = device.identity
-        self.imager = DriveImager()
+        self.imager = VirtualDriveImager() if virtual else DriveImager()
         self.set_busy(True)
         self.progress.setValue(0)
         self.status.setText("Preparing drive backup…")
@@ -1072,13 +1158,31 @@ class Window(QMainWindow):
                     raise RuntimeError(
                         "The selected drive changed or was disconnected. Refresh and try again."
                     )
+                current_device = matches[0]
+                if path_is_on_device(str(destination), current_device):
+                    raise RuntimeError(
+                        "The backup destination moved onto the drive being imaged. "
+                        "Choose a destination on another disk."
+                    )
                 assert self.imager is not None
-                self.imager.backup(
-                    device, destination,
-                    lambda done, total: self.bridge.progress.emit(done, total, "Saving drive"),
-                    sparse=False,
+                if virtual:
+                    self.imager.backup(
+                        current_device, destination,
+                        lambda done, total: self.bridge.progress.emit(
+                            done, total, "Capturing, converting, and verifying drive"
+                        ),
+                    )
+                else:
+                    self.imager.backup(
+                        current_device, destination,
+                        lambda done, total: self.bridge.progress.emit(
+                            done, total, "Saving drive"
+                        ),
+                        sparse=False,
+                    )
+                self.bridge.finished.emit(
+                    True, f"{output_name} backup saved to {destination}"
                 )
-                self.bridge.finished.emit(True, f"Drive image saved to {destination}")
             except WriteCancelled as error:
                 self.bridge.finished.emit(False, str(error))
             except Exception as error:
@@ -1095,10 +1199,10 @@ class Window(QMainWindow):
         dialog.setWindowTitle("Drive tools")
         dialog.setMinimumWidth(500)
         layout = QVBoxLayout(dialog)
-        title = QLabel(device.label)
+        title = QLabel(self.display_device(device))
         title.setObjectName("cardTitle")
         layout.addWidget(title)
-        save = QPushButton("Save complete drive as a raw image…")
+        save = QPushButton("Save complete drive as an image…")
         save.setToolTip("Read-only backup; the source drive is not modified")
         restore = QPushButton("Restore as an empty data drive…")
         restore.setToolTip("Erases the drive and creates one new filesystem")
@@ -1171,7 +1275,7 @@ class Window(QMainWindow):
             label = device.label or "unlabelled disc"
             source.addItem(
                 f"{name or 'Optical drive'} · {device.path} · {label} · "
-                f"{format_size(device.size)}",
+                f"{self.display_size(device.size)}",
                 device,
             )
         choose_layout.addWidget(source)
@@ -1202,7 +1306,7 @@ class Window(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Capture this optical disc?",
-            f"Read {format_size(plan.readable_bytes)} from {device.path}\n"
+            f"Read {self.display_size(plan.readable_bytes)} from {device.path}\n"
             f"Label: {device.label or 'not reported'}\n\n"
             f"Save a new ISO to:\n{plan.destination}\n\n"
             "The disc is not modified, and ISOpropyl will not overwrite an existing file.",
@@ -1258,7 +1362,8 @@ class Window(QMainWindow):
             return
         answer = QMessageBox.question(
             self, "Hide this drive?",
-            f"Hide {device.label} from ISOpropyl's destination list on future connections?\n\n"
+            f"Hide {self.display_device(device)} from ISOpropyl's destination list "
+            "on future connections?\n\n"
             "You can clear the ignored-drive list under Settings.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
@@ -1266,7 +1371,12 @@ class Window(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         ignored = self.ignored_devices()
-        ignored[device.stable_id] = device.label
+        name = " ".join(
+            part for part in (device.vendor, device.model) if part
+        ).strip() or "USB drive"
+        # Persist an identity-oriented description, not a size rendered using
+        # the display-unit preference that happened to be active at this time.
+        ignored[device.stable_id] = f"{name} · {device.path}"
         self.settings.setValue("ignored_devices", json.dumps(ignored, sort_keys=True))
         self.logger.info("Added device to safety denylist: %s", device.stable_id)
         self.refresh_devices()
@@ -1287,13 +1397,43 @@ class Window(QMainWindow):
         layout.addWidget(notice)
         layout.addWidget(QLabel("Filesystem"))
         filesystem = QComboBox()
-        filesystem.addItem("FAT32 — widest device compatibility", FormatFilesystem.FAT32)
-        filesystem.addItem("exFAT — large files and cross-platform use", FormatFilesystem.EXFAT)
-        filesystem.addItem("NTFS — Windows-focused", FormatFilesystem.NTFS)
-        filesystem.addItem("ext2 — legacy Linux compatibility", FormatFilesystem.EXT2)
-        filesystem.addItem("ext3 — journaled legacy Linux", FormatFilesystem.EXT3)
-        filesystem.addItem("ext4 — Linux-focused", FormatFilesystem.EXT4)
+        filesystem_choices = (
+            (
+                "FAT12 — tiny legacy media (up to "
+                f"{self.display_size(256 * 1024**2)})",
+                FormatFilesystem.FAT12,
+            ),
+            (
+                "FAT16 — legacy media ("
+                f"{self.display_size(128 * 1024**2)} to "
+                f"{self.display_size(4 * 1024**3)})",
+                FormatFilesystem.FAT16,
+            ),
+            ("FAT32 — widest device compatibility", FormatFilesystem.FAT32),
+            ("exFAT — large files and cross-platform use", FormatFilesystem.EXFAT),
+            ("NTFS — Windows-focused", FormatFilesystem.NTFS),
+            (
+                "UDF 2.01 — large cross-platform files (macOS caveat)",
+                FormatFilesystem.UDF,
+            ),
+            ("ext2 — legacy Linux compatibility", FormatFilesystem.EXT2),
+            ("ext3 — journaled legacy Linux", FormatFilesystem.EXT3),
+            ("ext4 — Linux-focused", FormatFilesystem.EXT4),
+        )
+        for text, candidate in filesystem_choices:
+            if restore_filesystem_size_supported(candidate, device.size):
+                filesystem.addItem(text, candidate)
+        filesystem.setCurrentIndex(filesystem.findData(FormatFilesystem.FAT32))
         layout.addWidget(filesystem)
+        filesystem_note = QLabel(
+            "Only full-capacity formats compatible with this drive's size are listed. "
+            "FAT12/FAT16 limits are conservative formatter envelopes, not universal "
+            "device-compatibility promises. A partitioned UDF drive works on Linux "
+            "and Windows but is generally not mounted automatically by macOS."
+        )
+        filesystem_note.setWordWrap(True)
+        filesystem_note.setObjectName("muted")
+        layout.addWidget(filesystem_note)
         layout.addWidget(QLabel("Partition table"))
         table = QComboBox()
         table.addItem("MBR — widest legacy compatibility", FormatPartitionTable.MBR)
@@ -1330,7 +1470,7 @@ class Window(QMainWindow):
                 return
         answer = QMessageBox.warning(
             self, "Erase and restore this drive?",
-            f"ALL DATA WILL BE ERASED\n\n{device.label}\n"
+            f"ALL DATA WILL BE ERASED\n\n{self.display_device(device)}\n"
             f"Serial: {device.serial or device.wwn or 'not reported'}\n"
             f"New layout: {plan.partition_table.value.upper()}, "
             f"{plan.filesystem.value.upper()}, label {plan.label or '(none)'}\n\n"
@@ -1386,11 +1526,12 @@ class Window(QMainWindow):
         layout.addWidget(warning)
         mode = QComboBox()
         mode.addItem(
-            f"Full zero pass — overwrite all {format_size(device.size)}",
+            f"Full zero pass — overwrite all {self.display_size(device.size)}",
             EraseMode.FULL_ZERO,
         )
         mode.addItem(
-            "Quick boundary zero — first and last 16 MiB only",
+            "Quick boundary zero — first and last "
+            f"{self.display_size(QUICK_BOUNDARY_BYTES)} only",
             EraseMode.QUICK_BOUNDARY_ZERO,
         )
         layout.addWidget(mode)
@@ -1412,7 +1553,9 @@ class Window(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            plan = build_erase_plan(device, mode.currentData())
+            plan = build_erase_plan(
+                device, mode.currentData(), size_unit_mode=self.size_unit_mode,
+            )
         except Exception as error:
             QMessageBox.warning(self, "Drive erase unavailable", str(error))
             return
@@ -1472,7 +1615,10 @@ class Window(QMainWindow):
                 if plan.mode is EraseMode.FULL_ZERO:
                     description = "one logical zero pass across the advertised drive size"
                 else:
-                    description = "the first and last 16 MiB boundaries"
+                    description = (
+                        "the first and last "
+                        f"{self.display_size(QUICK_BOUNDARY_BYTES)} boundaries"
+                    )
                 self.bridge.finished.emit(
                     True,
                     f"ISOpropyl zeroed {description}. This was not a hardware secure erase. "
@@ -1526,7 +1672,8 @@ class Window(QMainWindow):
             return
         try:
             plan = build_media_test_plan(
-                device, mode.currentData(), passes=int(passes.currentData())
+                device, mode.currentData(), passes=int(passes.currentData()),
+                size_unit_mode=self.size_unit_mode,
             )
         except Exception as error:
             QMessageBox.warning(self, "Media test unavailable", str(error))
@@ -1635,12 +1782,14 @@ class Window(QMainWindow):
             self.logger.info("Image inspection: %s", self.inspection.summary)
             if self.inspection.compression != "none":
                 self.image_label.setText(
-                    f"{self.image.name}  ·  {format_size(self.inspection.size)} expanded"
+                    f"{self.image.name}  ·  "
+                    f"{self.display_size(self.inspection.size)} expanded"
                 )
             elif self.inspection.virtual_format:
                 self.image_label.setText(
-                    f"{self.image.name}  ·  {format_size(self.inspection.size)} virtual "
-                    f"({format_size(self.inspection.container_size)} container)"
+                    f"{self.image.name}  ·  "
+                    f"{self.display_size(self.inspection.size)} virtual "
+                    f"({self.display_size(self.inspection.container_size)} container)"
                 )
             self.image_detail.setText(f"DD mode · {self.inspection.summary}")
             detail_lines = [
@@ -1948,8 +2097,8 @@ class Window(QMainWindow):
             f"Firmware: {'BIOS ' if plan.layout.bios_bootable else ''}"
             f"{'UEFI' if plan.layout.uefi_bootable else ''}".strip(),
             f"Cataloged files: {len(entries)}",
-            f"File content: {format_size(plan.minimum_content_bytes)}",
-            f"Conservative target minimum: {format_size(plan.minimum_target_bytes)}",
+            f"File content: {self.display_size(plan.minimum_content_bytes)}",
+            f"Conservative target minimum: {self.display_size(plan.minimum_target_bytes)}",
         ]
         if plan.needs_wim_split:
             lines.append("Transformation: split sources/install.wim for FAT32")
@@ -2143,7 +2292,8 @@ class Window(QMainWindow):
             else:
                 helper_detail = (
                     "This image needs NTFS because it contains a file larger than FAT32 "
-                    "can store. ISOpropyl will obtain the 1 MiB UEFI:NTFS v2.8 helper "
+                    "can store. ISOpropyl will obtain the "
+                    f"{self.display_size(UEFI_NTFS_SIZE)} UEFI:NTFS v2.8 helper "
                     "from a release-pinned Rufus source URL (or use its verified cache), "
                     "then check its exact size and SHA-256 before asking to erase the "
                     "drive.\n\n"
@@ -2420,7 +2570,7 @@ class Window(QMainWindow):
             )
             customization += (
                 "\nPersistent storage: "
-                f"{format_size(pending.persistence_bytes)} for Ubuntu "
+                f"{self.display_size(pending.persistence_bytes)} for Ubuntu "
                 f"{pending.persistence_profile.ubuntu_release} LTS amd64."
             )
         elif strategy is BootStrategy.UEFI_NTFS:
@@ -2443,12 +2593,13 @@ class Window(QMainWindow):
         answer = QMessageBox.warning(
             self,
             "Erase drive and write in ISO mode?",
-            f"Everything on {device.label} will be permanently erased.\n\n"
+            f"Everything on {self.display_device(device)} will be permanently erased.\n\n"
             f"Image: {image.name}\n"
             f"Mode: {mode_description}\n"
             f"Target: {device.path}\n"
             f"Serial: {device.serial or device.wwn or 'not reported'}\n"
-            f"Temporary space required: {format_size(staging_plan.required_free_bytes)}"
+            f"Temporary space required: "
+            f"{self.display_size(staging_plan.required_free_bytes)}"
             f"{customization}\n\n"
             "Keep the image, working disk, and target connected until completion.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
@@ -2612,7 +2763,7 @@ class Window(QMainWindow):
             self,
             "Extract ISO files?",
             f"Safely extract {len(plan.entries)} cataloged members "
-            f"({format_size(plan.content_bytes)} of file data) to:\n\n"
+            f"({self.display_size(plan.content_bytes)} of file data) to:\n\n"
             f"{plan.destination}\n\n"
             "The source ISO and removable drives will not be modified. The destination "
             "must remain absent until extraction completes. Windows options are applied "
@@ -2718,6 +2869,12 @@ class Window(QMainWindow):
         current = str(self.settings.value("appearance", "dark"))
         theme.setCurrentIndex(max(0, theme.findData(current)))
         layout.addWidget(theme)
+        layout.addWidget(QLabel("Display units"))
+        units = QComboBox()
+        units.addItem("Decimal — MB, GB, TB", SizeUnitMode.SI.value)
+        units.addItem("Binary — MiB, GiB, TiB", SizeUnitMode.IEC.value)
+        units.setCurrentIndex(max(0, units.findData(self.size_unit_mode.value)))
+        layout.addWidget(units)
         layout.addWidget(QLabel("Ignored drives"))
         ignored = self.ignored_devices()
         ignored_text = QPlainTextEdit()
@@ -2750,7 +2907,7 @@ class Window(QMainWindow):
             answer = QMessageBox.question(
                 dialog,
                 "Reset all settings?",
-                "Reset appearance and the ignored-drive list when you save? "
+                "Reset appearance, display units, and the ignored-drive list when you save? "
                 "No images, logs, or drive contents are removed.",
                 QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
                 QMessageBox.StandardButton.Cancel,
@@ -2760,6 +2917,7 @@ class Window(QMainWindow):
             reset_requested = True
             clear_requested = True
             theme.setCurrentIndex(max(0, theme.findData("dark")))
+            units.setCurrentIndex(max(0, units.findData(SizeUnitMode.SI.value)))
             ignored_text.setPlainText("All settings will be reset when saved")
             clear_ignored.setEnabled(False)
             reset_all.setEnabled(False)
@@ -2779,15 +2937,20 @@ class Window(QMainWindow):
 
         def save() -> None:
             selected = str(theme.currentData())
+            selected_units = SizeUnitMode(str(units.currentData()))
             if reset_requested:
                 self.settings.clear()
                 selected = "dark"
+                selected_units = SizeUnitMode.SI
             else:
                 self.settings.setValue("appearance", selected)
+                self.settings.setValue("size_units", selected_units.value)
             if clear_requested and not reset_requested:
                 self.settings.remove("ignored_devices")
+            self.size_unit_mode = selected_units
             QApplication.instance().setStyleSheet(THEMES[selected])
             dialog.accept()
+            self.refresh_size_labels()
             if clear_requested:
                 self.refresh_devices()
 
@@ -2836,8 +2999,9 @@ class Window(QMainWindow):
             if count:
                 noun = "helper" if count == 1 else "helpers"
                 summary.setText(
-                    f"{count} cataloged {noun} · {format_size(current.total_size)} cached · "
-                    f"{format_size(current.deletable_size)} safe to delete"
+                    f"{count} cataloged {noun} · "
+                    f"{self.display_size(current.total_size)} cached · "
+                    f"{self.display_size(current.deletable_size)} safe to delete"
                 )
                 lines = []
                 for artifact in current.artifacts:
@@ -2848,7 +3012,7 @@ class Window(QMainWindow):
                         status = f"{status}: {artifact.issue}"
                     lines.append(
                         f"{artifact.family} {artifact.version} · {artifact.name} · "
-                        f"{format_size(artifact.size)} · {status}"
+                        f"{self.display_size(artifact.size)} · {status}"
                     )
                 if current.issues:
                     lines.extend(f"Cache notice: {issue}" for issue in current.issues)
@@ -2876,7 +3040,7 @@ class Window(QMainWindow):
                 dialog,
                 "Delete downloaded boot helpers?",
                 f"Delete {len(keys)} cataloged cached helper(s) representing "
-                f"{format_size(current.deletable_size)} of logical file data?\n\n"
+                f"{self.display_size(current.deletable_size)} of logical file data?\n\n"
                 "ISOpropyl will ask before downloading a required helper again. "
                 "Unknown or unsafe cache entries will not be touched.",
                 QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
@@ -2892,7 +3056,7 @@ class Window(QMainWindow):
             skipped = len(result.skipped)
             message = (
                 f"Deleted {len(result.deleted)} helper(s), representing "
-                f"{format_size(result.bytes_deleted)} of logical file data."
+                f"{self.display_size(result.bytes_deleted)} of logical file data."
             )
             if skipped or result.issues:
                 reasons = [item.reason for item in result.skipped]
@@ -2977,7 +3141,7 @@ class Window(QMainWindow):
             elif self.windows_wim_member is not None and not available_editions:
                 image_detail.setText(
                     f"Inspecting editions temporarily extracts "
-                    f"{format_size(self.windows_wim_member.size)} from the ISO. "
+                    f"{self.display_size(self.windows_wim_member.size)} from the ISO. "
                     "The private copy is deleted immediately afterward."
                 )
             else:
@@ -2993,7 +3157,7 @@ class Window(QMainWindow):
         inspect_editions.setEnabled(self.windows_wim_member is not None)
         if self.windows_wim_member is not None:
             inspect_editions.setToolTip(
-                f"Temporarily extract {format_size(self.windows_wim_member.size)} from "
+                f"Temporarily extract {self.display_size(self.windows_wim_member.size)} from "
                 "the ISO, inspect it with trusted wimlib-imagex, then delete the copy."
             )
         elif self.windows_wim_error:

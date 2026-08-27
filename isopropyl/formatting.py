@@ -46,9 +46,12 @@ class FormatCancelled(FormattingError):
 
 
 class Filesystem(str, Enum):
+    FAT12 = "fat12"
+    FAT16 = "fat16"
     FAT32 = "fat32"
     EXFAT = "exfat"
     NTFS = "ntfs"
+    UDF = "udf"
     EXT2 = "ext2"
     EXT3 = "ext3"
     EXT4 = "ext4"
@@ -155,27 +158,36 @@ _MINIMUM_DEVICE_SIZE = 16 * 1024 * 1024
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 _MKFS_NAMES: Mapping[Filesystem, str] = {
+    Filesystem.FAT12: "mkfs.vfat",
+    Filesystem.FAT16: "mkfs.vfat",
     Filesystem.FAT32: "mkfs.vfat",
     Filesystem.EXFAT: "mkfs.exfat",
     Filesystem.NTFS: "mkfs.ntfs",
+    Filesystem.UDF: "mkudffs",
     Filesystem.EXT2: "mkfs.ext2",
     Filesystem.EXT3: "mkfs.ext3",
     Filesystem.EXT4: "mkfs.ext4",
 }
 
 _MBR_TYPES: Mapping[Filesystem, str] = {
+    Filesystem.FAT12: "1",
+    Filesystem.FAT16: "e",
     Filesystem.FAT32: "c",
     Filesystem.EXFAT: "7",
     Filesystem.NTFS: "7",
+    Filesystem.UDF: "7",
     Filesystem.EXT2: "83",
     Filesystem.EXT3: "83",
     Filesystem.EXT4: "83",
 }
 
 _GPT_TYPES: Mapping[Filesystem, str] = {
+    Filesystem.FAT12: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+    Filesystem.FAT16: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     Filesystem.FAT32: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     Filesystem.EXFAT: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     Filesystem.NTFS: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+    Filesystem.UDF: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     Filesystem.EXT2: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
     Filesystem.EXT3: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
     Filesystem.EXT4: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
@@ -208,8 +220,34 @@ _MINIMUM_UEFI_NTFS_DATA_MIB = 32
 _MAXIMUM_GPT_PARTITIONS = 128
 _MAXIMUM_MBR_PARTITIONS = 4
 MIB_BYTES = 1024 * 1024
+# dosfstools starts FAT12/16 at four sectors per cluster and will grow to at
+# most 128 sectors per cluster.  These are formatter capability envelopes, not
+# broad OS-compatibility promises: near the maxima, large clusters can reduce
+# interoperability.  The whole-device maxima leave at least the leading
+# aligned MiB outside the filesystem, keeping a 512-byte-sector FAT12 below
+# 4085 clusters and FAT16 below 65525 clusters.  FAT16's lower bound also leaves
+# enough clusters on supported 4096-byte-sector media after alignment.
+_FAT12_MAX_DEVICE_SIZE = 256 * MIB_BYTES
+_FAT16_MIN_DEVICE_SIZE = 128 * MIB_BYTES
+_FAT16_MAX_DEVICE_SIZE = 4096 * MIB_BYTES
+# UDF 2.01 addresses at most 2**32 logical blocks.  Capping at the 512-byte
+# case is conservative for every logical block size accepted below.
+_UDF_MAX_DEVICE_SIZE = 2 * 1024**4
+_RESTORE_ONLY_FILESYSTEMS = frozenset({
+    Filesystem.FAT12, Filesystem.FAT16, Filesystem.UDF,
+})
 _PROCESS_TIMEOUT_SECONDS = 30 * 60
 _PROCESS_STOP_GRACE_SECONDS = 2
+_PROBE_TIMEOUT_SECONDS = 15
+_UNMOUNT_TIMEOUT_SECONDS = 30
+_MKUDFFS_PREFLIGHT_TIMEOUT_SECONDS = 5
+_MKUDFFS_PREFLIGHT_MAX_OUTPUT = 64 * 1024
+_MINIMUM_MKUDFFS_VERSION = (1, 1)
+_GPT_PARTITION_ENTRY_BYTES = _MAXIMUM_GPT_PARTITIONS * 128
+_TRUSTED_TOOL_DIRECTORIES = frozenset(_TRUSTED_TOOL_PATH.split(":"))
+_MKUDFFS_VERSION_LINE = re.compile(
+    rb"(?m)^mkudffs from udftools ([0-9]+)\.([0-9]+)(?:\.[0-9]+)?\r?$"
+)
 
 
 def _partition_belongs_to_device(device_path: str, partition_path: str) -> bool:
@@ -264,23 +302,60 @@ def validate_label(filesystem: Filesystem | str, label: str) -> str:
         raise FormatValidationError("The volume label cannot start or end with whitespace")
     if any(ord(character) < 32 or ord(character) == 127 for character in label):
         raise FormatValidationError("The volume label cannot contain control characters")
-    if fs is Filesystem.FAT32:
-        if len(label.encode("utf-8")) > 11:
-            raise FormatValidationError("FAT32 labels can be at most 11 UTF-8 bytes")
+    try:
+        utf8 = label.encode("utf-8")
+        utf16_units = len(label.encode("utf-16-le")) // 2
+    except UnicodeEncodeError as error:
+        raise FormatValidationError(
+            "The volume label contains an invalid Unicode character"
+        ) from error
+    if fs in {Filesystem.FAT12, Filesystem.FAT16, Filesystem.FAT32}:
+        if not label.isascii():
+            raise FormatValidationError(
+                f"{fs.value.upper()} labels must contain only ASCII characters"
+            )
+        if len(label) > 11:
+            raise FormatValidationError(
+                f"{fs.value.upper()} labels can be at most 11 ASCII characters"
+            )
+        if label.casefold() == "no name".casefold():
+            raise FormatValidationError(
+                f"{fs.value.upper()} label NO NAME means no label; leave the field empty instead"
+            )
         if any(character in _FAT_FORBIDDEN for character in label):
-            raise FormatValidationError("The FAT32 label contains an unsupported character")
+            raise FormatValidationError(
+                f"The {fs.value.upper()} label contains an unsupported character"
+            )
     elif fs is Filesystem.EXFAT:
-        if len(label.encode("utf-16-le")) // 2 > 15:
+        if utf16_units > 15:
             raise FormatValidationError("exFAT labels can be at most 15 UTF-16 characters")
         if any(character in _WINDOWS_FORBIDDEN for character in label):
             raise FormatValidationError("The exFAT label contains an unsupported character")
     elif fs is Filesystem.NTFS:
-        if len(label.encode("utf-16-le")) // 2 > 32:
+        if utf16_units > 32:
             raise FormatValidationError("NTFS labels can be at most 32 UTF-16 characters")
         if any(character in _WINDOWS_FORBIDDEN for character in label):
             raise FormatValidationError("The NTFS label contains an unsupported character")
+    elif fs is Filesystem.UDF:
+        # --label sets both the 128-byte logical-volume identifier and the
+        # narrower 32-byte volume identifier. Its dstring reserves one byte
+        # for the OSTA compression ID and one final byte for the encoded
+        # length, leaving 30 ASCII bytes or 15 UTF-16 code units.
+        limit = 30 if label.isascii() else 15
+        length = len(label) if label.isascii() else utf16_units
+        if length > limit:
+            raise FormatValidationError(
+                f"UDF labels can be at most {limit} "
+                + ("ASCII characters" if label.isascii() else "UTF-16 characters")
+            )
+        if any(character in _WINDOWS_FORBIDDEN for character in label):
+            raise FormatValidationError("The UDF label contains an unsupported character")
+        if any(ord(character) > 0xFFFF for character in label):
+            raise FormatValidationError(
+                "UDF labels must use Unicode Basic Multilingual Plane characters"
+            )
     else:
-        if len(label.encode("utf-8")) > 16:
+        if len(utf8) > 16:
             raise FormatValidationError(
                 f"{fs.value} labels can be at most 16 UTF-8 bytes"
             )
@@ -289,6 +364,41 @@ def validate_label(filesystem: Filesystem | str, label: str) -> str:
                 f"The {fs.value} label cannot contain a slash"
             )
     return label
+
+
+def _validate_restore_filesystem_size(filesystem: Filesystem, size: object) -> None:
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise FormatValidationError("The format plan contains an invalid device size")
+    if filesystem is Filesystem.FAT12 and size > _FAT12_MAX_DEVICE_SIZE:
+        raise FormatValidationError("FAT12 restore formatting is limited to 256 MiB drives")
+    if filesystem is Filesystem.FAT16 and not (
+        _FAT16_MIN_DEVICE_SIZE <= size <= _FAT16_MAX_DEVICE_SIZE
+    ):
+        raise FormatValidationError(
+            "FAT16 restore formatting requires a drive from 128 MiB through 4 GiB"
+        )
+    if filesystem is Filesystem.UDF and size > _UDF_MAX_DEVICE_SIZE:
+        raise FormatValidationError(
+            "UDF 2.01 restore formatting is conservatively limited to 2 TiB drives"
+        )
+
+
+def restore_filesystem_size_supported(
+    filesystem: Filesystem | str,
+    size: object,
+) -> bool:
+    """Return whether *size* fits the same envelope used by format plans.
+
+    This intentionally never raises, so presentation layers can filter choices
+    without duplicating destructive-operation policy constants.
+    """
+
+    try:
+        fs = _coerce_filesystem(filesystem)
+        _validate_restore_filesystem_size(fs, size)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def create_format_plan(
@@ -300,6 +410,7 @@ def create_format_plan(
     validate_device(device)
     fs = _coerce_filesystem(filesystem)
     table = _coerce_table(partition_table)
+    _validate_restore_filesystem_size(fs, device.size)
     return FormatPlan(device.path, device.identity, fs, table, validate_label(fs, label))
 
 
@@ -315,6 +426,10 @@ def _validate_partition_spec(
         raise FormatValidationError("A partition contains an invalid semantic role")
     if spec.filesystem is not None and not isinstance(spec.filesystem, Filesystem):
         raise FormatValidationError("A partition contains an invalid filesystem")
+    if spec.filesystem in _RESTORE_ONLY_FILESYSTEMS:
+        raise FormatValidationError(
+            f"{spec.filesystem.value.upper()} is supported only by single-partition restore formatting"
+        )
     explicit_geometry = (
         spec.start_sector is not None or spec.sector_count is not None
     )
@@ -555,6 +670,13 @@ def validate_plan(plan: FormatPlan) -> None:
         raise FormatValidationError("The format plan contains an invalid partition table")
     if not _WHOLE_DISK.fullmatch(plan.device_path):
         raise FormatValidationError("The format plan contains an unsafe device path")
+    if (
+        not isinstance(plan.device_identity, tuple)
+        or len(plan.device_identity) != 6
+        or plan.device_identity[0] != plan.device_path
+    ):
+        raise FormatValidationError("The format plan contains an invalid device identity")
+    _validate_restore_filesystem_size(plan.filesystem, plan.device_identity[1])
     validate_label(plan.filesystem, plan.label)
 
 
@@ -719,8 +841,13 @@ def _format_command(
     partition: str,
 ) -> list[str]:
     command = [mkfs]
-    if filesystem is Filesystem.FAT32:
-        command.extend(["-F", "32"])
+    if filesystem in {Filesystem.FAT12, Filesystem.FAT16, Filesystem.FAT32}:
+        fat_bits = {
+            Filesystem.FAT12: "12",
+            Filesystem.FAT16: "16",
+            Filesystem.FAT32: "32",
+        }[filesystem]
+        command.extend(["-F", fat_bits])
         if label:
             command.extend(["-n", label])
     elif filesystem is Filesystem.EXFAT:
@@ -730,6 +857,14 @@ def _format_command(
         command.append("-f")
         if label:
             command.extend(["-L", label])
+    elif filesystem is Filesystem.UDF:
+        # mkudffs option ordering is significant: encoding first, media type
+        # before the revision it selects defaults for.  Omitting --blocksize
+        # makes mkudffs use and validate the device's logical sector size.
+        command.extend([
+            "--utf8", "--media-type=hd", "--udfrev=0x0201",
+            f"--label={label}",
+        ])
     else:
         command.append("-F")
         if label:
@@ -967,6 +1102,250 @@ def validate_explicit_partition_metadata(
             )
 
 
+def validate_single_partition_metadata(
+    plan: FormatPlan,
+    payload: str,
+    partition: str,
+    expected_logical_sector_size: int | None = None,
+) -> int:
+    """Validate the exact full-capacity layout created by ``partition_script``.
+
+    A single-partition restore deliberately has no caller-selectable geometry:
+    it starts at LBA 2048 and consumes every usable sector.  Binding that exact
+    result prevents a stale or concurrently replaced partition table from being
+    accepted merely because one plausible child pathname appeared.
+    """
+
+    validate_plan(plan)
+    if (
+        not isinstance(partition, str)
+        or not _BLOCK_PATH.fullmatch(partition)
+        or not _partition_belongs_to_device(plan.device_path, partition)
+    ):
+        raise FormatValidationError("Exact metadata validation requires a safe partition path")
+    try:
+        table = json.loads(payload).get("partitiontable")
+    except (AttributeError, TypeError, json.JSONDecodeError) as error:
+        raise FormattingError("sfdisk returned invalid single-partition metadata") from error
+    expected_label = "dos" if plan.partition_table is PartitionTable.MBR else "gpt"
+    if not isinstance(table, dict) or (
+        table.get("label") != expected_label
+        or table.get("device") != plan.device_path
+        or table.get("unit") != "sectors"
+    ):
+        raise FormattingError(
+            "The partition table identity, type, or unit is unexpected"
+        )
+    sector_size = table.get("sectorsize")
+    if (
+        not isinstance(sector_size, int)
+        or isinstance(sector_size, bool)
+        or sector_size < 256
+        or sector_size > 65_536
+        or sector_size & (sector_size - 1)
+    ):
+        raise FormattingError("The partition table reports an invalid logical sector size")
+    if (
+        expected_logical_sector_size is not None
+        and sector_size != expected_logical_sector_size
+    ):
+        raise DeviceChangedError(
+            "The partition table logical sector size differs from the preflight value"
+        )
+    device_size = plan.device_identity[1]
+    if device_size % sector_size:
+        raise FormattingError("The target capacity is not an exact logical-sector multiple")
+    total_sectors = device_size // sector_size
+    start_sector = 2048
+    if plan.partition_table is PartitionTable.GPT:
+        trailing_sectors = 1 + (
+            _GPT_PARTITION_ENTRY_BYTES + sector_size - 1
+        ) // sector_size
+    else:
+        trailing_sectors = 0
+    expected_size = total_sectors - start_sector - trailing_sectors
+    if expected_size <= 0:
+        raise FormattingError("The target has no room for the frozen partition geometry")
+
+    reported = table.get("partitions")
+    if not isinstance(reported, list) or len(reported) != 1:
+        raise FormattingError("The partition table does not contain exactly one partition")
+    entry = reported[0]
+    expected_type = (
+        _MBR_TYPES if plan.partition_table is PartitionTable.MBR else _GPT_TYPES
+    )[plan.filesystem]
+    if not isinstance(entry, dict):
+        raise FormattingError("The partition metadata is invalid")
+    type_matches = (
+        str(entry.get("type") or "").casefold() == expected_type.casefold()
+        if plan.partition_table is PartitionTable.GPT
+        else _normalized_mbr_type(entry.get("type"))
+        == _normalized_mbr_type(expected_type)
+    )
+    if not (
+        entry.get("node") == partition
+        and entry.get("start") == start_sector
+        and entry.get("size") == expected_size
+        and type_matches
+    ):
+        raise FormattingError(
+            "The single partition path, start, size, or type differs from the frozen layout"
+        )
+    if plan.partition_table is PartitionTable.GPT:
+        expected_last_lba = total_sectors - trailing_sectors - 1
+        reported_last_lba = table.get("lastlba")
+        if reported_last_lba is not None and reported_last_lba != expected_last_lba:
+            raise FormattingError("The GPT usable-sector boundary is unexpected")
+    return sector_size
+
+
+def _read_bounded_probe_output(
+    stream: object,
+    sink: bytearray,
+    limit: int,
+    overflow: threading.Event,
+) -> None:
+    """Drain one child pipe while retaining no more than ``limit + 1`` bytes."""
+
+    try:
+        while True:
+            block = stream.read(16 * 1024)  # type: ignore[attr-defined]
+            if not block:
+                return
+            remaining = max(0, limit + 1 - len(sink))
+            if remaining:
+                sink.extend(block[:remaining])
+            if len(sink) > limit:
+                overflow.set()
+    finally:
+        stream.close()  # type: ignore[attr-defined]
+
+
+def _stop_bounded_probe(
+    process: subprocess.Popen[bytes],
+    grace_seconds: float,
+) -> None:
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired as error:
+        raise FormattingError(
+            "The mkudffs capability inspection did not stop after termination and kill"
+        ) from error
+
+
+def _capture_mkudffs_help(
+    mkudffs: str,
+    *,
+    popen: Callable[..., subprocess.Popen[bytes]],
+    cancel_event: threading.Event,
+    timeout_seconds: float,
+    max_output: int = _MKUDFFS_PREFLIGHT_MAX_OUTPUT,
+) -> tuple[int, bytes]:
+    """Return bounded ``mkudffs --help`` output without touching a device."""
+
+    normalized = os.path.normpath(mkudffs) if isinstance(mkudffs, str) else ""
+    if (
+        not isinstance(mkudffs, str)
+        or not os.path.isabs(mkudffs)
+        or normalized != mkudffs
+        or os.path.dirname(mkudffs) not in _TRUSTED_TOOL_DIRECTORIES
+        or os.path.basename(mkudffs) != "mkudffs"
+    ):
+        raise MissingFormatToolError(f"Refusing untrusted mkudffs path: {mkudffs!r}")
+    if cancel_event.is_set():
+        raise FormatCancelled("Formatting was cancelled")
+    try:
+        process = popen(
+            [mkudffs, "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=False,
+        )
+    except OSError as error:
+        raise MissingFormatToolError(
+            "Could not start mkudffs capability inspection"
+        ) from error
+    if process.stdout is None:
+        _stop_bounded_probe(process, _PROCESS_STOP_GRACE_SECONDS)
+        raise FormattingError("Could not capture mkudffs capability output")
+
+    output = bytearray()
+    overflow = threading.Event()
+    reader = threading.Thread(
+        target=_read_bounded_probe_output,
+        args=(process.stdout, output, max_output, overflow),
+        daemon=True,
+    )
+    reader.start()
+    deadline = time.monotonic() + timeout_seconds
+    failure: FormattingError | None = None
+    while process.poll() is None:
+        if cancel_event.is_set():
+            failure = FormatCancelled("Formatting was cancelled")
+            break
+        if overflow.is_set():
+            failure = FormattingError(
+                "mkudffs capability inspection produced too much output"
+            )
+            break
+        if time.monotonic() >= deadline:
+            failure = FormattingError("mkudffs capability inspection timed out")
+            break
+        cancel_event.wait(0.01)
+
+    if failure is not None:
+        _stop_bounded_probe(process, _PROCESS_STOP_GRACE_SECONDS)
+    reader.join(timeout=_PROCESS_STOP_GRACE_SECONDS)
+    if reader.is_alive():
+        _stop_bounded_probe(process, _PROCESS_STOP_GRACE_SECONDS)
+        raise FormattingError("Could not finish reading mkudffs capability output")
+    if overflow.is_set() and failure is None:
+        failure = FormattingError(
+            "mkudffs capability inspection produced too much output"
+        )
+    if cancel_event.is_set():
+        failure = FormatCancelled("Formatting was cancelled")
+    if failure is not None:
+        raise failure
+    return process.returncode or 0, bytes(output)
+
+
+def _validate_mkudffs_help(returncode: int, payload: bytes) -> tuple[int, int]:
+    """Require the upstream version whose label and sector defaults we use."""
+
+    # Upstream mkudffs intentionally returns 1 for --help; some downstream
+    # builds use the more conventional 0.  No other status is accepted.
+    if returncode not in {0, 1}:
+        raise MissingFormatToolError("mkudffs capability inspection failed")
+    matches = _MKUDFFS_VERSION_LINE.findall(payload)
+    if len(matches) != 1 or b"--label=" not in payload:
+        raise MissingFormatToolError(
+            "Could not verify mkudffs version and --label support"
+        )
+    version = tuple(int(value) for value in matches[0])
+    if version < _MINIMUM_MKUDFFS_VERSION:
+        raise MissingFormatToolError(
+            "UDF restore requires mkudffs 1.1 or newer for --label and "
+            "logical-sector block-size detection"
+        )
+    return version
+
+
 class FormatExecutor:
     """Execute a FormatPlan without ever passing user data through a shell."""
 
@@ -976,6 +1355,7 @@ class FormatExecutor:
         device_lookup: DeviceLookup | None = None,
         which: Callable[[str], str | None] = _trusted_which,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        preflight_popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         lstat_func: Callable[[str], os.stat_result] = os.lstat,
         sleep: Callable[[float], None] = time.sleep,
@@ -983,10 +1363,20 @@ class FormatExecutor:
         discovery_interval: float = 0.25,
         process_timeout: float = _PROCESS_TIMEOUT_SECONDS,
         stop_grace: float = _PROCESS_STOP_GRACE_SECONDS,
+        mkudffs_preflight_timeout: float = _MKUDFFS_PREFLIGHT_TIMEOUT_SECONDS,
     ) -> None:
+        if (
+            isinstance(mkudffs_preflight_timeout, bool)
+            or not isinstance(mkudffs_preflight_timeout, (int, float))
+            or not 0 < mkudffs_preflight_timeout <= 60
+        ):
+            raise FormatValidationError(
+                "The mkudffs preflight timeout must be between 0 and 60 seconds"
+            )
         self._device_lookup = device_lookup
         self._which = which
         self._popen = popen
+        self._preflight_popen = preflight_popen
         self._runner = runner
         self._lstat = lstat_func
         self._sleep = sleep
@@ -994,6 +1384,7 @@ class FormatExecutor:
         self._discovery_interval = max(0.0, discovery_interval)
         self._process_timeout = max(0.01, process_timeout)
         self._stop_grace = max(0.1, stop_grace)
+        self._mkudffs_preflight_timeout = float(mkudffs_preflight_timeout)
         self._cancelled = threading.Event()
         self._process: subprocess.Popen[bytes] | None = None
 
@@ -1005,19 +1396,44 @@ class FormatExecutor:
         self._cancelled.set()
         process = self._process
         if process is not None and process.poll() is None:
-            process.terminate()
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
 
     def _check_cancelled(self) -> None:
         if self._cancelled.is_set():
             raise FormatCancelled("Formatting was cancelled")
 
+    def _run_probe(
+        self,
+        argv: Sequence[str],
+        *,
+        purpose: str,
+        timeout: float = _PROBE_TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a bounded, non-streaming probe and normalize timeout/cancel."""
+
+        self._check_cancelled()
+        try:
+            result = self._runner(
+                list(argv), capture_output=True, text=True,
+                timeout=timeout, shell=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            if self._cancelled.is_set():
+                raise FormatCancelled("Formatting was cancelled") from error
+            raise FormattingError(f"{purpose} timed out") from error
+        self._check_cancelled()
+        return result
+
     def _lookup_device(self, path: str, tools: FormatTools) -> Device | None:
         if self._device_lookup is not None:
             return self._device_lookup(path)
         fields = "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,MAJ:MIN,MOUNTPOINTS,RO"
-        result = self._runner(
+        result = self._run_probe(
             [tools.lsblk, "--tree", "--bytes", "--json", "--output", fields, path],
-            capture_output=True, text=True, shell=False,
+            purpose="Target identity inspection",
         )
         if result.returncode:
             return None
@@ -1038,6 +1454,64 @@ class FormatExecutor:
                 "The drive at the selected path changed; formatting was stopped"
             )
         return current
+
+    def _assert_restore_filesystem_geometry(
+        self,
+        plan: FormatPlan,
+        tools: FormatTools,
+        expected_logical_sector_size: int | None = None,
+    ) -> int | None:
+        """Bind geometry needed by the validated FAT12/16 and UDF plans."""
+        if plan.filesystem not in _RESTORE_ONLY_FILESYSTEMS:
+            return None
+        self._check_cancelled()
+        result = self._run_probe(
+            [
+                tools.lsblk, "--bytes", "--json", "--nodeps", "--output",
+                "PATH,TYPE,LOG-SEC", plan.device_path,
+            ],
+            purpose="Target logical-sector inspection",
+        )
+        if result.returncode:
+            message = ((result.stdout or "") + (result.stderr or "")).strip()
+            raise FormattingError(
+                message or "Could not read the target logical sector size"
+            )
+        observed = parse_logical_sector_size(result.stdout, plan.device_path)
+        if expected_logical_sector_size is not None and (
+            observed != expected_logical_sector_size
+        ):
+            raise DeviceChangedError(
+                "The target logical sector size changed during formatting"
+            )
+        if plan.filesystem in {Filesystem.FAT12, Filesystem.FAT16}:
+            if observed not in {512, 4096}:
+                raise FormatValidationError(
+                    "FAT12/16 restore formatting supports only 512- or "
+                    "4096-byte logical sectors"
+                )
+        elif observed not in {512, 1024, 2048, 4096}:
+            raise FormatValidationError(
+                "UDF requires a power-of-two logical sector size from 512 "
+                "through 4096 bytes"
+            )
+        return observed
+
+    def _preflight_udf_formatter(
+        self,
+        plan: FormatPlan,
+        tools: FormatTools,
+    ) -> None:
+        if plan.filesystem is not Filesystem.UDF:
+            return
+        returncode, payload = _capture_mkudffs_help(
+            tools.mkfs,
+            popen=self._preflight_popen,
+            cancel_event=self._cancelled,
+            timeout_seconds=self._mkudffs_preflight_timeout,
+        )
+        self._check_cancelled()
+        _validate_mkudffs_help(returncode, payload)
 
     def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
         if process.poll() is None:
@@ -1085,6 +1559,7 @@ class FormatExecutor:
                     if time.monotonic() >= deadline:
                         self._stop_process(process)
                         raise FormattingError("A formatting child timed out")
+            self._check_cancelled()
             if process.returncode:
                 message = stderr.decode(errors="replace").strip()
                 fallback = message or f"Command failed: {argv[1]}"
@@ -1119,13 +1594,85 @@ class FormatExecutor:
         except CooperativeLockError as error:
             raise FormattingError(str(error)) from error
 
+    def _observe_partition_nodes(
+        self,
+        plan: FormatPlan | MultiFormatPlan,
+        tools: FormatTools | MultiFormatTools,
+        partitions: Sequence[str],
+    ) -> tuple[tuple[str, str], ...]:
+        """Bind direct child paths to both kernel and device-node identities."""
+
+        result = self._run_probe(
+            [
+                tools.lsblk, "--json", "--paths", "--output",
+                "PATH,TYPE,PKNAME,MAJ:MIN", plan.device_path,
+            ],
+            purpose="Partition identity inspection",
+        )
+        if result.returncode:
+            message = ((result.stdout or "") + (result.stderr or "")).strip()
+            raise FormattingError(
+                message or "Could not bind the new partition device identities"
+            )
+        observed = parse_partition_identities(result.stdout, plan.device_path)
+        if tuple(path for path, _identity in observed) != tuple(partitions):
+            raise DeviceChangedError("The partition device paths changed after discovery")
+        for path, major_minor in observed:
+            try:
+                info = self._lstat(path)
+            except OSError as error:
+                raise DeviceChangedError(
+                    f"The partition device node disappeared: {path}"
+                ) from error
+            if (
+                not stat.S_ISBLK(info.st_mode)
+                or f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}" != major_minor
+            ):
+                raise DeviceChangedError(
+                    f"The partition device node identity changed: {path}"
+                )
+        return observed
+
+    def _verify_partition_nodes(
+        self,
+        plan: FormatPlan | MultiFormatPlan,
+        tools: FormatTools | MultiFormatTools,
+        partitions: Sequence[str],
+        expected: tuple[tuple[str, str], ...],
+    ) -> None:
+        if self._observe_partition_nodes(plan, tools, partitions) != expected:
+            raise DeviceChangedError(
+                "A partition device identity changed before filesystem creation"
+            )
+
+    def _verify_single_geometry(
+        self,
+        plan: FormatPlan,
+        tools: FormatTools,
+        partition: str,
+        expected_logical_sector_size: int | None,
+    ) -> int:
+        result = self._run_probe(
+            [tools.pkexec, tools.sfdisk, "--json", plan.device_path],
+            purpose="Exact single-partition geometry validation",
+        )
+        if result.returncode:
+            message = ((result.stdout or "") + (result.stderr or "")).strip()
+            raise FormattingError(
+                message or "Could not validate the exact partition geometry"
+            )
+        return validate_single_partition_metadata(
+            plan, result.stdout, partition, expected_logical_sector_size,
+        )
+
     def _unmount(self, device: Device, tools: FormatTools) -> None:
         targets = device.partitions or ((device.path,) if device.mountpoints else ())
         for target in targets:
             self._check_cancelled()
-            result = self._runner(
+            result = self._run_probe(
                 [tools.udisksctl, "unmount", "--block-device", target],
-                capture_output=True, text=True, shell=False,
+                purpose=f"Unmounting {target}",
+                timeout=_UNMOUNT_TIMEOUT_SECONDS,
             )
             combined = ((result.stdout or "") + (result.stderr or "")).strip()
             if result.returncode and not any(
@@ -1137,12 +1684,12 @@ class FormatExecutor:
     def _discover_partition(self, plan: FormatPlan, tools: FormatTools) -> str:
         for attempt in range(self._discovery_attempts):
             self._check_cancelled()
-            result = self._runner(
+            result = self._run_probe(
                 [
                     tools.lsblk, "--json", "--paths", "--output", "PATH,TYPE",
                     plan.device_path,
                 ],
-                capture_output=True, text=True, shell=False,
+                purpose="New partition discovery",
             )
             if result.returncode:
                 message = ((result.stdout or "") + (result.stderr or "")).strip()
@@ -1172,12 +1719,17 @@ class FormatExecutor:
         validate_label(plan.filesystem, plan.label)
         tools = resolve_tools(plan, self._which)  # Preflight before touching the drive.
         flock = self._resolve_flock()
+        self._preflight_udf_formatter(plan, tools)
         report = stage or (lambda _message: None)
 
         current = self._assert_identity(plan, tools)
+        logical_sector_size = self._assert_restore_filesystem_geometry(plan, tools)
         report("Unmounting")
         self._unmount(current, tools)
         self._assert_identity(plan, tools)
+        self._assert_restore_filesystem_geometry(
+            plan, tools, logical_sector_size,
+        )
 
         report("Creating partition table")
         self._run_process(partition_command(plan, tools), partition_script(plan))
@@ -1187,12 +1739,39 @@ class FormatExecutor:
         report("Waiting for partition")
         partition = self._discover_partition(plan, tools)
         self._assert_identity(plan, tools)
+        self._assert_restore_filesystem_geometry(
+            plan, tools, logical_sector_size,
+        )
+        bound_table_sector_size = self._verify_single_geometry(
+            plan, tools, partition, logical_sector_size,
+        )
+        partition_identities = self._observe_partition_nodes(
+            plan, tools, (partition,),
+        )
 
         report("Creating filesystem")
+        self._assert_identity(plan, tools)
+        self._assert_restore_filesystem_geometry(
+            plan, tools, logical_sector_size,
+        )
+        self._verify_single_geometry(
+            plan, tools, partition, bound_table_sector_size,
+        )
+        self._assert_identity(plan, tools)
+        self._verify_partition_nodes(
+            plan, tools, (partition,), partition_identities,
+        )
         self._run_process(self._locked_format_command(
             format_command(plan, tools, partition), tools, flock, plan.device_path,
         ))
         self._run_process([tools.udevadm, "settle"])
+        self._assert_identity(plan, tools)
+        self._verify_single_geometry(
+            plan, tools, partition, bound_table_sector_size,
+        )
+        self._verify_partition_nodes(
+            plan, tools, (partition,), partition_identities,
+        )
         report("Complete")
         return partition
 
@@ -1207,13 +1786,12 @@ class MultiFormatExecutor(FormatExecutor):
     ) -> tuple[str, ...]:
         expected_count = len(plan.partitions)
         for attempt in range(self._discovery_attempts):
-            self._check_cancelled()
-            result = self._runner(
+            result = self._run_probe(
                 [
                     tools.lsblk, "--json", "--paths", "--output", "PATH,TYPE",
                     plan.device_path,
                 ],
-                capture_output=True, text=True, shell=False,
+                purpose="New partition discovery",
             )
             if result.returncode:
                 message = ((result.stdout or "") + (result.stderr or "")).strip()
@@ -1239,10 +1817,9 @@ class MultiFormatExecutor(FormatExecutor):
     ) -> None:
         if plan.logical_sector_size is None:
             return
-        self._check_cancelled()
-        result = self._runner(
+        result = self._run_probe(
             [tools.pkexec, tools.sfdisk, "--json", plan.device_path],
-            capture_output=True, text=True, shell=False,
+            purpose="Exact partition geometry validation",
         )
         if result.returncode:
             message = ((result.stdout or "") + (result.stderr or "")).strip()
@@ -1251,56 +1828,6 @@ class MultiFormatExecutor(FormatExecutor):
             )
         validate_explicit_partition_metadata(plan, result.stdout, partitions)
 
-    def _observe_partition_nodes(
-        self,
-        plan: MultiFormatPlan,
-        tools: MultiFormatTools,
-        partitions: Sequence[str],
-    ) -> tuple[tuple[str, str], ...]:
-        self._check_cancelled()
-        result = self._runner(
-            [
-                tools.lsblk, "--json", "--paths", "--output",
-                "PATH,TYPE,PKNAME,MAJ:MIN", plan.device_path,
-            ],
-            capture_output=True, text=True, timeout=15, shell=False,
-        )
-        if result.returncode:
-            message = ((result.stdout or "") + (result.stderr or "")).strip()
-            raise FormattingError(
-                message or "Could not bind the new partition device identities"
-            )
-        observed = parse_partition_identities(result.stdout, plan.device_path)
-        if tuple(path for path, _identity in observed) != tuple(partitions):
-            raise DeviceChangedError("The partition device paths changed after discovery")
-        for path, major_minor in observed:
-            try:
-                info = self._lstat(path)
-            except OSError as error:
-                raise DeviceChangedError(
-                    f"The partition device node disappeared: {path}"
-                ) from error
-            if (
-                not stat.S_ISBLK(info.st_mode)
-                or f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}" != major_minor
-            ):
-                raise DeviceChangedError(
-                    f"The partition device node identity changed: {path}"
-                )
-        return observed
-
-    def _verify_partition_nodes(
-        self,
-        plan: MultiFormatPlan,
-        tools: MultiFormatTools,
-        partitions: Sequence[str],
-        expected: tuple[tuple[str, str], ...],
-    ) -> None:
-        if self._observe_partition_nodes(plan, tools, partitions) != expected:
-            raise DeviceChangedError(
-                "A partition device identity changed before filesystem creation"
-            )
-
     def _assert_logical_sector_size(
         self,
         plan: MultiFormatPlan,
@@ -1308,13 +1835,12 @@ class MultiFormatExecutor(FormatExecutor):
     ) -> None:
         if plan.logical_sector_size is None:
             return
-        self._check_cancelled()
-        result = self._runner(
+        result = self._run_probe(
             [
                 tools.lsblk, "--bytes", "--json", "--nodeps", "--output",
                 "PATH,TYPE,LOG-SEC", plan.device_path,
             ],
-            capture_output=True, text=True, timeout=15, shell=False,
+            purpose="Target logical-sector inspection",
         )
         if result.returncode:
             message = ((result.stdout or "") + (result.stderr or "")).strip()

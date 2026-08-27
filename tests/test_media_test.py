@@ -11,7 +11,7 @@ import unittest
 from dataclasses import FrozenInstanceError, replace
 from unittest.mock import patch
 
-from isopropyl.devices import Device
+from isopropyl.devices import Device, SizeUnitMode
 from isopropyl.media_test import (
     BADBLOCK_PATTERNS,
     BadblocksProgressParser,
@@ -223,6 +223,16 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(any("type exactly: ERASE /dev/sdb" in item for item in plan.warnings))
         with self.assertRaises(FrozenInstanceError):
             plan.passes = 3  # type: ignore[misc]
+
+    def test_binary_unit_plan_keeps_every_destructive_warning_in_iec(self):
+        plan = build_media_test_plan(
+            removable_device(), MediaTestMode.FULL_SURFACE,
+            finder=find_program, size_unit_mode=SizeUnitMode.IEC,
+        )
+        warning = " ".join(plan.warnings)
+        self.assertEqual(plan.size_unit_mode, SizeUnitMode.IEC)
+        self.assertIn("14.9 GiB", warning)
+        self.assertNotIn("16.0 GB", warning)
 
     def test_rejects_invalid_passes_fixed_read_only_and_non_device_paths(self):
         for passes in (0, 5):

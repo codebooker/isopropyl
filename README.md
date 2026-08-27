@@ -84,13 +84,18 @@ ISOpropyl warns before enabling this option, and S-mode media should not use it.
 
 ### Maintain and validate removable media
 
-- Save a complete removable drive as an atomic raw image backup.
+- Save a complete removable drive as an atomic raw, VHD, or VHDX backup. Virtual
+  backups are made from a private exact capture, checked for exact virtual size,
+  and content-compared before publication.
 - Capture readable optical media to ISO without modifying the disc.
-- Restore a drive as FAT32, exFAT, NTFS, ext2, ext3, or ext4 using MBR or GPT.
+- Restore a drive as FAT12, FAT16, FAT32, exFAT, NTFS, UDF 2.01, ext2, ext3,
+  or ext4 using MBR or GPT. The UI states the legacy-FAT limits and partitioned
+  UDF's macOS automount caveat.
 - Run destructive bad-block passes and F3 fake-capacity probes as separate,
   heavily warned workflows.
 - Zero the full device or only its boundary metadata regions.
 - Export privacy-conscious diagnostics and a rotating local activity log.
+- Choose decimal MB/GB/TB or binary MiB/GiB/TiB display units.
 
 ## Safety model
 
@@ -145,8 +150,9 @@ Optional tools unlock additional workflows:
 
 | Capability | Tool |
 |---|---|
-| VHD/VHDX/QCOW/QCOW2 | `qemu-img` |
-| NTFS ISO mode and NTFS/exFAT/ext2/ext3/ext4 restore | `mkfs.ntfs`, `mkfs.exfat`, `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` |
+| VHD/VHDX/QCOW/QCOW2 input and VHD/VHDX drive backup | `qemu-img` |
+| FAT12/FAT16/FAT32 restore and FAT32 ISO mode | `mkfs.vfat` (dosfstools) |
+| NTFS/exFAT/UDF/ext2/ext3/ext4 restore | `mkfs.ntfs`, `mkfs.exfat`, `mkudffs` 1.1+, `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` |
 | Experimental matched Ubuntu persistence profile | `mkfs.ext4` |
 | Surface and fake-capacity tests | `badblocks`, `f3probe` |
 | Additional ISO inspection | `xorriso` |
@@ -182,8 +188,8 @@ You can also launch the working tree directly:
 
 Install required host tools through your distribution's package manager. On
 Debian/Ubuntu-family systems, the relevant package names commonly include
-`p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `e2fsprogs`,
-`ntfs-3g`, `wimtools`, and `qemu-utils`.
+`p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `exfatprogs`,
+`udftools`, `e2fsprogs`, `ntfs-3g`, `wimtools`, and `qemu-utils`.
 
 The first UEFI:NTFS use asks permission to download a 1 MiB helper from its
 release-pinned Rufus source URL. ISOpropyl verifies the exact byte count and
@@ -244,7 +250,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 450 tests. Device-facing tests mock block
+The suite currently contains more than 500 tests. Device-facing tests mock block
 devices and privileged commands; the automated suite never writes a real drive.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
 path.

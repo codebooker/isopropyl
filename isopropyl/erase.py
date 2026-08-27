@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import BinaryIO
 
-from .devices import Device, format_size, parse_lsblk
+from .devices import Device, SizeUnitMode, format_size, parse_lsblk
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -104,6 +104,7 @@ class ErasePlan:
     ranges: tuple[EraseRange, ...]
     tools: EraseTools
     confirmation_phrase: str
+    size_unit_mode: SizeUnitMode
     warnings: tuple[str, ...]
 
     @property
@@ -233,24 +234,31 @@ def _confirmation_for(device: Device) -> str:
     return f"ERASE {device.path} {device.major_minor}"
 
 
-def _warnings_for(device: Device, mode: EraseMode) -> tuple[str, ...]:
+def _warnings_for(
+    device: Device,
+    mode: EraseMode,
+    size_unit_mode: SizeUnitMode,
+) -> tuple[str, ...]:
     confirmation = _confirmation_for(device)
     common = (
         "THIS OPERATION IS DESTRUCTIVE AND CANNOT BE UNDONE.",
         (
-            f"Target: {device.label}; serial {device.serial or 'not reported'}; "
+            f"Target: {device.display_label(size_unit_mode)}; "
+            f"serial {device.serial or 'not reported'}; "
             f"kernel identity {device.major_minor}."
         ),
         "This is a logical overwrite, not a hardware secure erase or sanitization command.",
     )
     if mode is EraseMode.FULL_ZERO:
         scope = (
-            f"ISOpropyl will write one pass of zeros across all {format_size(device.size)} "
+            "ISOpropyl will write one pass of zeros across all "
+            f"{format_size(device.size, size_unit_mode)} "
             "of the drive's advertised logical address space.",
         )
     else:
         scope = (
-            "Quick boundary zero writes only the first and last 16 MiB "
+            "Quick boundary zero writes only the first and last "
+            f"{format_size(QUICK_BOUNDARY_BYTES, size_unit_mode)} "
             "(or their merged union on a very small drive).",
             "Data outside those boundary ranges is untouched and may remain recoverable.",
         )
@@ -265,16 +273,20 @@ def build_erase_plan(
     mode: EraseMode,
     *,
     finder: Callable[[str], str | None] = _trusted_which,
+    size_unit_mode: SizeUnitMode = SizeUnitMode.SI,
 ) -> ErasePlan:
     """Validate a selection and bind an erase plan to its observed identity."""
     if not isinstance(mode, EraseMode):
         raise ValueError("mode must be an EraseMode")
+    if not isinstance(size_unit_mode, SizeUnitMode):
+        raise ValueError("size_unit_mode must be a SizeUnitMode")
     _validate_device(device)
     tools = resolve_erase_tools(finder)
     ranges = _erase_ranges(device.size, mode)
     confirmation = _confirmation_for(device)
     return ErasePlan(
-        device, mode, ranges, tools, confirmation, _warnings_for(device, mode),
+        device, mode, ranges, tools, confirmation, size_unit_mode,
+        _warnings_for(device, mode, size_unit_mode),
     )
 
 
@@ -289,7 +301,11 @@ def validate_erase_plan(plan: ErasePlan) -> None:
         raise EraseSafetyError("The erase plan contains unexpected byte ranges")
     if plan.confirmation_phrase != _confirmation_for(plan.device):
         raise EraseSafetyError("The erase plan contains an invalid confirmation phrase")
-    if plan.warnings != _warnings_for(plan.device, plan.mode):
+    if not isinstance(plan.size_unit_mode, SizeUnitMode):
+        raise EraseSafetyError("The erase plan contains an invalid size-unit mode")
+    if plan.warnings != _warnings_for(
+        plan.device, plan.mode, plan.size_unit_mode,
+    ):
         raise EraseSafetyError("The erase plan contains invalid safety warnings")
     for name in ("pkexec", "udisksctl", "lsblk", "dd", "flock"):
         try:

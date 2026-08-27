@@ -12,7 +12,7 @@ import unittest
 from dataclasses import FrozenInstanceError, replace
 from unittest.mock import patch
 
-from isopropyl.devices import Device
+from isopropyl.devices import Device, SizeUnitMode
 from isopropyl.erase import (
     MAX_ERROR_CHARACTERS,
     QUICK_BOUNDARY_BYTES,
@@ -215,8 +215,25 @@ class PlanTests(unittest.TestCase):
         ))
         self.assertEqual(plan.total_bytes, QUICK_BOUNDARY_BYTES * 2)
         warning = " ".join(plan.warnings)
-        self.assertIn("only the first and last 16 MiB", warning)
+        self.assertIn("only the first and last 16.8 MB", warning)
         self.assertIn("untouched and may remain recoverable", warning)
+
+    def test_binary_unit_plan_keeps_every_destructive_warning_in_iec(self):
+        plan = build_erase_plan(
+            removable_device(), EraseMode.FULL_ZERO, finder=find_program,
+            size_unit_mode=SizeUnitMode.IEC,
+        )
+        warning = " ".join(plan.warnings)
+        self.assertEqual(plan.size_unit_mode, SizeUnitMode.IEC)
+        self.assertIn("29.8 GiB", warning)
+        self.assertNotIn("32.0 GB", warning)
+        validate_erase_plan(plan)
+
+        quick = build_erase_plan(
+            removable_device(), EraseMode.QUICK_BOUNDARY_ZERO,
+            finder=find_program, size_unit_mode=SizeUnitMode.IEC,
+        )
+        self.assertIn("first and last 16.0 MiB", " ".join(quick.warnings))
 
     def test_quick_zero_merges_overlap_for_small_drives(self):
         size = QUICK_BOUNDARY_BYTES + 123
@@ -297,6 +314,7 @@ class PlanTests(unittest.TestCase):
             replace(plan, tools=replace(plan.tools, dd="/tmp/dd")),
             replace(plan, tools=replace(plan.tools, flock="/tmp/flock")),
             replace(plan, tools=replace(plan.tools, flock="/usr/bin/../bin/flock")),
+            replace(plan, size_unit_mode="iec"),
             replace(plan, warnings=()),
         )
         for item in forged:

@@ -3,10 +3,12 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import json
+import math
 import os
 import subprocess
 from dataclasses import dataclass
 from collections.abc import Callable
+from enum import Enum
 
 
 DEVICE_DISCOVERY_TIMEOUT_SECONDS = 15
@@ -15,6 +17,13 @@ MAX_DEVICE_DISCOVERY_OUTPUT = 2 * 1024 * 1024
 
 class DeviceDiscoveryError(RuntimeError):
     pass
+
+
+class SizeUnitMode(str, Enum):
+    """Unit families available for human-readable byte counts."""
+
+    SI = "si"
+    IEC = "iec"
 
 
 @dataclass(frozen=True)
@@ -35,8 +44,15 @@ class Device:
 
     @property
     def label(self) -> str:
+        return self.display_label()
+
+    def display_label(
+        self, mode: SizeUnitMode | str = SizeUnitMode.SI,
+    ) -> str:
+        """Return the device-picker label in the requested unit family."""
+
         name = " ".join(x for x in (self.vendor, self.model) if x).strip() or "USB drive"
-        return f"{name}  ·  {format_size(self.size)}  ·  {self.path}"
+        return f"{name}  ·  {format_size(self.size, mode)}  ·  {self.path}"
 
     @property
     def identity(self) -> tuple[str, int, str, str, str, str]:
@@ -53,13 +69,44 @@ class Device:
         return None
 
 
-def format_size(size: int | float) -> str:
+def format_size(
+    size: int | float,
+    mode: SizeUnitMode | str = SizeUnitMode.SI,
+) -> str:
+    """Format non-negative bytes using decimal SI or binary IEC units.
+
+    SI remains the default to preserve ISOpropyl's existing display strings.
+    Rate callers can continue appending ``/s`` to the returned value.
+    """
+
+    try:
+        selected = SizeUnitMode(mode)
+    except (TypeError, ValueError) as error:
+        choices = ", ".join(item.value for item in SizeUnitMode)
+        raise ValueError(f"Unsupported size unit mode {mode!r}; choose {choices}") from error
     value = float(size)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1000 or unit == "TB":
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1000
-    return f"{value:.1f} TB"
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("Size must be a finite, non-negative number")
+    divisor, units = (
+        (1000, ("B", "KB", "MB", "GB", "TB"))
+        if selected is SizeUnitMode.SI
+        else (1024, ("B", "KiB", "MiB", "GiB", "TiB"))
+    )
+    index = 0
+    while value >= divisor and index < len(units) - 1:
+        value /= divisor
+        index += 1
+    # Do not display boundary-impossible strings such as 1000.0 KB or
+    # 1024.0 KiB merely because the value crossed the boundary when rounded.
+    if (
+        index > 0
+        and index < len(units) - 1
+        and float(f"{value:.1f}") >= divisor
+    ):
+        value /= divisor
+        index += 1
+    unit = units[index]
+    return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
 
 
 def _mounts(node: dict) -> list[str]:

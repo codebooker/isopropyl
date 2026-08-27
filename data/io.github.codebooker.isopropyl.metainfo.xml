@@ -23,8 +23,9 @@
       It can inspect common boot layouts, calculate and compare checksums, stream
       compressed disk images, inspect and convert virtual disk images, inspect
       and select Windows WIM/ESD editions, customize supported Windows installers,
-      save raw drive or optical-disc images, restore ordinary data storage, and
-      run explicitly separated destructive media tests.
+      save raw, VHD, or VHDX drive backups and optical-disc images, restore
+      ordinary data storage with nine filesystem choices, and run explicitly
+      separated destructive media tests.
     </p>
   </description>
   <launchable type="desktop-id">io.github.codebooker.isopropyl.desktop</launchable>
@@ -50,7 +51,7 @@
   <releases>
     <release version="0.1.0" date="2026-08-27" type="development">
       <description>
-        <p>Initial alpha with DD and UEFI FAT32/UEFI:NTFS ISO writing, image analysis, Windows edition selection and customization, drive backup, formatting, erasure, and media testing.</p>
+        <p>Initial alpha with DD and UEFI FAT32/UEFI:NTFS ISO writing, image analysis, Windows edition selection and customization, raw/VHD/VHDX drive backup, nine restore filesystems, erasure, and media testing.</p>
       </description>
     </release>
   </releases>

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import io
 import json
 import os
 import stat
@@ -38,9 +39,11 @@ from isopropyl.formatting import (
     partition_script,
     resolve_multi_tools,
     resolve_tools,
+    restore_filesystem_size_supported,
     validate_label,
     validate_explicit_partition_metadata,
     validate_multi_plan,
+    validate_single_partition_metadata,
 )
 
 
@@ -87,6 +90,53 @@ class FakeProcess:
         self.returncode = -9
 
 
+SUPPORTED_MKUDFFS_HELP = (
+    b"mkudffs from udftools 2.3\n"
+    b"Usage:\n"
+    b"\tmkudffs [options] device [blocks-count]\n"
+    b"\t--label=, -l       UDF label\n"
+    b"\t--blocksize=, -b   Size of blocks in bytes (default: detect)\n"
+)
+
+
+class MkudffsHelpProcess:
+    def __init__(
+        self,
+        argv,
+        *,
+        output=SUPPORTED_MKUDFFS_HELP,
+        returncode=1,
+        running=False,
+        **kwargs,
+    ):
+        self.argv = argv
+        self.kwargs = kwargs
+        self.stdout = io.BytesIO(output)
+        self.returncode = None if running else returncode
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+        return self.returncode
+
+
+def supported_mkudffs_popen(argv, **kwargs):
+    return MkudffsHelpProcess(argv, **kwargs)
+
+
 def completed(stdout="", stderr="", code=0):
     return subprocess.CompletedProcess([], code, stdout, stderr)
 
@@ -96,13 +146,51 @@ def partition_lstat(path: str):
     return Mock(st_mode=stat.S_IFBLK, st_rdev=os.makedev(65, 144 + number))
 
 
+def single_metadata_payload(
+    plan: FormatPlan,
+    *,
+    sector_size: int = 512,
+    partition: str = "/dev/sdz1",
+    start: int = 2048,
+    size: int | None = None,
+    partition_type: str | None = None,
+) -> str:
+    total_sectors = plan.device_identity[1] // sector_size
+    trailing_sectors = (
+        1 + (128 * 128 + sector_size - 1) // sector_size
+        if plan.partition_table is PartitionTable.GPT else 0
+    )
+    expected_size = total_sectors - start - trailing_sectors
+    script_type = partition_script(plan).decode("ascii").split("type=", 1)[1].strip()
+    table = {
+        "label": "gpt" if plan.partition_table is PartitionTable.GPT else "dos",
+        "device": plan.device_path,
+        "unit": "sectors",
+        "sectorsize": sector_size,
+        "partitions": [{
+            "node": partition,
+            "start": start,
+            "size": expected_size if size is None else size,
+            "type": script_type if partition_type is None else partition_type,
+        }],
+    }
+    if plan.partition_table is PartitionTable.GPT:
+        table["lastlba"] = total_sectors - trailing_sectors - 1
+    return json.dumps({"partitiontable": table})
+
+
 class FormatPlanTests(unittest.TestCase):
     def test_supports_each_filesystem_and_partition_table(self):
         for filesystem in Filesystem:
             for table in PartitionTable:
                 with self.subTest(filesystem=filesystem, table=table):
-                    plan = create_format_plan(test_device(), filesystem, table, "USB")
-                    self.assertEqual(plan.device_identity, test_device().identity)
+                    device = test_device(
+                        size=128 * 1024 * 1024
+                        if filesystem in {Filesystem.FAT12, Filesystem.FAT16}
+                        else test_device().size,
+                    )
+                    plan = create_format_plan(device, filesystem, table, "USB")
+                    self.assertEqual(plan.device_identity, device.identity)
                     self.assertEqual(plan.filesystem, filesystem)
                     self.assertEqual(plan.partition_table, table)
 
@@ -122,15 +210,22 @@ class FormatPlanTests(unittest.TestCase):
                     create_format_plan(device, "fat32", "mbr")
 
     def test_filesystem_specific_label_limits_and_characters(self):
+        self.assertEqual(validate_label("fat12", "ELEVENCHARS"), "ELEVENCHARS")
+        self.assertEqual(validate_label("fat16", "ELEVENCHARS"), "ELEVENCHARS")
         self.assertEqual(validate_label("fat32", "ELEVENCHARS"), "ELEVENCHARS")
         self.assertEqual(validate_label("exfat", "portable"), "portable")
         self.assertEqual(validate_label("ntfs", "Windows media"), "Windows media")
+        self.assertEqual(validate_label("udf", "Portable media"), "Portable media")
+        self.assertEqual(validate_label("udf", "x" * 30), "x" * 30)
+        self.assertEqual(validate_label("udf", "é" * 15), "é" * 15)
         self.assertEqual(validate_label("ext2", "Linux media"), "Linux media")
         self.assertEqual(validate_label("ext3", "Linux media"), "Linux media")
         self.assertEqual(validate_label("ext4", "Linux media"), "Linux media")
         for filesystem, label in (
+            ("fat12", "twelve-chars"), ("fat16", "BAD:LABEL"),
             ("fat32", "twelve-chars"), ("fat32", "BAD:LABEL"),
             ("exfat", "x" * 16), ("ntfs", "x" * 33),
+            ("udf", "x" * 31), ("udf", "é" * 16), ("udf", "BAD:LABEL"),
             ("ext2", "0123456789abcdefg"), ("ext2", "bad/label"),
             ("ext3", "0123456789abcdefg"), ("ext3", "bad/label"),
             ("ext4", "0123456789abcdefg"), ("ext4", "bad/label"),
@@ -138,6 +233,79 @@ class FormatPlanTests(unittest.TestCase):
             with self.subTest(filesystem=filesystem, label=label):
                 with self.assertRaises(FormatValidationError):
                     validate_label(filesystem, label)
+
+        with self.assertRaisesRegex(FormatValidationError, "invalid Unicode"):
+            validate_label("udf", "\ud800")
+
+    def test_fat_labels_require_safe_ascii_and_reject_no_name_semantics(self):
+        for filesystem in ("fat12", "fat16", "fat32"):
+            with self.subTest(filesystem=filesystem):
+                self.assertEqual(validate_label(filesystem, "ABCDEFGHIJK"), "ABCDEFGHIJK")
+                with self.assertRaisesRegex(FormatValidationError, "11 ASCII"):
+                    validate_label(filesystem, "ABCDEFGHIJKL")
+                with self.assertRaisesRegex(FormatValidationError, "only ASCII"):
+                    validate_label(filesystem, "é" * 5)
+                for sentinel in ("NO NAME", "no name", "No Name"):
+                    with self.assertRaisesRegex(FormatValidationError, "means no label"):
+                        validate_label(filesystem, sentinel)
+
+    def test_udf_labels_reject_supplementary_unicode_at_preflight(self):
+        self.assertEqual(validate_label("udf", "Résumé"), "Résumé")
+        with self.assertRaisesRegex(FormatValidationError, "Basic Multilingual Plane"):
+            validate_label("udf", "USB😀")
+
+    def test_fat12_fat16_and_udf_size_bounds_fail_closed(self):
+        for filesystem, size, message in (
+            ("fat12", 256 * 1024 * 1024 + 1, "256 MiB"),
+            ("fat16", 128 * 1024 * 1024 - 1, "128 MiB"),
+            ("fat16", 4 * 1024**3 + 1, "4 GiB"),
+            ("udf", 2 * 1024**4 + 1, "2 TiB"),
+        ):
+            with self.subTest(filesystem=filesystem, size=size):
+                with self.assertRaisesRegex(FormatValidationError, message):
+                    create_format_plan(
+                        test_device(size=size), filesystem, "gpt", "USB",
+                    )
+
+        self.assertEqual(
+            create_format_plan(
+                test_device(size=256 * 1024 * 1024), "fat12", "mbr",
+            ).filesystem,
+            Filesystem.FAT12,
+        )
+        self.assertEqual(
+            create_format_plan(
+                test_device(size=4 * 1024**3), "fat16", "mbr",
+            ).filesystem,
+            Filesystem.FAT16,
+        )
+        self.assertEqual(
+            create_format_plan(
+                test_device(size=2 * 1024**4), "udf", "gpt",
+            ).filesystem,
+            Filesystem.UDF,
+        )
+
+    def test_restore_size_support_helper_shares_exact_plan_boundaries(self):
+        cases = (
+            ("fat12", 256 * 1024**2, True),
+            ("fat12", 256 * 1024**2 + 1, False),
+            ("fat16", 128 * 1024**2, True),
+            ("fat16", 128 * 1024**2 - 1, False),
+            ("fat16", 4 * 1024**3, True),
+            ("fat16", 4 * 1024**3 + 1, False),
+            ("udf", 2 * 1024**4, True),
+            ("udf", 2 * 1024**4 + 1, False),
+            ("fat32", test_device().size, True),
+        )
+        for filesystem, size, expected in cases:
+            with self.subTest(filesystem=filesystem, size=size):
+                self.assertIs(
+                    restore_filesystem_size_supported(filesystem, size), expected,
+                )
+        for filesystem, size in (("bogus", 1), ("fat12", 0), ([], 128 * 1024**2)):
+            with self.subTest(filesystem=filesystem, size=size):
+                self.assertFalse(restore_filesystem_size_supported(filesystem, size))
 
     def test_partition_scripts_have_explicit_table_alignment_and_type(self):
         fat_mbr = create_format_plan(test_device(), "fat32", "mbr")
@@ -155,6 +323,58 @@ class FormatPlanTests(unittest.TestCase):
                     b"0FC63DAF-8483-4772-8E79-3D69D8477DE4",
                     partition_script(ext_gpt),
                 )
+        for filesystem, expected_type in (("fat12", b"type=1"), ("fat16", b"type=e")):
+            with self.subTest(filesystem=filesystem):
+                plan = create_format_plan(
+                    test_device(size=128 * 1024 * 1024), filesystem, "mbr",
+                )
+                self.assertIn(expected_type, partition_script(plan))
+        udf_mbr = create_format_plan(test_device(), "udf", "mbr")
+        udf_gpt = create_format_plan(test_device(), "udf", "gpt")
+        self.assertIn(b"type=7", partition_script(udf_mbr))
+        self.assertIn(
+            b"EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+            partition_script(udf_gpt),
+        )
+
+    def test_single_partition_metadata_binds_exact_full_capacity_geometry(self):
+        cases = (
+            create_format_plan(test_device(), "udf", "mbr", "USB"),
+            create_format_plan(test_device(), "udf", "gpt", "USB"),
+        )
+        for plan in cases:
+            with self.subTest(table=plan.partition_table):
+                payload = single_metadata_payload(plan)
+                self.assertEqual(
+                    validate_single_partition_metadata(
+                        plan, payload, "/dev/sdz1", 512,
+                    ),
+                    512,
+                )
+
+    def test_single_partition_metadata_rejects_each_geometry_or_identity_change(self):
+        plan = create_format_plan(test_device(), "udf", "gpt", "USB")
+        cases = (
+            (dict(partition="/dev/sdy1"), "safe partition path"),
+            (dict(partition="/dev/sdz2"), "path, start, size, or type"),
+            (dict(start=4096), "path, start, size, or type"),
+            (dict(size=1), "path, start, size, or type"),
+            (dict(partition_type="DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF"),
+             "path, start, size, or type"),
+        )
+        for changes, message in cases:
+            with self.subTest(changes=changes):
+                payload_changes = dict(changes)
+                partition = payload_changes.pop("partition", "/dev/sdz1")
+                payload = single_metadata_payload(plan, **payload_changes)
+                with self.assertRaisesRegex((FormatValidationError, FormattingError), message):
+                    validate_single_partition_metadata(plan, payload, partition, 512)
+
+        with self.assertRaisesRegex(DeviceChangedError, "logical sector size"):
+            validate_single_partition_metadata(
+                plan, single_metadata_payload(plan, sector_size=4096),
+                "/dev/sdz1", 512,
+            )
 
     def test_commands_are_argv_and_labels_remain_single_arguments(self):
         plan = create_format_plan(test_device(), "fat32", "mbr", "MY USB")
@@ -168,6 +388,38 @@ class FormatPlanTests(unittest.TestCase):
             format_command(plan, TOOLS, "--help")
         with self.assertRaises(FormatValidationError):
             format_command(plan, TOOLS, "/dev/sdy1")
+
+    def test_fat12_fat16_and_udf_commands_are_exact(self):
+        for filesystem, bits in (("fat12", "12"), ("fat16", "16")):
+            with self.subTest(filesystem=filesystem):
+                plan = create_format_plan(
+                    test_device(size=128 * 1024 * 1024),
+                    filesystem, "mbr", "MY USB",
+                )
+                self.assertEqual(
+                    format_command(plan, TOOLS, "/dev/sdz1"),
+                    [
+                        TOOLS.pkexec, TOOLS.mkfs, "-F", bits, "-n", "MY USB",
+                        "/dev/sdz1",
+                    ],
+                )
+        udf_tools = FormatTools(
+            TOOLS.pkexec, TOOLS.udisksctl, TOOLS.sfdisk, TOOLS.partprobe,
+            TOOLS.udevadm, TOOLS.lsblk, "/usr/sbin/mkudffs",
+        )
+        udf = create_format_plan(test_device(), "udf", "gpt", "MY USB")
+        self.assertEqual(
+            format_command(udf, udf_tools, "/dev/sdz1"),
+            [
+                TOOLS.pkexec, "/usr/sbin/mkudffs", "--utf8",
+                "--media-type=hd", "--udfrev=0x0201", "--label=MY USB",
+                "/dev/sdz1",
+            ],
+        )
+        empty = create_format_plan(test_device(), "udf", "gpt")
+        self.assertIn(
+            "--label=", format_command(empty, udf_tools, "/dev/sdz1"),
+        )
 
     def test_nvme_and_mmc_partition_child_naming_is_supported(self):
         for device_path, partition_path in (
@@ -214,6 +466,25 @@ class FormatPlanTests(unittest.TestCase):
                 self.assertEqual(tools.mkfs, f"/usr/bin/mkfs.{filesystem}")
                 self.assertIn(f"mkfs.{filesystem}", requested)
                 self.assertNotIn("mkfs.ext4", requested)
+
+    def test_new_restore_formats_resolve_exact_trusted_formatters(self):
+        for filesystem, size, expected in (
+            ("fat12", 128 * 1024 * 1024, "mkfs.vfat"),
+            ("fat16", 128 * 1024 * 1024, "mkfs.vfat"),
+            ("udf", test_device().size, "mkudffs"),
+        ):
+            with self.subTest(filesystem=filesystem):
+                requested = []
+
+                def finder(name):
+                    requested.append(name)
+                    return f"/usr/sbin/{name}"
+
+                plan = create_format_plan(
+                    test_device(size=size), filesystem, "gpt", "USB",
+                )
+                self.assertEqual(resolve_tools(plan, finder).mkfs, f"/usr/sbin/{expected}")
+                self.assertIn(expected, requested)
 
     def test_missing_tools_are_reported_together(self):
         plan = create_format_plan(test_device(), "exfat", "gpt")
@@ -511,6 +782,16 @@ class MultiFormatPlanTests(unittest.TestCase):
                 with self.assertRaises(FormatValidationError):
                     create_multi_format_plan(test_device(), table, specs)
 
+    def test_restore_only_filesystems_are_rejected_from_multi_layouts(self):
+        for filesystem in (Filesystem.FAT12, Filesystem.FAT16, Filesystem.UDF):
+            with self.subTest(filesystem=filesystem):
+                with self.assertRaisesRegex(
+                    FormatValidationError, "single-partition restore",
+                ):
+                    create_multi_format_plan(test_device(), "gpt", (
+                        PartitionSpec(PartitionRole.DATA, filesystem, "DATA"),
+                    ))
+
     def test_rejects_duplicate_singleton_roles_and_oversized_fixed_layout(self):
         duplicate = (
             PartitionSpec(PartitionRole.EFI_SYSTEM, Filesystem.FAT32, "ESP1", 32),
@@ -598,6 +879,10 @@ class FormatExecutorTests(unittest.TestCase):
 
         def runner(argv, **kwargs):
             self.run_calls.append((argv, kwargs))
+            if "--json" in argv and any(
+                argument.endswith("/sfdisk") for argument in argv
+            ):
+                return completed(single_metadata_payload(self.plan))
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
@@ -609,7 +894,8 @@ class FormatExecutorTests(unittest.TestCase):
         self.executor = FormatExecutor(
             device_lookup=lambda _path: self.device,
             which=lambda name: f"/usr/bin/{name}",
-            popen=popen, runner=runner, sleep=lambda _seconds: None,
+            popen=popen, runner=runner, lstat_func=partition_lstat,
+            sleep=lambda _seconds: None,
         )
 
     def test_complete_flow_unmounts_partitions_and_uses_no_shell(self):
@@ -621,6 +907,7 @@ class FormatExecutorTests(unittest.TestCase):
             ["/usr/bin/udisksctl", "unmount", "--block-device", "/dev/sdz1"],
         )
         self.assertTrue(all(call[1]["shell"] is False for call in self.run_calls))
+        self.assertTrue(all(call[1]["timeout"] > 0 for call in self.run_calls))
         self.assertTrue(all(process.kwargs["shell"] is False for process in self.processes))
         self.assertEqual(self.processes[0].inputs[0], partition_script(self.plan))
         self.assertEqual(self.processes[-2].argv[-1], "/dev/sdz1")
@@ -641,6 +928,7 @@ class FormatExecutorTests(unittest.TestCase):
                 plan = create_format_plan(
                     self.device, filesystem, "gpt", "LINUX",
                 )
+                self.plan = plan
                 self.executor.execute(self.device, plan)
                 spawned = self.processes[before:]
                 mkfs = next(
@@ -654,6 +942,137 @@ class FormatExecutorTests(unittest.TestCase):
                 self.assertEqual(mkfs[7], self.device.path)
                 self.assertEqual(mkfs[8], f"/usr/bin/mkfs.{filesystem}")
                 self.assertEqual(mkfs[-1], "/dev/sdz1")
+
+    def test_new_restore_formats_bind_sector_geometry_and_lock_mkfs(self):
+        for filesystem, size, formatter in (
+            ("fat12", 128 * 1024 * 1024, "mkfs.vfat"),
+            ("fat16", 128 * 1024 * 1024, "mkfs.vfat"),
+            ("udf", self.device.size, "mkudffs"),
+        ):
+            with self.subTest(filesystem=filesystem):
+                device = test_device(size=size)
+                plan = create_format_plan(device, filesystem, "gpt", "USB")
+                processes = []
+                geometry_probes = []
+
+                def popen(argv, **kwargs):
+                    process = FakeProcess(argv, **kwargs)
+                    processes.append(process)
+                    return process
+
+                def runner(argv, **kwargs):
+                    if "--json" in argv and any(
+                        argument.endswith("/sfdisk") for argument in argv
+                    ):
+                        return completed(single_metadata_payload(plan))
+                    if "lsblk" in argv[0] and "PATH,TYPE,LOG-SEC" in argv:
+                        geometry_probes.append(argv)
+                        return completed(json.dumps({"blockdevices": [{
+                            "path": device.path, "type": "disk", "log-sec": 512,
+                        }]}))
+                    if "lsblk" in argv[0]:
+                        return completed(json.dumps({"blockdevices": [{
+                            "path": device.path, "type": "disk", "children": [{
+                                "path": "/dev/sdz1", "type": "part",
+                                "pkname": device.path, "maj:min": "65:145",
+                            }],
+                        }]}))
+                    return completed()
+
+                executor = FormatExecutor(
+                    device_lookup=lambda _path: device,
+                    which=lambda name: f"/usr/bin/{name}",
+                    popen=popen, preflight_popen=supported_mkudffs_popen,
+                    runner=runner, lstat_func=partition_lstat,
+                    sleep=lambda _seconds: None,
+                )
+                self.assertEqual(executor.execute(device, plan), "/dev/sdz1")
+                self.assertEqual(len(geometry_probes), 4)
+                mkfs = next(
+                    process.argv for process in processes
+                    if any(argument.endswith(f"/{formatter}") for argument in process.argv)
+                )
+                self.assertEqual(mkfs[:8], [
+                    "/usr/bin/pkexec", "/usr/bin/flock", "--exclusive", "--nonblock",
+                    "--conflict-exit-code", "75", "--no-fork", device.path,
+                ])
+                self.assertEqual(mkfs[8], f"/usr/bin/{formatter}")
+
+    def test_restore_geometry_failure_occurs_before_unmount_or_spawn(self):
+        for filesystem, size, sector_size, error_type, message in (
+            (
+                "fat12", 128 * 1024 * 1024, 8192,
+                FormatValidationError, "512- or 4096-byte",
+            ),
+            (
+                "udf", self.device.size, 8192,
+                FormatValidationError, "512 through 4096",
+            ),
+            (
+                "udf", self.device.size, 1000,
+                FormattingError, "invalid logical sector size",
+            ),
+        ):
+            with self.subTest(filesystem=filesystem):
+                device = test_device(size=size)
+                plan = create_format_plan(device, filesystem, "mbr", "USB")
+                calls = []
+
+                def runner(argv, **_kwargs):
+                    calls.append(argv)
+                    return completed(json.dumps({"blockdevices": [{
+                        "path": device.path, "type": "disk", "log-sec": sector_size,
+                    }]}))
+
+                popen = Mock()
+                executor = FormatExecutor(
+                    device_lookup=lambda _path: device,
+                    which=lambda name: f"/usr/bin/{name}",
+                    runner=runner, popen=popen,
+                    preflight_popen=supported_mkudffs_popen,
+                )
+                with self.assertRaisesRegex(error_type, message):
+                    executor.execute(device, plan)
+                self.assertEqual(len(calls), 1)
+                self.assertIn("PATH,TYPE,LOG-SEC", calls[0])
+                popen.assert_not_called()
+
+    def test_udf_accepts_supported_baseline_logical_sector_boundaries(self):
+        device = self.device
+        plan = create_format_plan(device, "udf", "gpt", "USB")
+        tools = resolve_tools(plan, lambda name: f"/usr/bin/{name}")
+        for sector_size in (512, 4096):
+            with self.subTest(sector_size=sector_size):
+                executor = FormatExecutor(runner=lambda _argv, **_kwargs: completed(
+                    json.dumps({"blockdevices": [{
+                        "path": device.path, "type": "disk", "log-sec": sector_size,
+                    }]}),
+                ))
+                self.assertEqual(
+                    executor._assert_restore_filesystem_geometry(plan, tools),
+                    sector_size,
+                )
+
+    def test_changed_restore_geometry_is_rejected_before_partitioning(self):
+        device = test_device(size=128 * 1024 * 1024)
+        plan = create_format_plan(device, "fat16", "gpt", "USB")
+        sectors = iter((512, 4096))
+        popen = Mock()
+
+        def runner(argv, **_kwargs):
+            if "lsblk" in argv[0]:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": device.path, "type": "disk", "log-sec": next(sectors),
+                }]}))
+            return completed()
+
+        executor = FormatExecutor(
+            device_lookup=lambda _path: device,
+            which=lambda name: f"/usr/bin/{name}", runner=runner, popen=popen,
+        )
+        with self.assertRaisesRegex(DeviceChangedError, "logical sector size changed"):
+            executor.execute(device, plan)
+        popen.assert_not_called()
 
     def test_preflight_missing_tool_never_unmounts_or_spawns(self):
         executor = FormatExecutor(
@@ -675,6 +1094,147 @@ class FormatExecutorTests(unittest.TestCase):
             executor.execute(self.device, self.plan)
         executor._popen.assert_not_called()
         executor._runner.assert_not_called()
+
+    def test_udf_rejects_old_or_malformed_mkudffs_before_device_access(self):
+        plan = create_format_plan(self.device, "udf", "gpt", "USB")
+        cases = (
+            (
+                b"mkudffs from udftools 1.0\n--label=, -l\n",
+                "1.1 or newer",
+            ),
+            (
+                b"mkudffs from udftools current\n--label=, -l\n",
+                "Could not verify",
+            ),
+            (
+                b"mkudffs from udftools 2.3\nUsage:\n",
+                "--label support",
+            ),
+        )
+        for output, message in cases:
+            with self.subTest(output=output):
+                identity_lookup = Mock()
+                runner = Mock()
+                destructive_popen = Mock()
+                preflight_calls = []
+
+                def preflight_popen(argv, **kwargs):
+                    preflight_calls.append((argv, kwargs))
+                    return MkudffsHelpProcess(argv, output=output, **kwargs)
+
+                executor = FormatExecutor(
+                    device_lookup=identity_lookup,
+                    which=lambda name: f"/usr/bin/{name}",
+                    popen=destructive_popen,
+                    preflight_popen=preflight_popen,
+                    runner=runner,
+                )
+                with self.assertRaisesRegex(MissingFormatToolError, message):
+                    executor.execute(self.device, plan)
+                self.assertEqual(len(preflight_calls), 1)
+                identity_lookup.assert_not_called()
+                runner.assert_not_called()
+                destructive_popen.assert_not_called()
+
+    def test_udf_mkudffs_preflight_accepts_minimum_and_current_exact_argv_first(self):
+        plan = create_format_plan(self.device, "udf", "gpt", "USB")
+        for version in (b"1.1", b"2.3"):
+            with self.subTest(version=version):
+                events = []
+                calls = []
+                output = (
+                    b"mkudffs from udftools " + version
+                    + b"\nUsage:\n--label=, -l\n"
+                )
+
+                def preflight_popen(argv, **kwargs):
+                    events.append("mkudffs preflight")
+                    calls.append((argv, kwargs))
+                    return MkudffsHelpProcess(argv, output=output, **kwargs)
+
+                def lookup(_path):
+                    events.append("identity lookup")
+                    return None
+
+                executor = FormatExecutor(
+                    device_lookup=lookup,
+                    which=lambda name: f"/usr/bin/{name}",
+                    popen=Mock(), runner=Mock(),
+                    preflight_popen=preflight_popen,
+                )
+                with self.assertRaisesRegex(DeviceChangedError, "no longer connected"):
+                    executor.execute(self.device, plan)
+                self.assertEqual(events, ["mkudffs preflight", "identity lookup"])
+                self.assertEqual(calls[0][0], ["/usr/bin/mkudffs", "--help"])
+                self.assertEqual(calls[0][1], {
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "shell": False,
+                })
+                executor._runner.assert_not_called()
+                executor._popen.assert_not_called()
+
+    def test_udf_mkudffs_preflight_rejects_untrusted_formatter_path(self):
+        plan = create_format_plan(self.device, "udf", "gpt", "USB")
+        identity_lookup = Mock()
+        preflight_popen = Mock()
+        executor = FormatExecutor(
+            device_lookup=identity_lookup,
+            which=lambda name: (
+                "/tmp/mkudffs" if name == "mkudffs" else f"/usr/bin/{name}"
+            ),
+            popen=Mock(), runner=Mock(), preflight_popen=preflight_popen,
+        )
+        with self.assertRaisesRegex(MissingFormatToolError, "untrusted mkudffs"):
+            executor.execute(self.device, plan)
+        preflight_popen.assert_not_called()
+        identity_lookup.assert_not_called()
+        executor._runner.assert_not_called()
+        executor._popen.assert_not_called()
+
+    def test_udf_mkudffs_preflight_timeout_is_bounded_before_device_access(self):
+        plan = create_format_plan(self.device, "udf", "gpt", "USB")
+        process = MkudffsHelpProcess(
+            ["/usr/bin/mkudffs", "--help"], running=True,
+        )
+        identity_lookup = Mock()
+        runner = Mock()
+        destructive_popen = Mock()
+        executor = FormatExecutor(
+            device_lookup=identity_lookup,
+            which=lambda name: f"/usr/bin/{name}",
+            popen=destructive_popen,
+            preflight_popen=lambda _argv, **_kwargs: process,
+            runner=runner,
+            mkudffs_preflight_timeout=0.01,
+        )
+        with self.assertRaisesRegex(FormattingError, "inspection timed out"):
+            executor.execute(self.device, plan)
+        self.assertTrue(process.terminated)
+        identity_lookup.assert_not_called()
+        runner.assert_not_called()
+        destructive_popen.assert_not_called()
+
+    def test_udf_mkudffs_preflight_caps_output_before_device_access(self):
+        plan = create_format_plan(self.device, "udf", "gpt", "USB")
+        identity_lookup = Mock()
+        runner = Mock()
+        destructive_popen = Mock()
+        executor = FormatExecutor(
+            device_lookup=identity_lookup,
+            which=lambda name: f"/usr/bin/{name}",
+            popen=destructive_popen,
+            preflight_popen=lambda argv, **kwargs: MkudffsHelpProcess(
+                argv, output=SUPPORTED_MKUDFFS_HELP + b"x" * (64 * 1024), **kwargs,
+            ),
+            runner=runner,
+        )
+        with self.assertRaisesRegex(FormattingError, "too much output"):
+            executor.execute(self.device, plan)
+        identity_lookup.assert_not_called()
+        runner.assert_not_called()
+        destructive_popen.assert_not_called()
 
     def test_lock_conflict_exit_is_reported_specifically(self):
         class ConflictProcess(FakeProcess):
@@ -763,6 +1323,54 @@ class FormatExecutorTests(unittest.TestCase):
         self.assertEqual(len(processes), 1)
         self.assertTrue(processes[0].terminated)
 
+    def test_cancelled_child_exit_is_classified_as_cancellation(self):
+        holder = {}
+
+        class PromptlyTerminatedProcess(FakeProcess):
+            def __init__(self, argv, **kwargs):
+                super().__init__(argv, **kwargs)
+                self.returncode = None
+
+            def communicate(self, input=None, timeout=None):
+                self.inputs.append(input)
+                holder["executor"].cancel()
+                return b"", b""
+
+        executor = FormatExecutor(
+            popen=lambda argv, **kwargs: PromptlyTerminatedProcess(argv, **kwargs),
+        )
+        holder["executor"] = executor
+        with self.assertRaisesRegex(FormatCancelled, "cancelled"):
+            executor._run_process([
+                "/usr/bin/pkexec", "/usr/sbin/mkfs.vfat", "/dev/sdz1",
+            ])
+
+    def test_bounded_probe_normalizes_timeout_and_cancel(self):
+        observed_kwargs = []
+
+        def timeout_runner(argv, **kwargs):
+            observed_kwargs.append(kwargs)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        executor = FormatExecutor(runner=timeout_runner)
+        with self.assertRaisesRegex(FormattingError, "Device inspection timed out"):
+            executor._run_probe(
+                ["/usr/bin/lsblk"], purpose="Device inspection", timeout=0.5,
+            )
+        self.assertEqual(observed_kwargs[0]["timeout"], 0.5)
+        self.assertFalse(observed_kwargs[0]["shell"])
+
+        holder = {}
+
+        def cancelling_runner(_argv, **_kwargs):
+            holder["executor"].cancel()
+            return completed()
+
+        cancelled = FormatExecutor(runner=cancelling_runner)
+        holder["executor"] = cancelled
+        with self.assertRaisesRegex(FormatCancelled, "cancelled"):
+            cancelled._run_probe(["/usr/bin/lsblk"], purpose="Device inspection")
+
     def test_stuck_child_is_killed_after_bounded_timeout(self):
         class StubbornProcess(FakeProcess):
             def __init__(self, argv, **kwargs):
@@ -807,6 +1415,102 @@ class FormatExecutorTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(FormattingError, "device is busy"):
             executor.execute(self.device, self.plan)
+
+    def test_unmount_timeout_is_bounded_before_partitioning(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        popen = Mock()
+        executor = FormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: f"/usr/bin/{name}", runner=runner, popen=popen,
+        )
+        with self.assertRaisesRegex(FormattingError, "Unmounting .* timed out"):
+            executor.execute(self.device, self.plan)
+        self.assertEqual(calls[0][1]["timeout"], 30)
+        popen.assert_not_called()
+
+    def test_single_partition_node_replacement_stops_before_mkfs(self):
+        processes = []
+        lstat_calls = 0
+
+        def popen(argv, **kwargs):
+            process = FakeProcess(argv, **kwargs)
+            processes.append(process)
+            return process
+
+        def runner(argv, **_kwargs):
+            if "--json" in argv and any(
+                argument.endswith("/sfdisk") for argument in argv
+            ):
+                return completed(single_metadata_payload(self.plan))
+            return completed(json.dumps({"blockdevices": [{
+                "path": self.device.path, "type": "disk", "children": [{
+                    "path": "/dev/sdz1", "type": "part",
+                    "pkname": self.device.path, "maj:min": "65:145",
+                }],
+            }]}))
+
+        def changing_lstat(path):
+            nonlocal lstat_calls
+            lstat_calls += 1
+            info = partition_lstat(path)
+            if lstat_calls == 2:
+                info.st_rdev = os.makedev(65, 199)
+            return info
+
+        executor = FormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: f"/usr/bin/{name}", popen=popen, runner=runner,
+            lstat_func=changing_lstat, sleep=lambda _seconds: None,
+        )
+        with self.assertRaisesRegex(DeviceChangedError, "node identity changed"):
+            executor.execute(self.device, self.plan)
+        self.assertFalse(any(
+            any(argument.endswith("/mkfs.vfat") for argument in process.argv)
+            for process in processes
+        ))
+
+    def test_single_partition_geometry_replacement_stops_before_mkfs(self):
+        processes = []
+        geometry_calls = 0
+
+        def popen(argv, **kwargs):
+            process = FakeProcess(argv, **kwargs)
+            processes.append(process)
+            return process
+
+        def runner(argv, **_kwargs):
+            nonlocal geometry_calls
+            if "--json" in argv and any(
+                argument.endswith("/sfdisk") for argument in argv
+            ):
+                geometry_calls += 1
+                return completed(single_metadata_payload(
+                    self.plan, size=None if geometry_calls == 1 else 1,
+                ))
+            return completed(json.dumps({"blockdevices": [{
+                "path": self.device.path, "type": "disk", "children": [{
+                    "path": "/dev/sdz1", "type": "part",
+                    "pkname": self.device.path, "maj:min": "65:145",
+                }],
+            }]}))
+
+        executor = FormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: f"/usr/bin/{name}", popen=popen, runner=runner,
+            lstat_func=partition_lstat, sleep=lambda _seconds: None,
+        )
+        with self.assertRaisesRegex(FormattingError, "path, start, size, or type"):
+            executor.execute(self.device, self.plan)
+        self.assertEqual(geometry_calls, 2)
+        self.assertFalse(any(
+            any(argument.endswith("/mkfs.vfat") for argument in process.argv)
+            for process in processes
+        ))
 
     def test_multiple_discovered_partitions_are_not_guessed(self):
         def runner(argv, **_kwargs):

@@ -5,8 +5,8 @@ import unittest
 from unittest.mock import patch
 
 from isopropyl.devices import (
-    MAX_DEVICE_DISCOVERY_OUTPUT, Device, DeviceDiscoveryError, format_size,
-    image_is_on_device, list_devices, parse_lsblk, path_is_on_device,
+    MAX_DEVICE_DISCOVERY_OUTPUT, Device, DeviceDiscoveryError, SizeUnitMode,
+    format_size, image_is_on_device, list_devices, parse_lsblk, path_is_on_device,
 )
 
 
@@ -50,6 +50,69 @@ class DeviceTests(unittest.TestCase):
 
     def test_decimal_sizes(self):
         self.assertEqual(format_size(2_500_000_000), "2.5 GB")
+
+    def test_si_default_is_compatible_at_unit_boundaries(self):
+        for size, expected in (
+            (0, "0 B"),
+            (999, "999 B"),
+            (1_000, "1.0 KB"),
+            (1_000_000, "1.0 MB"),
+            (1_000_000_000, "1.0 GB"),
+            (1_000_000_000_000, "1.0 TB"),
+            (1_000_000_000_000_000, "1000.0 TB"),
+        ):
+            with self.subTest(size=size):
+                self.assertEqual(format_size(size), expected)
+                self.assertEqual(format_size(size, SizeUnitMode.SI), expected)
+                self.assertEqual(format_size(size, "si"), expected)
+
+    def test_iec_mode_uses_binary_boundaries_and_labels(self):
+        for size, expected in (
+            (0, "0 B"),
+            (1023, "1023 B"),
+            (1024, "1.0 KiB"),
+            (1024**2, "1.0 MiB"),
+            (1024**3, "1.0 GiB"),
+            (1024**4, "1.0 TiB"),
+            (1024**5, "1024.0 TiB"),
+        ):
+            with self.subTest(size=size):
+                self.assertEqual(format_size(size, SizeUnitMode.IEC), expected)
+                self.assertEqual(format_size(size, "iec"), expected)
+
+    def test_fractional_values_and_rates_keep_the_existing_composition(self):
+        self.assertEqual(format_size(1500.0, "si"), "1.5 KB")
+        self.assertEqual(format_size(1536.0, "iec"), "1.5 KiB")
+        self.assertEqual(f"{format_size(1536, 'iec')}/s", "1.5 KiB/s")
+
+    def test_rounding_promotes_values_at_the_next_display_boundary(self):
+        self.assertEqual(format_size(999_999, "si"), "1.0 MB")
+        self.assertEqual(format_size(1_048_575, "iec"), "1.0 MiB")
+        self.assertNotIn("1000.0 KB", format_size(999_999, "si"))
+        self.assertNotIn("1024.0 KiB", format_size(1_048_575, "iec"))
+
+    def test_invalid_modes_negative_and_non_finite_sizes_are_rejected(self):
+        for mode in ("binary", "decimal", "", None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                ValueError, "Unsupported size unit mode",
+            ):
+                format_size(1, mode)  # type: ignore[arg-type]
+        for size in (-1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(size=size), self.assertRaisesRegex(
+                ValueError, "finite, non-negative",
+            ):
+                format_size(size)
+
+    def test_device_label_retains_the_decimal_default(self):
+        item = Device(
+            "/dev/sdb", 8_000_000_000, "Flash", "Acme", "usb", "SERIAL",
+            "", "8:16", True, True, False, (), (),
+        )
+        self.assertEqual(item.label, "Acme Flash  ·  8.0 GB  ·  /dev/sdb")
+        self.assertEqual(
+            item.display_label(SizeUnitMode.IEC),
+            "Acme Flash  ·  7.5 GiB  ·  /dev/sdb",
+        )
 
     def test_stable_denylist_id_prefers_wwn_then_transport_serial(self):
         base = Device(

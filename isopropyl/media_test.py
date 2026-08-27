@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import BinaryIO
 
-from .devices import Device, format_size, list_devices
+from .devices import Device, SizeUnitMode, format_size, list_devices
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -99,6 +99,7 @@ class MediaTestPlan:
     phases: tuple[MediaTestPhase, ...]
     udisksctl_path: str
     confirmation_phrase: str
+    size_unit_mode: SizeUnitMode
     warnings: tuple[str, ...]
 
 
@@ -198,7 +199,10 @@ def _confirmation_for(device: Device) -> str:
     return f"ERASE {device.path}"
 
 
-def _warnings_for(device: Device) -> tuple[str, ...]:
+def _warnings_for(
+    device: Device,
+    size_unit_mode: SizeUnitMode,
+) -> tuple[str, ...]:
     confirmation = _confirmation_for(device)
     return (
         "THIS TEST IS DESTRUCTIVE AND CANNOT BE UNDONE.",
@@ -207,8 +211,9 @@ def _warnings_for(device: Device) -> tuple[str, ...]:
             "including every partition, filesystem, and file."
         ),
         (
-            f"Verify the target again: {device.label}; serial "
-            f"{device.serial or 'not reported'}; capacity {format_size(device.size)}."
+            f"Verify the target again: {device.display_label(size_unit_mode)}; "
+            f"serial {device.serial or 'not reported'}; capacity "
+            f"{format_size(device.size, size_unit_mode)}."
         ),
         "Do not unplug the drive, suspend the computer, or remove power during the test.",
         f"To authorize this separate destructive operation, type exactly: {confirmation}",
@@ -221,10 +226,13 @@ def build_media_test_plan(
     *,
     passes: int = 1,
     finder: Callable[[str], str | None] = _trusted_which,
+    size_unit_mode: SizeUnitMode = SizeUnitMode.SI,
 ) -> MediaTestPlan:
     """Validate choices and construct all privileged argv without a shell."""
     if not isinstance(mode, MediaTestMode):
         raise ValueError("mode must be a MediaTestMode")
+    if not isinstance(size_unit_mode, SizeUnitMode):
+        raise ValueError("size_unit_mode must be a SizeUnitMode")
     _validate_device(device)
     if not 1 <= passes <= len(BADBLOCK_PATTERNS):
         raise ValueError("passes must be between 1 and 4")
@@ -268,7 +276,7 @@ def build_media_test_plan(
             ))
 
     confirmation = _confirmation_for(device)
-    warnings = _warnings_for(device)
+    warnings = _warnings_for(device, size_unit_mode)
     return MediaTestPlan(
         device=device,
         mode=mode,
@@ -276,6 +284,7 @@ def build_media_test_plan(
         phases=tuple(phases),
         udisksctl_path=udisksctl,
         confirmation_phrase=confirmation,
+        size_unit_mode=size_unit_mode,
         warnings=warnings,
     )
 
@@ -296,7 +305,9 @@ def validate_media_test_plan(plan: MediaTestPlan) -> None:
         raise MediaTestSafetyError("The media-test plan contains an invalid pass count")
     if plan.confirmation_phrase != _confirmation_for(plan.device):
         raise MediaTestSafetyError("The media-test plan contains an invalid confirmation phrase")
-    if plan.warnings != _warnings_for(plan.device):
+    if not isinstance(plan.size_unit_mode, SizeUnitMode):
+        raise MediaTestSafetyError("The media-test plan contains an invalid size-unit mode")
+    if plan.warnings != _warnings_for(plan.device, plan.size_unit_mode):
         raise MediaTestSafetyError("The media-test plan contains invalid safety warnings")
     try:
         _validate_program_path("udisksctl", plan.udisksctl_path)

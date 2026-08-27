@@ -10,18 +10,23 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QMessageBox, QPlainTextEdit, QPushButton,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
+    QLabel, QPlainTextEdit, QPushButton,
 )
 
 from isopropyl.app import PendingIsoWrite, Window
+from isopropyl.backup import VHD_MAX_SIZE
 from isopropyl.bootloaders import (
     BootloaderCacheDeletionResult, BootloaderCacheInventory, CacheDeletion,
     CachedBootloaderArtifact,
 )
 from isopropyl.casper_media import supported_casper_profile
-from isopropyl.devices import Device
-from isopropyl.formatting import Filesystem as FormatFilesystem
+from isopropyl.devices import Device, SizeUnitMode
+from isopropyl.formatting import (
+    Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
+)
 from isopropyl.images import ImageInspection, ImageMember
 from isopropyl.iso import WriteMode
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
@@ -116,8 +121,17 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        with patch("isopropyl.app.list_devices", return_value=[]):
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
             self.window = Window()
+        self.window.size_unit_mode = SizeUnitMode.SI
         self.window.device_refresh_generation += 1
         self.window.device_refresh_busy = False
         self.window.devices = [device()]
@@ -128,9 +142,12 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
         self.window.close()
         self.window.deleteLater()
         self.application.processEvents()
+        self.settings_home.cleanup()
 
-    def test_restore_selector_exposes_ext2_ext3_and_ext4(self):
+    def test_restore_selector_filters_by_capacity_and_keeps_safe_defaults(self):
         observed = []
+        defaults = []
+        notes = []
 
         def inspect_dialog(dialog) -> int:
             combo = next(
@@ -141,6 +158,12 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
                 )
             )
             observed.extend(combo.itemData(index) for index in range(combo.count()))
+            tables = next(
+                candidate for candidate in dialog.findChildren(QComboBox)
+                if candidate.findData(FormatFilesystem.FAT32) < 0
+            )
+            defaults.extend((combo.currentData(), tables.currentData()))
+            notes.extend(label.text() for label in dialog.findChildren(QLabel))
             return QDialog.DialogCode.Rejected
 
         with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
@@ -149,10 +172,46 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
             observed,
             [
                 FormatFilesystem.FAT32, FormatFilesystem.EXFAT,
-                FormatFilesystem.NTFS, FormatFilesystem.EXT2,
-                FormatFilesystem.EXT3, FormatFilesystem.EXT4,
+                FormatFilesystem.NTFS, FormatFilesystem.UDF,
+                FormatFilesystem.EXT2, FormatFilesystem.EXT3,
+                FormatFilesystem.EXT4,
             ],
         )
+        self.assertEqual(
+            defaults,
+            [FormatFilesystem.FAT32, FormatPartitionTable.MBR],
+        )
+        self.assertIn("not mounted automatically by macOS", " ".join(notes))
+
+    def test_restore_capacity_envelopes_hide_only_incompatible_formats(self):
+        cases = (
+            (64 * 1024**2, {FormatFilesystem.FAT12}, {FormatFilesystem.FAT16}),
+            (
+                200 * 1024**2,
+                {FormatFilesystem.FAT12, FormatFilesystem.FAT16},
+                set(),
+            ),
+            (3 * 1024**4, set(), {FormatFilesystem.UDF}),
+        )
+        for size, present, absent in cases:
+            with self.subTest(size=size):
+                self.window.devices = [device(size)]
+                observed = set()
+
+                def inspect_dialog(dialog) -> int:
+                    combo = next(
+                        candidate for candidate in dialog.findChildren(QComboBox)
+                        if candidate.findData(FormatFilesystem.FAT32) >= 0
+                    )
+                    observed.update(
+                        combo.itemData(index) for index in range(combo.count())
+                    )
+                    return QDialog.DialogCode.Rejected
+
+                with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
+                    self.window.format_drive()
+                self.assertTrue(present <= observed)
+                self.assertFalse(absent & observed)
 
 
 class BootloaderCacheDialogTests(unittest.TestCase):
@@ -161,7 +220,15 @@ class BootloaderCacheDialogTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        with patch("isopropyl.app.list_devices", return_value=[]):
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
             self.window = Window()
         self.window.device_refresh_generation += 1
         self.window.device_refresh_busy = False
@@ -170,6 +237,7 @@ class BootloaderCacheDialogTests(unittest.TestCase):
         self.window.close()
         self.window.deleteLater()
         self.application.processEvents()
+        self.settings_home.cleanup()
 
     def test_cache_dialog_deletes_only_inventory_entries_marked_safe(self):
         safe = CachedBootloaderArtifact(
@@ -229,8 +297,16 @@ class WindowWriteMethodTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.settings_home = tempfile.TemporaryDirectory()
-        with patch("isopropyl.app.list_devices", return_value=[]):
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
             self.window = Window()
+        self.window.size_unit_mode = SizeUnitMode.SI
         # Any queued result from the constructor's worker is now deliberately stale.
         self.window.device_refresh_generation += 1
         self.window.device_refresh_busy = False
@@ -274,6 +350,196 @@ class WindowWriteMethodTests(unittest.TestCase):
             self.assertIn(pattern, image_filter)
         for pattern in ("*.wim", "*.esd", "*.ffu", "*.vtsi"):
             self.assertNotIn(pattern, image_filter)
+
+    def test_image_inspection_oserror_leaves_the_window_ready(self):
+        failed_image = Path(self.settings_home.name) / "unreadable.iso"
+        failed_image.write_bytes(b"fixture")
+
+        with (
+            patch(
+                "isopropyl.app.inspect_image",
+                side_effect=OSError("fixture inspection failure"),
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch.object(self.window.logger, "warning") as warning,
+        ):
+            self.window.load_image(failed_image)
+
+        self.assertIsNone(self.window.inspection)
+        self.assertIsNone(self.window.inspection_identity)
+        self.assertFalse(self.window.write_method.isEnabled())
+        self.assertEqual(
+            self.window.write_method_reason.text(),
+            "Image inspection did not complete.",
+        )
+        self.assertIn("fixture inspection failure", self.window.image_detail.text())
+        warning.assert_called_once()
+
+    def test_settings_persist_binary_units_and_refresh_device_label(self):
+        self.window.size_unit_mode = SizeUnitMode.SI
+        self.window.refresh_size_labels()
+        self.assertIn("8.6 GB", self.window.device_combo.itemText(0))
+
+        def choose_binary(dialog) -> int:
+            unit_combos = [
+                combo for combo in dialog.findChildren(QComboBox)
+                if combo.findData(SizeUnitMode.IEC.value) >= 0
+            ]
+            self.assertEqual(len(unit_combos), 1)
+            combo = unit_combos[0]
+            combo.setCurrentIndex(combo.findData(SizeUnitMode.IEC.value))
+            boxes = dialog.findChildren(QDialogButtonBox)
+            self.assertEqual(len(boxes), 1)
+            boxes[0].button(QDialogButtonBox.StandardButton.Save).click()
+            return 0
+
+        with patch("isopropyl.app.QDialog.exec", new=choose_binary):
+            self.window.show_settings()
+
+        self.assertEqual(self.window.size_unit_mode, SizeUnitMode.IEC)
+        self.assertEqual(
+            self.window.settings.value("size_units"), SizeUnitMode.IEC.value,
+        )
+        self.assertIn("8.0 GiB", self.window.device_combo.itemText(0))
+
+    def test_settings_cannot_change_display_units_during_an_operation(self):
+        self.window.set_busy(True)
+
+        self.assertFalse(self.window.settings_button.isEnabled())
+
+        self.window.set_busy(False)
+        self.assertTrue(self.window.settings_button.isEnabled())
+
+    def test_ignored_drive_description_is_independent_of_display_units(self):
+        self.window.size_unit_mode = SizeUnitMode.IEC
+        with (
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.ignore_drive(self.window.devices[0])
+
+        description = self.window.ignored_devices()["serial:usb:serial"]
+        self.assertEqual(description, "ISOpropyl Test Drive · /dev/sdz")
+        self.assertNotIn("GiB", description)
+
+    def test_drive_backup_filter_selects_raw_vhd_or_vhdx_backend_and_suffix(self):
+        invocations = []
+
+        class FakeRawImager:
+            def cancel(self) -> None:
+                pass
+
+            def backup(self, source, destination, progress, *, sparse=False) -> None:
+                invocations.append(("raw", source, destination, sparse))
+                progress(source.size, source.size)
+
+        class FakeVirtualImager:
+            def cancel(self) -> None:
+                pass
+
+            def backup(self, source, destination, progress) -> None:
+                invocations.append(("virtual", source, destination, None))
+                progress(source.size * 3, source.size * 3)
+
+        cases = (
+            ("Raw disk image (*.img)", "chosen.vhdx", "chosen.img", "raw"),
+            ("Virtual PC disk (*.vhd)", "chosen.img", "chosen.vhd", "virtual"),
+            ("Hyper-V virtual disk (*.vhdx)", "chosen.backup", "chosen.backup.vhdx", "virtual"),
+        )
+        for selected_filter, entered_name, expected_name, backend in cases:
+            with self.subTest(selected_filter=selected_filter):
+                invocations.clear()
+                entered = Path(self.settings_home.name) / entered_name
+                with (
+                    patch(
+                        "isopropyl.app.QFileDialog.getSaveFileName",
+                        return_value=(str(entered), selected_filter),
+                    ),
+                    patch("isopropyl.app.path_is_on_device", return_value=False),
+                    patch("isopropyl.app.shutil.disk_usage", return_value=Mock(free=10**15)),
+                    patch(
+                        "isopropyl.app.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.Yes,
+                    ),
+                    patch("isopropyl.app.QMessageBox.information"),
+                    patch("isopropyl.app.QMessageBox.critical") as critical,
+                    patch("isopropyl.app.list_devices", return_value=self.window.devices),
+                    patch("isopropyl.app.DriveImager", FakeRawImager),
+                    patch("isopropyl.app.VirtualDriveImager", FakeVirtualImager),
+                    patch("isopropyl.app.threading.Thread", ImmediateThread),
+                ):
+                    self.window.save_drive()
+
+                critical.assert_not_called()
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(invocations[0][0], backend)
+                self.assertEqual(invocations[0][2].name, expected_name)
+                self.assertIs(invocations[0][1], self.window.devices[0])
+                self.assertEqual(invocations[0][3], False if backend == "raw" else None)
+
+    def test_drive_backup_rechecks_destination_against_refreshed_device(self):
+        backend = Mock()
+
+        class FakeRawImager:
+            def cancel(self) -> None:
+                pass
+
+            def backup(self, *args, **kwargs) -> None:
+                backend(*args, **kwargs)
+
+        selected = self.window.devices[0]
+        refreshed = Device(
+            selected.path, selected.size, selected.model, selected.vendor,
+            selected.transport, selected.serial, selected.wwn,
+            selected.major_minor, selected.removable, selected.hotplug,
+            selected.read_only, ("/media/new",), ("/dev/sdz1",),
+        )
+        destination = Path(self.settings_home.name) / "backup.img"
+        with (
+            patch(
+                "isopropyl.app.QFileDialog.getSaveFileName",
+                return_value=(str(destination), "Raw disk image (*.img)"),
+            ),
+            patch("isopropyl.app.path_is_on_device", side_effect=(False, True)),
+            patch("isopropyl.app.shutil.disk_usage", return_value=Mock(free=10**15)),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.QMessageBox.information"),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch("isopropyl.app.list_devices", return_value=[refreshed]),
+            patch("isopropyl.app.DriveImager", FakeRawImager),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch.object(self.window.logger, "exception"),
+        ):
+            self.window.save_drive()
+
+        backend.assert_not_called()
+        self.assertTrue(critical.called)
+        self.assertIn("destination moved onto", critical.call_args.args[2])
+
+    def test_oversized_vhd_is_rejected_before_space_check_or_confirmation(self):
+        self.window.devices = [device(VHD_MAX_SIZE + 512)]
+        destination = Path(self.settings_home.name) / "too-large.vhd"
+        with (
+            patch(
+                "isopropyl.app.QFileDialog.getSaveFileName",
+                return_value=(str(destination), "Virtual PC disk (*.vhd)"),
+            ),
+            patch("isopropyl.app.shutil.disk_usage") as disk_usage,
+            patch("isopropyl.app.QMessageBox.question") as question,
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.save_drive()
+
+        disk_usage.assert_not_called()
+        question.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn("too large for VHD", warning.call_args.args[2])
 
     def test_explicit_dd_selection_remains_visible_and_changes_dispatch_label(self):
         self.window.rebuild_write_recommendation(preserve_selection=False)
@@ -341,7 +607,14 @@ class WindowPersistenceTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.settings_home = tempfile.TemporaryDirectory()
-        with patch("isopropyl.app.list_devices", return_value=[]):
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
             self.window = Window()
         self.window.device_refresh_generation += 1
         self.window.device_refresh_busy = False
