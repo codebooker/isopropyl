@@ -10,6 +10,7 @@ import json
 import stat
 import tempfile
 from dataclasses import dataclass, replace
+from importlib.resources import files
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSettings, QTimer, Qt, pyqtSignal
@@ -4525,9 +4526,8 @@ def main() -> int:
     app.setDesktopFileName("io.github.codebooker.isopropyl")
     icon = QIcon.fromTheme("io.github.codebooker.isopropyl")
     if icon.isNull():
-        source_icon = (
-            Path(__file__).resolve().parent.parent
-            / "data" / "io.github.codebooker.isopropyl.svg"
+        source_icon = files("isopropyl").joinpath(
+            "data/io.github.codebooker.isopropyl.svg"
         )
         if source_icon.is_file():
             icon = QIcon(str(source_icon))

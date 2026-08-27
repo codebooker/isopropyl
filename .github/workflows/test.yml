@@ -26,4 +26,4 @@ jobs:
       - run: appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
       - run: python -m json.tool isopropyl/data/bootloaders-v2.json > /dev/null
       - run: python -m pip wheel --no-deps . --wheel-dir /tmp/isopropyl-wheel
-      - run: python -c "import glob,zipfile; n=zipfile.ZipFile(glob.glob('/tmp/isopropyl-wheel/*.whl')[0]).namelist(); assert any(x.endswith('/THIRD_PARTY_NOTICES.md') for x in n); assert any(x.endswith('/CERTVALIDATOR-MIT.txt') for x in n)"
+      - run: python -c "import glob,zipfile; n=zipfile.ZipFile(glob.glob('/tmp/isopropyl-wheel/*.whl')[0]).namelist(); assert 'isopropyl/data/io.github.codebooker.isopropyl.svg' in n; assert any(x.endswith('/THIRD_PARTY_NOTICES.md') for x in n); assert any(x.endswith('/CERTVALIDATOR-MIT.txt') for x in n)"

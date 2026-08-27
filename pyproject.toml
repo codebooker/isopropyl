@@ -42,7 +42,7 @@ include = ["isopropyl*"]
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*"]
 
 [tool.setuptools.package-data]
-isopropyl = ["data/*.json"]
+isopropyl = ["data/*.json", "data/*.svg"]
 
 [tool.setuptools.data-files]
 "share/applications" = ["data/io.github.codebooker.isopropyl.desktop"]

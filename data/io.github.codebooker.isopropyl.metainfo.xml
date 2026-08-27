@@ -42,9 +42,13 @@
     <keyword>disk image</keyword>
   </keywords>
   <content_rating type="oars-1.1"/>
+  <branding>
+    <color type="primary" scheme_preference="light">#1B2230</color>
+    <color type="primary" scheme_preference="dark">#F6922E</color>
+  </branding>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/codebooker/isopropyl/main/data/screenshot.png</image>
+      <image>https://raw.githubusercontent.com/codebooker/isopropyl/5da7c0b9a73b2b3d05f00eb00c25d742ee9042f8/data/screenshot.png</image>
       <caption>Inspect an image, choose a protected removable target, and select DD or ISO mode.</caption>
     </screenshot>
   </screenshots>

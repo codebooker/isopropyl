@@ -9,231 +9,50 @@
 
 **A capable, safety-first USB image writer for Linux.**
 
-[Features](#features) · [Install](#installation) · [ISO mode](#iso-mode) · [Safety](#safety-model) · [Roadmap](ROADMAP.md)
+[Install](#installation) · [Quick start](#quick-start) · [Features](#features) · [Safety](#safety-model) · [Roadmap](ROADMAP.md) · [Contribute](CONTRIBUTING.md)
 
 <sub>RAW DD &nbsp;•&nbsp; UEFI ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; READ-BACK VERIFICATION</sub>
 
 </div>
 
-![ISOpropyl application window inspecting a Windows 11 ISO](data/screenshot.png)
+![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](data/screenshot.png)
 
-<p align="center"><sub>Inspect the image, choose an explicit write method, and verify the exact removable target before anything is erased.</sub></p>
+<p align="center"><sub>Deterministically rendered example with synthetic image and device metadata; no physical drive was written.</sub></p>
 
-ISOpropyl creates bootable USB and SD media without asking you to surrender a
-whole graphical application to root. It combines straightforward DD writing
-with a filesystem-aware UEFI ISO workflow, deep image inspection, Windows
-installer customization, verification, backups, formatting, and media tools.
+ISOpropyl creates bootable USB and SD media without running an entire graphical
+application as root. It combines exact DD writing with a filesystem-aware UEFI
+ISO workflow, inspection before erasure, best-effort Windows installer
+customization, checksums, backups, formatting, media tests, and full read-back
+verification when the default verification option remains enabled.
 
-> [!WARNING]
-> ISOpropyl is alpha software that can overwrite entire drives. Read the target
-> model, capacity, path, and serial number before confirming any destructive
-> operation. Keep backups of anything important.
+> [!CAUTION]
+> **ISOpropyl is destructive alpha software.** There is no packaged release yet,
+> and block-device workflows currently have extensive mocked coverage but limited
+> physical-media certification. ISO mode is UEFI-only, Secure Boot acceptance is
+> not established, and unusual firmware or installer layouts may not boot. Keep
+> backups and verify the target model, capacity, path, and serial before writing.
 
-## Features
+## Why ISOpropyl?
 
-### Write more than raw images
-
-- A first-class **ISO vs DD selector** recommends the safest compatible method
-  from the inspected image, explains why, and never silently changes your choice.
-- **DD mode** for hybrid ISOs and raw disk images, with cancellation and
-  byte-for-byte read-back verification.
-- **ISO mode** for supported UEFI media: safely extract the ISO, choose FAT32
-  or NTFS automatically, split a sole conventional Windows
-  `sources/install.wim` when useful,
-  optionally add `autounattend.xml`, and SHA-256 verify every copied file from
-  the USB. Large-file NTFS media use an exact, read-back-verified UEFI:NTFS
-  bridge obtained from a version-and-hash-pinned upstream artifact.
-- Stream `.gz`, `.gzip`, `.bz2`, `.bzip2`, `.xz`, `.lzma`, `.zst`, `.zstd`,
-  legacy `.Z`, and single-file ZIP images without creating an expanded copy.
-  Five-field file identity binds inspection and confirmation; the writer then
-  opens one no-follow descriptor and keeps it through the privileged write.
-  Every decoded read is rechecked before its bytes can be yielded, and a changed
-  descriptor fails closed.
-- Inspect and convert VHD, VHDX, QCOW, and QCOW2 containers through a bounded,
-  identity-checked `qemu-img` staging step—container headers are never written
-  as if they were disk sectors.
-
-### Understand an image before writing it
-
-- For raw and ISO inputs, structurally validate MBR, extended-partition chains,
-  protective/hybrid MBR, and reciprocal primary/backup GPT metadata—including
-  mandatory protective fields, revisions, reserved bytes, CRCs, bounds, GUIDs,
-  attributes, and overlaps—before recommending DD. Plain MBR geometry uses the
-  conventional 512-byte-LBA interpretation; GPT logical-sector size is detected
-  and validated at 512 or 4096 bytes.
-- Treat legal compressed images whose partition metadata falls outside the
-  bounded prefix/tail capture as “inspection incomplete,” never as corrupt or
-  automatically DD-ready.
-- Classify common Windows, GRUB, and Syslinux MBR boot code and surface malformed
-  partition metadata instead of treating a signature alone as a valid disk.
-- Parse El Torito boot catalogs and report their BIOS/UEFI boot entries.
-- Inspect removable-media EFI executables, PE architecture, certificate-table
-  framing, and SBAT structure. A sealed, resource-limited worker checks one
-  embedded Authenticode signature's SHA-256/384/512 file integrity and signer
-  signature, while clearly labeling the result untrusted: Microsoft/firmware
-  trust, revocation, signing timestamps, DBX policy, and Secure Boot acceptance
-  are not evaluated and never influence write authorization.
-- Detect Windows installer media and exact GRUB/Syslinux payload identities when
-  the image contains enough evidence.
-- Calculate MD5, SHA-1, SHA-256, and SHA-512 in one cancellable pass over a
-  descriptor bound to the exact inspected identity, reject file replacement or
-  mutation, and compare a provider's pasted checksum without guessing.
-
-### Customize Windows installation media
-
-ISOpropyl inspects a sole canonical `sources/install.esd` or up to four exact,
-regular `install.wim` sources, including safe nested architecture/edition
-layouts. The source picker shows each edition, index, architecture, version, and
-build, then generates a source-scoped answer-file selection using the image
-index and, for nested or multi-source media, the exact catalog path—or leaves
-the choice to Setup. Booted Windows Setup certification for uncommon nested and
-multi-source launch layouts remains open. ISOpropyl can also generate and apply
-a transparent Windows answer file with options for:
-
-- Windows 11 RAM, TPM 2.0, and Secure Boot setup-check bypasses;
-- local administrator creation and Microsoft-account screen suppression;
-- a separate fixed `BypassNRO` offline-account path for a selected, recognized
-  non-Home x64/ARM64 Windows 11 21H2–24H2 edition;
-- privacy/OOBE choices and automatic BitLocker-device-encryption prevention;
-- input locale, system/UI language, user locale, keyboard layout, and time zone.
-
-The XML is inspectable and exportable. Before staging, ISOpropyl regenerates it
-byte-for-byte from the frozen typed options and selected architecture. Existing
-root or OEM/Panther Windows answer files are detected case-insensitively and
-never silently combined or replaced.
-
-The stronger offline-account option is deliberately disabled for Home, x86,
-Windows 25H2/26H1, unknown editions, and metadata with an obvious normalized
-S-mode or cloud marker because the fixed registry method is not assumed to
-survive new Setup behavior. WIM metadata cannot prove that a localized or
-offline-serviced image has no S-mode policy, so the GUI requires an explicit
-acknowledgment of that residual limitation. It also advises disconnecting
-networking during OOBE. This is a transparent best-effort compatibility option,
-not a promise that Microsoft will keep the path working.
-
-Local-account creation deliberately embeds no secret: the administrator starts
-with a blank password, and one sequential first-logon command requests an
-immediate password replacement and applies the selected expiration policy.
-That command is a Windows Setup policy, not a security guarantee; it does not
-run in Windows S mode and can be affected by setup policy or command failure.
-ISOpropyl warns before enabling this option, and S-mode media should not use it.
-
-### Maintain and validate removable media
-
-- Save a complete removable drive as an atomic raw, VHD, or VHDX backup. Virtual
-  backups are made from a private exact capture, checked for exact virtual size,
-  and content-compared before publication.
-- Capture readable optical media to ISO without modifying the disc.
-- Preserve portable file and explicit-directory modification times cataloged by
-  ISO/UDF media through safe extraction and FAT32/NTFS construction, subject to
-  the temporary workspace and destination filesystem timestamp resolutions.
-  Workspace normalization is accepted only below FAT's two-second granularity,
-  and that first observed value is carried through later transformations. The
-  constructed plan rejects non-portable staging times before touching a target;
-  after destination normalization, read-back must match the observed value
-  exactly. Image ownership and permission metadata are never applied.
-- Restore a drive as FAT12, FAT16, FAT32, exFAT, NTFS, UDF 2.01, ext2, ext3,
-  or ext4 using MBR or GPT. Exact, geometry-safe allocation-unit choices are
-  available for FAT/exFAT/NTFS and portable block-size choices for ext. Automatic
-  appears only when the modeled formatter-default policy is conservatively valid
-  once logical-sector geometry is known; if discovery omits that geometry, the
-  choice is provisional and is revalidated before unmounting. An explicit safe
-  size is required when a known default cannot be guaranteed. The UI switches to
-  GPT when known geometry proves a full-capacity partition exceeds MBR's 32-bit
-  sector fields, and states the legacy-FAT limits and partitioned UDF's macOS
-  automount caveat.
-- Run destructive bad-block passes and F3 fake-capacity probes as separate,
-  heavily warned workflows.
-- Zero the full device or only its boundary metadata regions.
-- Export privacy-conscious diagnostics and a rotating local activity log.
-- Choose decimal MB/GB/TB or binary MiB/GiB/TiB display units.
-
-## Safety model
-
-Destructive disk software deserves boring, explicit safeguards. ISOpropyl:
-
-- excludes the disk backing the running root filesystem;
-- shows removable USB/SD media only, hiding USB hard drives and SSDs unless you
-  explicitly reveal them;
-- operates only on validated whole-device paths beneath `/dev`;
-- binds the selected model, capacity, serial/WWN, transport, and major:minor
-  identity, then rechecks them around unmounting and immediately before writes;
-- binds the image selected for inspection to the image approved for writing,
-  including device, inode, size, modification time, and change time, then streams
-  from the writer's identity-checked no-follow descriptor instead of asking
-  privileged `dd` to reopen a pathname;
-- refuses to preselect DD when a validated image layout uses a logical-sector
-  size different from the selected target, or when the selected target does not
-  report the sector size needed to validate structured partition LBAs; for plain
-  MBR this is explicitly the conventional assumed 512-byte interpretation;
-- binds the target's logical-sector size before destructive restore work and
-  rechecks it again before the selected formatter runs;
-- refuses an image or staging tree stored on the destination drive;
-- runs privileged tools with fixed argument arrays—never constructed shell text;
-- wraps privileged destructive tools in fail-fast, whole-device cooperative
-  locks that coordinate with systemd-udevd and other lock-aware storage tools;
-- time-bounds short-lived privileged-command wrappers and uses bounded
-  terminate/kill/reap handling when cancelling long-running destructive tools;
-- will not overwrite backup, optical-capture, extraction, or staging outputs;
-- keeps drive erasure and destructive media testing outside the normal write
-  button, with separate confirmations.
-
-See [SECURITY.md](SECURITY.md) for the reporting policy and security invariants.
-
-## Supported inputs
-
-| Input | Current path | Notes |
-|---|---|---|
-| Hybrid `.iso` | DD mode | Preserves the image's existing disk layout. |
-| UEFI `.iso` | ISO mode | GPT/FAT32 when every file fits; GPT/NTFS plus a pinned UEFI:NTFS bridge for x64, x86, ARM64, and explicitly consented unsigned ARM32/RISC-V64 large-file media. |
-| `.img`, `.raw`, `.usb`, `.wic`, and raw disk images | DD mode | Exact image bytes are written. `.usb` and Yocto-style `.wic` files are treated as raw disk images, not structured installers. |
-| Compressed raw images | Streaming DD | Formats listed above; ZIP must contain exactly one regular image. |
-| VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; backing files and encrypted containers are rejected. |
-
-Unsupported formats fail closed instead of being guessed. FFU, VTSI, Windows To
-Go, dual BIOS+UEFI construction, broader persistence profiles, and broader
-architecture/firmware profiles are tracked in the
-[feature audit](FEATURE_MATRIX.md).
-
-## Requirements
-
-- Linux with Python 3.10 or newer and PyQt 6.5 or newer.
-- The Python installation resolves the exact pinned Signify/Authenticode
-  analysis backend automatically. A directly launched, otherwise uninstalled
-  working tree stays usable but reports cryptographic analysis as unsupported.
-- `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`
-  for normal device work.
-- 7-Zip (`7z`) for ISO cataloging and safe extraction.
-- `sfdisk` and `mkfs.vfat` for FAT32 ISO mode; `mkfs.ntfs` (usually supplied by
-  `ntfs-3g`) for large-file UEFI:NTFS media.
-- `wimlib-imagex` (commonly packaged as `wimtools`) to inspect or select Windows
-  WIM/ESD editions, and to split a sole conventional `sources/install.wim` when
-  it exceeds FAT32's per-file limit. Nested or multi-source oversized WIM media
-  remain unchanged on NTFS so source paths stay valid.
-
-Optional tools unlock additional workflows:
-
-| Capability | Tool |
+| | What it means |
 |---|---|
-| VHD/VHDX/QCOW/QCOW2 input and VHD/VHDX drive backup | `qemu-img` |
-| FAT12/FAT16/FAT32 restore and FAT32 ISO mode | `mkfs.vfat` (dosfstools) |
-| NTFS/exFAT/UDF/ext2/ext3/ext4 restore | `mkfs.ntfs`, `mkfs.exfat`, `mkudffs` 1.1+, `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` |
-| Experimental matched Ubuntu persistence profile | `mkfs.ext4` |
-| Surface and fake-capacity tests | `badblocks`, `f3probe` |
-| Additional ISO inspection | `xorriso` |
-| Zstandard-compressed images | Python `zstandard` module or `zstd` |
-| Legacy Unix `.Z` images | `gzip` |
-| Busy-drive process names after an unmount failure | `fuser` (psmisc) |
-
-ISO mode needs temporary free space for the extracted tree. Splitting a large
-WIM conservatively requires room for the extracted WIM and its split parts at
-the same time; ISOpropyl calculates and displays the requirement before starting.
-Edition inspection also extracts the complete WIM/ESD member into private
-temporary storage and can therefore require several gigabytes.
+| **Choose the write method** | DD and ISO mode are explicit. ISOpropyl recommends a compatible path and explains why, but never silently changes your choice. |
+| **Inspect before erasing** | Partition tables, boot entries, Windows metadata, EFI payloads, and image identity are examined automatically; opt-in checksums are available before writing. |
+| **Keep privilege narrow** | The GUI stays in the desktop session as your user. `pkexec` is requested only for the block-device step. |
+| **Prove the result** | With verification enabled, DD mode compares every written image byte; ISO mode SHA-256 verifies every copied file from the finished USB. |
+| **Fail closed** | Unsafe transformations and automatic recommendations stop on ambiguous evidence. Explicit byte-for-byte DD may remain available, with warnings, when an exact copy is still meaningful. |
 
 ## Installation
 
-### Run from source
+ISOpropyl currently has no release tarball, Flatpak, AppImage, or distribution
+package. Install Python 3, `python3-venv`, `python3-pip`, and the required host
+tools from your distribution first. Debian/Ubuntu package names commonly include
+`p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `ntfs-3g`, and
+`wimtools`; names vary across distributions. See [Requirements](#requirements)
+for which tool unlocks each capability.
+
+For alpha testing, run ISOpropyl from a source checkout in an isolated Python
+environment:
 
 ```bash
 git clone https://github.com/codebooker/isopropyl.git
@@ -241,91 +60,193 @@ cd isopropyl
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install .
 isopropyl
 ```
 
-You can also launch the working tree directly:
+To work on the source, replace `python -m pip install .` with
+`python -m pip install -e .`. After the environment is prepared, the checkout
+launchers are also available:
 
 ```bash
 ./isopropyl-gui
 ./isopropyl-gui path/to/image.iso
 ```
 
-Install required host tools through your distribution's package manager. On
-Debian/Ubuntu-family systems, the relevant package names commonly include
-`p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `exfatprogs`,
-`udftools`, `e2fsprogs`, `ntfs-3g`, `wimtools`, `qemu-utils`, and `psmisc`.
-
-The first UEFI:NTFS use asks permission to download a 1 MiB helper from its
-release-pinned Rufus source URL. ISOpropyl verifies the exact byte count and
-SHA-256 before it can reach a destructive operation, caches it locally, and
-revalidates the cache on every use. **Settings → Manage downloaded boot
-helpers…** inventories catalog-known cache entries and can remove filesystem-safe
-regular files—including corrupt or incomplete copies. Unknown paths, links,
-hard-linked files, and entries that change during inspection are deliberately
-left untouched.
-
-**Create UEFI Shell…** makes a GPT/FAT32 recovery drive containing the exact
-upstream 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 applications. ISOpropyl
-asks before networking, pins every file's size and SHA-256, verifies its PE
-architecture and EFI application subsystem, stages canonical fallback paths,
-then applies the same target binding, typed erase confirmation, and full file
-read-back as other constructed media. The downloaded applications are never
-executed on Linux. They are unsigned, so Secure Boot must be disabled on the
-computer that boots this USB.
-
 > [!IMPORTANT]
-> Run ISOpropyl as your normal desktop user. It requests narrowly scoped
-> elevation through `pkexec` only when a block-device operation begins.
+> Run ISOpropyl as your normal desktop user. Do not launch the GUI with `sudo`.
 
-## Usage
+## Quick start
 
-### DD mode
+### Exact DD write
 
-1. Choose or drop an image.
-2. Select the removable destination and review its identity.
-3. Choose **DD mode — exact byte-for-byte copy** in the visible method selector.
-4. Leave **Verify after writing** enabled, select **Write in DD mode**, review
-   the final erase warning, and confirm.
+1. Choose or drop a hybrid/raw-write-compatible ISO, raw image, compressed image,
+   or supported virtual disk, and follow the write-method recommendation.
+2. Select a removable target and review its model, capacity, path, and serial.
+3. Choose **DD mode — exact byte-for-byte copy**.
+4. Keep verification enabled, review the final erase warning, and confirm.
 
-### UEFI Shell recovery media
+### Filesystem-aware ISO write
 
-1. Select a removable destination; no ISO is required.
-2. Choose **Create UEFI Shell…** and approve the release-pinned download.
-3. Review the exact drive identity, GPT/FAT32 layout, and five architectures.
-4. Type the displayed `WRITE /dev/…` phrase to authorize the erase and write.
-
-### ISO mode
-
-1. Select an ISO and a destination drive.
-2. Choose **ISO mode — filesystem-aware, UEFI-only**. ISOpropyl shows why it
-   recommends ISO or DD mode and never switches methods silently.
-3. Optionally open **Plan details…**, then select **Write in ISO mode** and
-   choose a disk with enough temporary working space.
-4. Review the exact filesystem, firmware limitation, transformations, target
-   path, and serial number, then confirm.
-
-An experimental **Persistent storage** control exists only for candidate
-remastered Ubuntu amd64 images whose catalog exposes a recognized UEFI GRUB
-config path and legacy Casper file layout. Private staging then validates that
-the file really contains an eligible kernel line before any target change.
-Current official Ubuntu 20.04.6, 22.04.5, and 24.04.3 desktop catalogs do not
-meet even the candidate gate, so ISOpropyl deliberately hides the option for
-them instead of producing media that only appears persistent.
-
-For supported Windows media, configure **Windows options…** before starting ISO
-mode. If the ISO contains several supported `install.wim` sources, first choose
-the exact source and then its edition; otherwise you can choose a specific
-WIM/ESD edition or let Windows Setup ask. Windows customization is applied only
-in ISO mode; choosing DD mode produces an explicit warning instead of silently
-discarding the profile.
+1. Choose an eligible, structurally validated UEFI ISO and a removable target.
+2. Choose **ISO mode — filesystem-aware, UEFI-only** and open **Plan details…**.
+3. For recognized Windows media, optionally configure **Windows options…** and
+   inspect the generated answer file.
+4. Review the filesystem, transformations, firmware limitations, temporary-space
+   requirement, and exact target identity before confirming.
 
 Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
 <kbd>Ctrl</kbd>+<kbd>R</kbd> refreshes targets,
 <kbd>Ctrl</kbd>+<kbd>L</kbd> opens the log, and <kbd>Esc</kbd> cancels.
 
-## Development
+## Features
+
+### Write and verify
+
+- **DD mode** streams hybrid ISOs and raw disk images with cancellation and
+  byte-for-byte read-back verification.
+- **ISO mode** safely extracts eligible UEFI media, selects FAT32 or NTFS,
+  handles a sole conventional oversized Windows WIM when possible, and verifies
+  every destination file. NTFS media use a release-and-hash-pinned UEFI:NTFS
+  bridge after explicit download consent.
+- Compressed `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, legacy `.Z`, and single-file
+  ZIP images stream without an expanded copy. VHD, VHDX, QCOW, and QCOW2 inputs
+  use an identity-checked `qemu-img` staging step.
+- Image selection is bound to device, inode, size, modification time, and change
+  time so a replacement or mutation cannot quietly become the written image.
+
+### Inspect and customize
+
+- Validate MBR, extended partitions, protective/hybrid MBR, and reciprocal GPT
+  metadata at supported sector sizes; malformed or incomplete evidence is shown
+  instead of treated as bootable.
+- Parse El Torito BIOS/UEFI entries and inspect EFI PE architecture, certificate
+  framing, and SBAT. A sealed, resource-limited worker can report embedded
+  Authenticode **integrity only**; it does not establish publisher, Microsoft,
+  firmware, revocation, timestamp, DBX, or Secure Boot trust.
+- Calculate MD5, SHA-1, SHA-256, and SHA-512 in one cancellable pass and compare a
+  pasted checksum without guessing its algorithm.
+- Inspect recognized Windows WIM/ESD sources and editions. ISO mode can add a
+  transparent `autounattend.xml` for setup-check bypasses, privacy/OOBE choices,
+  locale and time-zone settings, BitLocker-device-encryption prevention, and
+  carefully gated local/offline account paths.
+
+Windows customization is best-effort and intentionally conservative. Existing
+answer files are never silently combined or replaced; unsupported Home, S-mode,
+future-release, architecture, or ambiguous layouts disable the stronger account
+paths. The exact gates and residual limitations are documented in the
+[feature matrix](FEATURE_MATRIX.md) and [security model](SECURITY.md).
+
+### Maintain removable media
+
+- Save a complete removable drive as an atomic raw, VHD, or VHDX backup, or
+  capture readable optical media to ISO without modifying the disc.
+- Restore ordinary storage as FAT12/16/32, exFAT, NTFS, UDF 2.01, or ext2/3/4
+  using geometry-checked MBR or GPT layouts.
+- Run destructive bad-block or F3 fake-capacity tests in separate, heavily
+  warned workflows; zero a whole device or only its boundary metadata regions.
+- Create a verified GPT/FAT32 UEFI Shell recovery drive for five architectures
+  from exact upstream files after explicit networking consent.
+- Export privacy-conscious diagnostics, keep a rotating local activity log, and
+  choose decimal or binary display units.
+
+For the implementation-level capability audit and Rufus comparison, see
+[FEATURE_MATRIX.md](FEATURE_MATRIX.md).
+
+## Supported inputs
+
+| Input | Path | Important limitation |
+|---|---|---|
+| Hybrid `.iso` | DD mode | Preserves the image's existing layout exactly. |
+| Eligible UEFI `.iso` | ISO mode | UEFI-only; FAT32 or verified UEFI:NTFS depending on file sizes and architecture. |
+| `.img`, `.raw`, `.usb`, `.wic` | DD mode | Treated as raw disk images, not structured installers. |
+| Compressed raw image | Streaming DD | ZIP must contain exactly one regular image. |
+| VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; encrypted containers and backing files are rejected. |
+
+Unsupported formats fail closed. FFU, VTSI, Windows To Go, dual BIOS+UEFI
+construction, broader persistence profiles, localization, and release packaging
+remain on the [roadmap](ROADMAP.md).
+
+## Safety model
+
+Destructive disk software should be predictable. ISOpropyl:
+
+- excludes the disk backing the running root filesystem;
+- shows removable USB/SD media by default and hides USB HDDs/SSDs unless revealed;
+- accepts only validated whole-device paths beneath `/dev`;
+- freezes model, capacity, serial/WWN, transport, major:minor, and logical-sector
+  identity, then rechecks it around unmounting and immediately before writes;
+- refuses images or staging trees stored on the destination drive;
+- uses fixed privileged argument arrays, never constructed shell text;
+- coordinates destructive operations with fail-fast whole-device locks;
+- time-bounds helper processes and uses bounded terminate/kill/reap cancellation;
+- will not overwrite backup, capture, extraction, or staging outputs; and
+- keeps erase and destructive media tests outside the normal write button with
+  separate confirmations.
+
+Read the complete invariants and vulnerability-reporting policy in
+[SECURITY.md](SECURITY.md).
+
+## Requirements
+
+Core application requirements:
+
+- Linux, Python 3.10 or newer, and PyQt6 6.5 through 6.x;
+- `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`;
+- 7-Zip (`7z`) for ISO cataloging and safe extraction; and
+- `sfdisk` plus `mkfs.vfat` for FAT32 ISO mode, or `mkfs.ntfs` for large-file
+  UEFI:NTFS media.
+
+Optional tools unlock additional workflows:
+
+| Capability | Tool |
+|---|---|
+| Windows WIM/ESD inspection, selection, and splitting | `wimlib-imagex` (`wimtools`) |
+| VHD/VHDX/QCOW/QCOW2 input and VHD/VHDX backup | `qemu-img` |
+| exFAT/UDF/ext restore | `mkfs.exfat`, `mkudffs` 1.1+, `mkfs.ext2/3/4` |
+| Surface and fake-capacity tests | `badblocks`, `f3probe` |
+| Additional ISO inspection | `xorriso` |
+| Zstandard-compressed images | Python `zstandard` or `zstd` |
+| Legacy Unix `.Z` images | `gzip` |
+| Busy-drive process names | `fuser` (`psmisc`) |
+
+ISO mode also needs temporary space for its private extracted tree. WIM edition
+inspection or splitting can require several additional gigabytes. Missing
+optional tools disable the relevant path rather than weakening its checks.
+
+## Troubleshooting and support
+
+- **No destination is listed:** refresh the device list, confirm the medium is
+  removable, and leave **Show USB hard drives/SSDs** off unless that is truly the
+  intended target. The root-backed disk is never eligible.
+- **ISO mode is unavailable:** open **Plan details…**. The image may lack a safe
+  UEFI fallback loader, require an unavailable filesystem/helper, or contain a
+  layout ISOpropyl will not transform.
+- **A privilege prompt fails:** check that `pkexec`, a PolicyKit agent, udisks2,
+  and the required formatter are installed in the desktop session.
+- **Secure Boot fails:** Authenticode integrity is not a firmware trust verdict.
+  Review the payload report; unsigned UEFI Shell media explicitly requires
+  Secure Boot to be disabled.
+- **A write or inspection fails:** open **View log**, then choose
+  **Export diagnostics…**. Serial numbers, WWNs, mount paths, volume labels,
+  image member names, member-scoped issues, and command lines are omitted by
+  default.
+
+Report reproducible problems through [GitHub Issues](https://github.com/codebooker/isopropyl/issues).
+Never attach secrets, private installer answer files, or unredacted drive data.
+
+## Project status
+
+ISOpropyl is an ambitious alpha, not yet a feature-for-feature Rufus replacement.
+CI currently exercises the non-destructive suite on an Ubuntu x86-64 runner with
+Python 3.12; device-facing tests mock block devices and privileged commands and
+never write a real drive. Broad distro, desktop, Wayland/X11, firmware, Secure
+Boot, card-reader, and physical-media testing is still required.
+
+The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
+and [ROADMAP.md](ROADMAP.md).
+
+## Development and contributing
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -334,38 +255,23 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 700 tests. Device-facing tests mock block
-devices and privileged commands; the automated suite never writes a real drive.
-See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
-path.
+The suite contains more than 700 tests. See [CONTRIBUTING.md](CONTRIBUTING.md)
+before changing any destructive path. Security vulnerabilities should follow the
+private-reporting guidance in [SECURITY.md](SECURITY.md), not a public issue.
 
-## Project status
-
-ISOpropyl is an ambitious alpha, not yet a feature-for-feature Rufus replacement.
-The FAT32 and UEFI:NTFS ISO paths are real but have only mocked block-device
-coverage; they still need broad distro, firmware, Secure Boot, card-reader, and
-physical-media testing. Persistence has a hardened layout backend and guarded
-GUI plumbing, but current official Ubuntu images need embedded UEFI GRUB-config
-support before the option can be offered. BIOS/dual-firmware construction,
-broader persistence profiles, Windows To Go, broader verified-download catalogs,
-localization, and release packaging remain active work. The UEFI Shell path is
-implemented but still needs physical firmware certification across architectures.
-
-The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
-and [ROADMAP.md](ROADMAP.md).
-
-## Inspiration and license
+## Credits and third-party software
 
 ISOpropyl is inspired by the clarity and capability of
-[Rufus](https://github.com/pbatard/rufus). Its application code is an independent
-Linux-native implementation. The optional UEFI:NTFS runtime helper is an
-unmodified, hash-pinned upstream artifact with separate licensing documented in
+[Rufus](https://github.com/pbatard/rufus), but its application code is an
+independent Linux-native implementation. Optional UEFI:NTFS and UEFI Shell files
+remain under their upstream licenses and are acquired only after explicit user
+consent. Dependency licenses and provenance are recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-The UEFI Shell workflow likewise uses unmodified, hash-pinned upstream files
-under their separate BSD-2-Clause-Patent license.
 
-The official symbol, repository banner, palette, and naming guidance live in
+The symbol, repository banner, palette, and naming guidance live in
 [BRANDING.md](BRANDING.md).
 
-Copyright is held by ISOpropyl contributors. The project is free software under
+## License
+
+Copyright is held by ISOpropyl contributors. ISOpropyl is free software under
 the [GNU Affero General Public License v3.0 or later](LICENSE).

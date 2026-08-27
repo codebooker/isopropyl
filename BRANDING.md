@@ -31,3 +31,8 @@ executable, and repository name remain lowercase `isopropyl`.
 Keep the symbol's proportions intact, preserve clear space around it, and do not
 separate the disc from the droplet. The source SVGs are the canonical assets;
 raster exports should be derived from them rather than edited independently.
+
+The application icon is also copied into `isopropyl/data/` so installed wheels
+retain a theme-independent runtime fallback. The two SVG files must remain
+byte-for-byte identical. Unless a file says otherwise, ISOpropyl's original
+brand artwork is distributed under `AGPL-3.0-or-later` with the application.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 """Privacy-conscious diagnostic bundle generation."""
 
+import enum
 import json
 import os
 import platform
@@ -51,12 +52,50 @@ def _device_record(device: Device, include_identifiers: bool) -> dict[str, Any]:
 def _image_record(inspection: ImageInspection | None) -> dict[str, Any] | None:
     if inspection is None:
         return None
-    # Member paths can contain private project/customer names; counts retain
-    # the useful diagnostic fact without exporting that catalog.
+    # Volume labels, member paths, and member-scoped issue text can contain
+    # private project/customer names. Counts retain the useful diagnostic facts
+    # without exporting that catalog. El Torito identifiers and selection bytes
+    # are likewise image-controlled, so export only a structural summary.
     record = asdict(inspection)
+    record.pop("volume_label", None)
+    record["volume_label_present"] = bool(inspection.volume_label)
     record.pop("members", None)
     record["member_count"] = len(inspection.members)
-    return record
+    record.pop("bootloader_issues", None)
+    record["bootloader_issue_count"] = len(inspection.bootloader_issues)
+    record.pop("uefi_payloads", None)
+    record["uefi_payload_count"] = len(inspection.uefi_payloads)
+    record.pop("uefi_analysis_issues", None)
+    record["uefi_analysis_issue_count"] = len(inspection.uefi_analysis_issues)
+    if inspection.eltorito is not None:
+        record["eltorito"] = {
+            "source_size": inspection.eltorito.source_size,
+            "catalog_lba": inspection.eltorito.catalog_lba,
+            "catalog_offset": inspection.eltorito.catalog_offset,
+            "catalog_size": inspection.eltorito.catalog_size,
+            "descriptors_scanned": inspection.eltorito.descriptors_scanned,
+            "validation_platform": inspection.eltorito.validation.platform.value,
+            "entry_count": len(inspection.eltorito.entries),
+            "bootable_platforms": [
+                platform.value for platform in inspection.eltorito.bootable_platforms
+            ],
+        }
+    return _json_safe(record)
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a bounded diagnostic value made only of JSON-native types."""
+    if isinstance(value, enum.Enum):
+        return _json_safe(value.value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"Unsupported diagnostic value: {type(value).__name__}")
 
 
 def probe_tool_versions(

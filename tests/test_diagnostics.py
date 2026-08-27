@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from isopropyl.devices import Device
 from isopropyl.diagnostics import build_diagnostics, write_diagnostics
+from isopropyl.eltorito import (
+    BootEntry, BootPlatform, ElToritoInspection, EmulationType, ValidationEntry,
+)
 from isopropyl.images import ImageInspection, ImageMember
+from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 
 
 def device() -> Device:
@@ -30,17 +35,59 @@ def inspection() -> ImageInspection:
 
 class DiagnosticTests(unittest.TestCase):
     def test_default_report_omits_sensitive_fields(self):
+        private_inspection = replace(
+            inspection(),
+            volume_label="SECRET-VOLUME",
+            bootloader_issues=("EFI/customer-secret/grub.cfg: issue",),
+            uefi_payloads=(ImageUefiPayload(
+                "EFI/customer-secret/loader.efi", "x64", "EFI application",
+                True, SignatureTableState.PRESENT_UNVERIFIED,
+                SbatState.PRESENT, (),
+            ),),
+            uefi_analysis_issues=("EFI/another-secret/loader.efi: issue",),
+        )
         report = build_diagnostics(
-            [device()], inspection(), log_text="/home/alice/private.iso",
+            [device()], private_inspection, log_text="/home/alice/private.iso",
             tool_probe=lambda: {},
         )
         rendered = json.dumps(report)
         for secret in (
-            "SECRET-SERIAL", "SECRET-WWN", "/media/alice", "private-name", "/home/alice",
+            "SECRET-SERIAL", "SECRET-WWN", "/media/alice", "private-name",
+            "/home/alice", "SECRET-VOLUME", "customer-secret", "another-secret",
         ):
             self.assertNotIn(secret, rendered)
         self.assertFalse(report["privacy"]["identifiers_included"])
-        self.assertEqual(report["selected_image_inspection"]["member_count"], 1)
+        image = report["selected_image_inspection"]
+        self.assertEqual(image["member_count"], 1)
+        self.assertEqual(image["bootloader_issue_count"], 1)
+        self.assertEqual(image["uefi_payload_count"], 1)
+        self.assertEqual(image["uefi_analysis_issue_count"], 1)
+        self.assertTrue(image["volume_label_present"])
+
+    def test_eltorito_diagnostics_are_json_safe_and_omit_image_text(self):
+        eltorito = ElToritoInspection(
+            source_size=100_000,
+            catalog_lba=20,
+            catalog_offset=40_960,
+            catalog_size=64,
+            descriptors_scanned=2,
+            validation=ValidationEntry(
+                BootPlatform.EFI, "SECRET-VALIDATION", 0,
+            ),
+            entries=(BootEntry(
+                1, True, BootPlatform.EFI, "SECRET-SECTION", True,
+                EmulationType.NO_EMULATION, 0, 0, 4, 24, 49_152,
+                2_048, 51_200, 1, b"SECRET-CRITERIA",
+            ),),
+        )
+        report = build_diagnostics(
+            [], replace(inspection(), eltorito=eltorito), tool_probe=lambda: {},
+        )
+        rendered = json.dumps(report)
+        self.assertNotIn("SECRET", rendered)
+        summary = report["selected_image_inspection"]["eltorito"]
+        self.assertEqual(summary["entry_count"], 1)
+        self.assertEqual(summary["bootable_platforms"], [BootPlatform.EFI.value])
 
     def test_explicit_opt_in_includes_identifiers_and_log(self):
         report = build_diagnostics(
