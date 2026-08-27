@@ -48,6 +48,15 @@ class PartitionTable(str, Enum):
     GPT = "gpt"
 
 
+class PartitionRole(str, Enum):
+    """Semantic partition roles used by constructed-media workflows."""
+
+    DATA = "data"
+    EFI_SYSTEM = "efi-system"
+    PERSISTENCE = "persistence"
+    MICROSOFT_RESERVED = "microsoft-reserved"
+
+
 DeviceIdentity = tuple[str, int, str, str, str, str]
 StageCallback = Callable[[str], None]
 DeviceLookup = Callable[[str], Device | None]
@@ -65,6 +74,32 @@ class FormatPlan:
 
 
 @dataclass(frozen=True)
+class PartitionSpec:
+    """One ordered partition in a multi-partition layout.
+
+    ``size_mib=None`` means consume the remaining device space and is accepted
+    only for the final partition.  Partitions such as the Microsoft Reserved
+    Partition deliberately have no filesystem and are not formatted.
+    """
+
+    role: PartitionRole
+    filesystem: Filesystem | None
+    label: str = ""
+    size_mib: int | None = None
+    bootable: bool = False
+
+
+@dataclass(frozen=True)
+class MultiFormatPlan:
+    """A complete ordered partitioning intent bound to one selected drive."""
+
+    device_path: str
+    device_identity: DeviceIdentity
+    partition_table: PartitionTable
+    partitions: tuple[PartitionSpec, ...]
+
+
+@dataclass(frozen=True)
 class FormatTools:
     pkexec: str
     udisksctl: str
@@ -73,6 +108,25 @@ class FormatTools:
     udevadm: str
     lsblk: str
     mkfs: str
+
+
+@dataclass(frozen=True)
+class MultiFormatTools:
+    pkexec: str
+    udisksctl: str
+    sfdisk: str
+    partprobe: str
+    udevadm: str
+    lsblk: str
+    mkfs_tools: tuple[tuple[Filesystem, str], ...]
+
+    def mkfs_for(self, filesystem: Filesystem) -> str:
+        for candidate, path in self.mkfs_tools:
+            if candidate is filesystem:
+                return path
+        raise MissingFormatToolError(
+            f"The multi-partition plan has no formatter for {filesystem.value}"
+        )
 
 
 _WHOLE_DISK = re.compile(
@@ -105,6 +159,29 @@ _GPT_TYPES: Mapping[Filesystem, str] = {
     Filesystem.NTFS: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     Filesystem.EXT4: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
 }
+
+_MBR_ROLE_TYPES: Mapping[PartitionRole, str] = {
+    PartitionRole.EFI_SYSTEM: "ef",
+    PartitionRole.PERSISTENCE: "83",
+}
+
+_GPT_ROLE_TYPES: Mapping[PartitionRole, str] = {
+    PartitionRole.DATA: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+    PartitionRole.EFI_SYSTEM: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+    PartitionRole.PERSISTENCE: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+    PartitionRole.MICROSOFT_RESERVED: "E3C9E316-0B5C-4DB8-817D-F92DF00215AE",
+}
+
+_PARTITION_NAMES: Mapping[PartitionRole, str] = {
+    PartitionRole.DATA: "ISOpropyl data",
+    PartitionRole.EFI_SYSTEM: "ISOpropyl boot",
+    PartitionRole.PERSISTENCE: "ISOpropyl persistence",
+    PartitionRole.MICROSOFT_RESERVED: "Microsoft reserved",
+}
+
+_MINIMUM_PARTITION_MIB = 1
+_MAXIMUM_GPT_PARTITIONS = 128
+_MAXIMUM_MBR_PARTITIONS = 4
 
 
 def _partition_belongs_to_device(device_path: str, partition_path: str) -> bool:
@@ -194,6 +271,101 @@ def create_format_plan(
     return FormatPlan(device.path, device.identity, fs, table, validate_label(fs, label))
 
 
+def _validate_partition_spec(
+    spec: PartitionSpec,
+    table: PartitionTable,
+    index: int,
+    count: int,
+) -> None:
+    if not isinstance(spec, PartitionSpec):
+        raise FormatValidationError("Every partition must be a PartitionSpec")
+    if not isinstance(spec.role, PartitionRole):
+        raise FormatValidationError("A partition contains an invalid semantic role")
+    if spec.filesystem is not None and not isinstance(spec.filesystem, Filesystem):
+        raise FormatValidationError("A partition contains an invalid filesystem")
+    if spec.size_mib is not None and (
+        isinstance(spec.size_mib, bool)
+        or not isinstance(spec.size_mib, int)
+        or spec.size_mib < _MINIMUM_PARTITION_MIB
+    ):
+        raise FormatValidationError(
+            f"Partition {index + 1} must be at least {_MINIMUM_PARTITION_MIB} MiB"
+        )
+    if spec.size_mib is None and index != count - 1:
+        raise FormatValidationError(
+            "Only the final partition may consume the remaining device space"
+        )
+    if spec.filesystem is None:
+        if spec.label:
+            raise FormatValidationError("An unformatted partition cannot have a volume label")
+    else:
+        validate_label(spec.filesystem, spec.label)
+    if spec.role is PartitionRole.DATA and spec.filesystem is None:
+        raise FormatValidationError("A data partition requires a filesystem")
+    if spec.role is PartitionRole.EFI_SYSTEM and spec.filesystem is not Filesystem.FAT32:
+        raise FormatValidationError("An EFI System Partition must use FAT32")
+    if spec.role is PartitionRole.PERSISTENCE and spec.filesystem is not Filesystem.EXT4:
+        raise FormatValidationError("A persistence partition must use ext4")
+    if spec.role is PartitionRole.MICROSOFT_RESERVED:
+        if table is not PartitionTable.GPT or spec.filesystem is not None:
+            raise FormatValidationError(
+                "A Microsoft Reserved Partition must be unformatted and use GPT"
+            )
+    if spec.bootable and table is not PartitionTable.MBR:
+        raise FormatValidationError("The legacy bootable flag is valid only for MBR")
+
+
+def validate_multi_plan(plan: MultiFormatPlan) -> None:
+    if not isinstance(plan, MultiFormatPlan):
+        raise FormatValidationError("A MultiFormatPlan is required")
+    if not isinstance(plan.partition_table, PartitionTable):
+        raise FormatValidationError("The multi-partition plan has an invalid partition table")
+    if not _WHOLE_DISK.fullmatch(plan.device_path):
+        raise FormatValidationError("The multi-partition plan has an unsafe device path")
+    limit = (
+        _MAXIMUM_MBR_PARTITIONS
+        if plan.partition_table is PartitionTable.MBR
+        else _MAXIMUM_GPT_PARTITIONS
+    )
+    if not plan.partitions or len(plan.partitions) > limit:
+        raise FormatValidationError(
+            f"A {plan.partition_table.value.upper()} plan requires 1 to {limit} partitions"
+        )
+    seen_singletons: set[PartitionRole] = set()
+    for index, spec in enumerate(plan.partitions):
+        _validate_partition_spec(spec, plan.partition_table, index, len(plan.partitions))
+        if spec.role in {PartitionRole.EFI_SYSTEM, PartitionRole.MICROSOFT_RESERVED}:
+            if spec.role in seen_singletons:
+                raise FormatValidationError(
+                    f"The plan contains more than one {spec.role.value} partition"
+                )
+            seen_singletons.add(spec.role)
+    fixed_bytes = sum(
+        spec.size_mib * 1024 * 1024
+        for spec in plan.partitions
+        if spec.size_mib is not None
+    )
+    # Device size is part of the frozen identity tuple.  Reserve one MiB for
+    # the partition-table header/alignment and one MiB between each partition.
+    device_size = plan.device_identity[1]
+    alignment_reserve = (len(plan.partitions) + 1) * 1024 * 1024
+    if fixed_bytes + alignment_reserve > device_size:
+        raise FormatValidationError("The fixed partitions do not fit on the selected drive")
+
+
+def create_multi_format_plan(
+    device: Device,
+    partition_table: PartitionTable | str,
+    partitions: Sequence[PartitionSpec],
+) -> MultiFormatPlan:
+    validate_device(device)
+    table = _coerce_table(partition_table)
+    frozen = tuple(partitions)
+    plan = MultiFormatPlan(device.path, device.identity, table, frozen)
+    validate_multi_plan(plan)
+    return plan
+
+
 def validate_plan(plan: FormatPlan) -> None:
     if not isinstance(plan, FormatPlan):
         raise FormatValidationError("A FormatPlan is required")
@@ -244,6 +416,45 @@ def resolve_tools(
     )
 
 
+def required_multi_tool_names(plan: MultiFormatPlan) -> tuple[str, ...]:
+    validate_multi_plan(plan)
+    base = ("pkexec", "udisksctl", "sfdisk", "partprobe", "udevadm", "lsblk")
+    formatters = tuple(dict.fromkeys(
+        _MKFS_NAMES[spec.filesystem]
+        for spec in plan.partitions
+        if spec.filesystem is not None
+    ))
+    return base + formatters
+
+
+def resolve_multi_tools(
+    plan: MultiFormatPlan,
+    which: Callable[[str], str | None] = _trusted_which,
+) -> MultiFormatTools:
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for name in required_multi_tool_names(plan):
+        path = which(name)
+        if not path:
+            missing.append(name)
+        else:
+            resolved[name] = os.path.abspath(path)
+    if missing:
+        raise MissingFormatToolError(
+            "Multi-partition formatting requires missing system tool"
+            + ("s" if len(missing) != 1 else "") + ": " + ", ".join(missing)
+        )
+    filesystems = tuple(dict.fromkeys(
+        spec.filesystem for spec in plan.partitions if spec.filesystem is not None
+    ))
+    return MultiFormatTools(
+        pkexec=resolved["pkexec"], udisksctl=resolved["udisksctl"],
+        sfdisk=resolved["sfdisk"], partprobe=resolved["partprobe"],
+        udevadm=resolved["udevadm"], lsblk=resolved["lsblk"],
+        mkfs_tools=tuple((filesystem, resolved[_MKFS_NAMES[filesystem]]) for filesystem in filesystems),
+    )
+
+
 def partition_script(plan: FormatPlan) -> bytes:
     label = "dos" if plan.partition_table is PartitionTable.MBR else "gpt"
     types = _MBR_TYPES if plan.partition_table is PartitionTable.MBR else _GPT_TYPES
@@ -253,11 +464,82 @@ def partition_script(plan: FormatPlan) -> bytes:
     ).encode("ascii")
 
 
+def _partition_type(spec: PartitionSpec, table: PartitionTable) -> str:
+    if table is PartitionTable.GPT:
+        if spec.role is PartitionRole.DATA:
+            assert spec.filesystem is not None
+            return _GPT_TYPES[spec.filesystem]
+        return _GPT_ROLE_TYPES[spec.role]
+    if spec.role is PartitionRole.DATA:
+        assert spec.filesystem is not None
+        return _MBR_TYPES[spec.filesystem]
+    try:
+        return _MBR_ROLE_TYPES[spec.role]
+    except KeyError as error:
+        raise FormatValidationError(
+            f"Partition role {spec.role.value!r} is not supported with MBR"
+        ) from error
+
+
+def multi_partition_script(plan: MultiFormatPlan) -> bytes:
+    """Return a complete deterministic sfdisk script for a frozen layout."""
+    validate_multi_plan(plan)
+    label = "dos" if plan.partition_table is PartitionTable.MBR else "gpt"
+    lines = [f"label: {label}", ""]
+    for spec in plan.partitions:
+        fields: list[str] = []
+        if spec.size_mib is not None:
+            fields.append(f"size={spec.size_mib}MiB")
+        fields.append(f"type={_partition_type(spec, plan.partition_table)}")
+        if plan.partition_table is PartitionTable.GPT:
+            fields.append(f'name="{_PARTITION_NAMES[spec.role]}"')
+        elif spec.bootable:
+            fields.append("bootable")
+        lines.append(", ".join(fields))
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
 def partition_command(plan: FormatPlan, tools: FormatTools) -> list[str]:
     return [
         tools.pkexec, tools.sfdisk, "--lock=yes", "--wipe", "always",
         "--wipe-partitions", "always", plan.device_path,
     ]
+
+
+def multi_partition_command(
+    plan: MultiFormatPlan, tools: MultiFormatTools,
+) -> list[str]:
+    validate_multi_plan(plan)
+    return [
+        tools.pkexec, tools.sfdisk, "--lock=yes", "--wipe", "always",
+        "--wipe-partitions", "always", plan.device_path,
+    ]
+
+
+def _format_command(
+    filesystem: Filesystem,
+    label: str,
+    mkfs: str,
+    partition: str,
+) -> list[str]:
+    command = [mkfs]
+    if filesystem is Filesystem.FAT32:
+        command.extend(["-F", "32"])
+        if label:
+            command.extend(["-n", label])
+    elif filesystem is Filesystem.EXFAT:
+        if label:
+            command.extend(["-L", label])
+    elif filesystem is Filesystem.NTFS:
+        command.append("-f")
+        if label:
+            command.extend(["-L", label])
+    else:
+        command.append("-F")
+        if label:
+            command.extend(["-L", label])
+    command.append(partition)
+    return command
 
 
 def format_command(plan: FormatPlan, tools: FormatTools, partition: str) -> list[str]:
@@ -266,24 +548,34 @@ def format_command(plan: FormatPlan, tools: FormatTools, partition: str) -> list
         or not _partition_belongs_to_device(plan.device_path, partition)
     ):
         raise FormatValidationError(f"Unsafe partition path: {partition!r}")
-    command = [tools.pkexec, tools.mkfs]
-    if plan.filesystem is Filesystem.FAT32:
-        command.extend(["-F", "32"])
-        if plan.label:
-            command.extend(["-n", plan.label])
-    elif plan.filesystem is Filesystem.EXFAT:
-        if plan.label:
-            command.extend(["-L", plan.label])
-    elif plan.filesystem is Filesystem.NTFS:
-        command.append("-f")
-        if plan.label:
-            command.extend(["-L", plan.label])
-    else:
-        command.append("-F")
-        if plan.label:
-            command.extend(["-L", plan.label])
-    command.append(partition)
-    return command
+    return [tools.pkexec, *_format_command(
+        plan.filesystem, plan.label, tools.mkfs, partition,
+    )]
+
+
+def multi_format_commands(
+    plan: MultiFormatPlan,
+    tools: MultiFormatTools,
+    partitions: Sequence[str],
+) -> tuple[list[str], ...]:
+    validate_multi_plan(plan)
+    if len(partitions) != len(plan.partitions):
+        raise FormatValidationError(
+            "The discovered partition count does not match the frozen layout"
+        )
+    commands: list[list[str]] = []
+    for spec, partition in zip(plan.partitions, partitions, strict=True):
+        if (
+            not _BLOCK_PATH.fullmatch(partition)
+            or not _partition_belongs_to_device(plan.device_path, partition)
+        ):
+            raise FormatValidationError(f"Unsafe partition path: {partition!r}")
+        if spec.filesystem is None:
+            continue
+        commands.append([tools.pkexec, *_format_command(
+            spec.filesystem, spec.label, tools.mkfs_for(spec.filesystem), partition,
+        )])
+    return tuple(commands)
 
 
 def parse_partitions(payload: str, device_path: str) -> tuple[str, ...]:
@@ -312,7 +604,9 @@ def parse_partitions(payload: str, device_path: str) -> tuple[str, ...]:
 
     for node in nodes:
         visit(node)
-    return tuple(dict.fromkeys(found))
+    prefix = device_path + ("p" if device_path[-1].isdigit() else "")
+    unique = dict.fromkeys(found)
+    return tuple(sorted(unique, key=lambda path: int(path.removeprefix(prefix))))
 
 
 class FormatExecutor:
@@ -482,3 +776,81 @@ class FormatExecutor:
         self._run_process([tools.udevadm, "settle"])
         report("Complete")
         return partition
+
+
+class MultiFormatExecutor(FormatExecutor):
+    """Execute an immutable multi-partition layout without guessing children."""
+
+    def _discover_partitions(
+        self,
+        plan: MultiFormatPlan,
+        tools: MultiFormatTools,
+    ) -> tuple[str, ...]:
+        expected_count = len(plan.partitions)
+        for attempt in range(self._discovery_attempts):
+            self._check_cancelled()
+            result = self._runner(
+                [
+                    tools.lsblk, "--json", "--paths", "--output", "PATH,TYPE",
+                    plan.device_path,
+                ],
+                capture_output=True, text=True, shell=False,
+            )
+            if result.returncode:
+                message = ((result.stdout or "") + (result.stderr or "")).strip()
+                raise FormattingError(message or "Could not inspect the new partitions")
+            partitions = parse_partitions(result.stdout, plan.device_path)
+            if len(partitions) == expected_count:
+                return partitions
+            if len(partitions) > expected_count:
+                raise FormattingError(
+                    "Partitioning returned more children than the frozen layout"
+                )
+            if attempt + 1 < self._discovery_attempts:
+                self._sleep(self._discovery_interval)
+        raise FormattingError(
+            f"Expected {expected_count} new partitions, but they did not all appear"
+        )
+
+    def execute_multi(
+        self,
+        device: Device,
+        plan: MultiFormatPlan,
+        stage: StageCallback | None = None,
+    ) -> tuple[str, ...]:
+        """Create, format, and return every partition in canonical number order."""
+        validate_device(device)
+        validate_multi_plan(plan)
+        if device.path != plan.device_path or device.identity != plan.device_identity:
+            raise DeviceChangedError(
+                "The multi-partition plan does not belong to the selected drive"
+            )
+        tools = resolve_multi_tools(plan, self._which)  # Preflight before device access.
+        report = stage or (lambda _message: None)
+
+        current = self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        report("Unmounting")
+        self._unmount(current, tools)  # type: ignore[arg-type]
+        self._assert_identity(plan, tools)  # type: ignore[arg-type]
+
+        report("Creating partition table")
+        self._run_process(
+            multi_partition_command(plan, tools), multi_partition_script(plan),
+        )
+        self._run_process([tools.pkexec, tools.partprobe, plan.device_path])
+        self._run_process([tools.udevadm, "settle"])
+
+        report("Waiting for partitions")
+        partitions = self._discover_partitions(plan, tools)
+        self._assert_identity(plan, tools)  # type: ignore[arg-type]
+
+        commands = multi_format_commands(plan, tools, partitions)
+        if commands:
+            report("Creating filesystems")
+        for command in commands:
+            self._assert_identity(plan, tools)  # type: ignore[arg-type]
+            self._run_process(command)
+        self._run_process([tools.udevadm, "settle"])
+        self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        report("Complete")
+        return partitions
