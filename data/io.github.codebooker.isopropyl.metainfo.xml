@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.codebooker.isopropyl</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>ISOpropyl</name>
+  <summary>Write and inspect bootable USB images safely</summary>
+  <developer id="io.github.codebooker">
+    <name>ISOpropyl contributors</name>
+  </developer>
+  <url type="homepage">https://github.com/codebooker/isopropyl</url>
+  <url type="bugtracker">https://github.com/codebooker/isopropyl/issues</url>
+  <url type="vcs-browser">https://github.com/codebooker/isopropyl</url>
+  <description>
+    <p>
+      ISOpropyl is a graphical Linux utility for creating bootable USB and SD
+      media. It supports byte-for-byte disk images and a filesystem-aware UEFI
+      ISO workflow while emphasizing target identity checks, clear erase
+      confirmations, cancellation, logging, and read-back verification.
+    </p>
+    <p>
+      It can inspect common boot layouts, calculate and compare checksums, stream
+      compressed and virtual disk images, customize supported Windows installers,
+      save raw drive or optical-disc images, restore ordinary data storage, and
+      run explicitly separated destructive media tests.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.codebooker.isopropyl.desktop</launchable>
+  <provides>
+    <binary>isopropyl</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+  </categories>
+  <keywords>
+    <keyword>USB</keyword>
+    <keyword>ISO</keyword>
+    <keyword>bootable</keyword>
+    <keyword>disk image</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/codebooker/isopropyl/main/data/screenshot.png</image>
+      <caption>Inspect an image, choose a protected removable target, and select DD or ISO mode.</caption>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.1.0" date="2026-08-27">
+      <description>
+        <p>Initial alpha with DD and UEFI ISO writing, image analysis, Windows customization, drive backup, formatting, erasure, and media testing.</p>
+      </description>
+    </release>
+  </releases>
+</component>

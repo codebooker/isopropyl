@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+import json
+import os
+import subprocess
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Device:
+    path: str
+    size: int
+    model: str
+    vendor: str
+    transport: str
+    serial: str
+    wwn: str
+    major_minor: str
+    removable: bool
+    hotplug: bool
+    read_only: bool
+    mountpoints: tuple[str, ...]
+    partitions: tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        name = " ".join(x for x in (self.vendor, self.model) if x).strip() or "USB drive"
+        return f"{name}  ·  {format_size(self.size)}  ·  {self.path}"
+
+    @property
+    def identity(self) -> tuple[str, int, str, str, str, str]:
+        """Fields that should remain stable while a selected drive is connected."""
+        return (self.path, self.size, self.serial, self.wwn, self.model, self.major_minor)
+
+    @property
+    def stable_id(self) -> str | None:
+        """A reconnect-stable identifier suitable for a safety denylist."""
+        if self.wwn:
+            return f"wwn:{self.wwn.casefold()}"
+        if self.serial:
+            return f"serial:{self.transport.casefold()}:{self.serial.casefold()}"
+        return None
+
+
+def format_size(size: int | float) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1000 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{value:.1f} TB"
+
+
+def _mounts(node: dict) -> list[str]:
+    values = node.get("mountpoints") or []
+    if node.get("mountpoint"):
+        values.append(node["mountpoint"])
+    found = [str(v) for v in values if v]
+    for child in node.get("children") or []:
+        found.extend(_mounts(child))
+    return found
+
+
+def parse_lsblk(payload: str, include_usb_hdds: bool = False) -> list[Device]:
+    data = json.loads(payload)
+    devices: list[Device] = []
+    for node in data.get("blockdevices", []):
+        if node.get("type") != "disk":
+            continue
+        mounts = _mounts(node)
+        # The root backing disk is forbidden even if a USB-installed OS reports
+        # it as hot-pluggable/removable.
+        if "/" in mounts:
+            continue
+        removable = bool(node.get("rm"))
+        hotplug = bool(node.get("hotplug"))
+        transport = str(node.get("tran") or "")
+        if transport not in {"usb", "mmc"}:
+            continue
+        if not removable and not (include_usb_hdds and hotplug and transport == "usb"):
+            continue
+        children = node.get("children") or []
+        partitions = tuple(
+            str(child.get("path")) for child in children
+            if child.get("type") == "part" and child.get("path")
+        )
+        devices.append(Device(
+            path=str(node["path"]), size=int(node.get("size") or 0),
+            model=str(node.get("model") or "").strip(),
+            vendor=str(node.get("vendor") or "").strip(), transport=transport,
+            serial=str(node.get("serial") or "").strip(),
+            wwn=str(node.get("wwn") or "").strip(),
+            major_minor=str(node.get("maj:min") or "").strip(),
+            removable=removable, hotplug=hotplug, read_only=bool(node.get("ro")),
+            mountpoints=tuple(mounts), partitions=partitions,
+        ))
+    return devices
+
+
+def list_devices(include_usb_hdds: bool = False) -> list[Device]:
+    fields = "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,MAJ:MIN,MOUNTPOINTS,RO"
+    result = subprocess.run(
+        ["lsblk", "--tree", "--bytes", "--json", "--output", fields],
+        check=True, capture_output=True, text=True,
+    )
+    return sorted(
+        parse_lsblk(result.stdout, include_usb_hdds),
+        key=lambda device: (device.size, device.vendor.casefold(), device.model.casefold(), device.path),
+    )
+
+
+def image_is_on_device(image_path: str, device: Device) -> bool:
+    """Return whether an image file is backed by the prospective target disk."""
+    try:
+        source_id = os.stat(image_path).st_dev
+    except OSError:
+        return False
+    for block_path in (device.path, *device.partitions):
+        try:
+            if os.stat(block_path).st_rdev == source_id:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def path_is_on_device(path: str, device: Device) -> bool:
+    """Check an existing path (or a prospective file's parent) against a drive."""
+    candidate = path
+    while not os.path.exists(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return False
+        candidate = parent
+    try:
+        source_id = os.stat(candidate).st_dev
+    except OSError:
+        return False
+    for block_path in (device.path, *device.partitions):
+        try:
+            if os.stat(block_path).st_rdev == source_id:
+                return True
+        except OSError:
+            continue
+    return False

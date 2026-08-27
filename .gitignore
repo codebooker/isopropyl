@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Local captures, installer media, and virtual disks are never source assets.
+*.iso
+*.img
+*.raw
+*.vhd
+*.vhdx
+*.qcow
+*.qcow2
+*.ffu
+
+# Runtime logs and editor/desktop metadata.
+*.log
+*~
+.DS_Store
+.idea/
+.vscode/

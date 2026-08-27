@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isopropyl"
+version = "0.1.0"
+description = "A capable, safety-first USB image writer for Linux"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+authors = [{name = "ISOpropyl contributors"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications :: Qt",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Installation/Setup",
+]
+dependencies = ["PyQt6>=6.5,<7"]
+
+[project.urls]
+Homepage = "https://github.com/codebooker/isopropyl"
+Repository = "https://github.com/codebooker/isopropyl.git"
+Issues = "https://github.com/codebooker/isopropyl/issues"
+
+[project.gui-scripts]
+isopropyl = "isopropyl.app:main"
+
+[tool.setuptools.packages.find]
+include = ["isopropyl*"]
+
+[tool.setuptools.package-data]
+isopropyl = ["data/*.json"]
+
+[tool.setuptools.data-files]
+"share/applications" = ["data/io.github.codebooker.isopropyl.desktop"]
+"share/icons/hicolor/scalable/apps" = ["data/io.github.codebooker.isopropyl.svg"]
+"share/metainfo" = ["data/io.github.codebooker.isopropyl.metainfo.xml"]

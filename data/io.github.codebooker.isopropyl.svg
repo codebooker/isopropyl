@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">ISOpropyl</title>
+  <desc id="desc">An optical disc with an amber droplet, representing clean and dependable ISO writing.</desc>
+  <defs>
+    <linearGradient id="background" x1="32" y1="20" x2="224" y2="236" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B2230"/>
+      <stop offset="1" stop-color="#0D1118"/>
+    </linearGradient>
+    <linearGradient id="drop" x1="160" y1="92" x2="196" y2="205" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB34F"/>
+      <stop offset="1" stop-color="#F47D20"/>
+    </linearGradient>
+    <radialGradient id="disc" cx="0" cy="0" r="1" gradientTransform="translate(89 81) rotate(52) scale(111)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.66" stop-color="#E9EDF4"/>
+      <stop offset="1" stop-color="#C9D0DB"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="9" stdDeviation="9" flood-color="#020409" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#background)"/>
+  <rect x="8.75" y="8.75" width="238.5" height="238.5" rx="53.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.09" stroke-width="1.5"/>
+
+  <g filter="url(#shadow)">
+    <circle cx="111" cy="124" r="73" fill="url(#disc)"/>
+    <circle cx="111" cy="124" r="55" fill="none" stroke="#AEB8C8" stroke-opacity="0.55" stroke-width="2"/>
+    <path d="M61 151a73 73 0 0 0 65 44" fill="none" stroke="#F58A26" stroke-width="10" stroke-linecap="round"/>
+    <path d="M78 67a73 73 0 0 1 79 11" fill="none" stroke="#FFFFFF" stroke-opacity="0.72" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="111" cy="124" r="20" fill="#171D27"/>
+    <circle cx="111" cy="124" r="8" fill="#F6922E"/>
+  </g>
+
+  <path d="M181 83c0 0-38 47-38 80 0 25 17 43 38 43s38-18 38-43c0-33-38-80-38-80Z" fill="url(#drop)" stroke="#FFD291" stroke-width="3" stroke-linejoin="round" filter="url(#shadow)"/>
+  <path d="M174 111c-9 14-18 32-18 47 0 8 2 15 7 21" fill="none" stroke="#FFF4DF" stroke-opacity="0.72" stroke-width="7" stroke-linecap="round"/>
+</svg>

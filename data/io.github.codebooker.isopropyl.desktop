@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=ISOpropyl
+Comment=Write bootable disk images to removable drives
+Exec=isopropyl %f
+Icon=io.github.codebooker.isopropyl
+Terminal=false
+Type=Application
+Categories=System;
+Keywords=USB;ISO;image;bootable;writer;
+MimeType=application/x-iso9660-image;application/x-raw-disk-image;
