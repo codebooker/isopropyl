@@ -554,21 +554,26 @@ def build_write_plan(
         unsupported = next(
             (
                 architecture for architecture in inspection.architectures
-                if architecture not in {"x64", "x86", "ARM64"}
+                if architecture not in {"x64", "x86", "ARM64", "ARM", "RISC-V64"}
             ),
             None,
         )
-        if unsupported == "RISC-V64":
-            blockers.append(
-                "UEFI:NTFS v2.8 has an upstream RISC-V64 payload suffix mismatch."
-            )
-        elif unsupported == "LoongArch64":
+        if unsupported == "LoongArch64":
             blockers.append(
                 "The pinned UEFI:NTFS image has no complete LoongArch64 payload pair."
             )
         elif unsupported is not None:
             blockers.append(
                 f"UEFI:NTFS execution is not enabled for {unsupported}."
+            )
+        unsigned = tuple(
+            architecture for architecture in inspection.architectures
+            if architecture in {"ARM", "RISC-V64"}
+        )
+        if unsigned:
+            warnings.append(
+                "The " + ", ".join(unsigned) + " UEFI:NTFS payload is unsigned; "
+                "it requires explicit consent and Secure Boot disabled."
             )
     if any(entry.kind in {EntryKind.SYMLINK, EntryKind.HARDLINK} for entry in safe_entries):
         blockers.append(

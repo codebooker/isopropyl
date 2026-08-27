@@ -95,6 +95,7 @@ class PendingIsoWrite:
     write_plan: WritePlan
     workspace: tempfile.TemporaryDirectory[str]
     staging_plan: IsoStagingPlan
+    allow_unsigned_payloads: bool = False
 
 
 class Bridge(QObject):
@@ -1954,19 +1955,37 @@ class Window(QMainWindow):
             image, inspection, device, write_plan, workspace, staging_plan,
         )
         if strategy is BootStrategy.UEFI_NTFS:
+            unsigned_architectures = tuple(
+                architecture for architecture in inspection.architectures
+                if architecture.casefold() in {"arm", "risc-v64"}
+            )
+            if unsigned_architectures:
+                helper_detail = (
+                    "This image needs NTFS and uses the unsigned "
+                    + ", ".join(unsigned_architectures)
+                    + " UEFI:NTFS bridge. It will not boot while Secure Boot is "
+                    "enabled. ISOpropyl will still verify the helper's exact size "
+                    "and SHA-256.\n\nExplicitly allow these unsigned boot payloads?"
+                )
+                helper_default = QMessageBox.StandardButton.Cancel
+            else:
+                helper_detail = (
+                    "This image needs NTFS because it contains a file larger than FAT32 "
+                    "can store. ISOpropyl will obtain the 1 MiB UEFI:NTFS v2.8 helper "
+                    "from a release-pinned Rufus source URL (or use its verified cache), "
+                    "then check its exact size and SHA-256 before asking to erase the "
+                    "drive.\n\n"
+                    "The x64, x86, and ARM64 payloads are signed through Microsoft UEFI "
+                    "CA 2011. Secure Boot can still reject them on systems that disable "
+                    "third-party trust or revoke that certificate.\n\nContinue?"
+                )
+                helper_default = QMessageBox.StandardButton.Yes
             helper_answer = QMessageBox.question(
                 self,
                 "Prepare the verified UEFI:NTFS boot helper?",
-                "This image needs NTFS because it contains a file larger than FAT32 "
-                "can store. ISOpropyl will obtain the 1 MiB UEFI:NTFS v2.8 helper "
-                "from a release-pinned Rufus source URL (or use its verified cache), "
-                "then check its exact size and SHA-256 before asking to erase the "
-                "drive.\n\n"
-                "The x64, x86, and ARM64 payloads are signed through Microsoft UEFI "
-                "CA 2011. Secure Boot can still reject them on systems that disable "
-                "third-party trust or revoke that certificate.\n\nContinue?",
+                helper_detail,
                 QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
-                QMessageBox.StandardButton.Yes,
+                helper_default,
             )
             if helper_answer != QMessageBox.StandardButton.Yes:
                 try:
@@ -1974,6 +1993,8 @@ class Window(QMainWindow):
                 except OSError as error:
                     self.logger.warning("Could not remove ISO workspace: %s", error)
                 return
+            if unsigned_architectures:
+                pending = replace(pending, allow_unsigned_payloads=True)
             self.start_uefi_preparation(pending)
             return
         self.confirm_and_start_iso_write(pending, None, None)
@@ -2123,6 +2144,10 @@ class Window(QMainWindow):
                 "\nSecure Boot note: the bridge depends on Microsoft UEFI CA 2011 "
                 "third-party trust."
             )
+            if pending.allow_unsigned_payloads:
+                customization += (
+                    "\nUnsigned-payload warning: Secure Boot must be disabled."
+                )
         else:
             mode_description = (
                 "UEFI-only · GPT · FAT32 · full file read-back verification"
@@ -2188,6 +2213,7 @@ class Window(QMainWindow):
                         inspection.architectures,
                         artifact,
                         volume_label="ISOPROPYL",
+                        allow_unsigned_payloads=pending.allow_unsigned_payloads,
                         logical_sector_size=logical_sector_size,
                     )
                     result = self.uefi_ntfs_writer.execute(

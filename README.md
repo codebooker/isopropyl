@@ -113,7 +113,7 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and security invariants.
 | Input | Current path | Notes |
 |---|---|---|
 | Hybrid `.iso` | DD mode | Preserves the image's existing disk layout. |
-| UEFI `.iso` | ISO mode | GPT/FAT32 when every file fits; GPT/NTFS plus a pinned UEFI:NTFS bridge for supported x64, x86, and ARM64 large-file media. |
+| UEFI `.iso` | ISO mode | GPT/FAT32 when every file fits; GPT/NTFS plus a pinned UEFI:NTFS bridge for x64, x86, ARM64, and explicitly consented unsigned ARM32/RISC-V64 large-file media. |
 | `.img` and raw disk images | DD mode | Exact image bytes are written. |
 | Compressed raw images | Streaming DD | Formats listed above; ZIP must contain exactly one regular image. |
 | VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; backing files and encrypted containers are rejected. |

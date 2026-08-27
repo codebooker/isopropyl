@@ -180,12 +180,15 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.layout.boot_strategy, BootStrategy.UEFI_NTFS)
         self.assertFalse(plan.needs_wim_split)
 
-    def test_uefi_ntfs_blocks_known_broken_or_incomplete_architectures(self):
+    def test_uefi_ntfs_blocks_incomplete_or_unknown_architectures(self):
         for architecture, message in (
-            ("RISC-V64", "suffix mismatch"),
             ("LoongArch64", "no complete"),
-            ("ARM", "not enabled"),
+            ("MIPS64", "not enabled"),
         ):
+            fallback_name = {
+                "LoongArch64": "BOOTLOONGARCH64.EFI",
+                "MIPS64": "BOOTMIPS64.EFI",
+            }[architecture]
             image = inspection(
                 boot_modes=("UEFI",), architectures=(architecture,),
             )
@@ -193,14 +196,14 @@ class PlanTests(unittest.TestCase):
                 **image.__dict__,
                 "uefi_payloads": (
                     ImageUefiPayload(
-                        f"EFI/BOOT/BOOT{architecture}.EFI", architecture,
+                        f"EFI/BOOT/{fallback_name}", architecture,
                         "EFI application", True, SignatureTableState.ABSENT,
                         SbatState.ABSENT, (),
                     ),
                 ),
             })
             entries = [
-                ArchiveEntry(f"EFI/BOOT/BOOT{architecture}.EFI", 10),
+                ArchiveEntry(f"EFI/BOOT/{fallback_name}", 10),
                 ArchiveEntry("huge.bin", FAT32_MAX_FILE_SIZE + 1),
             ]
             with self.subTest(architecture=architecture):
@@ -209,6 +212,36 @@ class PlanTests(unittest.TestCase):
                 )
                 self.assertFalse(plan.executable)
                 self.assertTrue(any(message in item for item in plan.blockers))
+
+    def test_uefi_ntfs_allows_explicitly_confirmed_unsigned_architectures(self):
+        for architecture, fallback_name in (
+            ("ARM", "BOOTARM.EFI"),
+            ("RISC-V64", "BOOTRISCV64.EFI"),
+        ):
+            image = inspection(
+                boot_modes=("UEFI",), architectures=(architecture,),
+            )
+            image = ImageInspection(**{
+                **image.__dict__,
+                "uefi_payloads": (
+                    ImageUefiPayload(
+                        f"EFI/BOOT/{fallback_name}", architecture,
+                        "EFI application", True, SignatureTableState.ABSENT,
+                        SbatState.ABSENT, (),
+                    ),
+                ),
+            })
+            plan = build_write_plan(
+                image,
+                [
+                    ArchiveEntry(f"EFI/BOOT/{fallback_name}", 10),
+                    ArchiveEntry("huge.bin", FAT32_MAX_FILE_SIZE + 1),
+                ],
+                firmware_target=FirmwareTarget.UEFI_ONLY,
+            )
+            with self.subTest(architecture=architecture):
+                self.assertTrue(plan.executable, plan.blockers)
+                self.assertTrue(any("unsigned" in item for item in plan.warnings))
 
     def test_fallback_filename_must_match_the_pe_machine_architecture(self):
         image = inspection(boot_modes=("UEFI",), architectures=("x64",))

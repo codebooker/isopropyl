@@ -301,19 +301,21 @@ class PlanTests(unittest.TestCase):
         )
         self.assertGreater(plan.data_capacity, plan.content.required_capacity)
 
-    def test_supports_x86_arm64_and_explicit_unsigned_arm(self):
-        architectures = ("x86", "ARM64", "ARM")
+    def test_supports_x86_arm64_and_explicit_unsigned_architectures(self):
+        architectures = ("x86", "ARM64", "ARM", "RISC-V64")
         with tempfile.TemporaryDirectory() as directory, fixture_constants():
             root = staging_tree(Path(directory), architectures)
             with self.assertRaisesRegex(UefiNtfsSafetyError, "unsigned-payload"):
                 build_plan(root, architectures)
-            plan = build_plan(root, architectures, allow_unsigned_arm=True)
-        self.assertEqual([item.suffix for item in plan.payloads], ["ia32", "aa64", "arm"])
+            plan = build_plan(root, architectures, allow_unsigned_payloads=True)
+        self.assertEqual(
+            [item.suffix for item in plan.payloads],
+            ["ia32", "aa64", "arm", "riscv64"],
+        )
         self.assertEqual(plan.payloads[-1].trust, PayloadTrust.UNSIGNED)
 
-    def test_blocks_riscv_loongarch_unknown_and_missing_fallback(self):
+    def test_blocks_loongarch_unknown_and_missing_fallback(self):
         for architecture, message in (
-            ("RISC-V64", "suffix mismatch"),
             ("LoongArch64", "no complete"),
             ("MIPS64", "does not support"),
         ):

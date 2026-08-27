@@ -137,7 +137,7 @@ class UefiNtfsMediaPlan:
     content: ConstructedMediaPlan
     artifact: BoundArtifact
     architectures: tuple[str, ...]
-    allow_unsigned_arm: bool
+    allow_unsigned_payloads: bool
     payloads: tuple[ArchitecturePayload, ...]
     tools: UefiNtfsTools
     data_capacity: int
@@ -197,6 +197,12 @@ _ARCHITECTURES: dict[str, ArchitecturePayload] = {
         "EFI/Boot/bootarm.efi", "EFI/Rufus/ntfs_arm.efi",
         PayloadTrust.UNSIGNED,
         "The ARM32 bridge and driver are not Secure Boot signed.",
+    ),
+    "risc-v64": ArchitecturePayload(
+        "RISC-V64", "riscv64", "EFI/BOOT/BOOTRISCV64.EFI",
+        "EFI/Boot/bootriscv64.efi", "EFI/Rufus/ntfs_riscv64.efi",
+        PayloadTrust.UNSIGNED,
+        "The RISC-V64 bridge and driver are not Secure Boot signed.",
     ),
 }
 
@@ -369,17 +375,13 @@ def _payloads_for(
     architectures: Sequence[str],
     fallback_loaders: Sequence[str],
     *,
-    allow_unsigned_arm: bool,
+    allow_unsigned_payloads: bool,
 ) -> tuple[ArchitecturePayload, ...]:
     if not architectures:
         raise UefiNtfsSafetyError("No UEFI architecture was detected")
     available = {path.casefold() for path in fallback_loaders}
     payloads: list[ArchitecturePayload] = []
     for architecture in dict.fromkeys(item.casefold() for item in architectures):
-        if architecture == "risc-v64":
-            raise UefiNtfsSafetyError(
-                "UEFI:NTFS v2.8 has an upstream RISC-V64 suffix mismatch and is blocked"
-            )
         if architecture == "loongarch64":
             raise UefiNtfsSafetyError(
                 "The pinned UEFI:NTFS image has no complete LoongArch64 payload pair"
@@ -389,9 +391,10 @@ def _payloads_for(
             raise UefiNtfsSafetyError(
                 f"UEFI:NTFS does not support architecture {architecture!r}"
             )
-        if payload.trust is PayloadTrust.UNSIGNED and not allow_unsigned_arm:
+        if payload.trust is PayloadTrust.UNSIGNED and not allow_unsigned_payloads:
             raise UefiNtfsSafetyError(
-                "ARM32 UEFI:NTFS requires an explicit unsigned-payload opt-in"
+                f"{payload.architecture} UEFI:NTFS requires an explicit "
+                "unsigned-payload opt-in with Secure Boot disabled"
             )
         if payload.fallback_path.casefold() not in available:
             raise UefiNtfsSafetyError(
@@ -410,7 +413,7 @@ def build_uefi_ntfs_media_plan(
     *,
     volume_label: str = "ISO_DATA",
     bios_bootable: bool = False,
-    allow_unsigned_arm: bool = False,
+    allow_unsigned_payloads: bool = False,
     logical_sector_size: int | None = None,
     finder: Callable[[str], str | None] = _trusted_which,
     source_on_device: Callable[[str, Device], bool] = path_is_on_device,
@@ -447,7 +450,7 @@ def build_uefi_ntfs_media_plan(
     frozen_architectures = tuple(architectures)
     payloads = _payloads_for(
         frozen_architectures, content.fallback_loaders,
-        allow_unsigned_arm=allow_unsigned_arm,
+        allow_unsigned_payloads=allow_unsigned_payloads,
     )
     data_spec = layout.partitions[0]
     assert data_spec.sector_count is not None
@@ -465,7 +468,7 @@ def build_uefi_ntfs_media_plan(
     )
     return UefiNtfsMediaPlan(
         device, layout, content, artifact, frozen_architectures,
-        allow_unsigned_arm, payloads, tools, data_capacity,
+        allow_unsigned_payloads, payloads, tools, data_capacity,
     )
 
 
@@ -498,14 +501,14 @@ def validate_uefi_ntfs_media_plan(plan: UefiNtfsMediaPlan) -> None:
         not isinstance(plan.architectures, tuple)
         or not plan.architectures
         or any(not isinstance(item, str) or not item for item in plan.architectures)
-        or not isinstance(plan.allow_unsigned_arm, bool)
+        or not isinstance(plan.allow_unsigned_payloads, bool)
     ):
         raise UefiNtfsSafetyError("The plan has invalid architecture bindings")
     try:
         expected_payloads = _payloads_for(
             plan.architectures,
             plan.content.fallback_loaders,
-            allow_unsigned_arm=plan.allow_unsigned_arm,
+            allow_unsigned_payloads=plan.allow_unsigned_payloads,
         )
     except UefiNtfsSafetyError:
         raise
