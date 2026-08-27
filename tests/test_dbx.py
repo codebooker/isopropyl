@@ -3,13 +3,17 @@
 import hashlib
 import json
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from isopropyl.dbx import (
     CATALOG_RESOURCE, DbxAssessment, DbxCatalog, DbxError, DbxState, assess_dbx,
-    load_dbx_catalog, parse_dbx_catalog, pe_authenticode_sha256,
+    assess_staged_dbx, load_dbx_catalog, parse_dbx_catalog,
+    pe_authenticode_sha256,
 )
+from tests.test_constructed import build_plan
 
 
 def canonical_pe(
@@ -84,6 +88,16 @@ def divergent_multisection_pe() -> bytes:
 
 
 class DbxTests(unittest.TestCase):
+    @staticmethod
+    def catalog_with_x64(*digests: str) -> DbxCatalog:
+        empty = frozenset()
+        return DbxCatalog(
+            (("aarch64", empty), ("arm", empty), ("ia32", empty),
+             ("x64", frozenset(digests))),
+            (("aarch64", empty), ("arm", empty), ("ia32", empty),
+             ("x64", empty)),
+        )
+
     def test_assessment_rejects_mislabelled_snapshot_provenance(self):
         with self.assertRaisesRegex(ValueError, "provenance"):
             DbxAssessment(
@@ -298,6 +312,53 @@ class DbxTests(unittest.TestCase):
             + blob[certificate_offset + certificate_size:]
         ).hexdigest()
         self.assertEqual(pe_authenticode_sha256(blob).sha256, oracle)
+
+    def test_staged_tree_assessment_is_plan_bound_and_finds_added_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "staging"
+            fallback = root / "EFI/BOOT/BOOTX64.EFI"
+            vendor = root / "overlay/vendor/new.efi"
+            fallback.parent.mkdir(parents=True)
+            vendor.parent.mkdir(parents=True)
+            fallback.write_bytes(canonical_pe())
+            added = canonical_pe(post_section_data=b"overlay addition")
+            vendor.write_bytes(added)
+            plan = build_plan(root)
+            digest = pe_authenticode_sha256(added).sha256
+            result = assess_staged_dbx(
+                plan, catalog=self.catalog_with_x64(digest),
+            )
+            self.assertTrue(result.complete)
+            self.assertEqual(result.candidate_count, 2)
+            self.assertEqual(tuple(item.path for item in result.matches), (
+                "overlay/vendor/new.efi",
+            ))
+
+            vendor.write_bytes(canonical_pe(post_section_data=b"changed"))
+            changed = assess_staged_dbx(
+                plan, catalog=self.catalog_with_x64(digest),
+            )
+            self.assertFalse(changed.complete)
+            self.assertTrue(any("changed" in issue for issue in changed.issues))
+
+    def test_staged_tree_candidate_limit_is_explicitly_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "staging"
+            fallback = root / "EFI/BOOT/BOOTX64.EFI"
+            fallback.parent.mkdir(parents=True)
+            fallback.write_bytes(canonical_pe())
+            vendor = root / "EFI/vendor"
+            vendor.mkdir(parents=True)
+            for index in range(64):
+                (vendor / f"tool-{index:02d}.efi").write_bytes(canonical_pe())
+            plan = build_plan(root)
+            result = assess_staged_dbx(
+                plan, catalog=self.catalog_with_x64(),
+            )
+            self.assertEqual(result.candidate_count, 65)
+            self.assertEqual(result.selected_count, 64)
+            self.assertFalse(result.complete)
+            self.assertTrue(any("selected 64 of 65" in issue for issue in result.issues))
 
 
 if __name__ == "__main__":

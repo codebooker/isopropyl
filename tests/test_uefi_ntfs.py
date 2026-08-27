@@ -391,12 +391,22 @@ class FakeLayoutExecutor:
 
 
 class FakeContentExecutor:
-    def __init__(self, error=None, *, unmounted=True, cleanup_diagnostic=""):
+    def __init__(
+        self, error=None, *, preflight_error=None, unmounted=True,
+        cleanup_diagnostic="",
+    ):
         self.error = error
+        self.preflight_error = preflight_error
         self.unmounted = unmounted
         self.cleanup_diagnostic = cleanup_diagnostic
         self.calls = []
+        self.preflight_calls = []
         self.cancelled = False
+
+    def verify_pre_destructive(self, plan):
+        self.preflight_calls.append(plan)
+        if self.preflight_error:
+            raise self.preflight_error
 
     def populate_existing_partition(self, plan, partition, progress, *, power_off):
         self.calls.append((plan, partition, power_off))
@@ -476,12 +486,14 @@ class StubbornProcess:
 class ExecutorTests(unittest.TestCase):
     def make_executor(
         self, plan, *, readback=ARTIFACT_DATA, layout_error=None,
-        content_error=None, content_unmounted=True, changed_device=False,
+        content_error=None, preflight_error=None, content_unmounted=True,
+        changed_device=False,
         wrong_geometry=False, cleanup_diagnostic="",
     ):
         layout = FakeLayoutExecutor(layout_error)
         content = FakeContentExecutor(
             content_error,
+            preflight_error=preflight_error,
             unmounted=content_unmounted,
             cleanup_diagnostic=cleanup_diagnostic,
         )
@@ -534,6 +546,20 @@ class ExecutorTests(unittest.TestCase):
         self.assertFalse(any("cache" in argument for call in dd_calls for argument in call[0]))
         self.assertEqual(updates[-1].stage, "Complete")
         self.assertTrue(any(call[0][1] == "power-off" for call in commands))
+
+    def test_content_preflight_precedes_and_can_prevent_destructive_layout(self):
+        with tempfile.TemporaryDirectory() as directory, fixture_constants():
+            plan = build_plan(staging_tree(Path(directory)))
+            executor, layout, content, commands, processes = self.make_executor(
+                plan,
+                preflight_error=ConstructedMediaError("staging changed"),
+            )
+            with self.assertRaisesRegex(ConstructedMediaError, "staging changed"):
+                executor.execute(plan)
+        self.assertEqual(content.preflight_calls, [plan.content])
+        self.assertEqual(layout.calls, [])
+        self.assertEqual(commands, [])
+        self.assertEqual(processes, [])
 
     def test_raw_readback_corruption_fails_and_powers_off(self):
         with tempfile.TemporaryDirectory() as directory, fixture_constants():

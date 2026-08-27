@@ -31,7 +31,10 @@ from .backup import (
     virtual_backup_required_space,
 )
 from .authenticode import AuthenticodeIntegrityState
-from .dbx import DbxState, SOURCE_RELEASE, SOURCE_RELEASE_DATE
+from .dbx import (
+    DbxState, SOURCE_RELEASE, SOURCE_RELEASE_DATE, StagedDbxAnalysis,
+    StagedDbxPayload, assess_staged_dbx,
+)
 from .bootloaders import (
     CatalogError, bundle_for_dependency, delete_cached_artifacts, inventory_cache,
 )
@@ -161,6 +164,15 @@ class PendingIsoWrite:
     runtime_validation: PreparedRuntimeValidation | None = None
 
 
+@dataclass
+class StagedDbxConfirmation:
+    analysis: StagedDbxAnalysis
+    payloads: tuple[StagedDbxPayload, ...]
+    cancel_event: threading.Event
+    decision: threading.Event
+    accepted: bool = False
+
+
 @dataclass(frozen=True)
 class WindowsMetadataToken:
     generation: int
@@ -241,6 +253,7 @@ class Bridge(QObject):
     checksums_finished = pyqtSignal(object, object)
     zip_overlay_finished = pyqtSignal(object, object)
     iso_staging_preparation_finished = pyqtSignal(object, object)
+    staged_dbx_confirmation_requested = pyqtSignal(object)
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
     media_finished = pyqtSignal(object)
@@ -339,6 +352,9 @@ class Window(QMainWindow):
         self.bridge.iso_staging_preparation_finished.connect(
             self.on_iso_staging_preparation_finished
         )
+        self.bridge.staged_dbx_confirmation_requested.connect(
+            self.on_staged_dbx_confirmation_requested
+        )
         self.setWindowTitle("ISOpropyl")
         self.setMinimumSize(720, 700)
         self.setAcceptDrops(True)
@@ -434,9 +450,18 @@ class Window(QMainWindow):
         return safe
 
     def confirm_dbx_matches(self, inspection: ImageInspection) -> bool:
+        return self.confirm_dbx_payload_matches(
+            tuple(inspection.uefi_payloads), "the selected image",
+        )
+
+    def confirm_dbx_payload_matches(
+        self,
+        payloads: tuple[object, ...],
+        scope: str,
+    ) -> bool:
         matches = tuple(
-            payload for payload in inspection.uefi_payloads
-            if payload.dbx is not None and payload.dbx.matched
+            payload for payload in payloads
+            if getattr(payload, "dbx", None) is not None and payload.dbx.matched
         )
         if not matches:
             return True
@@ -461,7 +486,7 @@ class Window(QMainWindow):
         answer = QMessageBox.warning(
             self,
             "Secure Boot revocation match",
-            "ISOpropyl found EFI payloads whose SHA-256 Authenticode image "
+            f"ISOpropyl found EFI payloads in {scope} whose SHA-256 Authenticode image "
             "digest exactly matches entries published in Microsoft's bundled "
             f"Secure Boot DBX {SOURCE_RELEASE} snapshot "
             f"({SOURCE_RELEASE_DATE}).\n\n"
@@ -478,6 +503,53 @@ class Window(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         )
         return answer == QMessageBox.StandardButton.Yes
+
+    def on_staged_dbx_confirmation_requested(
+        self, request: StagedDbxConfirmation,
+    ) -> None:
+        if not isinstance(request, StagedDbxConfirmation) or request.decision.is_set():
+            return
+        try:
+            if request.cancel_event.is_set():
+                return
+            request.accepted = self.confirm_dbx_payload_matches(
+                tuple(request.payloads), "the final staged media",
+            )
+            if (
+                request.accepted
+                and not request.cancel_event.is_set()
+                and not request.analysis.complete
+            ):
+                unknown = sum(
+                    payload.dbx.state is DbxState.UNKNOWN
+                    for payload in request.analysis.payloads
+                )
+                unassessed = max(
+                    0,
+                    request.analysis.candidate_count
+                    - request.analysis.selected_count,
+                )
+                answer = QMessageBox.warning(
+                    self,
+                    "Incomplete final Secure Boot assessment",
+                    "ISOpropyl could not conclusively compare every EFI payload "
+                    "in the final staged media with the bundled Microsoft DBX "
+                    f"{SOURCE_RELEASE} snapshot ({SOURCE_RELEASE_DATE}).\n\n"
+                    f"Candidates: {request.analysis.candidate_count} · "
+                    f"inspected: {request.analysis.selected_count} · "
+                    f"unknown: {unknown} · unassessed: {unassessed}.\n\n"
+                    "A parser, size, architecture, read, or selection limit may "
+                    "have prevented a conclusive result. This does not establish "
+                    "that the media is unrevoked, trusted, compatible, or bootable. "
+                    "Continue writing anyway?",
+                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                request.accepted = answer == QMessageBox.StandardButton.Yes
+            if request.cancel_event.is_set():
+                request.accepted = False
+        finally:
+            request.decision.set()
 
     def refresh_size_labels(self) -> None:
         for index, device in enumerate(self.devices):
@@ -5247,6 +5319,62 @@ class Window(QMainWindow):
             image, device.path, device.identity,
         )
 
+        base_dbx_matches = frozenset(
+            payload.dbx.authenticode_sha256
+            for payload in inspection.uefi_payloads
+            if (
+                payload.dbx is not None
+                and payload.dbx.matched
+                and payload.dbx.authenticode_sha256
+            )
+        )
+
+        def check_final_staged_dbx(plan: ConstructedMediaPlan) -> StagedDbxAnalysis:
+            def cancel_check() -> None:
+                if runtime_validation_cancel_event.is_set():
+                    raise RuntimeValidationCancelled(
+                        "ISO-mode writing was cancelled before the target was changed"
+                    )
+
+            self.bridge.progress.emit(
+                0, 0, "Checking final staged Secure Boot payloads",
+            )
+            analysis = assess_staged_dbx(plan, cancel_check=cancel_check)
+            newly_matched = tuple(
+                payload for payload in analysis.matches
+                if payload.dbx.authenticode_sha256 not in base_dbx_matches
+            )
+            self.logger.info(
+                "Final staged DBX assessment: candidates=%s selected=%s "
+                "complete=%s matches=%s newly_matched=%s",
+                analysis.candidate_count,
+                analysis.selected_count,
+                analysis.complete,
+                len(analysis.matches),
+                len(newly_matched),
+            )
+            if newly_matched or not analysis.complete:
+                request = StagedDbxConfirmation(
+                    analysis,
+                    newly_matched,
+                    runtime_validation_cancel_event,
+                    threading.Event(),
+                )
+                self.bridge.staged_dbx_confirmation_requested.emit(request)
+                while not request.decision.wait(0.1):
+                    if runtime_validation_cancel_event.is_set():
+                        # Mark the request stale before unwinding so a queued
+                        # GUI delivery cannot open a warning after cancellation.
+                        request.decision.set()
+                    cancel_check()
+                cancel_check()
+                if not request.accepted:
+                    raise RuntimeValidationCancelled(
+                        "ISO-mode writing was cancelled after final staged "
+                        "Secure Boot review"
+                    )
+            return analysis
+
         def work() -> None:
             success = False
             message = "ISO-mode operation did not complete"
@@ -5284,6 +5412,7 @@ class Window(QMainWindow):
                         pending.persistence_bytes,
                         logical_sector_size,
                     )
+                    check_final_staged_dbx(target_plan.content)
                     result = self.casper_writer.execute(
                         target_plan,
                         lambda update: self.bridge.progress.emit(
@@ -5315,6 +5444,7 @@ class Window(QMainWindow):
                         allow_unsigned_payloads=pending.allow_unsigned_payloads,
                         logical_sector_size=logical_sector_size,
                     )
+                    check_final_staged_dbx(target_plan.content)
                     result = self.uefi_ntfs_writer.execute(
                         target_plan,
                         lambda update: self.bridge.progress.emit(
@@ -5352,6 +5482,7 @@ class Window(QMainWindow):
                         partition_table,
                         volume_label="ISOPROPYL",
                     )
+                    check_final_staged_dbx(target_plan)
                     result = self.constructed_writer.execute(
                         target_plan,
                         lambda update: self.bridge.progress.emit(

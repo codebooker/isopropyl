@@ -272,11 +272,16 @@ issue requesting a private contact channel without disclosing the vulnerability.
   safe, trusted, compatible, bootable, or accepted by the current machine.
   ISOpropyl does not read the machine's firmware DBX, authenticate live policy,
   or yet apply the snapshot's certificate/SVN entries or a current SBAT policy.
-  El Torito EFI boot images, additive overlays, persistence changes,
-  runtime-validation wrappers, and the UEFI:NTFS helper are not yet included in
-  a final transformed-media DBX pass. A destructive ISO confirmation labels the
-  advice as base-ISO-only whenever an overlay, runtime wrapper, or UEFI:NTFS
-  helper changes the final EFI set.
+  ISO mode performs another bounded, descriptor-bound pass over every selected
+  `.efi` file in the final constructed-media plan after overlays, persistence
+  changes, and runtime-validation wrappers. A newly introduced exact match opens
+  a second default-Cancel warning before any writer or formatter is invoked.
+  Incomplete final coverage—whether from selection limits or unknown
+  assessments—also requires a separate default-Cancel decision. The writer
+  independently rejects subsequent staged-tree identity drift. El
+  Torito EFI boot images and the embedded files inside the UEFI:NTFS helper image
+  are not included in that final pass; the destructive confirmation therefore
+  retains its base-image qualification whenever the helper changes the EFI set.
 - Automated device-facing tests use mocks and regular files. Hardware-backed
   write, boot, Secure Boot, cancellation, and failure-recovery testing is still
   required before the alpha label can be removed.

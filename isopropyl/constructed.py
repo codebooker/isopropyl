@@ -659,6 +659,79 @@ def _open_directory_chain(
         raise
 
 
+def read_bound_staged_file(
+    plan: ConstructedMediaPlan,
+    entry: StagedFile,
+    *,
+    max_bytes: int,
+    cancel_check: Callable[[], None] | None = None,
+) -> bytes:
+    """Read one plan-bound regular file without following a replaced path."""
+    if not isinstance(plan, ConstructedMediaPlan):
+        raise ConstructedMediaSafetyError("A ConstructedMediaPlan is required")
+    if not isinstance(entry, StagedFile) or entry not in plan.files:
+        raise ConstructedMediaSafetyError("The staged file is not bound to the plan")
+    if type(max_bytes) is not int or max_bytes < 0 or entry.size > max_bytes:
+        raise ConstructedMediaSafetyError("The staged file exceeds its read limit")
+    if cancel_check is not None:
+        cancel_check()
+    root_fd = _open_bound_root(plan)
+    directories = {item.parts: item for item in plan.directories}
+    parent_fd = -1
+    descriptor = -1
+    try:
+        parent_fd = _open_directory_chain(
+            root_fd, entry.parts[:-1], expected=directories,
+        )
+        before = os.stat(
+            entry.parts[-1], dir_fd=parent_fd, follow_symlinks=False,
+        )
+        if _file_from_stat(entry.parts, before) != entry:
+            raise ConstructedMediaSafetyError(
+                f"Staged file changed after planning: {entry.path!r}"
+            )
+        descriptor = os.open(entry.parts[-1], _READ_FLAGS, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if _file_from_stat(entry.parts, opened) != entry:
+            raise ConstructedMediaSafetyError(
+                f"Staged file changed while opening: {entry.path!r}"
+            )
+        chunks: list[bytes] = []
+        remaining = entry.size
+        while remaining:
+            if cancel_check is not None:
+                cancel_check()
+            block = os.read(descriptor, min(COPY_BLOCK_BYTES, remaining))
+            if not block:
+                raise ConstructedMediaSafetyError(
+                    f"Staged file ended while reading: {entry.path!r}"
+                )
+            chunks.append(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise ConstructedMediaSafetyError(
+                f"Staged file grew while reading: {entry.path!r}"
+            )
+        final = os.fstat(descriptor)
+        if _file_from_stat(entry.parts, final) != entry:
+            raise ConstructedMediaSafetyError(
+                f"Staged file changed while reading: {entry.path!r}"
+            )
+        if cancel_check is not None:
+            cancel_check()
+        return b"".join(chunks)
+    except OSError as error:
+        raise ConstructedMediaSafetyError(
+            _bounded_message(error, f"Could not safely read staged file {entry.path!r}")
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
 class ConstructedMediaExecutor:
     def __init__(
         self,

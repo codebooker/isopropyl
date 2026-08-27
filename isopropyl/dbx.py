@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import struct
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -37,6 +38,7 @@ SOURCE_LICENSE = "BSD-2-Clause-Patent"
 MAX_CATALOG_BYTES = 64 * 1024
 MAX_PE_BYTES = 256 * 1024 * 1024
 MAX_SECTIONS = 96
+MAX_STAGED_DBX_CANDIDATES = 64
 HASH_CHUNK_BYTES = 1024 * 1024
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 _ARCHITECTURE_COUNTS = {
@@ -129,6 +131,25 @@ class DbxAssessment:
     @property
     def matched(self) -> bool:
         return self.state in {DbxState.MATCHED_UNFLAGGED, DbxState.MATCHED_OPTIONAL}
+
+
+@dataclass(frozen=True)
+class StagedDbxPayload:
+    path: str
+    dbx: DbxAssessment
+
+
+@dataclass(frozen=True)
+class StagedDbxAnalysis:
+    payloads: tuple[StagedDbxPayload, ...]
+    candidate_count: int
+    selected_count: int
+    complete: bool
+    issues: tuple[str, ...] = ()
+
+    @property
+    def matches(self) -> tuple[StagedDbxPayload, ...]:
+        return tuple(payload for payload in self.payloads if payload.dbx.matched)
 
 
 def _duplicate_rejecting_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -524,3 +545,80 @@ def assess_dbx(
     else:
         state = DbxState.NOT_LISTED_IN_SNAPSHOT
     return DbxAssessment(state, measured.architecture, measured.sha256)
+
+
+def assess_staged_dbx(
+    plan: object,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+    catalog: DbxCatalog | None = None,
+) -> StagedDbxAnalysis:
+    """Assess a bounded EFI inventory bound to a constructed-media plan."""
+    from .constructed import (
+        ConstructedMediaPlan, ConstructedMediaSafetyError,
+        read_bound_staged_file,
+    )
+
+    if not isinstance(plan, ConstructedMediaPlan):
+        raise DbxError("a constructed-media plan is required for staged DBX analysis")
+    candidates = []
+    for entry in plan.files:
+        lowered = tuple(part.casefold() for part in entry.parts)
+        # EFI applications can be chainloaded from locations other than the
+        # conventional EFI directory.  Assess every final `.efi` file so an
+        # additive overlay or generated wrapper cannot evade review merely by
+        # choosing a nonstandard path.
+        if not lowered or not lowered[-1].endswith(".efi"):
+            continue
+        name = lowered[-1]
+        if (
+            len(lowered) == 3
+            and lowered[:2] == ("efi", "boot")
+            and name.startswith("boot")
+        ):
+            priority = 0
+        elif name in {"bootmgfw.efi", "cdboot.efi", "cdboot_noprompt.efi"}:
+            priority = 1
+        else:
+            priority = 2
+        key = tuple(
+            unicodedata.normalize("NFC", part).casefold()
+            for part in entry.parts
+        )
+        candidates.append((priority, key, entry))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    selected = candidates[:MAX_STAGED_DBX_CANDIDATES]
+    complete = len(selected) == len(candidates)
+    payloads: list[StagedDbxPayload] = []
+    issues: list[str] = []
+    for _priority, _key, entry in selected:
+        if cancel_check is not None:
+            cancel_check()
+        try:
+            blob = read_bound_staged_file(
+                plan, entry, max_bytes=MAX_PE_BYTES, cancel_check=cancel_check,
+            )
+        except ConstructedMediaSafetyError as error:
+            message = " ".join(str(error).split())[:512] or "staged EFI read failed"
+            issues.append(f"{entry.path}: {message}")
+            payloads.append(StagedDbxPayload(
+                entry.path, DbxAssessment(DbxState.UNKNOWN, error=message),
+            ))
+            complete = False
+            continue
+        assessment = assess_dbx(
+            blob, cancel_check=cancel_check, catalog=catalog,
+        )
+        payloads.append(StagedDbxPayload(entry.path, assessment))
+        if assessment.state is DbxState.UNKNOWN:
+            issues.append(f"{entry.path}: {assessment.error}")
+            complete = False
+    if len(candidates) > len(selected):
+        issues.append(
+            f"selected {len(selected)} of {len(candidates)} staged EFI candidates"
+        )
+    if cancel_check is not None:
+        cancel_check()
+    return StagedDbxAnalysis(
+        tuple(payloads), len(candidates), len(selected), complete, tuple(issues),
+    )

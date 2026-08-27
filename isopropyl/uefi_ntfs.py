@@ -828,8 +828,16 @@ class UefiNtfsExecutor:
         self._check_cancelled()
         validate_uefi_ntfs_media_plan(plan)
         powered_off = False
+        target_change_attempted = False
         try:
+            # Freeze and revalidate every staged source before the layout
+            # executor makes the first destructive target change.  The
+            # content executor repeats these checks while populating the
+            # partition, but by then the old partition table is already gone.
+            self._content.verify_pre_destructive(plan.content)
+            self._check_cancelled()
             progress(UefiNtfsProgress("Creating exact NTFS/boot layout"))
+            target_change_attempted = True
             partitions = self._layout.execute_multi(plan.device, plan.layout)
             if len(partitions) != 2:
                 raise UefiNtfsSafetyError("UEFI:NTFS requires exactly two partitions")
@@ -868,7 +876,8 @@ class UefiNtfsExecutor:
         except FormattingError as error:
             raise UefiNtfsError(str(error)) from error
         finally:
-            powered_off = self._power_off(plan)
+            if target_change_attempted:
+                powered_off = self._power_off(plan)
         return UefiNtfsResult(
             plan.device.identity, data_partition, boot_partition,
             content, plan.artifact.sha256, powered_off,

@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 from isopropyl.app import (
     BackgroundPreparation, ChecksumToken, IsoStagingPreparationRequest,
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
+    StagedDbxConfirmation,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
     ZipOverlayPlanningToken,
 )
@@ -35,7 +36,9 @@ from isopropyl.bootloaders import (
 from isopropyl.casper_media import supported_casper_profile
 from isopropyl.constructed import ConstructedMediaPlan
 from isopropyl.devices import Device, SizeUnitMode
-from isopropyl.dbx import DbxAssessment, DbxState
+from isopropyl.dbx import (
+    DbxAssessment, DbxState, StagedDbxAnalysis, StagedDbxPayload,
+)
 from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
 )
@@ -657,6 +660,77 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("SBAT", arguments[2])
         self.assertNotIn("safe to boot", arguments[2].casefold())
         self.assertEqual(arguments[4], QMessageBox.StandardButton.Cancel)
+
+    def test_final_staged_dbx_request_is_resolved_and_defaults_to_cancel(self):
+        request = StagedDbxConfirmation(
+            StagedDbxAnalysis((), 1, 0, False, ("selection limit",)),
+            (StagedDbxPayload(
+                "overlay/vendor/new.efi",
+                DbxAssessment(DbxState.MATCHED_OPTIONAL, "x64", "d" * 64),
+            ),),
+            threading.Event(),
+            threading.Event(),
+        )
+        with patch(
+            "isopropyl.app.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as warning:
+            self.window.on_staged_dbx_confirmation_requested(request)
+
+        self.assertTrue(request.decision.is_set())
+        self.assertFalse(request.accepted)
+        self.assertIn("final staged media", warning.call_args.args[2])
+        self.assertEqual(
+            warning.call_args.args[4], QMessageBox.StandardButton.Cancel,
+        )
+
+    def test_cancelled_final_dbx_request_never_opens_a_stale_warning(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        request = StagedDbxConfirmation(
+            StagedDbxAnalysis((), 0, 0, True),
+            (),
+            cancel_event,
+            threading.Event(),
+        )
+        with patch("isopropyl.app.QMessageBox.warning") as warning:
+            self.window.on_staged_dbx_confirmation_requested(request)
+        warning.assert_not_called()
+        self.assertTrue(request.decision.is_set())
+        self.assertFalse(request.accepted)
+
+    def test_incomplete_final_dbx_assessment_defaults_to_cancel(self):
+        request = StagedDbxConfirmation(
+            StagedDbxAnalysis(
+                (StagedDbxPayload(
+                    "EFI/BOOT/BOOTX64.EFI",
+                    DbxAssessment(DbxState.UNKNOWN, error="unsupported machine"),
+                ),),
+                2,
+                1,
+                False,
+                ("unsupported machine", "selected 1 of 2"),
+            ),
+            (),
+            threading.Event(),
+            threading.Event(),
+        )
+        with patch(
+            "isopropyl.app.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as warning:
+            self.window.on_staged_dbx_confirmation_requested(request)
+        self.assertFalse(request.accepted)
+        self.assertTrue(request.decision.is_set())
+        self.assertEqual(
+            warning.call_args.args[1],
+            "Incomplete final Secure Boot assessment",
+        )
+        self.assertIn("Candidates: 2", warning.call_args.args[2])
+        self.assertIn("unknown: 1", warning.call_args.args[2])
+        self.assertEqual(
+            warning.call_args.args[4], QMessageBox.StandardButton.Cancel,
+        )
 
     def test_dbx_review_never_hides_incomplete_or_inconsistent_coverage(self):
         original = self.window.inspection
@@ -3386,8 +3460,18 @@ class WindowRuntimeValidationTests(unittest.TestCase):
             self.window.image, root, self.window.archive_entries(), plan,
         )
         prepared = fake_runtime_validation()
+        acknowledged_digest = "f" * 64
+        acknowledged_payload = replace(
+            self.window.inspection.uefi_payloads[0],
+            dbx=DbxAssessment(
+                DbxState.MATCHED_UNFLAGGED, "x64", acknowledged_digest,
+            ),
+        )
+        acknowledged_inspection = replace(
+            self.window.inspection, uefi_payloads=(acknowledged_payload,),
+        )
         pending = PendingIsoWrite(
-            self.window.image, self.window.inspection, self.window.devices[0],
+            self.window.image, acknowledged_inspection, self.window.devices[0],
             plan, workspace, staging_plan, runtime_validation=prepared,
         )
         order = []
@@ -3415,7 +3499,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
             patch(
                 "isopropyl.app.QMessageBox.warning",
                 return_value=QMessageBox.StandardButton.Yes,
-            ),
+            ) as warning,
             patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
             patch("isopropyl.app.ConstructedMediaExecutor", return_value=writer),
             patch(
@@ -3434,11 +3518,33 @@ class WindowRuntimeValidationTests(unittest.TestCase):
                     order.append("plan") or object()
                 ),
             ),
+            patch(
+                "isopropyl.app.assess_staged_dbx",
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("dbx")
+                    or StagedDbxAnalysis(
+                        (StagedDbxPayload(
+                            "EFI/BOOT/BOOTX64.EFI",
+                            DbxAssessment(
+                                DbxState.MATCHED_UNFLAGGED,
+                                "x64",
+                                acknowledged_digest,
+                            ),
+                        ),),
+                        1,
+                        1,
+                        True,
+                    )
+                ),
+            ),
             patch("isopropyl.app.threading.Thread", ImmediateThread),
         ):
             self.window.confirm_and_start_iso_write(pending, None, None)
 
-        self.assertEqual(order, ["stage", "apply", "validate", "plan", "write"])
+        self.assertEqual(
+            order, ["stage", "apply", "validate", "plan", "dbx", "write"],
+        )
+        self.assertEqual(warning.call_count, 1)
         self.assertIs(apply.call_args.args[0], prepared)
         self.assertEqual(apply.call_args.args[1], root)
         self.assertIs(
@@ -3450,6 +3556,66 @@ class WindowRuntimeValidationTests(unittest.TestCase):
             self.window.runtime_validation_cancel_event,
         )
         self.assertTrue(finished.call_args.args[0])
+
+    def test_new_final_dbx_match_cancel_prevents_target_write(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        root = Path(self.settings_home.name) / "ready-media"
+        staging_plan = fake_iso_staging_plan(
+            self.window.image, root, self.window.archive_entries(), plan,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging_plan,
+            runtime_validation=fake_runtime_validation(),
+        )
+        stager = Mock()
+        stager.execute.return_value = SimpleNamespace(
+            destination=root, bytes_staged=1024,
+        )
+        writer = Mock()
+        final_match = StagedDbxPayload(
+            "EFI/BOOT/BOOTX64.EFI",
+            DbxAssessment(DbxState.MATCHED_UNFLAGGED, "x64", "e" * 64),
+        )
+        finished = Mock()
+        self.window.bridge.finished.disconnect()
+        self.window.bridge.finished.connect(finished)
+
+        def answer(_parent, title, *_args, **_kwargs):
+            if title == "Erase drive and write in ISO mode?":
+                return QMessageBox.StandardButton.Yes
+            self.assertEqual(title, "Secure Boot revocation match")
+            return QMessageBox.StandardButton.Cancel
+
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.validate_prepared_runtime_validation",
+                side_effect=lambda value: value,
+            ),
+            patch("isopropyl.app.QMessageBox.warning", side_effect=answer),
+            patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
+            patch("isopropyl.app.ConstructedMediaExecutor", return_value=writer),
+            patch("isopropyl.app.apply_runtime_validation"),
+            patch("isopropyl.app.validate_runtime_validation_stage"),
+            patch("isopropyl.app.build_constructed_media_plan", return_value=object()),
+            patch(
+                "isopropyl.app.assess_staged_dbx",
+                return_value=StagedDbxAnalysis(
+                    (final_match,), 1, 1, True,
+                ),
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        writer.execute.assert_not_called()
+        workspace.cleanup.assert_called_once_with()
+        self.assertFalse(finished.call_args.args[0])
+        self.assertIn("Secure Boot review", finished.call_args.args[1])
 
     def test_cancellation_during_transform_never_builds_target_plan(self):
         plan = self.window.write_recommendation.iso_plan
