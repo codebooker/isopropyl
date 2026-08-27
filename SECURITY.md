@@ -110,6 +110,16 @@ issue requesting a private contact channel without disclosing the vulnerability.
   before `/IMAGE/INDEX` metadata is emitted. Nested or multi-source WIM answer
   files also receive an `InstallFrom/Path` value validated against that catalog;
   a forged path, alias, stale result, or ambiguous ESD selection fails closed.
+  The staging plan retains the frozen typed customization and generator
+  architecture, regenerates the complete answer file before extraction, and
+  requires exact UTF-8 byte equality; structurally valid extra commands,
+  comments, or whitespace changes are rejected. The fixed `BypassNRO` command
+  contains no user-derived text and is enabled only for an explicitly selected,
+  recognized non-Home x64/ARM64 Windows 11 build in the 21H2–24H2 allowlist.
+  Home, x86, newer, unknown, and obvious normalized English S-mode/cloud markers
+  fail closed. WIM metadata cannot prove the absence of a localized or
+  offline-serviced S-mode policy, so the GUI requires a separate explicit
+  acknowledgment of that residual uncertainty before it can emit the command.
   This is an ISOpropyl construction invariant, not a claim that every unusual
   booted Windows Setup launch context has been physically certified. ISOpropyl
   never emits an automatic target-disk wipe instruction for Windows Setup.

@@ -89,12 +89,12 @@ Status meanings:
 | BIOS-only and dual BIOS+UEFI | **Planned** | Exact Windows/GRUB/Syslinux boot code and layouts required. |
 | UEFI:NTFS / dual partition | **Partial** | Exact 512-byte-sector GPT/MBR geometry, NTFS data partition, pinned 1 MiB upstream FAT12 helper image, x64/x86/ARM64 payload validation, conditional CA2011 warning, raw and file read-back verification, identity rechecks, and cancellation. ARM32 and RISC-V64 require an explicit unsigned-payload consent with Secure Boot disabled; LoongArch64 remains incomplete. Physical certification remains. |
 | Windows 11 RAM/TPM/Secure Boot bypass | **Done** | Transparent opt-in answer-file registry commands; applied only through ISO mode. |
-| Hide online Microsoft-account screen | **Partial** | OOBE settings ship; current Windows versions may require more version-aware mechanisms. |
+| Hide/bypass online Microsoft-account flow | **Partial** | General OOBE screen suppression ships. A separate fixed `BypassNRO` specialize command is available only after selecting a recognized non-Home x64/ARM64 Windows 11 21H2–24H2 edition; it implies the OOBE hiding settings and advises offline OOBE. Home, x86, 25H2/26H1, unknown editions, and obvious normalized S-mode/cloud markers fail closed. Because WIM metadata cannot prove that localized or offline-serviced media has no S-mode policy, enabling the option also requires an explicit limitations acknowledgment. |
 | Local administrator | **Partial** | Validated username and no collected secret; the account starts blank and a single sequential first-logon command mandates replacement and applies the chosen expiration policy. The GUI warns that this is best-effort and unsupported in S mode. |
 | Locale, language, keyboard, time zone | **Done** | Explicit validated Linux-side fields, not host-Windows settings replication. |
 | Privacy-question/Express settings | **Done** | Opt-in OOBE privacy settings. |
 | Prevent automatic BitLocker encryption | **Done** | Transparent opt-in unattend/registry behavior. |
-| Existing answer file protection | **Done** | Root `autounattend.xml` and `sources/$OEM$/$$/Panther/unattend.xml` are detected case-insensitively; customization refuses to combine with or replace either. |
+| Existing answer file protection | **Done** | Root `autounattend.xml` and `sources/$OEM$/$$/Panther/unattend.xml` are detected case-insensitively; customization refuses to combine with or replace either. The frozen staging plan binds the typed options and architecture, regenerates the answer file, and requires exact UTF-8 byte equality before extraction. |
 | Windows To Go | **Planned** | WIM apply, ESP/MSR/NTFS layout, offline BCD, SAN policy, and driver/hardware caveats. |
 | Internal disks offline for Windows To Go | **Planned** | Belongs to future offline SAN/BCD configuration. |
 | Windows CA 2023 / `SkuSiPolicy.p7b` | **Planned** | Security-sensitive, versioned validation required. |

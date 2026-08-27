@@ -31,8 +31,8 @@ evidence.
 - Add BIOS and dual BIOS+UEFI construction with exact, provenance-bound boot code.
 - Expand the implemented UEFI:NTFS path beyond 512-byte logical sectors only
   after upstream payload and firmware evidence supports it.
-- Track Windows CA 2023, `SkuSiPolicy.p7b`, S Mode, and version-specific online
-  account behavior without silently applying stale tweaks.
+- Track Windows CA 2023, `SkuSiPolicy.p7b`, S Mode, and post-24H2 online-account
+  behavior without silently extending the current exact-build `BypassNRO` policy.
 
 ### Linux boot and persistence
 

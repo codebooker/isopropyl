@@ -451,6 +451,8 @@ class IsoStagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = self.make_plan(root, windows_customization=customization)
+            self.assertEqual(plan.windows_customization, customization)
+            self.assertEqual(plan.windows_architecture, "amd64")
             result = IsoStagingExecutor(extractor=FakeExtractor()).execute(plan)
             answer = result.destination / "autounattend.xml"
             self.assertTrue(result.autounattend_added)
@@ -463,6 +465,89 @@ class IsoStagingTests(unittest.TestCase):
                     write_plan=write_plan(collision),
                     windows_customization=customization,
                 )
+
+    def test_answer_file_must_exactly_match_bound_customization(self):
+        customization = WindowsCustomization(
+            hide_online_account=True,
+            reduce_data_collection=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), windows_customization=customization,
+            )
+            xml = plan.autounattend_xml or ""
+            alterations = (
+                xml.replace(
+                    "</unattend>",
+                    "  <!-- structurally harmless but unbound -->\n</unattend>",
+                ),
+                xml.replace(
+                    "</unattend>",
+                    "  <settings pass=\"specialize\" />\n</unattend>",
+                ),
+                xml + "\n",
+            )
+            for forged_xml in alterations:
+                with self.subTest(forged_xml=forged_xml):
+                    extractor = FakeExtractor()
+                    with self.assertRaisesRegex(
+                        IsoStagingSafetyError, "bound customization",
+                    ):
+                        IsoStagingExecutor(extractor=extractor).execute(
+                            replace(plan, autounattend_xml=forged_xml),
+                        )
+                    self.assertEqual(extractor.calls, [])
+
+    def test_answer_file_requires_consistent_bound_generation_inputs(self):
+        customization = WindowsCustomization(hide_online_account=True)
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), windows_customization=customization,
+            )
+            invalid = (
+                replace(plan, windows_customization=None),
+                replace(plan, windows_architecture=None),
+                replace(plan, windows_customization=WindowsCustomization()),
+                replace(plan, autounattend_xml=None),
+                replace(
+                    plan,
+                    windows_customization=replace(
+                        customization, reduce_data_collection=True,
+                    ),
+                ),
+                replace(plan, autounattend_xml=b"not text"),
+                replace(plan, autounattend_xml="\ud800"),
+            )
+            for forged in invalid:
+                with self.subTest(forged=forged), self.assertRaises(
+                    IsoStagingSafetyError,
+                ):
+                    validate_iso_staging_plan(forged)
+
+    def test_answer_file_binds_selection_and_generation_architecture(self):
+        selection = selected_esd()
+        customization = WindowsCustomization(install_image=selection)
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), selected_esd_entries(),
+                windows_customization=customization,
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            changed_selection = selected_esd(build=22631)
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "selection is inconsistent",
+            ):
+                validate_iso_staging_plan(replace(
+                    plan,
+                    windows_customization=replace(
+                        customization, install_image=changed_selection,
+                    ),
+                ))
+            with self.assertRaisesRegex(IsoStagingSafetyError, "architecture"):
+                validate_iso_staging_plan(replace(
+                    plan, windows_architecture="arm64",
+                ))
 
     def test_refuses_known_oem_answer_file_case_insensitively(self):
         customization = WindowsCustomization(hide_online_account=True)

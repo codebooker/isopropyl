@@ -138,6 +138,8 @@ class IsoStagingPlan:
     wim_selection: WimSelection | None
     wimlib_imagex: str | None
     autounattend_xml: str | None
+    windows_customization: WindowsCustomization | None = None
+    windows_architecture: str | None = None
 
     @property
     def needs_wim_split(self) -> bool:
@@ -330,7 +332,7 @@ def _validate_catalog_shape(entries: Sequence[ArchiveEntry], wim_source: str | N
 def _validate_answer_file(xml: str) -> None:
     try:
         root = ET.fromstring(xml)
-    except (ET.ParseError, ValueError) as error:
+    except (ET.ParseError, UnicodeError, ValueError) as error:
         raise IsoStagingSafetyError("The generated Windows answer file is invalid") from error
     if root.tag != f"{{{UNATTEND_NS}}}unattend":
         raise IsoStagingSafetyError("The generated Windows answer file has an invalid root")
@@ -429,6 +431,8 @@ def build_iso_staging_plan(
     _validate_wim_selection_catalog(safe_entries, wim_selection)
 
     answer_file: str | None = None
+    bound_windows_customization: WindowsCustomization | None = None
+    bound_windows_architecture: str | None = None
     if windows_customization is not None and windows_customization.enabled:
         existing_answer_file = _existing_windows_answer_file(safe_entries)
         if existing_answer_file is not None:
@@ -485,6 +489,8 @@ def build_iso_staging_plan(
                     "A nested or multi-source Windows image requires an explicit "
                     "answer-file WIM path"
                 )
+        bound_windows_customization = windows_customization
+        bound_windows_architecture = windows_architecture
 
     try:
         extraction = build_extraction_plan(
@@ -531,6 +537,8 @@ def build_iso_staging_plan(
         wim_source=wim_source,
         wim_selection=wim_selection,
         wimlib_imagex=wimlib_imagex,
+        windows_customization=bound_windows_customization,
+        windows_architecture=bound_windows_architecture,
         autounattend_xml=answer_file,
     )
 
@@ -551,6 +559,10 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
     _validate_wim_selection_catalog(entries, plan.wim_selection)
     if wim_source != plan.wim_source:
         raise IsoStagingSafetyError("The plan contains inconsistent WIM transformation data")
+    if plan.autounattend_xml is not None and not isinstance(
+        plan.autounattend_xml, str,
+    ):
+        raise IsoStagingSafetyError("The Windows answer file must be text")
     if plan.autounattend_xml is not None:
         _validate_answer_file(plan.autounattend_xml)
         try:
@@ -616,6 +628,48 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
         raise IsoStagingSafetyError(
             "A selected Windows image requires a bound answer file"
         )
+    if plan.windows_customization is None:
+        if plan.windows_architecture is not None or plan.autounattend_xml is not None:
+            raise IsoStagingSafetyError(
+                "The staging plan does not bind its Windows customization inputs"
+            )
+    else:
+        if not isinstance(plan.windows_customization, WindowsCustomization):
+            raise IsoStagingSafetyError(
+                "The staging plan contains invalid Windows customization inputs"
+            )
+        if not plan.windows_customization.enabled:
+            raise IsoStagingSafetyError(
+                "The staging plan contains an empty Windows customization"
+            )
+        if plan.windows_customization.install_image != plan.wim_selection:
+            raise IsoStagingSafetyError(
+                "The staging plan Windows image selection is inconsistent"
+            )
+        if not isinstance(plan.windows_architecture, str):
+            raise IsoStagingSafetyError(
+                "The staging plan does not bind its Windows answer-file architecture"
+            )
+        try:
+            expected_answer_file = generate_autounattend(
+                plan.windows_customization, plan.windows_architecture,
+            )
+        except ValueError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        try:
+            exact_match = (
+                plan.autounattend_xml is not None
+                and plan.autounattend_xml.encode("utf-8")
+                == expected_answer_file.encode("utf-8")
+            )
+        except UnicodeEncodeError as error:
+            raise IsoStagingSafetyError(
+                "The Windows answer file is not valid UTF-8 text"
+            ) from error
+        if not exact_match:
+            raise IsoStagingSafetyError(
+                "The Windows answer file does not match its bound customization exactly"
+            )
     try:
         rebuilt = build_extraction_plan(
             plan.image, plan.destination, entries, seven_zip=plan.seven_zip,

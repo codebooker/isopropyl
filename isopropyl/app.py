@@ -95,7 +95,8 @@ from .wim import (
     WimEdition, WimInfo, WimSelection, inspect_wim, validate_wim_editions,
 )
 from .windows import (
-    WindowsCustomization, generate_autounattend, windows_architecture,
+    WindowsCustomization, generate_autounattend,
+    online_account_bypass_compatibility, windows_architecture,
 )
 
 
@@ -2330,9 +2331,13 @@ class Window(QMainWindow):
         if (
             self.windows_options.install_image is not None
             or self.windows_options.install_image_path
+            or self.windows_options.bypass_online_account_requirement
+            or self.windows_options.acknowledge_online_account_limitations
         ):
             self.windows_options = replace(
                 self.windows_options, install_image=None, install_image_path="",
+                bypass_online_account_requirement=False,
+                acknowledge_online_account_limitations=False,
             )
 
     def start_windows_wim_inspection(self) -> None:
@@ -2436,9 +2441,13 @@ class Window(QMainWindow):
             if (
                 self.windows_options.install_image is not None
                 or self.windows_options.install_image_path
+                or self.windows_options.bypass_online_account_requirement
+                or self.windows_options.acknowledge_online_account_limitations
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
+                    bypass_online_account_requirement=False,
+                    acknowledge_online_account_limitations=False,
                 )
             self.windows_wim_error = (
                 str(result) if isinstance(result, Exception)
@@ -2459,9 +2468,13 @@ class Window(QMainWindow):
             if (
                 self.windows_options.install_image is not None
                 or self.windows_options.install_image_path
+                or self.windows_options.bypass_online_account_requirement
+                or self.windows_options.acknowledge_online_account_limitations
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
+                    bypass_online_account_requirement=False,
+                    acknowledge_online_account_limitations=False,
                 )
             self.windows_wim_error = str(error)
             self.windows_button.setToolTip(
@@ -2473,9 +2486,13 @@ class Window(QMainWindow):
             if (
                 self.windows_options.install_image is not None
                 or self.windows_options.install_image_path
+                or self.windows_options.bypass_online_account_requirement
+                or self.windows_options.acknowledge_online_account_limitations
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
+                    bypass_online_account_requirement=False,
+                    acknowledge_online_account_limitations=False,
                 )
             self.windows_wim_error = (
                 "The WIM inspector returned metadata for a different catalog size"
@@ -2487,13 +2504,21 @@ class Window(QMainWindow):
         self.windows_wim_editions = info.editions
         self.windows_wim_error = ""
         current_selection = self.windows_options.install_image
-        if current_selection is not None and (
+        selection_is_stale = current_selection is not None and (
             current_selection.source_name != self.windows_wim_member.path
             or current_selection.source_size != self.windows_wim_member.size
             or current_selection.editions != info.editions
-        ):
+        )
+        selection_is_missing = current_selection is None and (
+            bool(self.windows_options.install_image_path)
+            or self.windows_options.bypass_online_account_requirement
+            or self.windows_options.acknowledge_online_account_limitations
+        )
+        if selection_is_stale or selection_is_missing:
             self.windows_options = replace(
                 self.windows_options, install_image=None, install_image_path="",
+                bypass_online_account_requirement=False,
+                acknowledge_online_account_limitations=False,
             )
         labels = "\n".join(edition.display_label for edition in info.editions)
         self.windows_button.setToolTip(labels)
@@ -3839,6 +3864,17 @@ class Window(QMainWindow):
 
         bypass = QCheckBox("Remove Windows 11 RAM, Secure Boot, and TPM 2.0 setup checks")
         online = QCheckBox("Hide the online Microsoft account screen")
+        offline_account = QCheckBox(
+            "Enable the Windows 11 offline-account path (known 21H2–24H2 builds)"
+        )
+        offline_account.setObjectName("windowsBypassOnlineRequirementCheckBox")
+        offline_account_acknowledgment = QCheckBox(
+            "I understand WIM metadata cannot prove S mode is absent and this "
+            "Setup workaround may stop working"
+        )
+        offline_account_acknowledgment.setObjectName(
+            "windowsBypassOnlineRequirementAcknowledgment",
+        )
         privacy = QCheckBox("Reduce setup data collection (skip Express privacy settings)")
         bitlocker = QCheckBox("Prevent automatic BitLocker device encryption")
         local = QCheckBox("Create a local administrator account")
@@ -3856,8 +3892,15 @@ class Window(QMainWindow):
             password_never_expires.setEnabled(enabled)
 
         local.toggled.connect(set_local_controls)
-        for checkbox in (bypass, online, privacy, bitlocker, local):
+        for checkbox in (
+            bypass, online, offline_account, privacy, bitlocker, local,
+        ):
             setup_layout.addWidget(checkbox)
+        offline_account_note = QLabel()
+        offline_account_note.setWordWrap(True)
+        offline_account_note.setObjectName("muted")
+        setup_layout.addWidget(offline_account_note)
+        setup_layout.addWidget(offline_account_acknowledgment)
         setup_layout.addWidget(username)
         setup_layout.addWidget(password_change)
         setup_layout.addWidget(password_never_expires)
@@ -3896,6 +3939,10 @@ class Window(QMainWindow):
         regional_form.addRow(regional_note)
         bypass.setChecked(current.bypass_hardware_requirements)
         online.setChecked(current.hide_online_account)
+        offline_account.setChecked(current.bypass_online_account_requirement)
+        offline_account_acknowledgment.setChecked(
+            current.acknowledge_online_account_limitations,
+        )
         privacy.setChecked(current.reduce_data_collection)
         bitlocker.setChecked(current.disable_automatic_bitlocker)
         local.setChecked(bool(current.local_username))
@@ -3908,6 +3955,37 @@ class Window(QMainWindow):
         user_locale.setText(current.user_locale)
         timezone.setText(current.timezone)
         set_local_controls(local.isChecked())
+
+        def selected_bypass_image() -> WimSelection | None:
+            member = selected_source()
+            selected_index = image_combo.currentData()
+            if member is None or selected_index is None or not available_editions:
+                return None
+            return WimSelection(
+                member.path, member.size, available_editions, int(selected_index),
+            )
+
+        def update_offline_account_control() -> None:
+            supported, reason = online_account_bypass_compatibility(
+                selected_bypass_image(),
+            )
+            offline_account.setEnabled(supported)
+            offline_account.setToolTip(reason)
+            offline_account_note.setText(reason)
+            if not supported:
+                offline_account.setChecked(False)
+
+        def update_offline_account_acknowledgment() -> None:
+            enabled = offline_account.isEnabled() and offline_account.isChecked()
+            offline_account_acknowledgment.setEnabled(enabled)
+            if not enabled:
+                offline_account_acknowledgment.setChecked(False)
+
+        source_combo.currentIndexChanged.connect(update_offline_account_control)
+        image_combo.currentIndexChanged.connect(update_offline_account_control)
+        offline_account.toggled.connect(update_offline_account_acknowledgment)
+        update_offline_account_control()
+        update_offline_account_acknowledgment()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel
@@ -3940,6 +4018,10 @@ class Window(QMainWindow):
             return WindowsCustomization(
                 bypass_hardware_requirements=bypass.isChecked(),
                 hide_online_account=online.isChecked(),
+                bypass_online_account_requirement=offline_account.isChecked(),
+                acknowledge_online_account_limitations=(
+                    offline_account_acknowledgment.isChecked()
+                ),
                 local_username=username.text() if local.isChecked() else "",
                 reduce_data_collection=privacy.isChecked(),
                 disable_automatic_bitlocker=bitlocker.isChecked(),

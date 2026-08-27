@@ -88,12 +88,24 @@ a transparent Windows answer file with options for:
 
 - Windows 11 RAM, TPM 2.0, and Secure Boot setup-check bypasses;
 - local administrator creation and Microsoft-account screen suppression;
+- a separate fixed `BypassNRO` offline-account path for a selected, recognized
+  non-Home x64/ARM64 Windows 11 21H2–24H2 edition;
 - privacy/OOBE choices and automatic BitLocker-device-encryption prevention;
 - input locale, system/UI language, user locale, keyboard layout, and time zone.
 
-The XML is inspectable and exportable. Existing root or OEM/Panther Windows
-answer files are detected case-insensitively and never silently combined or
-replaced.
+The XML is inspectable and exportable. Before staging, ISOpropyl regenerates it
+byte-for-byte from the frozen typed options and selected architecture. Existing
+root or OEM/Panther Windows answer files are detected case-insensitively and
+never silently combined or replaced.
+
+The stronger offline-account option is deliberately disabled for Home, x86,
+Windows 25H2/26H1, unknown editions, and metadata with an obvious normalized
+S-mode or cloud marker because the fixed registry method is not assumed to
+survive new Setup behavior. WIM metadata cannot prove that a localized or
+offline-serviced image has no S-mode policy, so the GUI requires an explicit
+acknowledgment of that residual limitation. It also advises disconnecting
+networking during OOBE. This is a transparent best-effort compatibility option,
+not a promise that Microsoft will keep the path working.
 
 Local-account creation deliberately embeds no secret: the administrator starts
 with a blank password, and one sequential first-logon command requests an

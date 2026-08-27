@@ -9,6 +9,7 @@ from isopropyl.wim import WimEdition, WimSelection
 from isopropyl.windows import (
     UNATTEND_NS, WCM_NS, WindowsCustomization, add_autounattend_to_staging,
     answer_file_install_index, answer_file_install_path, generate_autounattend,
+    online_account_bypass_compatibility,
     validate_input_locale, validate_install_wim_path, validate_language_tag,
     validate_timezone,
     validate_username, windows_architecture,
@@ -17,16 +18,116 @@ from isopropyl.windows import (
 NS = {"u": UNATTEND_NS}
 
 
-def install_selection(architecture: str = "amd64") -> WimSelection:
+def install_selection(
+    architecture: str = "amd64",
+    *,
+    build: int = 26100,
+    edition_id: str = "Professional",
+    name: str = "Windows 11 Pro",
+    description: str = "Professional desktop",
+    major_version: int = 10,
+    minor_version: int = 0,
+) -> WimSelection:
     edition = WimEdition(
-        index=6, name="Windows 11 Pro", description="Professional desktop",
-        edition_id="Professional", architecture=architecture,
-        major_version=10, minor_version=0, build=26100, service_pack_build=2454,
+        index=6, name=name, description=description,
+        edition_id=edition_id, architecture=architecture,
+        major_version=major_version, minor_version=minor_version,
+        build=build, service_pack_build=2454,
     )
     return WimSelection("sources/install.wim", 1234, (edition,), 6)
 
 
 class WindowsCustomizationTests(unittest.TestCase):
+    def test_emits_one_fixed_version_gated_online_account_bypass_command(self):
+        options = WindowsCustomization(
+            install_image=install_selection(),
+            bypass_online_account_requirement=True,
+            acknowledge_online_account_limitations=True,
+        )
+        root = ET.fromstring(generate_autounattend(options, "amd64"))
+        passes = [item.attrib.get("pass") for item in root.findall("u:settings", NS)]
+        self.assertLess(passes.index("windowsPE"), passes.index("specialize"))
+        specialize = [
+            item for item in root.findall("u:settings", NS)
+            if item.attrib.get("pass") == "specialize"
+        ]
+        self.assertEqual(len(specialize), 1)
+        components = specialize[0].findall("u:component", NS)
+        self.assertEqual(len(components), 1)
+        self.assertEqual(
+            components[0].attrib.get("name"), "Microsoft-Windows-Deployment",
+        )
+        commands = components[0].findall(
+            "u:RunSynchronous/u:RunSynchronousCommand", NS,
+        )
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0].attrib, {f"{{{WCM_NS}}}action": "add"})
+        self.assertEqual(commands[0].findtext("u:Order", namespaces=NS), "1")
+        self.assertEqual(
+            commands[0].findtext("u:Path", namespaces=NS),
+            'reg add "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\OOBE" '
+            "/v BypassNRO /t REG_DWORD /d 1 /f",
+        )
+        self.assertIsNotNone(root.find(".//u:HideOnlineAccountScreens", NS))
+        self.assertIsNotNone(root.find(".//u:HideWirelessSetupInOOBE", NS))
+
+    def test_online_account_bypass_accepts_only_known_21h2_through_24h2(self):
+        for build in (22000, 22621, 22631, 26100):
+            with self.subTest(build=build):
+                selection = install_selection(build=build)
+                supported, _reason = online_account_bypass_compatibility(selection)
+                self.assertTrue(supported)
+                generate_autounattend(WindowsCustomization(
+                    install_image=selection,
+                    bypass_online_account_requirement=True,
+                    acknowledge_online_account_limitations=True,
+                ))
+
+    def test_online_account_bypass_rejects_unbound_or_uncertain_media(self):
+        invalid = (
+            None,
+            install_selection(build=19045),
+            install_selection(build=22622),
+            install_selection(build=26200),
+            install_selection(build=28000),
+            install_selection(build=99999),
+            install_selection(edition_id="Core", name="Windows 11 Home"),
+            install_selection(edition_id="CloudEdition", name="Windows 11 SE"),
+            install_selection(
+                edition_id="Professional", name="Windows 11 Pro S Mode",
+            ),
+            install_selection(
+                edition_id="Professional", name="Windows 11 Pro S\N{NO-BREAK SPACE}Mode",
+            ),
+            install_selection(
+                edition_id="Professional", name="Windows 11 Pro S_Mode",
+            ),
+            install_selection(
+                edition_id="Professional", name="Windows 11 Pro SMode",
+            ),
+            install_selection("x86"),
+            install_selection(major_version=11),
+            install_selection(minor_version=1),
+        )
+        for selection in invalid:
+            with self.subTest(selection=selection):
+                supported, reason = online_account_bypass_compatibility(selection)
+                self.assertFalse(supported)
+                self.assertTrue(reason)
+                with self.assertRaises(ValueError):
+                    generate_autounattend(WindowsCustomization(
+                        install_image=selection,
+                        bypass_online_account_requirement=True,
+                        acknowledge_online_account_limitations=True,
+                    ))
+
+    def test_online_account_bypass_requires_explicit_limit_acknowledgment(self):
+        with self.assertRaisesRegex(ValueError, "Acknowledge"):
+            generate_autounattend(WindowsCustomization(
+                install_image=install_selection(),
+                bypass_online_account_requirement=True,
+            ))
+
     def test_answer_file_is_added_without_overwriting_existing_media_content(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

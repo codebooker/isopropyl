@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
     QLabel, QPlainTextEdit, QPushButton,
 )
 
@@ -898,6 +898,126 @@ class WindowWriteMethodTests(unittest.TestCase):
             self.window.windows_options.install_image_path, source.path,
         )
 
+    def test_online_account_bypass_requires_and_persists_compatible_edition(self):
+        source = ArchiveEntry("sources/install.wim", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26100, 0,
+        )
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_install_source_count = 1
+        self.window.windows_wim_member = source
+        self.window.windows_wim_editions = (edition,)
+
+        def enable_and_save(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsBypassOnlineRequirementCheckBox",
+            )
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsBypassOnlineRequirementAcknowledgment",
+            )
+            combo = dialog.findChild(QComboBox, "windowsEditionCombo")
+            assert checkbox is not None and acknowledgment is not None
+            assert combo is not None
+            self.assertFalse(checkbox.isEnabled())
+            self.assertFalse(acknowledgment.isEnabled())
+            combo.setCurrentIndex(combo.findData(edition.index))
+            self.assertTrue(checkbox.isEnabled())
+            self.assertIn("BypassNRO", checkbox.toolTip())
+            checkbox.setChecked(True)
+            self.assertTrue(acknowledgment.isEnabled())
+            acknowledgment.setChecked(True)
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=enable_and_save):
+            self.window.configure_windows()
+
+        self.assertTrue(
+            self.window.windows_options.bypass_online_account_requirement,
+        )
+        self.assertTrue(
+            self.window.windows_options.acknowledge_online_account_limitations,
+        )
+        self.assertEqual(self.window.windows_options.install_image.edition, edition)
+
+        def verify_reopened(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsBypassOnlineRequirementCheckBox",
+            )
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsBypassOnlineRequirementAcknowledgment",
+            )
+            assert checkbox is not None and acknowledgment is not None
+            self.assertTrue(checkbox.isEnabled())
+            self.assertTrue(checkbox.isChecked())
+            self.assertTrue(acknowledgment.isEnabled())
+            self.assertTrue(acknowledgment.isChecked())
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=verify_reopened):
+            self.window.configure_windows()
+
+    def test_online_account_bypass_disables_unknown_later_build(self):
+        source = ArchiveEntry("sources/install.wim", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26200, 0,
+        )
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_wim_member = source
+        self.window.windows_wim_editions = (edition,)
+
+        def inspect_disabled_control(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsBypassOnlineRequirementCheckBox",
+            )
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsBypassOnlineRequirementAcknowledgment",
+            )
+            combo = dialog.findChild(QComboBox, "windowsEditionCombo")
+            assert checkbox is not None and acknowledgment is not None
+            assert combo is not None
+            combo.setCurrentIndex(combo.findData(edition.index))
+            self.assertFalse(checkbox.isEnabled())
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(acknowledgment.isEnabled())
+            self.assertFalse(acknowledgment.isChecked())
+            self.assertIn("21H2–24H2", checkbox.toolTip())
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect_disabled_control):
+            self.window.configure_windows()
+
+    def test_changing_windows_source_clears_selection_bound_account_bypass(self):
+        first = ArchiveEntry("x64/sources/install.wim", 16)
+        second = ArchiveEntry("arm64/sources/install.wim", 18)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26100, 0,
+        )
+        selection = WimSelection(first.path, first.size, (edition,), 1)
+        self.window.windows_wim_candidates = (first, second)
+        self.window.windows_wim_member = first
+        self.window.windows_options = WindowsCustomization(
+            install_image=selection,
+            install_image_path=first.path,
+            bypass_online_account_requirement=True,
+            acknowledge_online_account_limitations=True,
+        )
+
+        self.window.select_windows_wim_source(second)
+
+        self.assertIsNone(self.window.windows_options.install_image)
+        self.assertEqual(self.window.windows_options.install_image_path, "")
+        self.assertFalse(
+            self.window.windows_options.bypass_online_account_requirement,
+        )
+        self.assertFalse(
+            self.window.windows_options.acknowledge_online_account_limitations,
+        )
+
     def test_nested_wim_edition_records_its_exact_source_path(self):
         source = ArchiveEntry("x64/sources/install.wim", 16)
         edition = WimEdition(
@@ -977,6 +1097,8 @@ class WindowWriteMethodTests(unittest.TestCase):
         selection = WimSelection(source.path, source.size, (edition,), 1)
         self.window.windows_options = WindowsCustomization(
             install_image=selection, install_image_path=source.path,
+            bypass_online_account_requirement=True,
+            acknowledge_online_account_limitations=True,
         )
         info = WimInfo("/tmp/install.wim", 17, (edition,), (1, 2, 17, 4, 5, 1))
 
@@ -987,6 +1109,12 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("different catalog size", self.window.windows_wim_error)
         self.assertIsNone(self.window.windows_options.install_image)
         self.assertEqual(self.window.windows_options.install_image_path, "")
+        self.assertFalse(
+            self.window.windows_options.bypass_online_account_requirement,
+        )
+        self.assertFalse(
+            self.window.windows_options.acknowledge_online_account_limitations,
+        )
 
     def test_settings_persist_binary_units_and_refresh_device_label(self):
         self.window.size_unit_mode = SizeUnitMode.SI

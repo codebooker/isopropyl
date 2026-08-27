@@ -5,11 +5,12 @@ import base64
 import os
 import re
 import stat
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-from .wim import WimSelection, validate_wim_selection
+from .wim import WimSelection, WimValidationError, validate_wim_selection
 from .windows_paths import validate_install_image_member_path
 
 UNATTEND_NS = "urn:schemas-microsoft-com:unattend"
@@ -28,6 +29,23 @@ RESERVED_USERNAMES = {
 LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
 KEYBOARD_LAYOUT = re.compile(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}")
 CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+ONLINE_ACCOUNT_BYPASS_BUILDS = frozenset({22000, 22621, 22631, 26100})
+ONLINE_ACCOUNT_BYPASS_EDITIONS = frozenset({
+    "education",
+    "educationn",
+    "enterprise",
+    "enterprisen",
+    "enterprises",
+    "enterprisesn",
+    "iotenterprise",
+    "iotenterprises",
+    "professional",
+    "professionaleducation",
+    "professionaleducationn",
+    "professionaln",
+    "professionalworkstation",
+    "professionalworkstationn",
+})
 
 
 @dataclass(frozen=True)
@@ -52,11 +70,14 @@ class WindowsCustomization:
     local_password_never_expires: bool = True
     install_image: WimSelection | None = None
     install_image_path: str = ""
+    bypass_online_account_requirement: bool = False
+    acknowledge_online_account_limitations: bool = False
 
     @property
     def enabled(self) -> bool:
         return any((
             self.bypass_hardware_requirements, self.hide_online_account,
+            self.bypass_online_account_requirement,
             bool(self.local_username), self.reduce_data_collection,
             self.disable_automatic_bitlocker, bool(self.input_locale),
             bool(self.system_locale), bool(self.ui_language),
@@ -141,6 +162,52 @@ def validate_install_wim_path(value: str) -> str:
     return validated.path
 
 
+def online_account_bypass_compatibility(
+    selection: WimSelection | None,
+) -> tuple[bool, str]:
+    """Return the conservative compatibility policy for the fixed BypassNRO tweak."""
+
+    if selection is None:
+        return False, "Inspect and select a Windows 11 edition before enabling this option"
+    try:
+        validate_wim_selection(selection)
+    except WimValidationError:
+        return False, "The selected Windows edition metadata is not valid"
+    edition = selection.edition
+    if (
+        edition.major_version != 10
+        or edition.minor_version != 0
+        or edition.build not in ONLINE_ACCOUNT_BYPASS_BUILDS
+    ):
+        return False, (
+            "The offline-account registry method is limited to known Windows 11 "
+            "21H2–24H2 builds 22000, 22621, 22631, and 26100"
+        )
+    if edition.architecture not in {"amd64", "arm64"}:
+        return False, "The offline-account registry method requires x64 or ARM64 Windows 11"
+    edition_text = unicodedata.normalize("NFKC", " ".join((
+        edition.name, edition.description, edition.edition_id,
+    ))).casefold()
+    compact_edition_text = "".join(
+        character for character in edition_text if character.isalnum()
+    )
+    if "smode" in compact_edition_text or "cloud" in compact_edition_text:
+        return False, (
+            "The offline-account registry method is disabled because the edition "
+            "contains an obvious S-mode or cloud marker"
+        )
+    if edition.edition_id.casefold() not in ONLINE_ACCOUNT_BYPASS_EDITIONS:
+        return False, (
+            "The offline-account registry method is disabled for Home/S-mode or "
+            "unrecognized Windows editions"
+        )
+    return True, (
+        "Uses the fixed BypassNRO registry value for a recognized non-Home Windows 11 "
+        "21H2–24H2 edition. Disconnect networking during OOBE; later builds are not "
+        "assumed compatible, and WIM metadata cannot rule out offline-serviced S mode."
+    )
+
+
 def _settings(root: ET.Element, passes: dict[str, ET.Element], name: str) -> ET.Element:
     settings = passes.get(name)
     if settings is None:
@@ -209,6 +276,15 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
             )
     elif install_image_path:
         raise ValueError("A Windows image path requires an explicitly selected image index")
+    if options.bypass_online_account_requirement:
+        if not options.acknowledge_online_account_limitations:
+            raise ValueError(
+                "Acknowledge that WIM metadata cannot prove S mode is absent and "
+                "that Microsoft may change the offline-account path"
+            )
+        compatible, reason = online_account_bypass_compatibility(options.install_image)
+        if not compatible:
+            raise ValueError(reason)
 
     root = ET.Element(f"{{{UNATTEND_NS}}}unattend")
     passes: dict[str, ET.Element] = {}
@@ -248,6 +324,15 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
         ET.SubElement(metadata, "Key").text = "/IMAGE/INDEX"
         ET.SubElement(metadata, "Value").text = str(options.install_image.selected_index)
 
+    if options.bypass_online_account_requirement:
+        deployment = component("specialize", "Microsoft-Windows-Deployment")
+        synchronous = ET.SubElement(deployment, "RunSynchronous")
+        _command(
+            synchronous, 1, "Enable the Windows 11 offline-account setup path",
+            'reg add "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\OOBE" '
+            "/v BypassNRO /t REG_DWORD /d 1 /f",
+        )
+
     international_values = (
         ("InputLocale", input_locale),
         ("SystemLocale", system_locale),
@@ -267,14 +352,22 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
                     ET.SubElement(international, element_name).text = value
 
     needs_shell = any((
-        options.hide_online_account, username, options.reduce_data_collection, timezone,
+        options.hide_online_account, options.bypass_online_account_requirement,
+        username, options.reduce_data_collection, timezone,
     ))
     if needs_shell:
         shell = component("oobeSystem", "Microsoft-Windows-Shell-Setup")
 
-        if options.hide_online_account or options.reduce_data_collection:
+        if (
+            options.hide_online_account
+            or options.bypass_online_account_requirement
+            or options.reduce_data_collection
+        ):
             oobe = ET.SubElement(shell, "OOBE")
-            if options.hide_online_account:
+            if (
+                options.hide_online_account
+                or options.bypass_online_account_requirement
+            ):
                 ET.SubElement(oobe, "HideOnlineAccountScreens").text = "true"
                 ET.SubElement(oobe, "HideWirelessSetupInOOBE").text = "true"
             if options.reduce_data_collection:
