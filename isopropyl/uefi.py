@@ -20,6 +20,7 @@ import stat
 import struct
 import time
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -34,6 +35,7 @@ from .authenticode import (
     verify_authenticode,
 )
 from .boot_identity import read_archive_member_with_7z
+from .dbx import DbxAssessment, DbxState, assess_dbx
 
 MAX_PE_SIZE = 256 * 1024 * 1024
 MAX_SECTIONS = 512
@@ -149,6 +151,7 @@ class UefiInspection:
     sbat: SbatMetadata
     warnings: tuple[str, ...] = ()
     authenticode: AuthenticodeResult | None = None
+    dbx: DbxAssessment | None = None
 
     @property
     def is_uefi_image(self) -> bool:
@@ -165,12 +168,23 @@ class ImageUefiPayload:
     sbat_state: SbatState
     warnings: tuple[str, ...]
     authenticode: AuthenticodeResult | None = None
+    dbx: DbxAssessment | None = None
 
 
 @dataclass(frozen=True)
 class ImageUefiAnalysis:
     payloads: tuple[ImageUefiPayload, ...]
     issues: tuple[str, ...] = ()
+    candidate_count: int = 0
+    selected_count: int = 0
+    complete: bool = True
+
+
+@dataclass(frozen=True)
+class UefiMemberSelection:
+    paths: tuple[str, ...]
+    candidate_count: int
+    complete: bool
 
 
 @dataclass(frozen=True)
@@ -460,6 +474,7 @@ def inspect_pe_bytes(
             )
 
     sbat = _parse_sbat_section(blob, tuple(sections))
+    dbx = assess_dbx(blob, cancel_check=authenticode_cancel_check)
     authenticode: AuthenticodeResult | None = None
     if certificate_table.state is SignatureTableState.PRESENT_UNVERIFIED:
         facts = CertificateTableFacts(
@@ -502,11 +517,21 @@ def inspect_pe_bytes(
         warnings.append(f"malformed certificate table: {certificate_table.error}")
     if sbat.state is SbatState.MALFORMED:
         warnings.append(f"malformed SBAT metadata: {sbat.error}")
+    if dbx.state is DbxState.MATCHED_UNFLAGGED:
+        warnings.append(
+            "Authenticode SHA-256 matches an unflagged entry in the bundled "
+            f"Microsoft DBX {dbx.snapshot_release} snapshot"
+        )
+    elif dbx.state is DbxState.MATCHED_OPTIONAL:
+        warnings.append(
+            "Authenticode SHA-256 matches an optional entry published with the "
+            f"Microsoft DBX {dbx.snapshot_release} snapshot"
+        )
 
     return UefiInspection(
         machine, MACHINE_ARCHITECTURES.get(machine, f"unknown (0x{machine:04x})"),
         pe_kind, subsystem, EFI_SUBSYSTEMS.get(subsystem, f"subsystem {subsystem}"),
-        tuple(sections), certificate_table, sbat, tuple(warnings), authenticode,
+        tuple(sections), certificate_table, sbat, tuple(warnings), authenticode, dbx,
     )
 
 
@@ -543,18 +568,33 @@ def _safe_archive_member(path: str) -> str | None:
     return pure.as_posix()
 
 
-def uefi_member_paths(paths: Iterable[str]) -> tuple[str, ...]:
-    """Choose a bounded, deterministic set of EFI payloads from an ISO catalog."""
+def _uefi_member_selection(paths: Iterable[str]) -> UefiMemberSelection:
+    """Choose EFI payloads and retain whether the bounded selection is complete."""
     selected: list[tuple[int, str]] = []
+    candidate_count = 0
+    complete = True
+    occupied: set[tuple[str, ...]] = set()
     for original in paths:
         path = _safe_archive_member(original)
         if path is None:
+            portable = original.replace("\\", "/").casefold()
+            if portable.endswith(".efi") and "efi/" in f"/{portable}":
+                complete = False
             continue
         lowered = path.casefold()
         if not lowered.endswith(".efi") or not (
             lowered.startswith("efi/") or "/efi/" in f"/{lowered}"
         ):
             continue
+        candidate_count += 1
+        key = tuple(
+            unicodedata.normalize("NFC", part).casefold()
+            for part in PurePosixPath(path).parts
+        )
+        if key in occupied:
+            complete = False
+            continue
+        occupied.add(key)
         name = PurePosixPath(lowered).name
         if lowered.startswith("efi/boot/boot"):
             priority = 0
@@ -564,7 +604,15 @@ def uefi_member_paths(paths: Iterable[str]) -> tuple[str, ...]:
             priority = 2
         selected.append((priority, path))
     ordered = sorted(dict.fromkeys(selected), key=lambda item: (item[0], item[1].casefold()))
-    return tuple(path for _, path in ordered[:MAX_UEFI_MEMBERS])
+    if len(ordered) > MAX_UEFI_MEMBERS:
+        complete = False
+    chosen = tuple(path for _, path in ordered[:MAX_UEFI_MEMBERS])
+    return UefiMemberSelection(chosen, candidate_count, complete)
+
+
+def uefi_member_paths(paths: Iterable[str]) -> tuple[str, ...]:
+    """Choose a bounded, deterministic set of EFI payloads from an ISO catalog."""
+    return _uefi_member_selection(paths).paths
 
 
 ArchiveReader = Callable[[Path, str], bytes]
@@ -589,7 +637,8 @@ def inspect_iso_uefi_payloads(
     started = time.monotonic()
     payloads: list[ImageUefiPayload] = []
     issues: list[str] = []
-    for member in uefi_member_paths(member_paths):
+    selection = _uefi_member_selection(member_paths)
+    for member in selection.paths:
         if cancel_check is not None:
             cancel_check()
         remaining = timeout - (time.monotonic() - started)
@@ -639,8 +688,17 @@ def inspect_iso_uefi_payloads(
             parsed.sbat.state,
             parsed.warnings,
             parsed.authenticode,
+            parsed.dbx,
         ))
-    return ImageUefiAnalysis(tuple(payloads), tuple(issues))
+    complete = bool(
+        selection.complete
+        and not issues
+        and len(payloads) == len(selection.paths)
+    )
+    return ImageUefiAnalysis(
+        tuple(payloads), tuple(issues), selection.candidate_count,
+        len(selection.paths), complete,
+    )
 
 
 def evaluate_sbat_policy(

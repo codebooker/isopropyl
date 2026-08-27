@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from isopropyl.devices import Device
+from isopropyl.dbx import DbxAssessment, DbxState
 from isopropyl.diagnostics import build_diagnostics, write_diagnostics
 from isopropyl.eltorito import (
     BootEntry, BootPlatform, ElToritoInspection, EmulationType, ValidationEntry,
@@ -42,7 +43,9 @@ class DiagnosticTests(unittest.TestCase):
             uefi_payloads=(ImageUefiPayload(
                 "EFI/customer-secret/loader.efi", "x64", "EFI application",
                 True, SignatureTableState.PRESENT_UNVERIFIED,
-                SbatState.PRESENT, (),
+                SbatState.PRESENT, (), dbx=DbxAssessment(
+                    DbxState.MATCHED_UNFLAGGED, "x64", "a" * 64,
+                ),
             ),),
             uefi_analysis_issues=("EFI/another-secret/loader.efi: issue",),
         )
@@ -54,6 +57,7 @@ class DiagnosticTests(unittest.TestCase):
         for secret in (
             "SECRET-SERIAL", "SECRET-WWN", "/media/alice", "private-name",
             "/home/alice", "SECRET-VOLUME", "customer-secret", "another-secret",
+            "a" * 64,
         ):
             self.assertNotIn(secret, rendered)
         self.assertFalse(report["privacy"]["identifiers_included"])
@@ -62,6 +66,9 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(image["bootloader_issue_count"], 1)
         self.assertEqual(image["uefi_payload_count"], 1)
         self.assertEqual(image["uefi_analysis_issue_count"], 1)
+        self.assertEqual(
+            image["dbx_advisor"]["counts"][DbxState.MATCHED_UNFLAGGED.value], 1,
+        )
         self.assertTrue(image["volume_label_present"])
 
     def test_eltorito_diagnostics_are_json_safe_and_omit_image_text(self):

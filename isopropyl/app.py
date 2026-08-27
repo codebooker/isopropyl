@@ -9,6 +9,7 @@ import shutil
 import json
 import stat
 import tempfile
+import unicodedata
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
@@ -30,6 +31,7 @@ from .backup import (
     virtual_backup_required_space,
 )
 from .authenticode import AuthenticodeIntegrityState
+from .dbx import DbxState, SOURCE_RELEASE, SOURCE_RELEASE_DATE
 from .bootloaders import (
     CatalogError, bundle_for_dependency, delete_cached_artifacts, inventory_cache,
 )
@@ -374,6 +376,108 @@ class Window(QMainWindow):
 
     def display_device(self, device: Device) -> str:
         return device.display_label(self.size_unit_mode)
+
+    @staticmethod
+    def dbx_review_text(inspection: ImageInspection) -> str:
+        assessed = tuple(
+            payload.dbx for payload in inspection.uefi_payloads
+            if payload.dbx is not None
+        )
+        matched = sum(assessment.matched for assessment in assessed)
+        if matched:
+            return (
+                f"{matched} selected EFI payload(s) match Microsoft DBX "
+                f"{SOURCE_RELEASE}; actual firmware policy can differ"
+            )
+        if not inspection.uefi_analysis_complete:
+            return (
+                f"offline DBX {SOURCE_RELEASE} coverage is incomplete or unknown; "
+                "no firmware verdict is available"
+            )
+        if (
+            assessed
+            and inspection.uefi_candidate_count > 0
+            and inspection.uefi_candidate_count
+                == inspection.uefi_selected_count
+                == len(inspection.uefi_payloads)
+            and len(assessed) == len(inspection.uefi_payloads)
+            and all(
+                assessment.state is DbxState.NOT_LISTED_IN_SNAPSHOT
+                for assessment in assessed
+            )
+        ):
+            return (
+                f"selected EFI payloads are not listed in Microsoft DBX "
+                f"{SOURCE_RELEASE}; this is not a firmware or safety verdict"
+            )
+        if inspection.uefi_payloads or inspection.uefi_candidate_count:
+            return (
+                f"offline DBX {SOURCE_RELEASE} coverage is incomplete or unknown; "
+                "no firmware verdict is available"
+            )
+        return "not available for this image"
+
+    @staticmethod
+    def dbx_display_path(path: str, limit: int = 160) -> str:
+        """Render an image-controlled member path without bidi or rich-text tricks."""
+        normalized = unicodedata.normalize("NFC", path)
+        safe = "".join(
+            "�" if unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}
+            else "‹" if character == "<"
+            else "›" if character == ">"
+            else "＆" if character == "&"
+            else character
+            for character in normalized
+        )
+        if len(safe) > limit:
+            safe = safe[:limit - 1] + "…"
+        return safe
+
+    def confirm_dbx_matches(self, inspection: ImageInspection) -> bool:
+        matches = tuple(
+            payload for payload in inspection.uefi_payloads
+            if payload.dbx is not None and payload.dbx.matched
+        )
+        if not matches:
+            return True
+        unflagged = sum(
+            payload.dbx is not None
+            and payload.dbx.state is DbxState.MATCHED_UNFLAGGED
+            for payload in matches
+        )
+        optional = len(matches) - unflagged
+        rendered = []
+        for payload in matches[:8]:
+            assert payload.dbx is not None
+            category = (
+                "unflagged" if payload.dbx.state is DbxState.MATCHED_UNFLAGGED
+                else "optional"
+            )
+            rendered.append(
+                f"• {self.dbx_display_path(payload.path)} ({category} entry)"
+            )
+        if len(matches) > len(rendered):
+            rendered.append(f"• and {len(matches) - len(rendered)} more")
+        answer = QMessageBox.warning(
+            self,
+            "Secure Boot revocation match",
+            "ISOpropyl found EFI payloads whose SHA-256 Authenticode image "
+            "digest exactly matches entries published in Microsoft's bundled "
+            f"Secure Boot DBX {SOURCE_RELEASE} snapshot "
+            f"({SOURCE_RELEASE_DATE}).\n\n"
+            + "\n".join(rendered)
+            + f"\n\nUnflagged entries: {unflagged} · optional entries: {optional}. "
+            "Microsoft marks optional entries as not necessarily present in every "
+            "released DBX binary; ISOpropyl does not infer extra semantics for "
+            "entries without that flag. Firmware containing a matched entry is expected "
+            "to reject that payload while Secure Boot is enabled.\n\n"
+            "This offline snapshot does not read the selected machine's firmware "
+            "DBX or evaluate certificate revocations, SBAT, SVN, platform keys, or "
+            "firmware configuration. Continue writing anyway?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def refresh_size_labels(self) -> None:
         for index, device in enumerate(self.devices):
@@ -1727,6 +1831,8 @@ class Window(QMainWindow):
                 "The image changed after inspection. Select it again before writing.",
             )
             return
+        if not self.confirm_dbx_matches(self.inspection):
+            return
         compatibility_warning = None
         if self.inspection.partition_table_malformed:
             compatibility_warning = (
@@ -1840,6 +1946,7 @@ class Window(QMainWindow):
             f"Image: {self.image.name}\nMethod: {method_description}\n"
             f"{virtual_size_details}"
             f"Layout: {self.inspection.layout}\n"
+            f"Secure Boot DBX advice: {self.dbx_review_text(self.inspection)}\n"
             f"Target: {device.path}\nSerial: {device.serial or device.wwn or 'not reported'}\n\n"
             "Check the target carefully before continuing.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
@@ -3594,9 +3701,10 @@ class Window(QMainWindow):
                 )
             if self.inspection.uefi_payloads:
                 detail_lines.append(
-                    "UEFI payload signatures — integrity only; signer identity, "
-                    "certificate trust/revocation, timestamps, and Secure Boot "
-                    "acceptance are not evaluated:"
+                    "UEFI payload advice — signature integrity and an offline "
+                    f"Microsoft DBX {SOURCE_RELEASE} ({SOURCE_RELEASE_DATE}) snapshot; "
+                    "actual firmware policy, certificate revocation, SBAT, SVN, "
+                    "timestamps, and Secure Boot acceptance are not evaluated:"
                 )
                 for payload in self.inspection.uefi_payloads[:8]:
                     if payload.authenticode is not None:
@@ -3615,11 +3723,32 @@ class Window(QMainWindow):
                         auth_state = "Authenticode absent"
                     else:
                         auth_state = "Authenticode not checked"
+                    if payload.dbx is None:
+                        dbx_state = "DBX result unavailable"
+                    elif payload.dbx.state is DbxState.MATCHED_UNFLAGGED:
+                        dbx_state = "DBX snapshot unflagged-entry match"
+                    elif payload.dbx.state is DbxState.MATCHED_OPTIONAL:
+                        dbx_state = "DBX snapshot optional-entry match"
+                    elif payload.dbx.state is DbxState.NOT_LISTED_IN_SNAPSHOT:
+                        dbx_state = (
+                            "not listed in the DBX snapshot (not a firmware verdict)"
+                        )
+                    else:
+                        dbx_state = "DBX snapshot result unknown"
                     detail_lines.append(
-                        f"  {payload.path}: {payload.architecture}, certificate "
+                        f"  {self.dbx_display_path(payload.path)}: "
+                        f"{payload.architecture}, certificate "
                         f"{payload.signature_state.value}, {auth_state}, "
-                        f"SBAT {payload.sbat_state.value}"
+                        f"SBAT {payload.sbat_state.value}, {dbx_state}"
                     )
+            if not self.inspection.uefi_analysis_complete:
+                detail_lines.append(
+                    "DBX coverage incomplete: selected "
+                    f"{self.inspection.uefi_selected_count} of "
+                    f"{self.inspection.uefi_candidate_count} cataloged EFI "
+                    "candidate(s), or a complete EFI catalog was unavailable; "
+                    "one or more candidates could not be selected or evaluated."
+                )
             if self.inspection.uefi_analysis_issues:
                 detail_lines.append(
                     f"UEFI inspection issues: {len(self.inspection.uefi_analysis_issues)}"
@@ -4230,6 +4359,8 @@ class Window(QMainWindow):
                 "The image changed after inspection. Select it again before writing.",
             )
             return
+        if not self.confirm_dbx_matches(inspection):
+            return
         if not device.removable:
             warning = QMessageBox.warning(
                 self, "External hard drive or SSD selected",
@@ -4775,6 +4906,11 @@ class Window(QMainWindow):
         strategy = write_plan.layout.boot_strategy
         persistence_enabled = pending.persistence_profile is not None
         runtime_validation_enabled = pending.runtime_validation is not None
+        final_efi_set_unassessed = bool(
+            staging_plan.overlay is not None
+            or runtime_validation_enabled
+            or strategy is BootStrategy.UEFI_NTFS
+        )
         runtime_architectures = self.runtime_validation_architectures(
             staging_plan.effective_entries
         )
@@ -4992,6 +5128,37 @@ class Window(QMainWindow):
                     "\nSecure Boot: signed wrappers still depend on Microsoft UEFI "
                     "CA 2011 third-party trust and current DBX policy."
                 )
+        dbx_advice = self.dbx_review_text(inspection)
+        if final_efi_set_unassessed:
+            dbx_advice = (
+                "base ISO only: " + dbx_advice
+                + "; the final transformed EFI payload set has not been assessed"
+            )
+        customization += "\nSecure Boot DBX advice: " + dbx_advice + "."
+
+        def source_still_matches_plan() -> bool:
+            try:
+                return image_identity(image) == staging_plan.image_identity
+            except OSError:
+                return False
+
+        def reject_changed_source() -> None:
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            self.set_busy(False)
+            self.status.setText("ISO mode is not active")
+            QMessageBox.warning(
+                self,
+                "Image changed",
+                "The selected image changed after ISO-mode preparation. Select it "
+                "again before erasing a drive.",
+            )
+
+        if not source_still_matches_plan():
+            reject_changed_source()
+            return
         answer = QMessageBox.warning(
             self,
             "Erase drive and write in ISO mode?",
@@ -5014,6 +5181,10 @@ class Window(QMainWindow):
                 self.logger.warning("Could not remove ISO workspace: %s", error)
             self.set_busy(False)
             self.status.setText("ISO mode is not active")
+            return
+
+        if not source_still_matches_plan():
+            reject_changed_source()
             return
 
         try:

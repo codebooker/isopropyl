@@ -1021,6 +1021,87 @@ Folder = -
             self.assertIs(result.eltorito, catalog)
             self.assertEqual(result.eltorito_issues, ())
 
+    def test_el_torito_uefi_without_complete_file_catalog_marks_dbx_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.iso"
+            data = bytearray(18 * 2048)
+            offset = 16 * 2048
+            data[offset + 1:offset + 6] = b"CD001"
+            path.write_bytes(data)
+            entry = BootEntry(
+                1, True, BootPlatform.EFI, "", True,
+                EmulationType.NO_EMULATION, 0, 0, 4, 24,
+                24 * 2048, 2048, 25 * 2048, 0, b"",
+            )
+            catalog = ElToritoInspection(
+                len(data), 20, 20 * 2048, 64, 3,
+                ValidationEntry(BootPlatform.EFI, "TEST", 0),
+                (entry,),
+            )
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    return_value=([], False),
+                ),
+                patch(
+                    "isopropyl.images.inspect_eltorito_file",
+                    return_value=catalog,
+                ),
+                patch(
+                    "isopropyl.images.inspect_iso_uefi_payloads",
+                    return_value=ImageUefiAnalysis((), (), 0, 0, True),
+                ),
+            ):
+                result = inspect_image(path)
+            self.assertEqual(result.boot_modes, ("UEFI",))
+            self.assertFalse(result.contents_scanned)
+            self.assertFalse(result.uefi_analysis_complete)
+            self.assertTrue(any(
+                "complete ISO file catalog" in issue
+                for issue in result.uefi_analysis_issues
+            ))
+
+    def test_el_torito_efi_boot_image_prevents_complete_dbx_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.iso"
+            data = bytearray(18 * 2048)
+            offset = 16 * 2048
+            data[offset + 1:offset + 6] = b"CD001"
+            path.write_bytes(data)
+            entry = BootEntry(
+                1, True, BootPlatform.EFI, "", True,
+                EmulationType.NO_EMULATION, 0, 0, 4, 24,
+                24 * 2048, 2048, 25 * 2048, 0, b"",
+            )
+            catalog = ElToritoInspection(
+                len(data), 20, 20 * 2048, 64, 3,
+                ValidationEntry(BootPlatform.EFI, "TEST", 0),
+                (entry,),
+            )
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    return_value=([ImageMember(
+                        "EFI/BOOT/BOOTX64.EFI", 1, "file",
+                    )], True),
+                ),
+                patch(
+                    "isopropyl.images.inspect_eltorito_file",
+                    return_value=catalog,
+                ),
+                patch(
+                    "isopropyl.images.inspect_iso_uefi_payloads",
+                    return_value=ImageUefiAnalysis((), (), 1, 1, True),
+                ),
+            ):
+                result = inspect_image(path)
+            self.assertTrue(result.contents_scanned)
+            self.assertFalse(result.uefi_analysis_complete)
+            self.assertTrue(any(
+                "EFI El Torito boot image" in issue
+                for issue in result.uefi_analysis_issues
+            ))
+
     def test_el_torito_parse_failure_is_reported_without_losing_iso_inspection(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "catalog.iso"
@@ -1035,6 +1116,37 @@ Folder = -
                 result = inspect_image(path)
             self.assertTrue(result.is_iso9660)
             self.assertEqual(result.eltorito_issues, ("invalid boot catalog",))
+
+    def test_el_torito_parse_failure_makes_visible_uefi_dbx_coverage_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.iso"
+            data = bytearray(18 * 2048)
+            offset = 16 * 2048
+            data[offset + 1:offset + 6] = b"CD001"
+            path.write_bytes(data)
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    return_value=([ImageMember(
+                        "EFI/BOOT/BOOTX64.EFI", 1, "file",
+                    )], True),
+                ),
+                patch(
+                    "isopropyl.images.inspect_eltorito_file",
+                    side_effect=ElToritoError("invalid boot catalog"),
+                ),
+                patch(
+                    "isopropyl.images.inspect_iso_uefi_payloads",
+                    return_value=ImageUefiAnalysis((), (), 1, 1, True),
+                ),
+            ):
+                result = inspect_image(path)
+            self.assertEqual(result.boot_modes, ("UEFI",))
+            self.assertFalse(result.uefi_analysis_complete)
+            self.assertTrue(any(
+                "malformed El Torito catalog" in issue
+                for issue in result.uefi_analysis_issues
+            ))
 
     def test_maps_exact_or_conflicting_payload_identity_without_guessing(self):
         exact = analyze_bootloader_members({

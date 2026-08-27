@@ -19,6 +19,7 @@ from typing import Any
 
 from . import __version__
 from .devices import Device
+from .dbx import SOURCE_COMMIT, SOURCE_RELEASE, SOURCE_RELEASE_DATE, DbxState
 from .images import ImageInspection
 
 TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
@@ -65,6 +66,21 @@ def _image_record(inspection: ImageInspection | None) -> dict[str, Any] | None:
     record["bootloader_issue_count"] = len(inspection.bootloader_issues)
     record.pop("uefi_payloads", None)
     record["uefi_payload_count"] = len(inspection.uefi_payloads)
+    dbx_counts = {state.value: 0 for state in DbxState}
+    dbx_unavailable = 0
+    for payload in inspection.uefi_payloads:
+        if payload.dbx is None:
+            dbx_unavailable += 1
+        else:
+            dbx_counts[payload.dbx.state.value] += 1
+    record["dbx_advisor"] = {
+        "snapshot_release": SOURCE_RELEASE,
+        "snapshot_commit": SOURCE_COMMIT,
+        "snapshot_date": SOURCE_RELEASE_DATE,
+        "counts": dbx_counts,
+        "unavailable": dbx_unavailable,
+        "analysis_complete": inspection.uefi_analysis_complete,
+    }
     record.pop("uefi_analysis_issues", None)
     record["uefi_analysis_issue_count"] = len(inspection.uefi_analysis_issues)
     if inspection.eltorito is not None:

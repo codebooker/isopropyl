@@ -35,6 +35,7 @@ from isopropyl.bootloaders import (
 from isopropyl.casper_media import supported_casper_profile
 from isopropyl.constructed import ConstructedMediaPlan
 from isopropyl.devices import Device, SizeUnitMode
+from isopropyl.dbx import DbxAssessment, DbxState
 from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
 )
@@ -621,6 +622,104 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertEqual(self.window.write_button.text(), "Write in ISO mode")
         self.assertTrue(self.window.write_button.isEnabled())
 
+    def test_dbx_match_warning_is_precise_and_defaults_to_cancel(self):
+        match = DbxAssessment(
+            DbxState.MATCHED_UNFLAGGED, "x64", "a" * 64,
+        )
+        optional = DbxAssessment(
+            DbxState.MATCHED_OPTIONAL, "x64", "b" * 64,
+        )
+        original = self.window.inspection
+        assert original is not None
+        loader = replace(original.uefi_payloads[0], dbx=match)
+        inspection = replace(
+            original,
+            uefi_payloads=(loader, replace(
+                loader,
+                path="EFI/vendor/\u202e" + "x" * 200 + "<optional>.efi",
+                dbx=optional,
+            )),
+        )
+        with patch(
+            "isopropyl.app.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as warning:
+            self.assertFalse(self.window.confirm_dbx_matches(inspection))
+
+        arguments = warning.call_args.args
+        self.assertEqual(arguments[1], "Secure Boot revocation match")
+        self.assertIn("unflagged entry", arguments[2])
+        self.assertIn("optional entry", arguments[2])
+        self.assertNotIn("\u202e", arguments[2])
+        self.assertNotIn("<optional>", arguments[2])
+        self.assertIn("…", arguments[2])
+        self.assertIn("offline snapshot", arguments[2])
+        self.assertIn("SBAT", arguments[2])
+        self.assertNotIn("safe to boot", arguments[2].casefold())
+        self.assertEqual(arguments[4], QMessageBox.StandardButton.Cancel)
+
+    def test_dbx_review_never_hides_incomplete_or_inconsistent_coverage(self):
+        original = self.window.inspection
+        assert original is not None
+        incomplete = replace(
+            original,
+            uefi_payloads=(),
+            uefi_analysis_complete=False,
+            uefi_candidate_count=0,
+            uefi_selected_count=0,
+        )
+        self.assertIn("incomplete or unknown", self.window.dbx_review_text(incomplete))
+
+        not_listed = replace(
+            original.uefi_payloads[0],
+            dbx=DbxAssessment(
+                DbxState.NOT_LISTED_IN_SNAPSHOT, "x64", "c" * 64,
+            ),
+        )
+        inconsistent = replace(
+            original,
+            uefi_payloads=(not_listed,),
+            uefi_analysis_complete=True,
+            uefi_candidate_count=0,
+            uefi_selected_count=0,
+        )
+        self.assertNotIn(
+            "are not listed", self.window.dbx_review_text(inconsistent),
+        )
+
+    def test_dd_and_direct_iso_dispatch_both_consult_dbx_advice(self):
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        inspection = self.window.inspection
+        assert inspection is not None
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch.object(
+                self.window, "confirm_dbx_matches", return_value=False,
+            ) as dbx,
+            patch.object(self.window, "start_write") as writer,
+        ):
+            self.window.write_method.setCurrentIndex(0)
+            self.window.confirm_write()
+        dbx.assert_called_once_with(inspection)
+        writer.assert_not_called()
+
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch.object(
+                self.window, "confirm_dbx_matches", return_value=False,
+            ) as dbx,
+            patch("isopropyl.app.QFileDialog.getExistingDirectory") as chooser,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+        dbx.assert_called_once_with(inspection)
+        chooser.assert_not_called()
+
     def test_distro_exclusion_removes_only_iso_and_keeps_plan_explanation(self):
         self.window.inspection = replace(
             optical_windows_inspection(hybrid=True),
@@ -1132,6 +1231,7 @@ class WindowWriteMethodTests(unittest.TestCase):
         original = optical_windows_inspection(hybrid=True)
         payload = replace(
             original.uefi_payloads[0],
+            path="EFI/<b>&\u202e\u2066" + "x" * 200 + ".efi",
             signature_state=SignatureTableState.PRESENT_UNVERIFIED,
             authenticode=authenticode,
         )
@@ -1183,6 +1283,11 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("Authenticode check unsupported", tooltip)
         self.assertIn("Authenticode result indeterminate", tooltip)
         self.assertNotIn("Untrusted Embedded Claim", tooltip)
+        self.assertNotIn("<b>", tooltip)
+        self.assertNotIn("\u202e", tooltip)
+        self.assertNotIn("\u2066", tooltip)
+        self.assertNotIn("&", tooltip)
+        self.assertIn("…", tooltip)
         self.assertNotIn("valid signature", tooltip.casefold())
 
     def test_image_tooltip_marks_plain_mbr_sector_size_as_assumed(self):
@@ -2828,7 +2933,45 @@ class WindowZipOverlayTests(unittest.TestCase):
         self.assertIn(self.overlay.archive.name, confirmation)
         self.assertIn(self.overlay.archive_sha256, confirmation)
         self.assertIn("additive only", confirmation)
+        self.assertIn("base ISO only", confirmation)
+        self.assertIn("final transformed EFI payload set", confirmation)
         workspace.cleanup.assert_called_once_with()
+
+    def test_iso_confirmation_rechecks_source_after_yes(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        plan = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            recommendation.iso_plan,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            recommendation.iso_plan, workspace, plan,
+        )
+        identities = iter((plan.image_identity, (9, 9, 9, 9, 9)))
+
+        def answer(_parent, title, *_args, **_kwargs):
+            return (
+                QMessageBox.StandardButton.Yes
+                if title == "Erase drive and write in ISO mode?" else
+                QMessageBox.StandardButton.Cancel
+            )
+
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", side_effect=lambda _path: next(identities)),
+            patch("isopropyl.app.QMessageBox.warning", side_effect=answer) as warning,
+            patch("isopropyl.app.IsoStagingExecutor") as executor,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        executor.assert_not_called()
+        workspace.cleanup.assert_called_once_with()
+        self.assertEqual(warning.call_args.args[1], "Image changed")
 
     def test_overlay_moving_onto_target_during_consent_aborts_before_staging(self):
         with patch("isopropyl.app.image_identity", return_value=self.identity):
@@ -3206,6 +3349,8 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         self.assertIn("not image authentication", confirmation)
         self.assertIn("chainload the original", confirmation)
         self.assertIn("Secure Boot", confirmation)
+        self.assertIn("base ISO only", confirmation)
+        self.assertIn("final transformed EFI payload set", confirmation)
         workspace.cleanup.assert_called_once_with()
 
     def test_malformed_prepared_payload_is_rejected_before_confirmation(self):

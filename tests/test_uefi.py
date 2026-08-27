@@ -9,12 +9,14 @@ from unittest.mock import Mock, patch
 from isopropyl.authenticode import (
     AuthenticodeIntegrityState, AuthenticodeResult, CertificateTableFacts,
 )
+from isopropyl.dbx import DbxState
 from isopropyl.uefi import (
     CertificateTable, ImageUefiPayload, PeFormatError, PolicyState, SbatMetadata,
     SbatRequirement, SbatState, SignatureTableState, UefiInspection,
     evaluate_sbat_policy, inspect_iso_uefi_payloads, inspect_pe_bytes, inspect_pe_file,
     uefi_member_paths,
 )
+from tests.test_dbx import canonical_pe
 
 
 def make_pe(
@@ -207,6 +209,35 @@ class UefiInspectionTests(unittest.TestCase):
         self.assertEqual(selected[0], "EFI/BOOT/BOOTX64.EFI")
         self.assertIn("EFI/vendor/tool.efi", selected)
         self.assertNotIn("../escape.efi", selected)
+
+    def test_unsigned_payload_receives_snapshot_scoped_dbx_advice(self):
+        result = inspect_pe_bytes(canonical_pe())
+        self.assertIsNotNone(result.dbx)
+        assert result.dbx is not None
+        self.assertIs(result.dbx.state, DbxState.NOT_LISTED_IN_SNAPSHOT)
+        self.assertEqual(result.dbx.architecture, "x64")
+        self.assertFalse(result.dbx.matched)
+
+    def test_iso_dbx_coverage_records_selection_overflow_and_aliases(self):
+        paths = tuple(f"EFI/vendor/tool-{index:02d}.efi" for index in range(17))
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "fixture.iso"
+            image.write_bytes(b"fixture")
+            overflow = inspect_iso_uefi_payloads(
+                image, paths, reader=lambda *_args: canonical_pe(),
+            )
+            alias = inspect_iso_uefi_payloads(
+                image,
+                ("EFI/BOOT/BOOTX64.EFI", "efi/boot/bootx64.efi"),
+                reader=lambda *_args: canonical_pe(),
+            )
+        self.assertEqual(overflow.candidate_count, 17)
+        self.assertEqual(overflow.selected_count, 16)
+        self.assertEqual(len(overflow.payloads), 16)
+        self.assertFalse(overflow.complete)
+        self.assertEqual(alias.candidate_count, 2)
+        self.assertEqual(alias.selected_count, 1)
+        self.assertFalse(alias.complete)
 
     def test_iso_analysis_reports_structure_without_claiming_trust(self):
         with tempfile.TemporaryDirectory() as directory:

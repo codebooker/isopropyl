@@ -100,6 +100,30 @@ certificates embedded in the inspected signature, disables fetching, and labels
 success as integrity-valid-untrusted. This is not a Microsoft, firmware,
 revocation, timestamp, DBX, or Secure Boot trust decision.
 
+## Microsoft Secure Boot DBX image-hash snapshot
+
+- Upstream release: [`secureboot_objects` v1.6.5](https://github.com/microsoft/secureboot_objects/releases/tag/v1.6.5)
+- Exact source commit: [`798cdc513e0c`](https://github.com/microsoft/secureboot_objects/tree/798cdc513e0c192fe90e99637105748ed3bb4ca5)
+- Canonical source: [`PreSignedObjects/DBX/dbx_info_msft_latest.json`](https://github.com/microsoft/secureboot_objects/blob/798cdc513e0c192fe90e99637105748ed3bb4ca5/PreSignedObjects/DBX/dbx_info_msft_latest.json)
+- Source size: 394,305 bytes
+- Source SHA-256:
+  `1020f0ef865f8cf22740298d928a01355ab51cb1d8d473b637fd6d83f74eb3f5`
+- License: BSD-2-Clause-Patent; the retained complete text is in
+  [`licenses/MICROSOFT-SECUREBOOT-OBJECTS-BSD-2-CLAUSE-PATENT.txt`](licenses/MICROSOFT-SECUREBOOT-OBJECTS-BSD-2-CLAUSE-PATENT.txt)
+
+ISOpropyl's package contains a deterministic compact projection, not Microsoft's
+signed DBX update binaries: 389 entries without an `isOptional` flag and 284
+entries marked optional, all SHA-256 Authenticode image hashes, separated across
+x64, IA32, AArch64, and ARM exactly as published. Arrays are lowercase, sorted,
+and retain architecture scope; one source hash occurs in both the x64 and IA32
+groups and is preserved in both. The compact JSON's independently
+pinned SHA-256 is
+`7019eb890a75e0ab3a1ff8e137ee66c6bc4f40644ddfc216fd0fdb74e7926874`.
+
+This snapshot is used only for offline advice. It does not represent the selected
+machine's installed firmware DBX, and ISOpropyl does not claim that an unlisted
+image is safe or that a listed image is present in every firmware policy.
+
 ## UEFI:NTFS boot helper
 
 - Artifact: `uefi-ntfs.img`

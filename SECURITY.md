@@ -252,9 +252,31 @@ issue requesting a private contact channel without disclosing the vulnerability.
   disabled, and countersignatures/signing timestamps and revocation are not
   evaluated. The result is presentation-only and cannot change the structural
   `present-unverified` state, ISO plan, payload trust class, Secure Boot warning,
-  unsigned-payload consent, or write authorization. ISOpropyl does not yet
-  authenticate Microsoft/firmware roots or a DBX/SVN revocation feed, and a
-  matching integrity result does not predict firmware acceptance.
+  unsigned-payload consent, or write authorization. A matching integrity result
+  does not predict firmware acceptance.
+- DBX advice is an independent, network-inactive comparison against the exact
+  Microsoft `secureboot_objects` v1.6.5 source JSON at commit
+  `798cdc513e0c192fe90e99637105748ed3bb4ca5`. ISOpropyl embeds only a strict
+  digest-pinned projection of its 673 architecture-specific Authenticode
+  SHA-256 image hashes, retaining Microsoft's unflagged/optional distinction;
+  “unflagged” means only that Microsoft's source did not mark an entry optional.
+  It measures unsigned payloads as well as signed ones and requires a bounded
+  PE layout for which Microsoft's catalog implementation, the UEFI/TianoCore
+  method, and Rufus's FileAlignment-rounded method produce the same digest.
+  Unsupported, malformed,
+  truncated, aliased, unreadable, timed-out, ambiguous, or catalog-invalid
+  analysis is `unknown`. Cancellation propagates instead of becoming unknown.
+- An unflagged or optional snapshot match opens a separate default-Cancel warning
+  before either DD or ISO-mode preparation continues. “Not listed” applies only
+  to the exact selected payload and pinned snapshot; it does not mean clean,
+  safe, trusted, compatible, bootable, or accepted by the current machine.
+  ISOpropyl does not read the machine's firmware DBX, authenticate live policy,
+  or yet apply the snapshot's certificate/SVN entries or a current SBAT policy.
+  El Torito EFI boot images, additive overlays, persistence changes,
+  runtime-validation wrappers, and the UEFI:NTFS helper are not yet included in
+  a final transformed-media DBX pass. A destructive ISO confirmation labels the
+  advice as base-ISO-only whenever an overlay, runtime wrapper, or UEFI:NTFS
+  helper changes the final EFI set.
 - Automated device-facing tests use mocks and regular files. Hardware-backed
   write, boot, Secure Boot, cancellation, and failure-recovery testing is still
   required before the alpha label can be removed.

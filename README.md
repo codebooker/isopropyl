@@ -164,7 +164,14 @@ confirmations and expanded drive visibility are never persisted.
 - Parse El Torito BIOS/UEFI entries and inspect EFI PE architecture, certificate
   framing, and SBAT. A sealed, resource-limited worker can report embedded
   Authenticode **integrity only**; it does not establish publisher, Microsoft,
-  firmware, revocation, timestamp, DBX, or Secure Boot trust.
+  firmware, timestamp, or Secure Boot trust. Separately, an offline advisor
+  compares eligible signed **and unsigned** EFI images against all 673
+  architecture-specific SHA-256 Authenticode hashes in Microsoft's pinned
+  `secureboot_objects` DBX v1.6.5 snapshot. Entries without Microsoft's optional
+  flag and entries marked optional are distinguished without inventing additional
+  policy semantics; exact matches receive a default-Cancel warning in DD and ISO
+  mode, incomplete or ambiguous analysis is labeled unknown, and “not listed”
+  is explicitly not presented as safe, trusted, compatible, or bootable.
 - Calculate MD5, SHA-1, SHA-256, and SHA-512 in one cancellable pass and compare a
   pasted checksum without guessing its algorithm.
 - Inspect recognized Windows WIM/ESD sources and editions. ISO mode can add a

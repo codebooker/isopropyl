@@ -133,6 +133,9 @@ class ImageInspection:
     partition_table_inspection_complete: bool = True
     sparse_format: str = ""
     decoded_container_size: int = 0
+    uefi_analysis_complete: bool = True
+    uefi_candidate_count: int = 0
+    uefi_selected_count: int = 0
 
     @property
     def partition_table_incomplete(self) -> bool:
@@ -844,6 +847,9 @@ def inspect_image(
             )
         uefi_payloads: tuple[ImageUefiPayload, ...] = ()
         uefi_issues: tuple[str, ...] = ()
+        uefi_complete = True
+        uefi_candidate_count = 0
+        uefi_selected_count = 0
         if inspection_fd >= 0 and "UEFI" in modes:
             uefi_analysis = inspect_iso_uefi_payloads(
                 path, [member.path for member in members], image_fd=inspection_fd,
@@ -851,6 +857,27 @@ def inspect_image(
             )
             uefi_payloads = uefi_analysis.payloads
             uefi_issues = uefi_analysis.issues
+            uefi_complete = uefi_analysis.complete
+            uefi_candidate_count = uefi_analysis.candidate_count
+            uefi_selected_count = uefi_analysis.selected_count
+            if not contents_scanned:
+                uefi_complete = False
+                uefi_issues += (
+                    "a complete ISO file catalog was unavailable for DBX analysis",
+                )
+            if (
+                eltorito is not None
+                and BootPlatform.EFI in eltorito.bootable_platforms
+            ):
+                uefi_complete = False
+                uefi_issues += (
+                    "the EFI El Torito boot image was not inspected for DBX analysis",
+                )
+            if eltorito_issues:
+                uefi_complete = False
+                uefi_issues += (
+                    "the malformed El Torito catalog prevents complete DBX analysis",
+                )
         if inspection_fd >= 0:
             final_bound = os.fstat(inspection_fd)
             final_bound_identity = (
@@ -875,6 +902,9 @@ def inspect_image(
         bootloader_issues=identity_issues,
         uefi_payloads=uefi_payloads,
         uefi_analysis_issues=uefi_issues,
+        uefi_analysis_complete=uefi_complete,
+        uefi_candidate_count=uefi_candidate_count,
+        uefi_selected_count=uefi_selected_count,
         eltorito=eltorito,
         eltorito_issues=eltorito_issues,
         partition_table_valid=(

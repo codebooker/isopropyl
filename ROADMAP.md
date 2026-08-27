@@ -63,10 +63,12 @@ evidence.
 
 ### Trust, formats, and advanced media
 
-- Extend the implemented integrity-only Authenticode check with independently
-  authenticated Microsoft/firmware trust policy, signing-time validation, and
-  DBX/SBAT/SVN revocation data; keep runtime media validation distinct from
-  static analysis and never promote an embedded-only result into boot trust.
+- Extend the implemented integrity-only Authenticode check and pinned offline
+  Microsoft DBX image-hash advisor with independently authenticated live
+  firmware policy, certificate revocation, signing-time validation, SBAT, SVN,
+  and final transformed-media reinspection. Keep runtime media validation
+  distinct from static analysis and never promote a snapshot miss or an
+  embedded-only result into boot trust.
 - Firmware-test the implemented default-off `uefi-md5sum` v1.2 transformation,
   including every fallback architecture, manifest failure/cancellation behavior,
   Secure Boot acceptance or rejection, and post-write corruption. Expand beyond
