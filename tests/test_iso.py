@@ -8,6 +8,7 @@ from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.iso import (
     FAT32_MAX_FILE_SIZE,
     ArchiveEntry,
+    BootStrategy,
     EntryKind,
     FileSystem,
     FirmwareTarget,
@@ -159,9 +160,75 @@ class PlanTests(unittest.TestCase):
         ])
         self.assertEqual(plan.layout.main_filesystem, FileSystem.NTFS)
         self.assertEqual(plan.layout.partition_count, 2)
-        self.assertEqual(plan.layout.boot_partition_filesystem, FileSystem.FAT32)
+        self.assertIsNone(plan.layout.boot_partition_filesystem)
+        self.assertEqual(plan.layout.boot_strategy, BootStrategy.UEFI_NTFS)
         uefi_ntfs = next(item for item in plan.requirements if item.key == "uefi-ntfs")
         self.assertEqual(uefi_ntfs.source, RequirementSource.VERIFIED_DOWNLOAD)
+
+    def test_uefi_only_ntfs_plan_is_executable_for_supported_architecture(self):
+        plan = build_write_plan(
+            inspection(boot_modes=("UEFI",)),
+            [
+                ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10),
+                ArchiveEntry("huge.bin", FAT32_MAX_FILE_SIZE + 1),
+            ],
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertTrue(plan.executable, plan.blockers)
+        self.assertEqual(plan.layout.boot_strategy, BootStrategy.UEFI_NTFS)
+        self.assertFalse(plan.needs_wim_split)
+
+    def test_uefi_ntfs_blocks_known_broken_or_incomplete_architectures(self):
+        for architecture, message in (
+            ("RISC-V64", "suffix mismatch"),
+            ("LoongArch64", "no complete"),
+            ("ARM", "not enabled"),
+        ):
+            image = inspection(
+                boot_modes=("UEFI",), architectures=(architecture,),
+            )
+            image = ImageInspection(**{
+                **image.__dict__,
+                "uefi_payloads": (
+                    ImageUefiPayload(
+                        f"EFI/BOOT/BOOT{architecture}.EFI", architecture,
+                        "EFI application", True, SignatureTableState.ABSENT,
+                        SbatState.ABSENT, (),
+                    ),
+                ),
+            })
+            entries = [
+                ArchiveEntry(f"EFI/BOOT/BOOT{architecture}.EFI", 10),
+                ArchiveEntry("huge.bin", FAT32_MAX_FILE_SIZE + 1),
+            ]
+            with self.subTest(architecture=architecture):
+                plan = build_write_plan(
+                    image, entries, firmware_target=FirmwareTarget.UEFI_ONLY,
+                )
+                self.assertFalse(plan.executable)
+                self.assertTrue(any(message in item for item in plan.blockers))
+
+    def test_fallback_filename_must_match_the_pe_machine_architecture(self):
+        image = inspection(boot_modes=("UEFI",), architectures=("x64",))
+        image = ImageInspection(**{
+            **image.__dict__,
+            "uefi_payloads": (
+                ImageUefiPayload(
+                    "EFI/BOOT/BOOTX64.EFI", "ARM64", "EFI application", True,
+                    SignatureTableState.ABSENT, SbatState.ABSENT, (),
+                ),
+            ),
+        })
+        plan = build_write_plan(
+            image,
+            [
+                ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10),
+                ArchiveEntry("huge.bin", FAT32_MAX_FILE_SIZE + 1),
+            ],
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertFalse(plan.executable)
+        self.assertTrue(any("does not match" in item for item in plan.blockers))
 
     def test_explicit_fat32_rejects_unsplittable_large_file(self):
         with self.assertRaisesRegex(PlanError, "cannot hold"):

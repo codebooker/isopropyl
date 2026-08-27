@@ -14,15 +14,17 @@
   <description>
     <p>
       ISOpropyl is a graphical Linux utility for creating bootable USB and SD
-      media. It supports byte-for-byte disk images and a filesystem-aware UEFI
-      ISO workflow while emphasizing target identity checks, clear erase
-      confirmations, cancellation, logging, and read-back verification.
+      media. It supports byte-for-byte disk images and filesystem-aware UEFI
+      FAT32 or verified UEFI:NTFS workflows while emphasizing target identity
+      checks, clear erase confirmations, cancellation, logging, and read-back
+      verification.
     </p>
     <p>
       It can inspect common boot layouts, calculate and compare checksums, stream
-      compressed and virtual disk images, customize supported Windows installers,
-      save raw drive or optical-disc images, restore ordinary data storage, and
-      run explicitly separated destructive media tests.
+      compressed and virtual disk images, inspect and select Windows WIM/ESD
+      editions, customize supported Windows installers, save raw drive or
+      optical-disc images, restore ordinary data storage, and run explicitly
+      separated destructive media tests.
     </p>
   </description>
   <launchable type="desktop-id">io.github.codebooker.isopropyl.desktop</launchable>
@@ -48,7 +50,7 @@
   <releases>
     <release version="0.1.0" date="2026-08-27">
       <description>
-        <p>Initial alpha with DD and UEFI ISO writing, image analysis, Windows customization, drive backup, formatting, erasure, and media testing.</p>
+        <p>Initial alpha with DD and UEFI FAT32/UEFI:NTFS ISO writing, image analysis, Windows edition selection and customization, drive backup, formatting, erasure, and media testing.</p>
       </description>
     </release>
   </releases>

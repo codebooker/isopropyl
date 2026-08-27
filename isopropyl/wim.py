@@ -71,15 +71,57 @@ class WimEdition:
     build: int
     service_pack_build: int
 
+    @property
+    def version(self) -> str:
+        value = f"{self.major_version}.{self.minor_version}.{self.build}"
+        return f"{value}.{self.service_pack_build}" if self.service_pack_build else value
+
+    @property
+    def display_label(self) -> str:
+        title = self.name or self.edition_id
+        edition = f" · {self.edition_id}" if self.edition_id != title else ""
+        return (
+            f"Index {self.index} · {title}{edition} · build {self.version} · "
+            f"{self.architecture.upper()}"
+        )
+
+
+FileIdentity = tuple[int, int, int, int]
+
 
 @dataclass(frozen=True)
 class WimInfo:
     path: str
     size: int
     editions: tuple[WimEdition, ...]
+    source_identity: FileIdentity
+
+    def select(self, source_name: str, index: int, *, expected_size: int | None = None) -> "WimSelection":
+        size = self.size if expected_size is None else expected_size
+        if size != self.size:
+            raise WimValidationError("The ISO catalog size does not match the inspected WIM/ESD")
+        selection = WimSelection(source_name, size, self.editions, index)
+        validate_wim_selection(selection)
+        return selection
 
 
-FileIdentity = tuple[int, int, int, int]
+@dataclass(frozen=True)
+class WimSelection:
+    """An exact ISO member/catalog binding for one Windows Setup image index."""
+
+    source_name: str
+    source_size: int
+    editions: tuple[WimEdition, ...]
+    selected_index: int
+
+    @property
+    def edition(self) -> WimEdition:
+        validate_wim_selection(self)
+        return next(item for item in self.editions if item.index == self.selected_index)
+
+    @property
+    def display_label(self) -> str:
+        return self.edition.display_label
 
 
 @dataclass(frozen=True)
@@ -328,6 +370,69 @@ _ARCHITECTURES = {
 }
 
 
+def validate_wim_editions(editions: tuple[WimEdition, ...]) -> None:
+    if (
+        not isinstance(editions, tuple)
+        or not editions
+        or len(editions) > MAX_IMAGES
+        or any(not isinstance(item, WimEdition) for item in editions)
+    ):
+        raise WimMetadataError("WIM metadata contains no images or too many images")
+    indexes: set[int] = set()
+    for item in editions:
+        integer_values = (
+            item.index, item.major_version, item.minor_version, item.build,
+            item.service_pack_build,
+        )
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in integer_values):
+            raise WimMetadataError("WIM edition contains invalid numeric metadata")
+        if (
+            item.index <= 0 or item.index in indexes or item.major_version < 0
+            or item.minor_version < 0 or item.build <= 0 or item.service_pack_build < 0
+            or any(value > 2_147_483_647 for value in integer_values)
+        ):
+            raise WimMetadataError("WIM edition contains ambiguous or invalid numeric metadata")
+        indexes.add(item.index)
+        text_values = (item.name, item.description, item.edition_id, item.architecture)
+        if any(not isinstance(value, str) or len(value) > 1024 for value in text_values):
+            raise WimMetadataError("WIM edition contains invalid text metadata")
+        if not item.edition_id or item.architecture not in _ARCHITECTURES.values():
+            raise WimMetadataError("WIM edition has an invalid edition or architecture")
+    if tuple(item.index for item in editions) != tuple(sorted(indexes)):
+        raise WimMetadataError("WIM image indexes are not in a canonical order")
+
+
+def validate_wim_selection(selection: WimSelection) -> None:
+    if not isinstance(selection, WimSelection):
+        raise WimValidationError("A WIM image selection is required")
+    if (
+        not isinstance(selection.source_name, str)
+        or selection.source_name.casefold() not in {
+            "sources/install.wim", "sources/install.esd",
+        }
+        or "\\" in selection.source_name
+    ):
+        raise WimValidationError("The selection must name sources/install.wim or install.esd")
+    if (
+        not isinstance(selection.source_size, int)
+        or isinstance(selection.source_size, bool)
+        or selection.source_size <= 0
+    ):
+        raise WimValidationError("The selected WIM/ESD has an invalid catalog size")
+    try:
+        validate_wim_editions(selection.editions)
+    except WimMetadataError as error:
+        raise WimValidationError(str(error)) from error
+    if (
+        not isinstance(selection.selected_index, int)
+        or isinstance(selection.selected_index, bool)
+        or sum(
+            item.index == selection.selected_index for item in selection.editions
+        ) != 1
+    ):
+        raise WimValidationError("The selected WIM image index is missing or ambiguous")
+
+
 def parse_wim_info_xml(payload: bytes | str) -> tuple[WimEdition, ...]:
     if isinstance(payload, str):
         encoded = payload.encode("utf-8")
@@ -398,7 +503,9 @@ def parse_wim_info_xml(payload: bytes | str) -> tuple[WimEdition, ...]:
             build=_integer(version, "BUILD", f"image {index} version", minimum=1),
             service_pack_build=_optional_integer(version, "SPBUILD", f"image {index} version"),
         ))
-    return tuple(sorted(editions, key=lambda item: item.index))
+    result = tuple(sorted(editions, key=lambda item: item.index))
+    validate_wim_editions(result)
+    return result
 
 
 def inspect_wim(
@@ -407,6 +514,7 @@ def inspect_wim(
     which: Callable[[str], str | None] = _trusted_which,
     runner: CommandRunner = run_bounded_command,
     timeout_seconds: float = 20,
+    cancel_event: threading.Event | None = None,
 ) -> WimInfo:
     source, status = _regular_file(path)
     tool = resolve_wimlib(which)
@@ -414,6 +522,7 @@ def inspect_wim(
         [tool, "info", str(source), "--xml"],
         timeout_seconds=timeout_seconds,
         max_output=MAX_INFO_OUTPUT,
+        cancel_event=cancel_event,
     )
     if len(result.stdout) > MAX_INFO_OUTPUT or len(result.stderr) > MAX_INFO_OUTPUT:
         raise WimCommandError("wimlib-imagex produced too much output")
@@ -421,7 +530,10 @@ def inspect_wim(
         detail = _error_text(result.stderr)
         raise WimCommandError(detail or "wimlib-imagex could not inspect the image")
     editions = parse_wim_info_xml(result.stdout)
-    return WimInfo(str(source), status.st_size, editions)
+    current, current_status = _regular_file(source)
+    if current != source or _identity(current_status) != _identity(status):
+        raise WimValidationError("The WIM/ESD source changed while metadata was inspected")
+    return WimInfo(str(source), status.st_size, editions, _identity(status))
 
 
 def requires_fat32_split(size: int) -> bool:

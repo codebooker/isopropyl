@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Prepare an ISO as an atomically published UEFI/FAT32 staging tree.
+"""Prepare an ISO as an atomically published UEFI staging tree.
 
 This module deliberately stops at a regular, unprivileged directory.  It does
 not mount, format, inspect, or write a block device.  The published directory
@@ -43,6 +43,7 @@ from .extraction import (
 from .iso import (
     FAT32_MAX_FILE_SIZE,
     ArchiveEntry,
+    BootStrategy,
     EntryKind,
     FileSystem,
     FirmwareTarget,
@@ -55,18 +56,24 @@ from .iso import (
 from .wim import (
     WimCancelled,
     WimError,
+    WimInfo,
+    WimSelection,
     WimSplitExecutor,
     WimSplitPlan,
     WimSplitResult,
     WimToolUnavailable,
     WimValidationError,
     create_split_plan,
+    inspect_wim,
     resolve_wimlib,
+    validate_wim_editions,
+    validate_wim_selection,
 )
 from .windows import (
     UNATTEND_NS,
     WindowsCustomization,
     add_autounattend_to_staging,
+    answer_file_install_index,
     generate_autounattend,
 )
 
@@ -92,6 +99,7 @@ ParentIdentity = tuple[int, int]
 Progress = Callable[["IsoStagingProgress"], None]
 Publisher = Callable[[Path, Path, int], None]
 SplitPlanBuilder = Callable[[Path, Path, str], WimSplitPlan]
+WimInspector = Callable[[Path, str, threading.Event], WimInfo]
 
 _DIR_FLAGS = (
     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -116,6 +124,7 @@ class IsoStagingPlan:
     content_bytes: int
     required_free_bytes: int
     wim_source: str | None
+    wim_selection: WimSelection | None
     wimlib_imagex: str | None
     autounattend_xml: str | None
 
@@ -160,6 +169,16 @@ def _identity(path: Path) -> FileIdentity:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
+def _wim_identity(path: Path) -> FileIdentity:
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise IsoStagingSafetyError("The selected WIM/ESD disappeared") from error
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size <= 0:
+        raise IsoStagingSafetyError("The selected WIM/ESD is no longer a safe regular file")
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
 def _case_key(path: str) -> tuple[str, ...]:
     return tuple(
         unicodedata.normalize("NFC", part).casefold()
@@ -195,16 +214,27 @@ def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> st
         raise IsoStagingSafetyError("ISO staging requires extracted-ISO write mode")
     if plan.firmware_target is not FirmwareTarget.UEFI_ONLY:
         raise IsoStagingSafetyError("ISO staging currently requires an explicit UEFI-only plan")
+    fat32_layout = (
+        layout is not None
+        and layout.main_filesystem is FileSystem.FAT32
+        and layout.partition_count == 1
+        and layout.boot_strategy is BootStrategy.IMAGE_NATIVE
+    )
+    uefi_ntfs_layout = (
+        layout is not None
+        and layout.main_filesystem is FileSystem.NTFS
+        and layout.partition_count == 2
+        and layout.boot_strategy is BootStrategy.UEFI_NTFS
+    )
     if (
         layout is None
-        or layout.main_filesystem is not FileSystem.FAT32
-        or layout.partition_count != 1
         or layout.boot_partition_filesystem is not None
         or not layout.uefi_bootable
         or layout.bios_bootable
+        or not (fat32_layout or uefi_ntfs_layout)
     ):
         raise IsoStagingSafetyError(
-            "ISO staging currently requires one UEFI-only FAT32 partition"
+            "ISO staging requires the supported UEFI/FAT32 or UEFI:NTFS layout"
         )
     if not plan.content_constraints_checked or plan.blockers:
         raise IsoStagingSafetyError("The write plan has not passed all content checks")
@@ -213,7 +243,10 @@ def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> st
     content_bytes = sum(entry.size for entry in files)
     if plan.minimum_content_bytes != content_bytes:
         raise IsoStagingSafetyError("The write plan is not bound to this ISO catalog")
-    oversized = tuple(entry for entry in files if entry.size > FAT32_MAX_FILE_SIZE)
+    oversized = (
+        tuple(entry for entry in files if entry.size > FAT32_MAX_FILE_SIZE)
+        if fat32_layout else ()
+    )
     eligible = tuple(
         entry for entry in oversized
         if entry.path.casefold() == "sources/install.wim"
@@ -222,7 +255,7 @@ def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> st
         raise IsoStagingSafetyError(
             "The ISO contains a non-WIM file that cannot be represented on FAT32"
         )
-    requires_split = bool(eligible)
+    requires_split = fat32_layout and bool(eligible)
     expected_transformations = (
         (Transformation.SPLIT_WINDOWS_WIM,) if requires_split else ()
     )
@@ -261,7 +294,7 @@ def _validate_catalog_shape(entries: Sequence[ArchiveEntry], wim_source: str | N
     for entry in entries:
         if entry.kind not in {EntryKind.FILE, EntryKind.DIRECTORY}:
             raise IsoStagingSafetyError(
-                "Constructed FAT32 staging refuses links and special archive entries"
+                "Constructed-media staging refuses links and special archive entries"
             )
     if wim_source is None:
         return
@@ -281,6 +314,32 @@ def _validate_answer_file(xml: str) -> None:
         raise IsoStagingSafetyError("The generated Windows answer file is invalid") from error
     if root.tag != f"{{{UNATTEND_NS}}}unattend":
         raise IsoStagingSafetyError("The generated Windows answer file has an invalid root")
+
+
+def _validate_wim_selection_catalog(
+    entries: Sequence[ArchiveEntry], selection: WimSelection | None,
+) -> None:
+    if selection is None:
+        return
+    try:
+        validate_wim_selection(selection)
+    except WimValidationError as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    candidates = tuple(
+        entry for entry in entries
+        if entry.kind is EntryKind.FILE and entry.path.casefold() in {
+            "sources/install.wim", "sources/install.esd",
+        }
+    )
+    if len(candidates) != 1:
+        raise IsoStagingSafetyError(
+            "A selected Windows image requires one unambiguous install.wim or install.esd"
+        )
+    source = candidates[0]
+    if source.path != selection.source_name or source.size != selection.source_size:
+        raise IsoStagingSafetyError(
+            "The selected Windows image is not bound to this ISO catalog"
+        )
 
 
 def _fixed_wim_resolver(path: str) -> Callable[[str], str | None]:
@@ -308,6 +367,11 @@ def build_iso_staging_plan(
         raise IsoStagingSafetyError("The ISO member catalog is empty")
     wim_source = _validate_write_plan(write_plan, safe_entries)
     _validate_catalog_shape(safe_entries, wim_source)
+    wim_selection = (
+        windows_customization.install_image
+        if windows_customization is not None else None
+    )
+    _validate_wim_selection_catalog(safe_entries, wim_selection)
 
     answer_file: str | None = None
     if windows_customization is not None and windows_customization.enabled:
@@ -326,6 +390,17 @@ def build_iso_staging_plan(
         except ValueError as error:
             raise IsoStagingSafetyError(str(error)) from error
         _validate_answer_file(answer_file)
+        try:
+            answer_index = answer_file_install_index(answer_file)
+        except ValueError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        expected_index = (
+            wim_selection.selected_index if wim_selection is not None else None
+        )
+        if answer_index != expected_index:
+            raise IsoStagingSafetyError(
+                "The Windows answer file is not bound to the selected image index"
+            )
 
     try:
         extraction = build_extraction_plan(
@@ -337,7 +412,7 @@ def build_iso_staging_plan(
         raise IsoStagingSafetyError(str(error)) from error
 
     wimlib_imagex: str | None = None
-    if wim_source is not None:
+    if wim_source is not None or wim_selection is not None:
         try:
             wimlib_imagex = wimlib_resolver()
             # Reuse wim.py's exact trusted-path validation instead of accepting
@@ -370,6 +445,7 @@ def build_iso_staging_plan(
         content_bytes=extraction.content_bytes,
         required_free_bytes=required_free,
         wim_source=wim_source,
+        wim_selection=wim_selection,
         wimlib_imagex=wimlib_imagex,
         autounattend_xml=answer_file,
     )
@@ -388,16 +464,39 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
         raise IsoStagingSafetyError("The ISO catalog binding is invalid")
     wim_source = _validate_write_plan(plan.write_plan, entries)
     _validate_catalog_shape(entries, wim_source)
+    _validate_wim_selection_catalog(entries, plan.wim_selection)
     if wim_source != plan.wim_source:
         raise IsoStagingSafetyError("The plan contains inconsistent WIM transformation data")
     if plan.autounattend_xml is not None:
         _validate_answer_file(plan.autounattend_xml)
+        try:
+            answer_index = answer_file_install_index(
+                plan.autounattend_xml,
+                (
+                    plan.wim_selection.edition.architecture
+                    if plan.wim_selection is not None else None
+                ),
+            )
+        except ValueError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        expected_index = (
+            plan.wim_selection.selected_index
+            if plan.wim_selection is not None else None
+        )
+        if answer_index != expected_index:
+            raise IsoStagingSafetyError(
+                "The answer file image index does not match the staging plan"
+            )
         if any(
             len(PurePosixPath(entry.path).parts) == 1
             and entry.path.casefold() == "autounattend.xml"
             for entry in entries
         ):
             raise IsoStagingSafetyError("The answer file would replace ISO content")
+    elif plan.wim_selection is not None:
+        raise IsoStagingSafetyError(
+            "A selected Windows image requires a bound answer file"
+        )
     try:
         rebuilt = build_extraction_plan(
             plan.image, plan.destination, entries, seven_zip=plan.seven_zip,
@@ -412,12 +511,12 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
         or rebuilt.content_bytes != plan.content_bytes
     ):
         raise IsoStagingSafetyError("The ISO, destination, or content binding changed")
-    if wim_source is None:
+    if wim_source is None and plan.wim_selection is None:
         if plan.wimlib_imagex is not None:
             raise IsoStagingSafetyError("The plan contains an unnecessary WIM tool")
     else:
         if plan.wimlib_imagex is None:
-            raise IsoStagingSafetyError("The plan does not bind a trusted WIM splitter")
+            raise IsoStagingSafetyError("The plan does not bind a trusted WIM tool")
         try:
             resolved = resolve_wimlib(_fixed_wim_resolver(plan.wimlib_imagex))
         except WimToolUnavailable as error:
@@ -578,6 +677,14 @@ def _default_split_plan_builder(source: Path, destination: Path, tool: str) -> W
     )
 
 
+def _default_wim_inspector(
+    source: Path, tool: str, cancel_event: threading.Event,
+) -> WimInfo:
+    return inspect_wim(
+        source, which=_fixed_wim_resolver(tool), cancel_event=cancel_event,
+    )
+
+
 def _rename_noreplace(source: Path, destination: Path, destination_parent_fd: int) -> None:
     """Atomically publish a directory without replacing even an empty target."""
 
@@ -630,11 +737,13 @@ class IsoStagingExecutor:
         extractor: SafeIsoExtractor | None = None,
         wim_splitter: WimSplitExecutor | None = None,
         split_plan_builder: SplitPlanBuilder = _default_split_plan_builder,
+        wim_inspector: WimInspector = _default_wim_inspector,
         publisher: Publisher = _rename_noreplace,
     ) -> None:
         self._extractor = extractor or SafeIsoExtractor()
         self._wim_splitter = wim_splitter
         self._split_plan_builder = split_plan_builder
+        self._wim_inspector = wim_inspector
         self._publisher = publisher
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
@@ -716,6 +825,45 @@ class IsoStagingExecutor:
                 raise IsoStagingSafetyError("The ISO source changed during extraction")
             _verify_extracted_catalog(tree, plan.entries)
 
+            selected_wim_path: Path | None = None
+            selected_wim_identity: FileIdentity | None = None
+            if plan.wim_selection is not None:
+                self._check_cancelled()
+                selection = plan.wim_selection
+                source = tree.joinpath(*PurePosixPath(selection.source_name).parts)
+                progress(IsoStagingProgress(
+                    "Validating Windows editions", selection.source_name, 0,
+                    plan.content_bytes,
+                ))
+                assert plan.wimlib_imagex is not None
+                info = self._wim_inspector(
+                    source, plan.wimlib_imagex, self._cancelled,
+                )
+                if not isinstance(info, WimInfo):
+                    raise IsoStagingSafetyError(
+                        "The WIM inspector returned invalid metadata"
+                    )
+                try:
+                    validate_wim_editions(info.editions)
+                except WimError as error:
+                    raise IsoStagingSafetyError(str(error)) from error
+                source_status = source.stat()
+                source_identity = (
+                    source_status.st_dev, source_status.st_ino,
+                    source_status.st_size, source_status.st_mtime_ns,
+                )
+                if (
+                    info.path != str(source.resolve())
+                    or info.size != selection.source_size
+                    or info.source_identity != source_identity
+                    or info.editions != selection.editions
+                ):
+                    raise IsoStagingSafetyError(
+                        "The WIM/ESD metadata changed after the image index was selected"
+                    )
+                selected_wim_path = source
+                selected_wim_identity = source_identity
+
             wim_parts: tuple[str, ...] = ()
             expected_files = {
                 _case_key(entry.path): _ScannedFile(entry.path, entry.size)
@@ -727,6 +875,14 @@ class IsoStagingExecutor:
                     "Splitting install.wim", plan.wim_source, 0, plan.content_bytes,
                 ))
                 source = tree.joinpath(*PurePosixPath(plan.wim_source).parts)
+                if (
+                    selected_wim_path == source
+                    and selected_wim_identity is not None
+                    and _wim_identity(source) != selected_wim_identity
+                ):
+                    raise IsoStagingSafetyError(
+                        "install.wim changed after its selected image metadata was validated"
+                    )
                 split_directory = private_root / "split-wim"
                 assert plan.wimlib_imagex is not None
                 split_plan = self._split_plan_builder(
@@ -786,6 +942,15 @@ class IsoStagingExecutor:
                     "Adding Windows customization", "autounattend.xml", 0,
                     plan.content_bytes,
                 ))
+                if (
+                    selected_wim_path is not None
+                    and selected_wim_identity is not None
+                    and plan.wim_source is None
+                    and _wim_identity(selected_wim_path) != selected_wim_identity
+                ):
+                    raise IsoStagingSafetyError(
+                        "The selected WIM/ESD changed before customization was added"
+                    )
                 try:
                     answer_path = add_autounattend_to_staging(tree, plan.autounattend_xml)
                 except ValueError as error:
@@ -799,7 +964,15 @@ class IsoStagingExecutor:
             self._check_cancelled()
             progress(IsoStagingProgress("Validating staging tree", "", 0, plan.content_bytes))
             try:
-                scanned_root, directories, files = scan_staging_tree(tree)
+                scanned_root, directories, files = scan_staging_tree(
+                    tree,
+                    max_file_bytes=(
+                        FAT32_MAX_FILE_SIZE
+                        if plan.write_plan.layout is not None
+                        and plan.write_plan.layout.main_filesystem is FileSystem.FAT32
+                        else None
+                    ),
+                )
             except ConstructedMediaSafetyError as error:
                 raise IsoStagingSafetyError(str(error)) from error
             if scanned_root != tree:
@@ -823,6 +996,15 @@ class IsoStagingExecutor:
                 raise IsoStagingSafetyError("The ISO catalog changed during staging")
             if _catalog_digest(plan.entries) != plan.catalog_digest:
                 raise IsoStagingSafetyError("The ISO catalog binding changed during staging")
+            if (
+                selected_wim_path is not None
+                and selected_wim_identity is not None
+                and plan.wim_source is None
+                and _wim_identity(selected_wim_path) != selected_wim_identity
+            ):
+                raise IsoStagingSafetyError(
+                    "The selected WIM/ESD changed before staging was published"
+                )
             _check_parent(plan, parent_fd)
             if os.path.lexists(plan.destination):
                 raise IsoStagingSafetyError("The staging destination appeared before publication")

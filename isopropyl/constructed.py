@@ -2,12 +2,14 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Construct narrowly scoped UEFI-only FAT32 removable media.
+"""Construct narrowly scoped, verified UEFI removable media.
 
 This backend consumes an already staged directory tree.  It does not extract
 archives and does not install or repair bootloaders.  A plan is accepted only
 when the tree contains at least one non-empty removable-media UEFI fallback
-loader at ``EFI/BOOT/BOOT*.EFI``.  No BIOS or NTFS support is implied.
+loader at ``EFI/BOOT/BOOT*.EFI``.  FAT32 is the default; NTFS content copying is
+available only to a higher-level plan that supplies a separate UEFI boot path.
+No BIOS bootloader installation is implied.
 """
 
 import hashlib
@@ -124,6 +126,7 @@ class ConstructedMediaPlan:
     required_capacity: int
     partition_table: PartitionTable
     volume_label: str
+    filesystem: Filesystem
     format_plan: FormatPlan
     tools: ConstructedTools
 
@@ -247,6 +250,7 @@ def _scan_directory_fd(
     directories: list[StagedDirectory],
     files: list[StagedFile],
     occupied: dict[tuple[str, ...], str],
+    max_file_bytes: int | None,
 ) -> None:
     try:
         names = sorted(os.listdir(directory_fd), key=lambda item: item.casefold())
@@ -297,7 +301,7 @@ def _scan_directory_fd(
                 directories.append(_directory_from_stat(child_parts, opened))
                 _scan_directory_fd(
                     child_fd, child_parts, root_device,
-                    directories, files, occupied,
+                    directories, files, occupied, max_file_bytes,
                 )
             finally:
                 os.close(child_fd)
@@ -306,9 +310,9 @@ def _scan_directory_fd(
                 raise ConstructedMediaSafetyError(
                     f"Hard-linked staged files are forbidden: {rendered!r}"
                 )
-            if before.st_size > FAT32_MAX_FILE_BYTES:
+            if max_file_bytes is not None and before.st_size > max_file_bytes:
                 raise ConstructedMediaSafetyError(
-                    f"Staged file exceeds FAT32's single-file limit: {rendered!r}"
+                    f"Staged file exceeds the selected filesystem's single-file limit: {rendered!r}"
                 )
             files.append(_file_from_stat(child_parts, before))
         else:
@@ -319,6 +323,8 @@ def _scan_directory_fd(
 
 def scan_staging_tree(
     root: Path | str,
+    *,
+    max_file_bytes: int | None = FAT32_MAX_FILE_BYTES,
 ) -> tuple[Path, tuple[StagedDirectory, ...], tuple[StagedFile, ...]]:
     staging = Path(root)
     if not staging.is_absolute():
@@ -346,7 +352,9 @@ def scan_staging_tree(
             raise ConstructedMediaSafetyError("The staging root changed while opening it")
         directories = [_directory_from_stat((), opened)]
         files: list[StagedFile] = []
-        _scan_directory_fd(root_fd, (), opened.st_dev, directories, files, {})
+        _scan_directory_fd(
+            root_fd, (), opened.st_dev, directories, files, {}, max_file_bytes,
+        )
     finally:
         os.close(root_fd)
     directories.sort(key=lambda item: (len(item.parts), _case_key(item.parts)))
@@ -386,6 +394,7 @@ def build_constructed_media_plan(
     partition_table: PartitionTable,
     *,
     volume_label: str = "ISOPROPYL",
+    filesystem: Filesystem = Filesystem.FAT32,
     finder: Callable[[str], str | None] = _trusted_which,
     source_on_device: Callable[[str, Device], bool] = path_is_on_device,
 ) -> ConstructedMediaPlan:
@@ -395,7 +404,16 @@ def build_constructed_media_plan(
         validate_device(device)
     except (FormattingError, ValueError) as error:
         raise ConstructedMediaSafetyError(str(error)) from error
-    staging, directories, files = scan_staging_tree(staging_root)
+    if filesystem not in {Filesystem.FAT32, Filesystem.NTFS}:
+        raise ConstructedMediaSafetyError(
+            "Constructed-media copying supports FAT32 or NTFS only"
+        )
+    staging, directories, files = scan_staging_tree(
+        staging_root,
+        max_file_bytes=(
+            FAT32_MAX_FILE_BYTES if filesystem is Filesystem.FAT32 else None
+        ),
+    )
     if source_on_device(str(staging), device):
         raise ConstructedMediaSafetyError(
             "The staging tree is stored on the target drive and would be destroyed"
@@ -409,7 +427,7 @@ def build_constructed_media_plan(
         )
     try:
         format_plan = create_format_plan(
-            device, Filesystem.FAT32, partition_table, volume_label,
+            device, filesystem, partition_table, volume_label,
         )
         # Resolve every formatting dependency during planning, before a caller
         # can present the plan as executable.
@@ -429,6 +447,7 @@ def build_constructed_media_plan(
         required_capacity=required,
         partition_table=partition_table,
         volume_label=volume_label,
+        filesystem=filesystem,
         format_plan=format_plan,
         tools=tools,
     )
@@ -439,6 +458,8 @@ def validate_constructed_media_plan(plan: ConstructedMediaPlan) -> None:
         raise ConstructedMediaSafetyError("A ConstructedMediaPlan is required")
     if not isinstance(plan.partition_table, PartitionTable):
         raise ConstructedMediaSafetyError("The plan contains an invalid partition table")
+    if plan.filesystem not in {Filesystem.FAT32, Filesystem.NTFS}:
+        raise ConstructedMediaSafetyError("The plan contains an unsupported filesystem")
     try:
         validate_device(plan.device)
     except (FormattingError, ValueError) as error:
@@ -485,7 +506,10 @@ def validate_constructed_media_plan(plan: ConstructedMediaPlan) -> None:
                 )
             )
             or item.link_count != 1
-            or item.size > FAT32_MAX_FILE_BYTES
+            or (
+                plan.filesystem is Filesystem.FAT32
+                and item.size > FAT32_MAX_FILE_BYTES
+            )
         ):
             raise ConstructedMediaSafetyError("The plan contains an invalid file identity")
         key = _case_key(item.parts)
@@ -508,12 +532,14 @@ def validate_constructed_media_plan(plan: ConstructedMediaPlan) -> None:
         raise ConstructedMediaSafetyError("The plan no longer fits on the target drive")
     try:
         expected_format = create_format_plan(
-            plan.device, Filesystem.FAT32, plan.partition_table, plan.volume_label,
+            plan.device, plan.filesystem, plan.partition_table, plan.volume_label,
         )
     except FormattingError as error:
         raise ConstructedMediaSafetyError(str(error)) from error
     if plan.format_plan != expected_format:
-        raise ConstructedMediaSafetyError("The plan is not an exact FAT32 format plan")
+        raise ConstructedMediaSafetyError(
+            "The plan is not an exact constructed-media format plan"
+        )
     for name in ("udisksctl", "findmnt", "lsblk"):
         try:
             _trusted_tool(name, lambda requested, n=name: (
@@ -576,7 +602,7 @@ def _open_directory_chain(
                     )
             if destination_device is not None and info.st_dev != destination_device:
                 raise ConstructedMediaSafetyError(
-                    "A destination directory escaped the mounted FAT32 filesystem"
+                    "A destination directory escaped the mounted data filesystem"
                 )
         return current
     except OSError as error:
@@ -679,7 +705,13 @@ class ConstructedMediaExecutor:
 
     def _verify_staging(self, plan: ConstructedMediaPlan) -> None:
         self._check_cancelled()
-        staging, directories, files = scan_staging_tree(plan.staging_root)
+        staging, directories, files = scan_staging_tree(
+            plan.staging_root,
+            max_file_bytes=(
+                FAT32_MAX_FILE_BYTES
+                if plan.filesystem is Filesystem.FAT32 else None
+            ),
+        )
         if (
             staging != plan.staging_root
             or directories != plan.directories
@@ -747,14 +779,20 @@ class ConstructedMediaExecutor:
         parent = str(node.get("pkname") or "")
         if parent and not parent.startswith("/dev/"):
             parent = "/dev/" + parent
+        reported_filesystem = str(node.get("fstype") or "").casefold()
+        expected_filesystems = (
+            {"vfat"}
+            if plan.filesystem is Filesystem.FAT32
+            else {"ntfs", "ntfs3", "fuseblk"}
+        )
         if not (
             str(node.get("path") or "") == partition
             and node.get("type") == "part"
             and parent == plan.device.path
-            and str(node.get("fstype") or "").casefold() == "vfat"
+            and reported_filesystem in expected_filesystems
         ):
             raise ConstructedMediaSafetyError(
-                "The new partition is not the expected FAT32 child of the target"
+                "The new partition is not the expected filesystem child of the target"
             )
 
     def _mount_partition(self, plan: ConstructedMediaPlan, partition: str) -> None:
@@ -772,12 +810,12 @@ class ConstructedMediaExecutor:
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise ConstructedMediaError(
-                _bounded_message(error, "Could not mount the new FAT32 partition")
+                _bounded_message(error, "Could not mount the new data partition")
             ) from error
         if result.returncode:
             message = (result.stdout or "") + (result.stderr or "")
             raise ConstructedMediaError(
-                _bounded_message(message, "Could not mount the new FAT32 partition")
+                _bounded_message(message, "Could not mount the new data partition")
             )
 
     def _find_mount(self, plan: ConstructedMediaPlan, partition: str) -> Path:
@@ -810,14 +848,20 @@ class ConstructedMediaExecutor:
         options = {
             item.casefold() for item in str(entry.get("options") or "").split(",") if item
         }
+        reported_filesystem = str(entry.get("fstype") or "").casefold()
+        expected_filesystems = (
+            {"vfat"}
+            if plan.filesystem is Filesystem.FAT32
+            else {"ntfs", "ntfs3", "fuseblk"}
+        )
         if (
             str(entry.get("source") or "") != partition
-            or str(entry.get("fstype") or "").casefold() != "vfat"
+            or reported_filesystem not in expected_filesystems
             or "rw" not in options
             or "ro" in options
         ):
             raise ConstructedMediaSafetyError(
-                "The mounted source, filesystem type, or write mode is not the expected FAT32 partition"
+                "The mounted source, filesystem type, or write mode is not the expected data partition"
             )
         target = Path(str(entry.get("target") or ""))
         if not target.is_absolute():
@@ -826,14 +870,14 @@ class ConstructedMediaExecutor:
             info = os.lstat(target)
         except OSError as error:
             raise ConstructedMediaSafetyError(
-                _bounded_message(error, "The FAT32 mount directory is unavailable")
+                _bounded_message(error, "The data mount directory is unavailable")
             ) from error
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise ConstructedMediaSafetyError(
-                "The FAT32 mount target is not a real directory"
+                "The data mount target is not a real directory"
             )
         if not self._access(str(target), os.W_OK | os.X_OK):
-            raise ConstructedMediaSafetyError("The FAT32 mount directory is not writable")
+            raise ConstructedMediaSafetyError("The data mount directory is not writable")
         return target
 
     @staticmethod
@@ -877,7 +921,7 @@ class ConstructedMediaExecutor:
             destination_info = os.fstat(destination_fd)
             if not stat.S_ISREG(destination_info.st_mode) or destination_info.st_dev != destination_device:
                 raise ConstructedMediaSafetyError(
-                    f"Destination escaped the FAT32 filesystem: {item.path!r}"
+                    f"Destination escaped the mounted filesystem: {item.path!r}"
                 )
             source_hash = hashlib.sha256()
             copied = 0
@@ -964,7 +1008,7 @@ class ConstructedMediaExecutor:
         except OSError as error:
             os.close(source_root_fd)
             raise ConstructedMediaSafetyError(
-                _bounded_message(error, "Could not safely open the FAT32 mount directory")
+                _bounded_message(error, "Could not safely open the data mount directory")
             ) from error
         try:
             destination_root_info = os.fstat(destination_root_fd)
@@ -972,7 +1016,7 @@ class ConstructedMediaExecutor:
                 raise ConstructedMediaSafetyError("The mount target is no longer a directory")
             if os.listdir(destination_root_fd):
                 raise ConstructedMediaSafetyError(
-                    "The newly formatted FAT32 partition is unexpectedly non-empty"
+                    "The newly formatted data partition is unexpectedly non-empty"
                 )
             destination_device = destination_root_info.st_dev
             directory_map = {item.parts: item for item in plan.directories}
@@ -988,7 +1032,7 @@ class ConstructedMediaExecutor:
                     try:
                         if os.fstat(child_fd).st_dev != destination_device:
                             raise ConstructedMediaSafetyError(
-                                "A created directory escaped the FAT32 filesystem"
+                                "A created directory escaped the mounted filesystem"
                             )
                         os.fsync(child_fd)
                     finally:
@@ -1014,14 +1058,19 @@ class ConstructedMediaExecutor:
             os.fsync(destination_root_fd)
         except OSError as error:
             raise ConstructedMediaError(
-                _bounded_message(error, "The FAT32 copy operation failed")
+                _bounded_message(error, "The constructed-media copy operation failed")
             ) from error
         finally:
             os.close(destination_root_fd)
             os.close(source_root_fd)
 
     def _best_effort_cleanup(
-        self, plan: ConstructedMediaPlan, partition: str | None, mounted: bool,
+        self,
+        plan: ConstructedMediaPlan,
+        partition: str | None,
+        mounted: bool,
+        *,
+        power_off: bool = True,
     ) -> tuple[bool, bool]:
         unmounted = not mounted
         if partition and mounted:
@@ -1041,6 +1090,8 @@ class ConstructedMediaExecutor:
             except (OSError, subprocess.SubprocessError):
                 unmounted = False
         powered_off = False
+        if not power_off:
+            return unmounted, powered_off
         try:
             result = self._run_command(
                 [
@@ -1053,6 +1104,75 @@ class ConstructedMediaExecutor:
         except (OSError, subprocess.SubprocessError):
             pass
         return unmounted, powered_off
+
+    def _populate_partition(
+        self,
+        plan: ConstructedMediaPlan,
+        partition: str,
+        progress: Progress,
+        *,
+        power_off: bool,
+    ) -> ConstructedMediaResult:
+        mounted = False
+        mountpoint: Path | None = None
+        try:
+            self._check_cancelled()
+            self._verify_device(plan)
+            self._verify_staging(plan)
+            self._validate_partition(plan, partition)
+            self._mount_partition(plan, partition)
+            mounted = True
+            mountpoint = self._find_mount(plan, partition)
+            self._verify_device(plan)
+            self._verify_staging(plan)
+            self._copy_tree(plan, mountpoint, progress)
+            self._verify_staging(plan)
+            self._verify_device(plan)
+            progress(ConstructedProgress(
+                "Complete", "", plan.total_bytes, plan.total_bytes,
+            ))
+        finally:
+            unmounted, powered_off = self._best_effort_cleanup(
+                plan, partition, mounted, power_off=power_off,
+            )
+        assert mountpoint is not None
+        return ConstructedMediaResult(
+            device_identity=plan.device.identity,
+            partition=partition,
+            mountpoint=str(mountpoint),
+            files_copied=len(plan.files),
+            bytes_copied=plan.total_bytes,
+            unmounted=unmounted,
+            powered_off=powered_off,
+        )
+
+    def populate_existing_partition(
+        self,
+        plan: ConstructedMediaPlan,
+        partition: str,
+        progress: Progress = lambda _progress: None,
+        *,
+        power_off: bool = False,
+    ) -> ConstructedMediaResult:
+        """Populate a preformatted partition from a separately bound layout.
+
+        This entry point performs every source, target, mount, copy, and
+        read-back check used by :meth:`execute`, but deliberately does not
+        partition or format the drive.  It is intended for a higher-level
+        multi-partition executor that has already frozen and created the exact
+        layout.  The caller remains responsible for validating that outer plan.
+        """
+        if self._started:
+            raise ConstructedMediaSafetyError("A constructed-media executor cannot be reused")
+        self._started = True
+        self._check_cancelled()
+        validate_constructed_media_plan(plan)
+        self._verify_staging(plan)
+        current = self._verify_device(plan)
+        self._verify_staging_not_on_target(plan, current)
+        return self._populate_partition(
+            plan, partition, progress, power_off=power_off,
+        )
 
     def execute(
         self,
@@ -1090,38 +1210,6 @@ class ConstructedMediaExecutor:
                 ) from error
             raise
 
-        mounted = False
-        mountpoint: Path | None = None
-        try:
-            self._check_cancelled()
-            self._verify_device(plan)
-            self._verify_staging(plan)
-            self._validate_partition(plan, partition)
-            self._mount_partition(plan, partition)
-            mounted = True
-            mountpoint = self._find_mount(plan, partition)
-            self._verify_device(plan)
-            self._verify_staging(plan)
-            self._copy_tree(plan, mountpoint, progress)
-            self._verify_staging(plan)
-            self._verify_device(plan)
-            progress(ConstructedProgress(
-                "Complete", "", plan.total_bytes, plan.total_bytes,
-            ))
-        finally:
-            unmounted, powered_off = self._best_effort_cleanup(
-                plan, partition, mounted,
-            )
-        # This assignment is deliberately after cleanup so result reports the
-        # actual best-effort device state without cleanup masking copy errors.
-        assert mountpoint is not None
-        result = ConstructedMediaResult(
-            device_identity=plan.device.identity,
-            partition=partition,
-            mountpoint=str(mountpoint),
-            files_copied=len(plan.files),
-            bytes_copied=plan.total_bytes,
-            unmounted=unmounted,
-            powered_off=powered_off,
+        return self._populate_partition(
+            plan, partition, progress, power_off=True,
         )
-        return result

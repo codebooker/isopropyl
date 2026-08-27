@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -37,7 +38,19 @@ def resource(value: bytes = b"trusted bootloader bytes") -> BootloaderResource:
 
 class BootloaderTests(unittest.TestCase):
     def test_bundled_catalog_is_valid_and_network_inactive(self):
-        self.assertEqual(load_catalog().resources, ())
+        catalog = load_catalog()
+        self.assertEqual(len(catalog.resources), 1)
+        image = catalog.find(
+            "uefi-ntfs", "2.8-rufus-2368e49a", "uefi-ntfs.img",
+        )
+        self.assertIsNotNone(image)
+        assert image is not None
+        self.assertEqual(image.size, 1_048_576)
+        self.assertEqual(
+            image.sha256,
+            "72683fa1250eeea772d3399277b434d4e55ba8dd0dc926e52d817e701fc2eb9e",
+        )
+        self.assertEqual(image.allowed_hosts, ("raw.githubusercontent.com",))
 
     def test_catalog_rejects_http_and_unsafe_names(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -90,6 +103,48 @@ class BootloaderTests(unittest.TestCase):
                     ),
                 )
             self.assertEqual(list(Path(directory).rglob("core.img")), [])
+
+    def test_cancelled_download_is_not_published_or_cached(self):
+        value = b"trusted bootloader bytes"
+        cancelled = threading.Event()
+
+        class CancellingResponse(Response):
+            def read(self, size=-1):
+                block = super().read(4 if size < 0 else min(size, 4))
+                cancelled.set()
+                return block
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(DownloadError, "cancelled"):
+                fetch_resource(
+                    resource(value), root,
+                    lambda *_args, **_kwargs: CancellingResponse(value),
+                    cancelled,
+                )
+            self.assertEqual(list(root.rglob("core.img")), [])
+            self.assertEqual(
+                [path for path in root.rglob("*") if path.name.startswith(".isopropyl-download-")],
+                [],
+            )
+
+    def test_pre_cancelled_download_never_opens_network(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        opened = False
+
+        def should_not_open(*_args, **_kwargs):
+            nonlocal opened
+            opened = True
+            raise AssertionError("network should not be opened")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(DownloadError, "cancelled"):
+                fetch_resource(
+                    resource(), Path(directory), should_not_open,
+                    cancel_event=cancelled,
+                )
+        self.assertFalse(opened)
 
     def test_installed_exact_version_is_preferred(self):
         def run(_args, **_kwargs):

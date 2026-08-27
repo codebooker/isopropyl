@@ -17,6 +17,14 @@ from isopropyl.images import ImageInspection
 FAT32_MAX_FILE_SIZE = (4 * 1024**3) - 1
 WIM_SPLIT_PART_SIZE = 3800 * 1024**2
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
+_FALLBACK_ARCHITECTURES = {
+    "bootia32.efi": "x86",
+    "bootx64.efi": "x64",
+    "bootarm.efi": "ARM",
+    "bootaa64.efi": "ARM64",
+    "bootriscv64.efi": "RISC-V64",
+    "bootloongarch64.efi": "LoongArch64",
+}
 
 
 class WriteMode(str, Enum):
@@ -39,6 +47,11 @@ class PartitionTable(str, Enum):
 class FileSystem(str, Enum):
     FAT32 = "fat32"
     NTFS = "ntfs"
+
+
+class BootStrategy(str, Enum):
+    IMAGE_NATIVE = "image-native"
+    UEFI_NTFS = "uefi-ntfs"
 
 
 class EntryKind(str, Enum):
@@ -105,10 +118,11 @@ class TargetLayout:
     boot_partition_filesystem: FileSystem | None
     bios_bootable: bool
     uefi_bootable: bool
+    boot_strategy: BootStrategy = BootStrategy.IMAGE_NATIVE
 
     @property
     def uses_uefi_ntfs(self) -> bool:
-        return self.uefi_bootable and self.main_filesystem is FileSystem.NTFS
+        return self.boot_strategy is BootStrategy.UEFI_NTFS
 
 
 @dataclass(frozen=True)
@@ -411,9 +425,15 @@ def build_write_plan(
         partition_table=partition_table,
         main_filesystem=filesystem,
         partition_count=2 if uefi_ntfs else 1,
-        boot_partition_filesystem=FileSystem.FAT32 if uefi_ntfs else None,
+        # UEFI:NTFS uses a catalog-pinned raw FAT12 image, not a formatter-
+        # created FAT32 filesystem. Keep the field empty rather than
+        # misrepresenting the on-media structure.
+        boot_partition_filesystem=None,
         bios_bootable=bios,
         uefi_bootable=uefi,
+        boot_strategy=(
+            BootStrategy.UEFI_NTFS if uefi_ntfs else BootStrategy.IMAGE_NATIVE
+        ),
     )
 
     requirements = [
@@ -484,11 +504,17 @@ def build_write_plan(
             and entry.size > 0
         }
         validated_payloads = {
-            payload.path.casefold()
+            payload.path.casefold(): payload.architecture
             for payload in inspection.uefi_payloads
             if payload.is_uefi_image
         }
-        invalid_fallbacks = sorted(fallback_paths - validated_payloads)
+        invalid_fallbacks = sorted(fallback_paths - validated_payloads.keys())
+        mismatched_fallbacks = sorted(
+            path for path in fallback_paths & validated_payloads.keys()
+            if _FALLBACK_ARCHITECTURES.get(
+                PurePosixPath(path).name.casefold()
+            ) != validated_payloads[path]
+        )
         if not fallback_paths:
             blockers.append(
                 "The validated ISO catalog contains no non-empty EFI/BOOT fallback loader."
@@ -498,13 +524,45 @@ def build_write_plan(
                 f"Fallback loader {invalid_fallbacks[0]!r} was not structurally "
                 "validated as an EFI application."
             )
-    if filesystem is not FileSystem.FAT32 or layout.partition_count != 1:
-        blockers.append(
-            "Constructed-media execution currently supports one FAT32 partition only."
+        elif mismatched_fallbacks:
+            path = mismatched_fallbacks[0]
+            blockers.append(
+                f"Fallback loader {path!r} contains {validated_payloads[path]} code, "
+                "which does not match its removable-media filename."
+            )
+    if not (
+        (filesystem is FileSystem.FAT32 and layout.partition_count == 1)
+        or (
+            layout.boot_strategy is BootStrategy.UEFI_NTFS
+            and filesystem is FileSystem.NTFS
+            and layout.partition_count == 2
+            and firmware_target is FirmwareTarget.UEFI_ONLY
         )
+    ):
+        blockers.append("No constructed-media executor supports the requested layout.")
+    if layout.boot_strategy is BootStrategy.UEFI_NTFS:
+        unsupported = next(
+            (
+                architecture for architecture in inspection.architectures
+                if architecture not in {"x64", "x86", "ARM64"}
+            ),
+            None,
+        )
+        if unsupported == "RISC-V64":
+            blockers.append(
+                "UEFI:NTFS v2.8 has an upstream RISC-V64 payload suffix mismatch."
+            )
+        elif unsupported == "LoongArch64":
+            blockers.append(
+                "The pinned UEFI:NTFS image has no complete LoongArch64 payload pair."
+            )
+        elif unsupported is not None:
+            blockers.append(
+                f"UEFI:NTFS execution is not enabled for {unsupported}."
+            )
     if any(entry.kind in {EntryKind.SYMLINK, EntryKind.HARDLINK} for entry in safe_entries):
         blockers.append(
-            "FAT32 construction does not yet materialize ISO symbolic or hard links."
+            "Constructed-media execution does not yet materialize ISO symbolic or hard links."
         )
     if bios and inspection.bootloader == "Unknown":
         blockers.append("The BIOS bootloader is unknown; ISOpropyl will not guess an installer.")

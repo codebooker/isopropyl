@@ -7,9 +7,10 @@ evidence.
 
 ## Release gate: certify what already exists
 
-1. Exercise UEFI/FAT32 ISO mode on Windows 10/11 and representative Linux ISOs
-   across x64 and ARM64 firmware, 512e/4Kn media, USB flash drives, SD readers,
-   and explicitly enabled USB SSDs.
+1. Exercise UEFI/FAT32 and UEFI:NTFS ISO mode on Windows 10/11 and representative
+   Linux ISOs across x64 and ARM64 firmware, Secure Boot policies, 512e/4Kn media
+   where supported, USB flash drives, SD readers, and explicitly enabled USB
+   SSDs.
 2. Test unplug, cancellation, authentication refusal, short writes, full disks,
    mount conflicts, and cleanup failures without weakening identity checks.
 3. Confirm the GPT partition type and removable-media fallback loaders across a
@@ -21,23 +22,23 @@ evidence.
 
 ### Windows installer workflow
 
-- Expose WIM/ESD build, edition, architecture, and index metadata in the GUI.
 - Make ISO/DD selection first-class rather than placing ISO mode in a secondary
   plan dialog.
 - Add BIOS and dual BIOS+UEFI construction with exact, provenance-bound boot code.
-- Add an audited NTFS or FAT-ESP-plus-NTFS path and signed multi-architecture
-  UEFI:NTFS payloads.
+- Expand the implemented UEFI:NTFS path beyond 512-byte logical sectors only
+  after upstream payload and firmware evidence supports it.
 - Track Windows CA 2023, `SkuSiPolicy.p7b`, S Mode, and version-specific online
   account behavior without silently applying stale tweaks.
 
 ### Linux boot and persistence
 
-- Populate the GRUB/Syslinux artifact catalog only with license-reviewed,
-  upstream-provenanced payloads, signed release metadata, exact sizes and hashes.
-- Integrate explicit download consent, cache inspection/deletion, and pre-use
-  revalidation.
-- Execute persistence for a narrow, versioned Ubuntu/Mint/Debian/Kali matrix,
-  including partition creation, `persistence.conf`, and boot-config mutation.
+- Populate GRUB/Syslinux catalog entries only with license-reviewed,
+  upstream-provenanced payloads, signed release metadata, exact sizes and hashes;
+  preserve the same consent and pre-use checks already used by UEFI:NTFS.
+- Add cache inspection/deletion UI for verified boot artifacts.
+- Integrate the executable Ubuntu amd64 LTS 20.04/22.04/24.04 Casper persistence
+  backend with initial media layout and a size control, then expand only through
+  release-specific fixtures and hardware results.
 - Add distro-specific DD-only rules and tested BIOS/UEFI construction profiles.
 
 ### Trust, formats, and advanced media

@@ -9,6 +9,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
+from .wim import WimSelection, validate_wim_selection
+
 UNATTEND_NS = "urn:schemas-microsoft-com:unattend"
 WCM_NS = "http://schemas.microsoft.com/WMIConfig/2002/State"
 ET.register_namespace("", UNATTEND_NS)
@@ -47,6 +49,7 @@ class WindowsCustomization:
     timezone: str = ""
     require_local_password_change: bool = True
     local_password_never_expires: bool = True
+    install_image: WimSelection | None = None
 
     @property
     def enabled(self) -> bool:
@@ -55,7 +58,7 @@ class WindowsCustomization:
             bool(self.local_username), self.reduce_data_collection,
             self.disable_automatic_bitlocker, bool(self.input_locale),
             bool(self.system_locale), bool(self.ui_language),
-            bool(self.user_locale), bool(self.timezone),
+            bool(self.user_locale), bool(self.timezone), self.install_image is not None,
         ))
 
 
@@ -164,13 +167,32 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
     timezone = validate_timezone(options.timezone)
     if architecture not in {"amd64", "arm64", "x86"}:
         raise ValueError(f"Unsupported Windows architecture: {architecture}")
+    if username and not options.require_local_password_change:
+        raise ValueError(
+            "A local administrator may not be created unless the mandatory "
+            "post-setup password-change policy is enabled"
+        )
+    if options.install_image is not None:
+        validate_wim_selection(options.install_image)
+        if options.install_image.edition.architecture != architecture:
+            raise ValueError(
+                "The selected Windows image architecture does not match Windows Setup"
+            )
 
     root = ET.Element(f"{{{UNATTEND_NS}}}unattend")
     passes: dict[str, ET.Element] = {}
+    components: dict[tuple[str, str], ET.Element] = {}
+
+    def component(pass_name: str, name: str) -> ET.Element:
+        key = (pass_name, name)
+        found = components.get(key)
+        if found is None:
+            found = _component(_settings(root, passes, pass_name), name, architecture)
+            components[key] = found
+        return found
 
     if options.bypass_hardware_requirements:
-        settings = _settings(root, passes, "windowsPE")
-        setup = _component(settings, "Microsoft-Windows-Setup", architecture)
+        setup = component("windowsPE", "Microsoft-Windows-Setup")
         synchronous = ET.SubElement(setup, "RunSynchronous")
         checks = (
             ("TPM", "BypassTPMCheck"), ("Secure Boot", "BypassSecureBootCheck"),
@@ -181,6 +203,17 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
                 synchronous, order, f"Bypass Windows 11 {label} requirement",
                 f'reg add "HKLM\\SYSTEM\\Setup\\LabConfig" /v {value} /t REG_DWORD /d 1 /f',
             )
+
+    if options.install_image is not None:
+        setup = component("windowsPE", "Microsoft-Windows-Setup")
+        image_install = ET.SubElement(setup, "ImageInstall")
+        os_image = ET.SubElement(image_install, "OSImage")
+        install_from = ET.SubElement(os_image, "InstallFrom")
+        metadata = ET.SubElement(install_from, "MetaData", {
+            f"{{{WCM_NS}}}action": "add",
+        })
+        ET.SubElement(metadata, "Key").text = "/IMAGE/INDEX"
+        ET.SubElement(metadata, "Value").text = str(options.install_image.selected_index)
 
     international_values = (
         ("InputLocale", input_locale),
@@ -195,19 +228,16 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
             ("windowsPE", "Microsoft-Windows-International-Core-WinPE"),
             ("oobeSystem", "Microsoft-Windows-International-Core"),
         ):
-            component = _component(
-                _settings(root, passes, pass_name), component_name, architecture,
-            )
+            international = component(pass_name, component_name)
             for element_name, value in international_values:
                 if value:
-                    ET.SubElement(component, element_name).text = value
+                    ET.SubElement(international, element_name).text = value
 
     needs_shell = any((
         options.hide_online_account, username, options.reduce_data_collection, timezone,
     ))
     if needs_shell:
-        settings = _settings(root, passes, "oobeSystem")
-        shell = _component(settings, "Microsoft-Windows-Shell-Setup", architecture)
+        shell = component("oobeSystem", "Microsoft-Windows-Shell-Setup")
 
         if options.hide_online_account or options.reduce_data_collection:
             oobe = ET.SubElement(shell, "OOBE")
@@ -241,18 +271,21 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
             first_logon_commands: list[tuple[str, str]] = []
             if options.require_local_password_change:
                 ps_username = username.replace("'", "''")
-                first_logon_commands.append((
-                    "Require a password change after initial setup",
-                    "powershell.exe -NoLogo -NoProfile -NonInteractive -Command "
+                account_policy = (
                     '"$u=[ADSI](\'WinNT://\'+$env:COMPUTERNAME+\'/'
-                    f"{ps_username},user\');$u.Put(\'PasswordExpired\',[int]1);$u.SetInfo()\"",
-                ))
-            if options.local_password_never_expires:
-                ps_username = username.replace("'", "''")
+                    f"{ps_username},user\');$u.Put(\'PasswordExpired\',[int]1);"
+                    "$u.SetInfo()"
+                )
+                if options.local_password_never_expires:
+                    account_policy += (
+                        f";Set-LocalUser -Name '{ps_username}' "
+                        "-PasswordNeverExpires $true"
+                    )
+                account_policy += '"'
                 first_logon_commands.append((
-                    "Keep the replacement password from expiring",
+                    "Apply the local-account password policy",
                     "powershell.exe -NoLogo -NoProfile -NonInteractive -Command "
-                    f'"Set-LocalUser -Name \'{ps_username}\' -PasswordNeverExpires $true"',
+                    + account_policy,
                 ))
             if first_logon_commands:
                 commands = ET.SubElement(shell, "FirstLogonCommands")
@@ -260,18 +293,91 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
                     _first_logon_command(commands, order, description, command)
 
     if options.disable_automatic_bitlocker:
-        settings = _settings(root, passes, "oobeSystem")
-        secure_startup = _component(
-            settings, "Microsoft-Windows-SecureStartup-FilterDriver", architecture,
+        secure_startup = component(
+            "oobeSystem", "Microsoft-Windows-SecureStartup-FilterDriver",
         )
         ET.SubElement(secure_startup, "PreventDeviceEncryption").text = "true"
-        enhanced_storage = _component(
-            settings, "Microsoft-Windows-EnhancedStorage-Adm", architecture,
-        )
+        enhanced_storage = component("oobeSystem", "Microsoft-Windows-EnhancedStorage-Adm")
         ET.SubElement(enhanced_storage, "TCGSecurityActivationDisabled").text = "1"
 
     ET.indent(root, space="  ")
     return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
+
+
+def answer_file_install_index(
+    xml: str, expected_architecture: str | None = None,
+) -> int | None:
+    """Return the exact Windows Setup /IMAGE/INDEX choice, if present."""
+
+    try:
+        root = ET.fromstring(xml)
+    except (ET.ParseError, ValueError) as error:
+        raise ValueError("The Windows answer file is not valid XML") from error
+    if root.tag != f"{{{UNATTEND_NS}}}unattend":
+        raise ValueError("The Windows answer file has an unexpected root element")
+    all_index_metadata: list[ET.Element] = []
+    for metadata in root.iter(f"{{{UNATTEND_NS}}}MetaData"):
+        key = metadata.findtext(f"{{{UNATTEND_NS}}}Key", default="").strip()
+        if key.casefold() == "/image/index":
+            if key != "/IMAGE/INDEX":
+                raise ValueError("The Windows image-index key must be uppercase")
+            all_index_metadata.append(metadata)
+    if not all_index_metadata:
+        return None
+
+    windows_pe = [
+        settings for settings in root.findall(f"{{{UNATTEND_NS}}}settings")
+        if settings.attrib.get("pass") == "windowsPE"
+    ]
+    if len(windows_pe) != 1:
+        raise ValueError("The Windows image index is outside one windowsPE pass")
+    setup_components = [
+        component
+        for component in windows_pe[0].findall(f"{{{UNATTEND_NS}}}component")
+        if component.attrib.get("name") == "Microsoft-Windows-Setup"
+    ]
+    if len(setup_components) != 1:
+        raise ValueError(
+            "The Windows image index is outside one Microsoft-Windows-Setup component"
+        )
+    setup_architecture = setup_components[0].attrib.get("processorArchitecture")
+    if expected_architecture is not None and setup_architecture != expected_architecture:
+        raise ValueError(
+            "The Windows Setup architecture does not match the selected image"
+        )
+    correct = setup_components[0].findall(
+        f"{{{UNATTEND_NS}}}ImageInstall/"
+        f"{{{UNATTEND_NS}}}OSImage/"
+        f"{{{UNATTEND_NS}}}InstallFrom/"
+        f"{{{UNATTEND_NS}}}MetaData"
+    )
+    if (
+        len(correct) != 1
+        or len(all_index_metadata) != 1
+        or correct[0] is not all_index_metadata[0]
+    ):
+        raise ValueError("The Windows image index is misplaced or ambiguous")
+    metadata = correct[0]
+    if metadata.attrib.get(f"{{{WCM_NS}}}action") != "add":
+        raise ValueError("The Windows image index metadata must use wcm:action=add")
+    key_elements = metadata.findall(f"{{{UNATTEND_NS}}}Key")
+    value_elements = metadata.findall(f"{{{UNATTEND_NS}}}Value")
+    if (
+        len(metadata) != 2
+        or len(key_elements) != 1
+        or len(value_elements) != 1
+        or list(metadata) != [key_elements[0], value_elements[0]]
+    ):
+        raise ValueError(
+            "The Windows image index metadata has ambiguous or unexpected children"
+        )
+    value = (value_elements[0].text or "").strip()
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("The Windows answer file has an ambiguous image index")
+    index = int(value)
+    if index <= 0:
+        raise ValueError("The Windows answer file has an invalid image index")
+    return index
 
 
 def windows_architecture(architectures: tuple[str, ...]) -> str:

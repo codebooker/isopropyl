@@ -190,6 +190,11 @@ class SafeIsoExtractor:
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
+    @property
+    def cancel_event(self) -> threading.Event:
+        """Share cancellation with a bounded follow-on inspection command."""
+        return self._cancelled
+
     def cancel(self) -> None:
         self._cancelled.set()
         with self._lock:

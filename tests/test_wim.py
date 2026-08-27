@@ -18,6 +18,7 @@ from isopropyl.wim import (
     CommandResult,
     WimCancelled,
     WimCommandError,
+    WimInfo,
     WimMetadataError,
     WimSplitExecutor,
     WimToolUnavailable,
@@ -30,6 +31,7 @@ from isopropyl.wim import (
     run_bounded_command,
     split_command,
     validate_split_plan,
+    validate_wim_selection,
 )
 
 TOOL = "/usr/bin/wimlib-imagex"
@@ -134,8 +136,95 @@ class WimInfoTests(unittest.TestCase):
             info = inspect_wim(source, which=trusted, runner=runner)
         self.assertEqual(info.path, str(source.resolve()))
         self.assertEqual(len(info.editions), 2)
+        self.assertEqual(info.source_identity[2], 3)
         self.assertEqual(calls[0][0], [TOOL, "info", str(source.resolve()), "--xml"])
         self.assertEqual(calls[0][1]["max_output"], 4 * 1024 * 1024)
+
+    def test_selection_binds_catalog_metadata_and_has_a_gui_label(self):
+        editions = parse_wim_info_xml(INFO_XML)
+        info = WimInfo("/tmp/install.esd", 123, editions, (1, 2, 123, 4))
+        selection = info.select("sources/install.esd", 2, expected_size=123)
+        validate_wim_selection(selection)
+        self.assertEqual(selection.edition.edition_id, "Professional")
+        self.assertEqual(selection.edition.version, "10.0.26100.2454")
+        self.assertIn("Index 2", selection.display_label)
+        self.assertIn("build 10.0.26100.2454", selection.display_label)
+        self.assertIn("AMD64", selection.display_label)
+        with self.assertRaisesRegex(WimValidationError, "catalog size"):
+            info.select("sources/install.esd", 2, expected_size=124)
+        for forged in (
+            replace(selection, selected_index=99),
+            replace(selection, source_name="sources/boot.wim"),
+            replace(selection, editions=(editions[0], editions[0])),
+        ):
+            with self.subTest(forged=forged), self.assertRaises(WimValidationError):
+                validate_wim_selection(forged)
+
+    def test_inspection_rejects_source_identity_change_during_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "install.wim"
+            source.write_bytes(b"before")
+
+            def runner(_argv, **_kwargs):
+                source.write_bytes(b"changed source")
+                return CommandResult(0, INFO_XML, b"")
+
+            with self.assertRaisesRegex(WimValidationError, "changed"):
+                inspect_wim(source, which=trusted, runner=runner)
+
+    def test_inspection_propagates_cancellation_to_bounded_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "install.wim"
+            source.write_bytes(b"wim")
+            cancelled = threading.Event()
+            cancelled.set()
+            with self.assertRaises(WimCancelled):
+                inspect_wim(
+                    source, which=trusted, cancel_event=cancelled,
+                )
+
+    def test_in_flight_info_cancellation_terminates_child(self):
+        cancelled = threading.Event()
+        started = threading.Event()
+        processes = []
+
+        def popen(argv, **kwargs):
+            process = FakeProcess(argv, blocked=True, **kwargs)
+            processes.append(process)
+            return process
+
+        def runner(argv, **kwargs):
+            return run_bounded_command(
+                argv,
+                popen=popen,
+                process_started=lambda _process: started.set(),
+                **kwargs,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "install.wim"
+            source.write_bytes(b"wim")
+            errors = []
+
+            def inspect() -> None:
+                try:
+                    inspect_wim(
+                        source, which=trusted, runner=runner,
+                        cancel_event=cancelled,
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=inspect)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            cancelled.set()
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], WimCancelled)
+            self.assertEqual(len(processes), 1)
+            self.assertTrue(processes[0].terminated)
 
     def test_missing_tool_or_command_failure_fails_closed(self):
         calls = []

@@ -17,6 +17,7 @@ from isopropyl.extraction import (
 from isopropyl.iso import (
     FAT32_MAX_FILE_SIZE,
     ArchiveEntry,
+    BootStrategy,
     EntryKind,
     FileSystem,
     FirmwareTarget,
@@ -37,11 +38,14 @@ from isopropyl.iso_staging import (
 from isopropyl.wim import (
     DEFAULT_SPLIT_PART_MIB,
     WimCancelled,
+    WimEdition,
     WimError,
+    WimInfo,
+    WimSelection,
     WimSplitPlan,
     WimSplitResult,
 )
-from isopropyl.windows import WindowsCustomization
+from isopropyl.windows import WindowsCustomization, answer_file_install_index
 
 
 SEVEN_ZIP = "/usr/bin/7z"
@@ -65,6 +69,30 @@ def windows_entries() -> tuple[ArchiveEntry, ...]:
     )
 
 
+def selected_esd_entries() -> tuple[ArchiveEntry, ...]:
+    return basic_entries() + (
+        ArchiveEntry("sources", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("sources/install.esd", 7),
+    )
+
+
+def selected_esd(build: int = 26100) -> WimSelection:
+    edition = WimEdition(
+        index=3, name="Windows 11 Pro", description="Professional desktop",
+        edition_id="Professional", architecture="amd64",
+        major_version=10, minor_version=0, build=build, service_pack_build=0,
+    )
+    return WimSelection("sources/install.esd", 7, (edition,), 3)
+
+
+def inspected_wim(path: Path, editions: tuple[WimEdition, ...]) -> WimInfo:
+    info = path.stat()
+    return WimInfo(
+        str(path.resolve()), info.st_size, editions,
+        (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns),
+    )
+
+
 def write_plan(
     entries: tuple[ArchiveEntry, ...],
     *,
@@ -73,7 +101,7 @@ def write_plan(
     firmware: FirmwareTarget = FirmwareTarget.UEFI_ONLY,
     filesystem: FileSystem = FileSystem.FAT32,
 ) -> WritePlan:
-    needs_split = any(
+    needs_split = filesystem is FileSystem.FAT32 and any(
         entry.kind is EntryKind.FILE
         and entry.path.casefold() == "sources/install.wim"
         and entry.size > FAT32_MAX_FILE_SIZE
@@ -82,10 +110,14 @@ def write_plan(
     layout = TargetLayout(
         partition_table=PartitionTable.GPT,
         main_filesystem=filesystem,
-        partition_count=1,
+        partition_count=1 if filesystem is FileSystem.FAT32 else 2,
         boot_partition_filesystem=None,
         bios_bootable=False,
         uefi_bootable=True,
+        boot_strategy=(
+            BootStrategy.IMAGE_NATIVE
+            if filesystem is FileSystem.FAT32 else BootStrategy.UEFI_NTFS
+        ),
     )
     content = sum(entry.size for entry in entries if entry.kind is EntryKind.FILE)
     return WritePlan(
@@ -270,7 +302,6 @@ class IsoStagingTests(unittest.TestCase):
                 write_plan(entries, blockers=("not ready",)),
                 write_plan(entries, mode=WriteMode.DD),
                 write_plan(entries, firmware=FirmwareTarget.AUTOMATIC),
-                write_plan(entries, filesystem=FileSystem.NTFS),
                 replace(write_plan(entries), minimum_content_bytes=999),
             ):
                 with self.subTest(candidate=candidate):
@@ -281,6 +312,20 @@ class IsoStagingTests(unittest.TestCase):
             )
             with self.assertRaises(IsoStagingSafetyError):
                 self.make_plan(root, linked, write_plan=write_plan(linked))
+
+    def test_ntfs_plan_stages_large_files_without_wim_splitting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = basic_entries() + (
+                ArchiveEntry("large.bin", FAT32_MAX_FILE_SIZE + 1),
+            )
+            plan = self.make_plan(
+                root, entries,
+                write_plan=write_plan(entries, filesystem=FileSystem.NTFS),
+            )
+            self.assertFalse(plan.needs_wim_split)
+            self.assertIsNone(plan.wimlib_imagex)
+            validate_iso_staging_plan(plan)
 
     def test_requires_absolute_absent_destination_and_unchanged_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -384,6 +429,141 @@ class IsoStagingTests(unittest.TestCase):
                     windows_customization=customization,
                 )
 
+    def test_selected_esd_index_is_bound_reinspected_and_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = selected_esd_entries()
+            selection = selected_esd()
+            plan = self.make_plan(
+                root, entries,
+                windows_customization=WindowsCustomization(install_image=selection),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            validate_iso_staging_plan(plan)
+            self.assertFalse(plan.needs_wim_split)
+            self.assertEqual(plan.wim_selection, selection)
+            self.assertEqual(plan.wimlib_imagex, WIMLIB)
+            self.assertEqual(answer_file_install_index(plan.autounattend_xml or ""), 3)
+            inspected = []
+
+            def inspector(source: Path, tool: str, _cancel_event) -> WimInfo:
+                inspected.append((source, tool))
+                return inspected_wim(source, selection.editions)
+
+            result = IsoStagingExecutor(
+                extractor=FakeExtractor(), wim_inspector=inspector,
+            ).execute(plan)
+            self.assertTrue(result.autounattend_added)
+            self.assertEqual(len(inspected), 1)
+            self.assertEqual(inspected[0][0].name, "install.esd")
+            self.assertEqual(inspected[0][1], WIMLIB)
+            self.assertTrue((result.destination / "sources/install.esd").is_file())
+
+    def test_changed_or_ambiguous_selected_wim_metadata_never_publishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = selected_esd_entries()
+            selection = selected_esd()
+            plan = self.make_plan(
+                root, entries,
+                windows_customization=WindowsCustomization(install_image=selection),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+
+            def changed(source: Path, _tool: str, _cancel_event) -> WimInfo:
+                return inspected_wim(source, selected_esd(build=22631).editions)
+
+            with self.assertRaisesRegex(IsoStagingSafetyError, "metadata changed"):
+                IsoStagingExecutor(
+                    extractor=FakeExtractor(), wim_inspector=changed,
+                ).execute(plan)
+            self.assertFalse(plan.destination.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = selected_esd_entries()
+            selection = selected_esd()
+            plan = self.make_plan(
+                root, entries,
+                windows_customization=WindowsCustomization(install_image=selection),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            inspected_source: list[Path] = []
+
+            def inspector(source: Path, _tool: str, _cancel_event) -> WimInfo:
+                inspected_source.append(source)
+                return inspected_wim(source, selection.editions)
+
+            def mutate_after_inspection(update) -> None:
+                if update.stage == "Adding Windows customization":
+                    inspected_source[0].write_bytes(b"changed")
+
+            with self.assertRaisesRegex(IsoStagingSafetyError, "changed before"):
+                IsoStagingExecutor(
+                    extractor=FakeExtractor(), wim_inspector=inspector,
+                ).execute(plan, mutate_after_inspection)
+            self.assertFalse(plan.destination.exists())
+
+        entries = selected_esd_entries() + (ArchiveEntry("sources/install.wim", 4),)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(IsoStagingSafetyError, "unambiguous"):
+                self.make_plan(
+                    Path(directory), entries,
+                    write_plan=write_plan(entries),
+                    windows_customization=WindowsCustomization(
+                        install_image=selected_esd(),
+                    ),
+                    windows_architecture="amd64",
+                    wimlib_resolver=lambda: WIMLIB,
+                )
+
+    def test_forged_selected_index_or_catalog_size_fails_plan_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = selected_esd_entries()
+            selection = selected_esd()
+            plan = self.make_plan(
+                root, entries,
+                windows_customization=WindowsCustomization(install_image=selection),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            forged_xml = (plan.autounattend_xml or "").replace(
+                "<Value>3</Value>", "<Value>2</Value>",
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "does not match"):
+                validate_iso_staging_plan(
+                    replace(plan, autounattend_xml=forged_xml),
+                )
+            missing_action = (plan.autounattend_xml or "").replace(
+                ' wcm:action="add"', "", 1,
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "wcm:action"):
+                validate_iso_staging_plan(
+                    replace(plan, autounattend_xml=missing_action),
+                )
+            forged_architecture = (plan.autounattend_xml or "").replace(
+                'processorArchitecture="amd64"',
+                'processorArchitecture="arm64"',
+                1,
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "architecture"):
+                validate_iso_staging_plan(
+                    replace(plan, autounattend_xml=forged_architecture),
+                )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "not bound"):
+                self.make_plan(
+                    root, entries,
+                    windows_customization=WindowsCustomization(
+                        install_image=replace(selection, source_size=8),
+                    ),
+                    windows_architecture="amd64",
+                    wimlib_resolver=lambda: WIMLIB,
+                )
+
     def test_cancel_before_start_and_during_extraction_cleans_private_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -436,6 +616,43 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], IsoStagingCancelled)
             self.assertTrue(splitter.cancelled)
+            self.assertFalse(plan.destination.exists())
+            self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_cancel_during_wim_metadata_inspection_cleans_private_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = selected_esd_entries()
+            plan = self.make_plan(
+                root,
+                entries,
+                windows_customization=WindowsCustomization(
+                    install_image=selected_esd(),
+                ),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            started = threading.Event()
+
+            def inspector(_source: Path, _tool: str, cancel_event) -> WimInfo:
+                started.set()
+                cancel_event.wait(timeout=3)
+                raise WimCancelled("WIM operation was cancelled")
+
+            executor = IsoStagingExecutor(
+                extractor=FakeExtractor(), wim_inspector=inspector,
+            )
+            errors = []
+            thread = threading.Thread(
+                target=lambda: self._capture_error(errors, executor.execute, plan),
+            )
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            executor.cancel()
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], IsoStagingCancelled)
             self.assertFalse(plan.destination.exists())
             self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
 

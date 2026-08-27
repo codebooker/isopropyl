@@ -8,6 +8,7 @@ import logging
 import shutil
 import json
 import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSettings, QTimer, pyqtSignal
@@ -42,11 +43,12 @@ from .images import (
     ImageInspection, calculate_checksums, compare_expected_checksum, inspect_image,
 )
 from .iso import (
-    ArchiveEntry, EntryKind, FirmwareTarget, WriteMode, WritePlan,
+    ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget, WriteMode, WritePlan,
     build_write_plan,
 )
 from .iso_staging import (
-    IsoStagingCancelled, IsoStagingExecutor, build_iso_staging_plan,
+    IsoStagingCancelled, IsoStagingExecutor, IsoStagingPlan,
+    build_iso_staging_plan,
 )
 from .logging_setup import read_log, setup_logging
 from .media_test import (
@@ -60,10 +62,39 @@ from .optical import (
 from .progress import ProgressEstimator, format_duration
 from .writer import ImageWriter, WriteCancelled
 from .virtual import VirtualConversionCancelled, VirtualDiskStager, inspect_virtual_disk
-from .windows import (
-    WindowsCustomization, add_autounattend_to_staging, generate_autounattend,
-    windows_architecture,
+from .uefi_ntfs import (
+    BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
+    build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
+    probe_uefi_ntfs_logical_sector_size,
 )
+from .wim import WimEdition, WimInfo, WimSelection, inspect_wim
+from .windows import (
+    WindowsCustomization, generate_autounattend, windows_architecture,
+)
+
+
+class BackgroundPreparation:
+    """Small cancellable operation token for pre-consent background work."""
+
+    def __init__(self) -> None:
+        self.cancel_event = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+
+@dataclass(frozen=True)
+class PendingIsoWrite:
+    image: Path
+    inspection: ImageInspection
+    device: Device
+    write_plan: WritePlan
+    workspace: tempfile.TemporaryDirectory[str]
+    staging_plan: IsoStagingPlan
 
 
 class Bridge(QObject):
@@ -76,6 +107,8 @@ class Bridge(QObject):
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
     media_finished = pyqtSignal(object)
+    windows_metadata_finished = pyqtSignal(object, object, object)
+    uefi_preparation_finished = pyqtSignal(object, object, object)
 
 
 class Window(QMainWindow):
@@ -94,9 +127,16 @@ class Window(QMainWindow):
         self.extractor: SafeIsoExtractor | None = None
         self.virtual_stager: VirtualDiskStager | None = None
         self.iso_stager: IsoStagingExecutor | None = None
+        self.windows_wim_extractor: SafeIsoExtractor | None = None
         self.constructed_writer: ConstructedMediaExecutor | None = None
+        self.uefi_ntfs_writer: UefiNtfsExecutor | None = None
+        self.uefi_preparer: BackgroundPreparation | None = None
+        self.pending_iso_write: PendingIsoWrite | None = None
         self.iso_workspace: tempfile.TemporaryDirectory[str] | None = None
         self.windows_options = WindowsCustomization()
+        self.windows_wim_member: ArchiveEntry | None = None
+        self.windows_wim_editions: tuple[WimEdition, ...] = ()
+        self.windows_wim_error = ""
         self.settings = QSettings("codebooker", "ISOpropyl")
         self.progress_estimator = ProgressEstimator()
         self.logger = logging.getLogger("isopropyl")
@@ -112,6 +152,12 @@ class Window(QMainWindow):
         self.bridge.status_changed.connect(self.status.setText)
         self.bridge.media_progress.connect(self.on_media_progress)
         self.bridge.media_finished.connect(self.on_media_finished)
+        self.bridge.windows_metadata_finished.connect(
+            self.on_windows_metadata_finished
+        )
+        self.bridge.uefi_preparation_finished.connect(
+            self.on_uefi_preparation_finished
+        )
         QShortcut(QKeySequence.StandardKey.Open, self, activated=self.choose_image)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_devices)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.show_log)
@@ -262,6 +308,11 @@ class Window(QMainWindow):
         self.logger.info("Selected image %s", path)
         self.inspection = None
         self.windows_options = WindowsCustomization()
+        self.windows_wim_member = None
+        self.windows_wim_editions = ()
+        self.windows_wim_error = ""
+        self.windows_button.setText("Windows options…")
+        self.windows_button.setToolTip("")
         self.windows_button.setEnabled(False)
         self.iso_plan_button.setEnabled(False)
         self.image_label.setText(f"{path.name}  ·  {format_size(path.stat().st_size)}")
@@ -345,7 +396,10 @@ class Window(QMainWindow):
             self.extractor,
             self.virtual_stager,
             self.iso_stager,
+            self.windows_wim_extractor,
             self.constructed_writer,
+            self.uefi_ntfs_writer,
+            self.uefi_preparer,
         ))
 
     def confirm_write(self) -> None:
@@ -503,9 +557,17 @@ class Window(QMainWindow):
         self.extractor = None
         self.virtual_stager = None
         self.iso_stager = None
+        self.windows_wim_extractor = None
         self.constructed_writer = None
+        self.uefi_ntfs_writer = None
+        self.uefi_preparer = None
+        self.pending_iso_write = None
         if self.iso_workspace is not None:
-            self.iso_workspace.cleanup()
+            try:
+                self.iso_workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+                message += " Temporary workspace cleanup was incomplete."
             self.iso_workspace = None
         self.progress.setRange(0, 1000)
         self.set_busy(False)
@@ -542,6 +604,9 @@ class Window(QMainWindow):
             self.writer, self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner, self.extractor, self.virtual_stager,
             self.iso_stager, self.constructed_writer,
+            self.uefi_ntfs_writer,
+            self.uefi_preparer,
+            self.windows_wim_extractor,
         )))
         if active:
             self.status.setText("Stopping…")
@@ -1199,6 +1264,26 @@ class Window(QMainWindow):
                 )
             if self.inspection.has_windows_installer:
                 detail_lines.append("Windows installer image detected")
+                candidates = tuple(
+                    member for member in self.inspection.members
+                    if member.kind == "file" and member.path.casefold() in {
+                        "sources/install.wim", "sources/install.esd",
+                    }
+                )
+                if len(candidates) == 1:
+                    member = candidates[0]
+                    self.windows_wim_member = ArchiveEntry(member.path, member.size)
+                    self.windows_wim_error = ""
+                    self.windows_button.setToolTip(
+                        f"Inspect {member.path} to list its Windows image indexes"
+                    )
+                else:
+                    self.windows_wim_member = None
+                    self.windows_wim_error = (
+                        "The ISO catalog does not contain exactly one "
+                        "sources/install.wim or sources/install.esd."
+                    )
+                    self.windows_button.setToolTip(self.windows_wim_error)
             if self.inspection.eltorito is not None:
                 platforms = ", ".join(
                     platform.display_name
@@ -1231,6 +1316,108 @@ class Window(QMainWindow):
             self.iso_plan_button.setEnabled(self.inspection.is_iso9660)
             self.checksum_button.setEnabled(True)
         self.update_ready()
+
+    def start_windows_wim_inspection(self) -> None:
+        image = self.image
+        member = self.windows_wim_member
+        if image is None or member is None or self.operation_active:
+            return
+        try:
+            identity = image_identity(image)
+        except OSError as error:
+            self.windows_wim_error = str(error)
+            return
+        self.windows_wim_extractor = SafeIsoExtractor()
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText(f"Inspecting Windows editions in {member.path}…")
+        self.windows_button.setText("Inspecting Windows editions…")
+
+        def work() -> None:
+            result: object
+            try:
+                with tempfile.TemporaryDirectory(prefix=".isopropyl-wim-info-") as directory:
+                    destination = Path(directory) / "image"
+                    plan = build_extraction_plan(image, destination, (member,))
+                    assert self.windows_wim_extractor is not None
+                    self.windows_wim_extractor.execute(
+                        plan,
+                        lambda update: self.bridge.progress.emit(
+                            update.bytes_done, update.total_bytes,
+                            "Extracting Windows image metadata source",
+                        ),
+                    )
+                    source = destination.joinpath(*Path(member.path).parts)
+                    info = inspect_wim(
+                        source,
+                        cancel_event=self.windows_wim_extractor.cancel_event,
+                    )
+                    if info.size != member.size:
+                        raise RuntimeError(
+                            "The extracted WIM/ESD size does not match the ISO catalog"
+                        )
+                    if image_identity(image) != identity:
+                        raise RuntimeError("The ISO changed while Windows editions were inspected")
+                    result = info
+            except Exception as error:
+                result = error
+            self.bridge.windows_metadata_finished.emit(identity, member.path, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_windows_metadata_finished(
+        self, identity: object, source_name: object, result: object,
+    ) -> None:
+        self.windows_wim_extractor = None
+        self.windows_button.setText("Windows options…")
+        self.progress.setValue(0)
+        self.set_busy(False)
+        self.update_ready()
+        if self.image is None or self.windows_wim_member is None:
+            return
+        try:
+            current_identity = image_identity(self.image)
+        except OSError:
+            return
+        if (
+            identity != current_identity
+            or source_name != self.windows_wim_member.path
+        ):
+            return
+        if isinstance(result, Exception) or not isinstance(result, WimInfo):
+            self.windows_wim_editions = ()
+            if self.windows_options.install_image is not None:
+                self.windows_options = replace(
+                    self.windows_options, install_image=None,
+                )
+            self.windows_wim_error = (
+                str(result) if isinstance(result, Exception)
+                else "The WIM inspector returned invalid metadata"
+            )
+            self.windows_button.setToolTip(
+                f"Windows edition metadata unavailable: {self.windows_wim_error}"
+            )
+            self.status.setText(
+                f"Windows edition inspection failed: {self.windows_wim_error}"
+            )
+            return
+        info = result
+        self.windows_wim_editions = info.editions
+        self.windows_wim_error = ""
+        current_selection = self.windows_options.install_image
+        if current_selection is not None and (
+            current_selection.source_name != self.windows_wim_member.path
+            or current_selection.source_size != self.windows_wim_member.size
+            or current_selection.editions != info.editions
+        ):
+            self.windows_options = replace(self.windows_options, install_image=None)
+        labels = "\n".join(edition.display_label for edition in info.editions)
+        self.windows_button.setToolTip(labels)
+        self.status.setText(
+            f"Found {len(info.editions)} Windows installation image"
+            f"{'s' if len(info.editions) != 1 else ''}"
+        )
 
     def calculate_image_checksums(self) -> None:
         if not self.image or self.checksum_busy:
@@ -1361,6 +1548,10 @@ class Window(QMainWindow):
         ]
         if plan.needs_wim_split:
             lines.append("Transformation: split sources/install.wim for FAT32")
+        if self.windows_options.install_image is not None:
+            lines.append(
+                f"Windows image: {self.windows_options.install_image.display_label}"
+            )
         lines.extend(("", "Dependencies:"))
         lines.extend(
             f"• {requirement.key}: {', '.join(requirement.alternatives)}"
@@ -1404,9 +1595,15 @@ class Window(QMainWindow):
             plan.executable and self.selected_device() is not None
         )
         if plan.executable:
-            write_iso_button.setToolTip(
-                "Stage the ISO privately, then create and verify a UEFI/FAT32 USB."
-            )
+            if plan.layout.boot_strategy is BootStrategy.UEFI_NTFS:
+                write_iso_button.setToolTip(
+                    "Stage the ISO privately, then create and verify an NTFS USB "
+                    "with a pinned UEFI:NTFS boot bridge."
+                )
+            else:
+                write_iso_button.setToolTip(
+                    "Stage the ISO privately, then create and verify a UEFI/FAT32 USB."
+                )
         else:
             write_iso_button.setToolTip(
                 "This image does not yet have an executable ISO-mode plan."
@@ -1470,24 +1667,208 @@ class Window(QMainWindow):
                 entries,
                 write_plan,
                 windows_customization=self.windows_options,
-                windows_architecture=windows_architecture(inspection.architectures),
+                windows_architecture=(
+                    self.windows_options.install_image.edition.architecture
+                    if self.windows_options.install_image is not None else
+                    windows_architecture(inspection.architectures)
+                ),
             )
         except Exception as error:
             if workspace is not None:
-                workspace.cleanup()
+                try:
+                    workspace.cleanup()
+                except OSError as cleanup_error:
+                    self.logger.warning(
+                        "Could not remove rejected ISO workspace: %s", cleanup_error,
+                    )
             QMessageBox.warning(self, "ISO mode unavailable", str(error))
+            return
+
+        assert write_plan.layout is not None
+        strategy = write_plan.layout.boot_strategy
+        pending = PendingIsoWrite(
+            image, inspection, device, write_plan, workspace, staging_plan,
+        )
+        if strategy is BootStrategy.UEFI_NTFS:
+            helper_answer = QMessageBox.question(
+                self,
+                "Prepare the verified UEFI:NTFS boot helper?",
+                "This image needs NTFS because it contains a file larger than FAT32 "
+                "can store. ISOpropyl will obtain the 1 MiB UEFI:NTFS v2.8 helper "
+                "from a release-pinned Rufus source URL (or use its verified cache), "
+                "then check its exact size and SHA-256 before asking to erase the "
+                "drive.\n\n"
+                "The x64, x86, and ARM64 payloads are signed through Microsoft UEFI "
+                "CA 2011. Secure Boot can still reject them on systems that disable "
+                "third-party trust or revoke that certificate.\n\nContinue?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Yes,
+            )
+            if helper_answer != QMessageBox.StandardButton.Yes:
+                try:
+                    workspace.cleanup()
+                except OSError as error:
+                    self.logger.warning("Could not remove ISO workspace: %s", error)
+                return
+            self.start_uefi_preparation(pending)
+            return
+        self.confirm_and_start_iso_write(pending, None, None)
+
+    def start_uefi_preparation(self, pending: PendingIsoWrite) -> None:
+        preparer = BackgroundPreparation()
+        self.pending_iso_write = pending
+        self.uefi_preparer = preparer
+        self.set_busy(True)
+        self.progress.setRange(0, 0)
+        self.status.setText(
+            "Checking the target and obtaining the verified UEFI:NTFS helper…"
+        )
+
+        def work() -> None:
+            try:
+                logical_sector_size = probe_uefi_ntfs_logical_sector_size(
+                    pending.device
+                )
+                if preparer.cancelled:
+                    raise UefiNtfsCancelled(
+                        "UEFI:NTFS helper preparation was cancelled"
+                    )
+                artifact = prepare_uefi_ntfs_artifact(
+                    cancel_event=preparer.cancel_event
+                )
+                if preparer.cancelled:
+                    raise UefiNtfsCancelled(
+                        "UEFI:NTFS helper preparation was cancelled"
+                    )
+                self.bridge.uefi_preparation_finished.emit(
+                    preparer, (artifact, logical_sector_size), None,
+                )
+            except Exception as error:
+                self.bridge.uefi_preparation_finished.emit(
+                    preparer, None, error,
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_uefi_preparation_finished(
+        self,
+        preparer: BackgroundPreparation,
+        result: object,
+        error: object,
+    ) -> None:
+        if preparer is not self.uefi_preparer:
+            return
+        pending = self.pending_iso_write
+        self.uefi_preparer = None
+        self.pending_iso_write = None
+        self.progress.setRange(0, 1000)
+        if pending is None:
+            self.set_busy(False)
+            return
+        if error is not None or preparer.cancelled:
+            try:
+                pending.workspace.cleanup()
+            except OSError as cleanup_error:
+                self.logger.warning(
+                    "Could not remove cancelled ISO workspace: %s", cleanup_error,
+                )
+            self.set_busy(False)
+            if preparer.cancelled:
+                message = "UEFI:NTFS helper preparation was cancelled"
+                self.logger.info(message)
+                self.status.setText(message)
+            else:
+                message = str(error)
+                self.logger.warning("UEFI:NTFS preparation failed: %s", message)
+                self.status.setText("ISO mode is not active")
+                QMessageBox.warning(
+                    self, "Verified boot helper unavailable", message,
+                )
+            return
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], BoundArtifact)
+            or result[1] != 512
+        ):
+            try:
+                pending.workspace.cleanup()
+            except OSError as cleanup_error:
+                self.logger.warning(
+                    "Could not remove rejected ISO workspace: %s", cleanup_error,
+                )
+            self.set_busy(False)
+            self.status.setText("ISO mode is not active")
+            QMessageBox.warning(
+                self,
+                "Verified boot helper unavailable",
+                "The background safety check returned an invalid result.",
+            )
+            return
+        artifact, logical_sector_size = result
+        self.status.setText("Verified UEFI:NTFS boot helper is ready")
+        self.confirm_and_start_iso_write(
+            pending, artifact, logical_sector_size,
+        )
+
+    def confirm_and_start_iso_write(
+        self,
+        pending: PendingIsoWrite,
+        artifact: BoundArtifact | None,
+        logical_sector_size: int | None,
+    ) -> None:
+        image = pending.image
+        inspection = pending.inspection
+        device = pending.device
+        write_plan = pending.write_plan
+        workspace = pending.workspace
+        staging_plan = pending.staging_plan
+        assert write_plan.layout is not None
+        strategy = write_plan.layout.boot_strategy
+        if strategy is BootStrategy.UEFI_NTFS and (
+            artifact is None or logical_sector_size != 512
+        ):
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "Verified boot helper unavailable",
+                "UEFI:NTFS requires a verified helper and a freshly observed "
+                "512-byte logical sector size.",
+            )
             return
 
         customization = (
             "\nWindows customization: autounattend.xml will be added."
             if self.windows_options.enabled else ""
         )
+        if self.windows_options.install_image is not None:
+            customization += (
+                "\nWindows image: "
+                f"{self.windows_options.install_image.display_label}."
+            )
+        if strategy is BootStrategy.UEFI_NTFS:
+            mode_description = (
+                "UEFI-only · GPT · NTFS + verified UEFI:NTFS bridge · "
+                "full file and bridge read-back verification"
+            )
+            customization += (
+                "\nSecure Boot note: the bridge depends on Microsoft UEFI CA 2011 "
+                "third-party trust."
+            )
+        else:
+            mode_description = (
+                "UEFI-only · GPT · FAT32 · full file read-back verification"
+            )
         answer = QMessageBox.warning(
             self,
             "Erase drive and write in ISO mode?",
             f"Everything on {device.label} will be permanently erased.\n\n"
             f"Image: {image.name}\n"
-            "Mode: UEFI-only · GPT · FAT32 · full file read-back verification\n"
+            f"Mode: {mode_description}\n"
             f"Target: {device.path}\n"
             f"Serial: {device.serial or device.wwn or 'not reported'}\n"
             f"Temporary space required: {format_size(staging_plan.required_free_bytes)}"
@@ -1497,12 +1878,20 @@ class Window(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
-            workspace.cleanup()
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            self.set_busy(False)
+            self.status.setText("ISO mode is not active")
             return
 
         self.iso_workspace = workspace
         self.iso_stager = IsoStagingExecutor()
-        self.constructed_writer = ConstructedMediaExecutor()
+        if strategy is BootStrategy.UEFI_NTFS:
+            self.uefi_ntfs_writer = UefiNtfsExecutor()
+        else:
+            self.constructed_writer = ConstructedMediaExecutor()
         self.set_busy(True)
         self.progress.setValue(0)
         self.status.setText("Preparing ISO-mode staging…")
@@ -1512,9 +1901,10 @@ class Window(QMainWindow):
         )
 
         def work() -> None:
+            success = False
+            message = "ISO-mode operation did not complete"
             try:
                 assert self.iso_stager is not None
-                assert self.constructed_writer is not None
                 staged = self.iso_stager.execute(
                     staging_plan,
                     lambda update: self.bridge.progress.emit(
@@ -1524,21 +1914,46 @@ class Window(QMainWindow):
                 partition_table = FormatPartitionTable(
                     write_plan.layout.partition_table.value  # type: ignore[union-attr]
                 )
-                target_plan = build_constructed_media_plan(
-                    staged.destination,
-                    device,
-                    partition_table,
-                    volume_label="ISOPROPYL",
-                )
-                result = self.constructed_writer.execute(
-                    target_plan,
-                    lambda update: self.bridge.progress.emit(
-                        update.bytes_done, update.total_bytes,
-                        update.stage + (
-                            f" · {update.relative_path}" if update.relative_path else ""
+                if strategy is BootStrategy.UEFI_NTFS:
+                    assert artifact is not None
+                    assert self.uefi_ntfs_writer is not None
+                    target_plan = build_uefi_ntfs_media_plan(
+                        staged.destination,
+                        device,
+                        partition_table,
+                        inspection.architectures,
+                        artifact,
+                        volume_label="ISOPROPYL",
+                        logical_sector_size=logical_sector_size,
+                    )
+                    result = self.uefi_ntfs_writer.execute(
+                        target_plan,
+                        lambda update: self.bridge.progress.emit(
+                            update.bytes_done, update.total_bytes,
+                            update.stage + (
+                                f" · {update.relative_path}"
+                                if update.relative_path else ""
+                            ),
                         ),
-                    ),
-                )
+                    )
+                else:
+                    assert self.constructed_writer is not None
+                    target_plan = build_constructed_media_plan(
+                        staged.destination,
+                        device,
+                        partition_table,
+                        volume_label="ISOPROPYL",
+                    )
+                    result = self.constructed_writer.execute(
+                        target_plan,
+                        lambda update: self.bridge.progress.emit(
+                            update.bytes_done, update.total_bytes,
+                            update.stage + (
+                                f" · {update.relative_path}"
+                                if update.relative_path else ""
+                            ),
+                        ),
+                    )
                 message = (
                     "Your UEFI bootable USB is ready and safely powered off. "
                     "You can remove it."
@@ -1546,13 +1961,22 @@ class Window(QMainWindow):
                     "Your UEFI bootable USB is ready. Eject it with your desktop "
                     "before removing it."
                 )
-                self.bridge.finished.emit(True, message)
-            except (IsoStagingCancelled, ConstructedMediaCancelled) as error:
+                success = True
+            except (
+                IsoStagingCancelled, ConstructedMediaCancelled, UefiNtfsCancelled,
+            ) as error:
                 self.logger.info("ISO-mode operation cancelled: %s", error)
-                self.bridge.finished.emit(False, str(error))
+                message = str(error)
             except Exception as error:
                 self.logger.exception("ISO-mode write failed")
-                self.bridge.finished.emit(False, str(error))
+                message = str(error)
+            finally:
+                try:
+                    workspace.cleanup()
+                except OSError as error:
+                    self.logger.warning("Could not remove ISO workspace: %s", error)
+                    message += " Temporary workspace cleanup was incomplete."
+                self.bridge.finished.emit(success, message)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1561,25 +1985,6 @@ class Window(QMainWindow):
     ) -> None:
         if not self.image or self.operation_active:
             return
-        profile_xml: str | None = None
-        if self.windows_options.enabled:
-            if any(entry.path.casefold() == "autounattend.xml" for entry in entries):
-                QMessageBox.warning(
-                    self,
-                    "Existing Windows answer file",
-                    "This ISO already contains autounattend.xml. ISOpropyl will not replace it; "
-                    "clear the Windows options or use different source media.",
-                )
-                return
-            try:
-                assert self.inspection is not None
-                profile_xml = generate_autounattend(
-                    self.windows_options,
-                    windows_architecture(self.inspection.architectures),
-                )
-            except ValueError as error:
-                QMessageBox.warning(self, "Invalid Windows options", str(error))
-                return
         try:
             plan = build_extraction_plan(self.image, destination, entries)
         except Exception as error:
@@ -1592,11 +1997,8 @@ class Window(QMainWindow):
             f"({format_size(plan.content_bytes)} of file data) to:\n\n"
             f"{plan.destination}\n\n"
             "The source ISO and removable drives will not be modified. The destination "
-            "must remain absent until extraction completes."
-            + (
-                "\n\nThe selected Windows profile will be added as autounattend.xml."
-                if profile_xml else ""
-            ),
+            "must remain absent until extraction completes. Windows options are applied "
+            "only by the private, atomically published ISO-to-USB staging workflow.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
         )
@@ -1617,16 +2019,13 @@ class Window(QMainWindow):
                         update.bytes_done, update.total_bytes, "Extracting ISO"
                     ),
                 )
-                if profile_xml is not None:
-                    add_autounattend_to_staging(result.destination, profile_xml)
                 self.logger.info(
                     "ISO extraction complete: image=%s destination=%s files=%s bytes=%s",
                     plan.image, result.destination, result.files, result.bytes_written,
                 )
                 self.bridge.finished.emit(
                     True,
-                    f"ISO files safely extracted to {result.destination}"
-                    + (" with autounattend.xml" if profile_xml else ""),
+                    f"ISO files safely extracted to {result.destination}",
                 )
             except ExtractionCancelled as error:
                 self.bridge.finished.emit(False, str(error))
@@ -1798,6 +2197,76 @@ class Window(QMainWindow):
         tabs.addTab(regional_tab, "Region and keyboard")
         layout.addWidget(tabs)
 
+        image_heading = QLabel("Windows edition")
+        image_heading.setObjectName("cardTitle")
+        image_combo = QComboBox()
+        image_combo.addItem("Ask during Windows Setup (no preselection)", None)
+        current = self.windows_options
+        available_editions = self.windows_wim_editions
+        if (
+            not available_editions and current.install_image is not None
+            and self.windows_wim_member is not None
+            and current.install_image.source_name == self.windows_wim_member.path
+            and current.install_image.source_size == self.windows_wim_member.size
+        ):
+            available_editions = current.install_image.editions
+        for edition in available_editions:
+            image_combo.addItem(edition.display_label, edition.index)
+        image_combo.setEnabled(bool(available_editions))
+        if current.install_image is not None:
+            selected_row = image_combo.findData(current.install_image.selected_index)
+            image_combo.setCurrentIndex(max(0, selected_row))
+        image_detail = QLabel()
+        image_detail.setWordWrap(True)
+        image_detail.setObjectName("muted")
+
+        def update_image_detail() -> None:
+            index = image_combo.currentData()
+            edition = next(
+                (item for item in available_editions if item.index == index), None,
+            )
+            if edition is not None:
+                image_detail.setText(
+                    f"Edition ID: {edition.edition_id} · architecture: "
+                    f"{edition.architecture.upper()} · Windows "
+                    f"{edition.major_version}.{edition.minor_version} · "
+                    f"build {edition.version}"
+                    + (f"\n{edition.description}" if edition.description else "")
+                )
+            elif self.windows_wim_error:
+                image_detail.setText(
+                    f"Edition metadata is unavailable: {self.windows_wim_error}"
+                )
+            elif self.windows_wim_member is not None and not available_editions:
+                image_detail.setText(
+                    f"Inspecting editions temporarily extracts "
+                    f"{format_size(self.windows_wim_member.size)} from the ISO. "
+                    "The private copy is deleted immediately afterward."
+                )
+            else:
+                image_detail.setText(
+                    "No edition is preselected; Windows Setup will ask when applicable."
+                )
+
+        image_combo.currentIndexChanged.connect(update_image_detail)
+        inspect_editions = QPushButton(
+            "Refresh edition metadata…" if available_editions
+            else "Inspect WIM/ESD editions…"
+        )
+        inspect_editions.setEnabled(self.windows_wim_member is not None)
+        if self.windows_wim_member is not None:
+            inspect_editions.setToolTip(
+                f"Temporarily extract {format_size(self.windows_wim_member.size)} from "
+                "the ISO, inspect it with trusted wimlib-imagex, then delete the copy."
+            )
+        elif self.windows_wim_error:
+            inspect_editions.setToolTip(self.windows_wim_error)
+        setup_layout.addWidget(image_heading)
+        setup_layout.addWidget(image_combo)
+        setup_layout.addWidget(image_detail)
+        setup_layout.addWidget(inspect_editions)
+        update_image_detail()
+
         bypass = QCheckBox("Remove Windows 11 RAM, Secure Boot, and TPM 2.0 setup checks")
         online = QCheckBox("Hide the online Microsoft account screen")
         privacy = QCheckBox("Reduce setup data collection (skip Express privacy settings)")
@@ -1805,12 +2274,15 @@ class Window(QMainWindow):
         local = QCheckBox("Create a local administrator account")
         username = QLineEdit()
         username.setPlaceholderText("Local account name")
-        password_change = QCheckBox("Require the local user to set a password after setup")
+        password_change = QCheckBox(
+            "Mandatory: require the local user to set a password after setup"
+        )
         password_never_expires = QCheckBox("Do not expire that replacement password")
 
         def set_local_controls(enabled: bool) -> None:
             username.setEnabled(enabled)
-            password_change.setEnabled(enabled)
+            password_change.setChecked(True)
+            password_change.setEnabled(False)
             password_never_expires.setEnabled(enabled)
 
         local.toggled.connect(set_local_controls)
@@ -1821,8 +2293,9 @@ class Window(QMainWindow):
         setup_layout.addWidget(password_never_expires)
         account_note = QLabel(
             "ISOpropyl exports no secret. The local account starts with a blank password; "
-            "the password-change option prompts the user to replace it after setup. "
-            "First-logon commands do not run in Windows S mode."
+            "a mandatory first-logon command marks it for replacement after setup. "
+            "Do not use this option for Windows S mode, where first-logon commands do "
+            "not run. Review the generated XML before use."
         )
         account_note.setWordWrap(True)
         account_note.setObjectName("muted")
@@ -1851,7 +2324,6 @@ class Window(QMainWindow):
         regional_note.setWordWrap(True)
         regional_note.setObjectName("muted")
         regional_form.addRow(regional_note)
-        current = self.windows_options
         bypass.setChecked(current.bypass_hardware_requirements)
         online.setChecked(current.hide_online_account)
         privacy.setChecked(current.reduce_data_collection)
@@ -1874,6 +2346,17 @@ class Window(QMainWindow):
         layout.addWidget(buttons)
 
         def selected() -> WindowsCustomization:
+            install_image = None
+            selected_index = image_combo.currentData()
+            if selected_index is not None:
+                if self.windows_wim_member is None or not available_editions:
+                    raise ValueError("Windows edition metadata is no longer available")
+                install_image = WimSelection(
+                    self.windows_wim_member.path,
+                    self.windows_wim_member.size,
+                    available_editions,
+                    int(selected_index),
+                )
             return WindowsCustomization(
                 bypass_hardware_requirements=bypass.isChecked(),
                 hide_online_account=online.isChecked(),
@@ -1887,13 +2370,19 @@ class Window(QMainWindow):
                 timezone=timezone.text(),
                 require_local_password_change=password_change.isChecked(),
                 local_password_never_expires=password_never_expires.isChecked(),
+                install_image=install_image,
             )
+
+        def profile_architecture(options: WindowsCustomization) -> str:
+            if options.install_image is not None:
+                return options.install_image.edition.architecture
+            return windows_architecture(self.inspection.architectures)
 
         def export_xml() -> None:
             try:
                 options = selected()
                 xml = generate_autounattend(
-                    options, windows_architecture(self.inspection.architectures)
+                    options, profile_architecture(options)
                 )
             except ValueError as error:
                 QMessageBox.warning(dialog, "Invalid Windows options", str(error))
@@ -1902,23 +2391,61 @@ class Window(QMainWindow):
                 dialog, "Export Windows answer file", "autounattend.xml", "XML files (*.xml)"
             )
             if filename:
-                Path(filename).write_text(xml, encoding="utf-8")
+                try:
+                    Path(filename).write_text(xml, encoding="utf-8")
+                except OSError as error:
+                    QMessageBox.warning(
+                        dialog, "Profile could not be saved", str(error),
+                    )
+                    return
                 QMessageBox.information(dialog, "Profile exported", f"Saved {filename}")
+
+        def confirm_local_account(options: WindowsCustomization) -> bool:
+            if options.local_username:
+                account_answer = QMessageBox.warning(
+                    dialog,
+                    "Confirm blank-password account workflow",
+                    "The local administrator is created with a blank initial password. "
+                    "A first-logon command marks it for mandatory replacement, but that "
+                    "command does not run in Windows S mode and can be affected by "
+                    "Windows setup policy.\n\nContinue with this account option?",
+                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if account_answer != QMessageBox.StandardButton.Yes:
+                    return False
+            return True
 
         def accept() -> None:
             try:
                 options = selected()
                 generate_autounattend(
-                    options, windows_architecture(self.inspection.architectures)
+                    options, profile_architecture(options)
                 )
             except ValueError as error:
                 QMessageBox.warning(dialog, "Invalid Windows options", str(error))
+                return
+            if not confirm_local_account(options):
                 return
             self.windows_options = options
             self.logger.info("Windows customization profile updated: %s", options)
             dialog.accept()
 
+        def inspect_metadata() -> None:
+            try:
+                options = selected()
+                generate_autounattend(options, profile_architecture(options))
+            except ValueError as error:
+                QMessageBox.warning(dialog, "Invalid Windows options", str(error))
+                return
+            if not confirm_local_account(options):
+                return
+            self.windows_options = options
+            dialog.accept()
+            QTimer.singleShot(0, self.start_windows_wim_inspection)
+
         export_button.clicked.connect(export_xml)
+        inspect_editions.clicked.connect(inspect_metadata)
         buttons.accepted.connect(accept)
         buttons.rejected.connect(dialog.reject)
         dialog.exec()

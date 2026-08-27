@@ -64,6 +64,7 @@ PROGRAMS = {
     "udevadm": "/usr/bin/udevadm",
     "lsblk": "/usr/bin/lsblk",
     "mkfs.vfat": "/usr/sbin/mkfs.vfat",
+    "mkfs.ntfs": "/usr/sbin/mkfs.ntfs",
     "findmnt": "/usr/bin/findmnt",
 }
 
@@ -219,6 +220,30 @@ class PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(ConstructedMediaSafetyError, "single-file limit"):
                 build_plan(staging)
 
+    def test_ntfs_plan_accepts_large_files_and_binds_ntfs_formatter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = make_staging(Path(directory))
+            huge = staging / "install.wim"
+            with huge.open("wb") as stream:
+                stream.truncate(FAT32_MAX_FILE_BYTES + 1)
+            plan = build_plan(
+                staging,
+                filesystem=Filesystem.NTFS,
+                device=removable_device(size=8_000_000_000),
+            )
+            self.assertEqual(plan.filesystem, Filesystem.NTFS)
+            self.assertEqual(plan.format_plan.filesystem, Filesystem.NTFS)
+            self.assertEqual(
+                next(item for item in plan.files if item.path == "install.wim").size,
+                FAT32_MAX_FILE_BYTES + 1,
+            )
+
+    def test_constructed_plan_rejects_unsupported_filesystem(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = make_staging(Path(directory))
+            with self.assertRaisesRegex(ConstructedMediaSafetyError, "FAT32 or NTFS"):
+                build_plan(staging, filesystem=Filesystem.EXFAT)
+
     def test_tool_preflight_uses_fixed_system_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             staging = make_staging(Path(directory))
@@ -352,6 +377,43 @@ class ExecutorTests(unittest.TestCase):
             self.assertEqual(byte_updates, sorted(byte_updates))
             self.assertEqual(updates[-1].stage, "Complete")
             self.assertEqual(updates[-1].fraction, 1.0)
+
+    def test_populates_preformatted_ntfs_without_reformat_or_poweroff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            staging = make_staging(base)
+            mountpoint = base / "mount"
+            mountpoint.mkdir()
+            plan = build_plan(staging, filesystem=Filesystem.NTFS)
+            formatter = FakeFormatExecutor()
+            calls: list[tuple] = []
+
+            def hook(argv, _kwargs):
+                if argv[0] == "/usr/bin/lsblk":
+                    return completed(stdout=json.dumps({"blockdevices": [{
+                        "path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz",
+                        "fstype": "ntfs",
+                    }]}))
+                if argv[0] == "/usr/bin/findmnt":
+                    return completed(stdout=json.dumps({"filesystems": [{
+                        "source": "/dev/sdz1", "target": str(mountpoint),
+                        "fstype": "ntfs3", "options": "rw,nosuid,nodev",
+                    }]}))
+                return None
+
+            executor = self.make_executor(
+                mountpoint, formatter, calls, command_hook=hook,
+            )
+            result = executor.populate_existing_partition(plan, "/dev/sdz1")
+            self.assertEqual(formatter.calls, [])
+            self.assertTrue(result.unmounted)
+            self.assertFalse(result.powered_off)
+            self.assertFalse(any(call[0][1] == "power-off" for call in calls))
+            self.assertEqual(
+                (mountpoint / "images" / "payload.bin").read_bytes(), b"payload",
+            )
+            with self.assertRaisesRegex(ConstructedMediaSafetyError, "cannot be reused"):
+                executor.populate_existing_partition(plan, "/dev/sdz1")
 
     def test_staging_change_before_execute_prevents_format(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.request
 from collections.abc import Callable
 from contextlib import closing
@@ -190,15 +191,22 @@ def fetch_resource(
     resource: BootloaderResource,
     cache_dir: Path | None = None,
     opener: OpenUrl = urllib.request.urlopen,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     """Fetch a cataloged artifact, accepting it only after size and SHA-256 checks.
 
     The catalog is shipped with ISOpropyl. Network metadata is never trusted to
     choose a URL, version, size, or digest.
     """
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadError("Bootloader download was cancelled")
+
+    check_cancelled()
     root = cache_dir or default_cache_dir()
     destination = root / resource.family / resource.version / resource.name
     if verify_resource(destination, resource):
+        check_cancelled()
         return destination
     # Never retain a known-bad object under a trusted cache key. A failed
     # replacement download must leave the dependency unavailable, not leave a
@@ -211,8 +219,10 @@ def fetch_resource(
     )
     temporary: Path | None = None
     try:
+        check_cancelled()
         response = opener(request, timeout=30)
         with closing(response):
+            check_cancelled()
             _validate_final_url(response.geturl(), resource)
             descriptor, name = tempfile.mkstemp(
                 prefix=".isopropyl-download-", dir=destination.parent
@@ -221,12 +231,17 @@ def fetch_resource(
             digest = hashlib.sha256()
             total = 0
             with os.fdopen(descriptor, "wb", buffering=0) as output:
-                while block := response.read(min(1024 * 1024, resource.size - total + 1)):
+                while True:
+                    check_cancelled()
+                    block = response.read(min(1024 * 1024, resource.size - total + 1))
+                    if not block:
+                        break
                     total += len(block)
                     if total > resource.size:
                         raise DownloadError("Downloaded bootloader artifact is larger than cataloged")
                     digest.update(block)
                     output.write(block)
+                check_cancelled()
                 os.fsync(output.fileno())
         if total != resource.size:
             raise DownloadError(

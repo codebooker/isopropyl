@@ -24,16 +24,19 @@ from isopropyl.formatting import (
     PartitionTable,
     create_format_plan,
     create_multi_format_plan,
+    create_uefi_ntfs_format_plan,
     format_command,
     multi_format_commands,
     multi_partition_command,
     multi_partition_script,
+    parse_logical_sector_size,
     parse_partitions,
     partition_command,
     partition_script,
     resolve_multi_tools,
     resolve_tools,
     validate_label,
+    validate_explicit_partition_metadata,
     validate_multi_plan,
 )
 
@@ -63,6 +66,7 @@ class FakeProcess:
         self.returncode = 0
         self.inputs = []
         self.terminated = False
+        self.killed = False
 
     def communicate(self, input=None, timeout=None):
         self.inputs.append(input)
@@ -74,6 +78,10 @@ class FakeProcess:
     def terminate(self):
         self.terminated = True
         self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
 
 def completed(stdout="", stderr="", code=0):
@@ -265,6 +273,157 @@ class MultiFormatPlanTests(unittest.TestCase):
         self.assertEqual(commands[0][-1], "/dev/sdz1")
         self.assertEqual(commands[1][-1], "/dev/sdz3")
 
+    def test_represents_raw_uefi_ntfs_tail_partition_without_formatting_it(self):
+        plan = create_uefi_ntfs_format_plan(test_device(), "gpt")
+        total_sectors = test_device().size // 512
+        boot_start = ((total_sectors - 33 - 2048) // 2048) * 2048
+        self.assertEqual(plan.logical_sector_size, 512)
+        self.assertEqual(plan.partitions[0].start_sector, 2048)
+        self.assertEqual(plan.partitions[0].sector_count, boot_start - 2048)
+        self.assertEqual(plan.partitions[1].start_sector, boot_start)
+        script = multi_partition_script(plan)
+        self.assertIn(b"unit: sectors\nsector-size: 512", script)
+        self.assertIn(b"start=2048", script)
+        self.assertIn(f"size={boot_start - 2048}".encode(), script)
+        self.assertIn(b'type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7', script)
+        self.assertIn(b'name="UEFI:NTFS", attrs=63', script)
+        tools = MultiFormatTools(
+            "/usr/bin/pkexec", "/usr/bin/udisksctl", "/usr/sbin/sfdisk",
+            "/usr/sbin/partprobe", "/usr/bin/udevadm", "/usr/bin/lsblk",
+            ((Filesystem.NTFS, "/usr/sbin/mkfs.ntfs"),),
+        )
+        self.assertEqual(
+            multi_format_commands(plan, tools, ("/dev/sdz1", "/dev/sdz2")),
+            ([
+                "/usr/bin/pkexec", "/usr/sbin/mkfs.ntfs", "-f", "-L",
+                "ISO_DATA", "/dev/sdz1",
+            ],),
+        )
+
+    def test_rejects_malformed_uefi_ntfs_partition(self):
+        for spec in (
+            PartitionSpec(PartitionRole.UEFI_NTFS, Filesystem.FAT32, size_mib=1),
+            PartitionSpec(PartitionRole.UEFI_NTFS, None, size_mib=2),
+            PartitionSpec(PartitionRole.UEFI_NTFS, None, "BOOT", 1),
+        ):
+            with self.subTest(spec=spec):
+                with self.assertRaisesRegex(FormatValidationError, "UEFI:NTFS"):
+                    create_multi_format_plan(test_device(), "gpt", (
+                        PartitionSpec(
+                            PartitionRole.DATA, Filesystem.NTFS, "DATA", 100,
+                        ),
+                        spec,
+                    ))
+
+    def test_uefi_ntfs_geometry_is_narrow_and_device_bound(self):
+        correct = create_uefi_ntfs_format_plan(test_device(), "gpt")
+        assert correct.partitions[0].sector_count is not None
+        assert correct.partitions[1].start_sector is not None
+        with self.assertRaisesRegex(FormatValidationError, "device-sized"):
+            create_multi_format_plan(test_device(), "gpt", (
+                PartitionSpec(
+                    PartitionRole.DATA, Filesystem.NTFS, "DATA",
+                    start_sector=2048,
+                    sector_count=correct.partitions[0].sector_count - 1,
+                ),
+                PartitionSpec(
+                    PartitionRole.UEFI_NTFS, None,
+                    start_sector=correct.partitions[1].start_sector,
+                    sector_count=2048,
+                ),
+            ), logical_sector_size=512)
+        with self.assertRaisesRegex(FormatValidationError, "NTFS or exFAT"):
+            create_uefi_ntfs_format_plan(
+                test_device(), "gpt", filesystem=Filesystem.FAT32,
+            )
+        with self.assertRaisesRegex(FormatValidationError, "requires MBR"):
+            create_uefi_ntfs_format_plan(
+                test_device(), "gpt", bios_bootable=True,
+            )
+        with self.assertRaisesRegex(FormatValidationError, "512-byte"):
+            create_uefi_ntfs_format_plan(
+                test_device(), "gpt", logical_sector_size=4096,
+            )
+        mbr = create_uefi_ntfs_format_plan(
+            test_device(), "mbr", bios_bootable=True,
+        )
+        self.assertIn(b"bootable", multi_partition_script(mbr))
+
+    def test_validates_exact_post_partition_gpt_metadata(self):
+        plan = create_uefi_ntfs_format_plan(test_device(), "gpt")
+        paths = ("/dev/sdz1", "/dev/sdz2")
+        payload = {
+            "partitiontable": {
+                "label": "gpt", "device": "/dev/sdz", "unit": "sectors",
+                "sectorsize": 512,
+                "partitions": [
+                    {
+                        "node": paths[0], "start": plan.partitions[0].start_sector,
+                        "size": plan.partitions[0].sector_count,
+                        "type": "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+                        "name": "ISOpropyl data",
+                    },
+                    {
+                        "node": paths[1], "start": plan.partitions[1].start_sector,
+                        "size": 2048,
+                        "type": "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+                        "name": "UEFI:NTFS", "attrs": "GUID:63",
+                    },
+                ],
+            },
+        }
+        validate_explicit_partition_metadata(plan, json.dumps(payload), paths)
+        mutations = (
+            ("sectorsize", 4096),
+            ("label", "dos"),
+            ("device", "/dev/sdy"),
+        )
+        for field, value in mutations:
+            changed = json.loads(json.dumps(payload))
+            changed["partitiontable"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(FormattingError):
+                    validate_explicit_partition_metadata(
+                        plan, json.dumps(changed), paths,
+                    )
+        for index, field, value in (
+            (0, "start", 4096),
+            (0, "size", 1),
+            (0, "node", "/dev/sdy1"),
+            (0, "type", "0FC63DAF-8483-4772-8E79-3D69D8477DE4"),
+            (1, "name", "ESP"),
+            (1, "attrs", "GUID:62"),
+        ):
+            changed = json.loads(json.dumps(payload))
+            changed["partitiontable"]["partitions"][index][field] = value
+            with self.subTest(partition=index, field=field):
+                with self.assertRaises(FormattingError):
+                    validate_explicit_partition_metadata(
+                        plan, json.dumps(changed), paths,
+                    )
+
+    def test_validates_exact_post_partition_mbr_metadata(self):
+        plan = create_uefi_ntfs_format_plan(
+            test_device(), "mbr", bios_bootable=True,
+        )
+        paths = ("/dev/sdz1", "/dev/sdz2")
+        payload = json.dumps({"partitiontable": {
+            "label": "dos", "device": "/dev/sdz", "unit": "sectors",
+            "sectorsize": 512,
+            "partitions": [
+                {
+                    "node": paths[0], "start": plan.partitions[0].start_sector,
+                    "size": plan.partitions[0].sector_count,
+                    "type": "7", "bootable": True,
+                },
+                {
+                    "node": paths[1], "start": plan.partitions[1].start_sector,
+                    "size": 2048, "type": "ef",
+                },
+            ],
+        }})
+        validate_explicit_partition_metadata(plan, payload, paths)
+
     def test_rejects_incoherent_partition_roles(self):
         cases = (
             ("gpt", ()),
@@ -350,6 +509,20 @@ class MultiFormatPlanTests(unittest.TestCase):
             parse_partitions(payload, "/dev/nvme1n2"),
             ("/dev/nvme1n2p1", "/dev/nvme1n2p2", "/dev/nvme1n2p10"),
         )
+
+    def test_logical_sector_probe_requires_one_exact_whole_device(self):
+        payload = json.dumps({"blockdevices": [{
+            "path": "/dev/sdz", "type": "disk", "log-sec": 512,
+        }]})
+        self.assertEqual(parse_logical_sector_size(payload, "/dev/sdz"), 512)
+        for bad in (
+            {"blockdevices": []},
+            {"blockdevices": [{"path": "/dev/sdy", "type": "disk", "log-sec": 512}]},
+            {"blockdevices": [{"path": "/dev/sdz", "type": "part", "log-sec": 512}]},
+            {"blockdevices": [{"path": "/dev/sdz", "type": "disk", "log-sec": 1000}]},
+        ):
+            with self.subTest(payload=bad), self.assertRaises(FormattingError):
+                parse_logical_sector_size(json.dumps(bad), "/dev/sdz")
 
 
 class FormatExecutorTests(unittest.TestCase):
@@ -455,6 +628,39 @@ class FormatExecutorTests(unittest.TestCase):
             executor.execute(self.device, self.plan)
         self.assertEqual(len(processes), 1)
         self.assertTrue(processes[0].terminated)
+
+    def test_stuck_child_is_killed_after_bounded_timeout(self):
+        class StubbornProcess(FakeProcess):
+            def __init__(self, argv, **kwargs):
+                super().__init__(argv, **kwargs)
+                self.returncode = None
+
+            def communicate(self, input=None, timeout=None):
+                self.inputs.append(input)
+                if not self.killed:
+                    raise subprocess.TimeoutExpired(self.argv, timeout)
+                return b"", b""
+
+            def terminate(self):
+                self.terminated = True
+
+        processes = []
+
+        def popen(argv, **kwargs):
+            process = StubbornProcess(argv, **kwargs)
+            processes.append(process)
+            return process
+
+        executor = FormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: f"/usr/bin/{name}", popen=popen,
+            runner=lambda _argv, **_kwargs: completed(),
+            process_timeout=0.01, stop_grace=0.01,
+        )
+        with self.assertRaisesRegex(FormattingError, "timed out"):
+            executor.execute(self.device, self.plan)
+        self.assertTrue(processes[0].terminated)
+        self.assertTrue(processes[0].killed)
 
     def test_unmount_failure_stops_before_partitioning(self):
         def runner(argv, **_kwargs):
@@ -648,6 +854,100 @@ class MultiFormatExecutorTests(unittest.TestCase):
         ]
         self.assertEqual(len(mkfs_commands), 1)
         self.assertEqual(mkfs_commands[0][-1], "/dev/sdz2")
+
+    def test_explicit_layout_is_verified_before_filesystem_creation(self):
+        plan = create_uefi_ntfs_format_plan(self.device, "gpt")
+        processes = []
+
+        def metadata(*, wrong_size=False):
+            return json.dumps({"partitiontable": {
+                "label": "gpt", "device": "/dev/sdz", "unit": "sectors",
+                "sectorsize": 512,
+                "partitions": [
+                    {
+                        "node": "/dev/sdz1", "start": plan.partitions[0].start_sector,
+                        "size": (
+                            1 if wrong_size else plan.partitions[0].sector_count
+                        ),
+                        "type": "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+                        "name": "ISOpropyl data",
+                    },
+                    {
+                        "node": "/dev/sdz2", "start": plan.partitions[1].start_sector,
+                        "size": 2048,
+                        "type": "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+                        "name": "UEFI:NTFS", "attrs": "GUID:63",
+                    },
+                ],
+            }})
+
+        def run_case(*, wrong_size=False):
+            processes.clear()
+
+            def popen(argv, **kwargs):
+                process = FakeProcess(argv, **kwargs)
+                processes.append(process)
+                return process
+
+            def runner(argv, **_kwargs):
+                if "--nodeps" in argv:
+                    return completed(json.dumps({"blockdevices": [{
+                        "path": "/dev/sdz", "type": "disk", "log-sec": 512,
+                    }]}))
+                if "lsblk" in argv[0]:
+                    return completed(json.dumps({"blockdevices": [{
+                        "path": "/dev/sdz", "type": "disk", "children": [
+                            {"path": "/dev/sdz1", "type": "part"},
+                            {"path": "/dev/sdz2", "type": "part"},
+                        ],
+                    }]}))
+                if argv[:3] == [
+                    "/usr/bin/pkexec", "/usr/bin/sfdisk", "--json",
+                ]:
+                    return completed(metadata(wrong_size=wrong_size))
+                return completed()
+
+            executor = MultiFormatExecutor(
+                device_lookup=lambda _path: self.device,
+                which=lambda name: f"/usr/bin/{name}",
+                runner=runner, popen=popen, sleep=lambda _seconds: None,
+            )
+            return executor.execute_multi(self.device, plan)
+
+        self.assertEqual(run_case(), ("/dev/sdz1", "/dev/sdz2"))
+        self.assertEqual(len([
+            process for process in processes
+            if any("mkfs." in argument for argument in process.argv)
+        ]), 1)
+        with self.assertRaisesRegex(FormattingError, "geometry"):
+            run_case(wrong_size=True)
+        self.assertFalse(any(
+            any("mkfs." in argument for argument in process.argv)
+            for process in processes
+        ))
+
+    def test_wrong_logical_sector_size_stops_before_unmount_or_partitioning(self):
+        plan = create_uefi_ntfs_format_plan(self.device, "gpt")
+        run_calls = []
+        popen = Mock()
+
+        def runner(argv, **kwargs):
+            run_calls.append((argv, kwargs))
+            if "--nodeps" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": "/dev/sdz", "type": "disk", "log-sec": 4096,
+                }]}))
+            return completed()
+
+        executor = MultiFormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: f"/usr/bin/{name}", runner=runner, popen=popen,
+        )
+        with self.assertRaisesRegex(DeviceChangedError, "4096-byte"):
+            executor.execute_multi(self.device, plan)
+        self.assertEqual(len(run_calls), 1)
+        self.assertIn("--nodeps", run_calls[0][0])
+        popen.assert_not_called()
 
 
 if __name__ == "__main__":
