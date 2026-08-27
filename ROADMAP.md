@@ -11,6 +11,9 @@ evidence.
    Linux ISOs across x64 and ARM64 firmware, Secure Boot policies, 512e/4Kn media
    where supported, USB flash drives, SD readers, and explicitly enabled USB
    SSDs.
+   Include the optional `uefi-md5sum` path on clean, corrupted, missing-manifest,
+   cancelled, signed-wrapper, and unsigned-wrapper boots; keep Casper/Ubuntu and
+   UEFI:NTFS disabled for that option until their separate compatibility runs pass.
 2. Test unplug, cancellation, authentication refusal, short writes, full disks,
    mount conflicts, overlay mutation/CRC/decompression failure, target-resident
    overlay refusal, VTSI expansion and exact-capacity restore, and cleanup failures
@@ -64,6 +67,10 @@ evidence.
   authenticated Microsoft/firmware trust policy, signing-time validation, and
   DBX/SBAT/SVN revocation data; keep runtime media validation distinct from
   static analysis and never promote an embedded-only result into boot trust.
+- Firmware-test the implemented default-off `uefi-md5sum` v1.2 transformation,
+  including every fallback architecture, manifest failure/cancellation behavior,
+  Secure Boot acceptance or rejection, and post-write corruption. Expand beyond
+  native FAT32 only after Casper/Ubuntu and UEFI:NTFS regressions are excluded.
 - Add Windows To Go through `wimlib` apply, offline BCD/SAN policy, and explicit
   internal-disk behavior.
 - Physically certify the strict VTSI v1.0 restore path on representative Ventoy

@@ -49,8 +49,8 @@ def resource(
 class BootloaderTests(unittest.TestCase):
     def test_bundled_catalog_is_valid_and_network_inactive(self):
         catalog = load_catalog()
-        self.assertEqual(len(catalog.resources), 15)
-        self.assertEqual(len(catalog.bundles), 9)
+        self.assertEqual(len(catalog.resources), 21)
+        self.assertEqual(len(catalog.bundles), 10)
         image = catalog.find(
             "uefi-ntfs", "2.8-rufus-2368e49a", "uefi-ntfs.img",
         )
@@ -94,6 +94,20 @@ class BootloaderTests(unittest.TestCase):
             x64.allowed_hosts,
             ("github.com", "release-assets.githubusercontent.com"),
         )
+        validator = catalog.find_bundle(
+            "uefi-md5sum", "1.2", "runtime-media-validation",
+        )
+        self.assertIsNotNone(validator)
+        assert validator is not None
+        self.assertEqual(
+            validator.artifact_names,
+            (
+                "bootaa64_signed.efi", "bootarm.efi",
+                "bootia32_signed.efi", "bootloongarch64.efi",
+                "bootriscv64.efi", "bootx64_signed.efi",
+            ),
+        )
+        self.assertEqual(validator.license, "GPL-2.0-or-later")
 
     def test_dependency_bundle_matching_never_truncates_versions(self):
         catalog = load_catalog()

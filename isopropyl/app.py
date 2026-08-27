@@ -92,6 +92,13 @@ from .progress import ProgressEstimator, format_duration
 from .persistence import (
     ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES, CasperCompatibilityProfile,
 )
+from .runtime_validation import (
+    RUNTIME_VALIDATION_ARTIFACTS, RUNTIME_VALIDATION_VERSION,
+    PreparedRuntimeValidation, RuntimeValidationCancelled,
+    RuntimeValidationError,
+    apply_runtime_validation, prepare_runtime_validation,
+    validate_prepared_runtime_validation, validate_runtime_validation_stage,
+)
 from .settings import (
     SettingsStore, application_settings, parse_application_arguments,
     portable_settings_path, settings_sync_error, settings_sync_was_committed,
@@ -149,6 +156,7 @@ class PendingIsoWrite:
     allow_unsigned_payloads: bool = False
     persistence_profile: CasperCompatibilityProfile | None = None
     persistence_bytes: int = 0
+    runtime_validation: PreparedRuntimeValidation | None = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +198,7 @@ class IsoStagingPreparationRequest:
     windows_architecture: str
     persistence_profile: CasperCompatibilityProfile | None
     persistence_bytes: int
+    runtime_validation_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -296,6 +305,7 @@ class Window(QMainWindow):
         self.casper_writer: CasperMediaExecutor | None = None
         self.pending_iso_write: PendingIsoWrite | None = None
         self.iso_workspace: tempfile.TemporaryDirectory[str] | None = None
+        self.runtime_validation_cancel_event = threading.Event()
         self.windows_options = WindowsCustomization()
         self.windows_wim_candidates: tuple[ArchiveEntry, ...] = ()
         self.windows_install_source_count = 0
@@ -548,12 +558,23 @@ class Window(QMainWindow):
         write_options = QHBoxLayout()
         self.verify = QCheckBox("Verify after writing")
         self.verify.setChecked(True)
+        self.runtime_validation = QCheckBox(
+            "Boot-time corruption check (MD5)"
+        )
+        self.runtime_validation.setObjectName("runtimeValidationCheckBox")
+        self.runtime_validation.setChecked(False)
+        self.runtime_validation.setToolTip(
+            "Optional accidental-corruption check on later boots. The unsigned "
+            "MD5 manifest does not authenticate the image, can be replaced with "
+            "the USB contents, and is bypassable/fail-open. It adds boot time."
+        )
         self.show_external = QCheckBox("Show USB hard drives/SSDs")
         self.show_external.setToolTip(
             "External fixed disks are hidden by default to protect backup drives."
         )
         self.show_external.toggled.connect(self.refresh_devices)
         write_options.addWidget(self.verify)
+        write_options.addWidget(self.runtime_validation)
         write_options.addWidget(self.show_external)
         write_options.addStretch()
         options.addLayout(write_options)
@@ -848,6 +869,9 @@ class Window(QMainWindow):
         self.persistence_checkbox.setChecked(False)
         self.persistence_checkbox.blockSignals(False)
         self.persistence_controls.setVisible(False)
+        self.runtime_validation.blockSignals(True)
+        self.runtime_validation.setChecked(False)
+        self.runtime_validation.blockSignals(False)
         self.windows_options = WindowsCustomization()
         if self.windows_wim_extractor is not None:
             self.windows_wim_extractor.cancel()
@@ -1014,6 +1038,85 @@ class Window(QMainWindow):
         if merged is None or merged.base_entries != base_entries:
             raise ValueError("The ZIP overlay no longer matches the inspected ISO catalog")
         return merged.merged_entries
+
+    @staticmethod
+    def runtime_validation_architectures(
+        entries: tuple[ArchiveEntry, ...],
+    ) -> tuple[str, ...]:
+        files = {
+            entry.path.casefold()
+            for entry in entries
+            if entry.kind is EntryKind.FILE
+        }
+        return tuple(
+            profile.architecture
+            for profile in RUNTIME_VALIDATION_ARTIFACTS
+            if profile.fallback_path.casefold() in files
+        )
+
+    def runtime_validation_exclusion_reason(self) -> str:
+        if self.selected_write_mode() is not WriteMode.EXTRACTED_ISO:
+            return "Choose filesystem-aware ISO mode."
+        recommendation = self.write_recommendation
+        plan = recommendation.iso_plan if recommendation is not None else None
+        if (
+            plan is None or not plan.executable or plan.layout is None
+            or plan.layout.boot_strategy is not BootStrategy.IMAGE_NATIVE
+            or plan.layout.main_filesystem.value != "fat32"
+        ):
+            return "The first supported path is native UEFI/FAT32 ISO mode."
+        if self.selected_persistence_bytes():
+            return "Boot-time validation is not yet certified with persistence."
+        try:
+            entries = self.effective_archive_entries()
+        except ValueError:
+            return "The effective ISO catalog is no longer valid."
+        if any(
+            entry.path.split("/", 1)[0].casefold() == "casper"
+            for entry in entries
+        ):
+            return (
+                "Casper/Ubuntu media are temporarily excluded pending installer "
+                "compatibility testing."
+            )
+        if any(
+            "/" not in entry.path
+            and entry.path.casefold() == "md5sum.txt"
+            and entry.path != "md5sum.txt"
+            for entry in entries
+        ):
+            return "A root case alias conflicts with the required md5sum.txt manifest."
+        reserved_originals = {
+            profile.original_path.casefold()
+            for profile in RUNTIME_VALIDATION_ARTIFACTS
+        }
+        if any(entry.path.casefold() in reserved_originals for entry in entries):
+            return "A reserved boot*_original.efi chainload path already exists."
+        overlay = self.zip_overlay_plan
+        if overlay is not None and any(
+            member.entry.path.casefold() == "md5sum.txt"
+            for member in overlay.members
+        ):
+            return "The ZIP overlay supplies the manifest name that must be regenerated."
+        if not self.runtime_validation_architectures(entries):
+            return "No supported removable-media UEFI fallback loader was found."
+        return ""
+
+    def update_runtime_validation_control(self) -> None:
+        reason = self.runtime_validation_exclusion_reason()
+        if reason:
+            self.runtime_validation.blockSignals(True)
+            self.runtime_validation.setChecked(False)
+            self.runtime_validation.blockSignals(False)
+        self.runtime_validation.setEnabled(not reason and not self.operation_active)
+        limitations = (
+            "The unsigned MD5 manifest detects accidental corruption only; it "
+            "does not authenticate the image, is replaceable with the USB files, "
+            "and can be bypassed or fail open. Validation adds boot time."
+        )
+        self.runtime_validation.setToolTip(
+            f"Unavailable: {reason}\n\n{limitations}" if reason else limitations
+        )
 
     def _zip_overlay_is_on_target(self, device: Device | None = None) -> bool:
         plan = self.zip_overlay_plan
@@ -1344,6 +1447,7 @@ class Window(QMainWindow):
             and self.persistence_checkbox.isChecked()
             and not self.operation_active
         )
+        self.update_runtime_validation_control()
         self.update_ready()
 
     def rebuild_write_recommendation(self, *, preserve_selection: bool = True) -> None:
@@ -1470,6 +1574,7 @@ class Window(QMainWindow):
         self.verify.setEnabled(
             not self.operation_active and not mandatory_verification
         )
+        self.update_runtime_validation_control()
         self.write_button.setText(
             "Write in ISO mode" if iso_mode else
             "Restore VTSI image" if vtsi_mode else
@@ -2012,6 +2117,7 @@ class Window(QMainWindow):
         self.casper_stager = None
         self.casper_writer = None
         self.pending_iso_write = None
+        self.runtime_validation_cancel_event = threading.Event()
         if self.iso_workspace is not None:
             try:
                 self.iso_workspace.cleanup()
@@ -2047,6 +2153,7 @@ class Window(QMainWindow):
         if mandatory_verification:
             self.verify.setChecked(True)
         self.verify.setEnabled(not busy and not mandatory_verification)
+        self.runtime_validation.setEnabled(False)
         self.show_external.setEnabled(not busy)
         self.tools_button.setEnabled(not busy and self.selected_device() is not None)
         self.uefi_shell_button.setEnabled(
@@ -2068,6 +2175,7 @@ class Window(QMainWindow):
         self.cancel_button.setEnabled(busy)
         if not busy:
             self.update_persistence_controls()
+            self.update_runtime_validation_control()
             self.update_ready()
 
     def cancel(self) -> None:
@@ -2080,6 +2188,7 @@ class Window(QMainWindow):
             self.zip_overlay_token = None
             self.update_zip_overlay_controls()
         self.inspection_cancel_event.set()
+        self.runtime_validation_cancel_event.set()
         self.inspection_busy = False
         active = tuple(filter(None, (
             self.writer, self.imager, self.formatter, self.media_runner, self.eraser,
@@ -4131,6 +4240,51 @@ class Window(QMainWindow):
             )
             if warning != QMessageBox.StandardButton.Yes:
                 return
+        runtime_validation_requested = self.runtime_validation.isChecked()
+        if runtime_validation_requested:
+            runtime_reason = self.runtime_validation_exclusion_reason()
+            if runtime_reason:
+                self.runtime_validation.setChecked(False)
+                QMessageBox.warning(
+                    self,
+                    "Boot-time corruption check unavailable",
+                    runtime_reason,
+                )
+                return
+            architectures = self.runtime_validation_architectures(effective_entries)
+            unsigned_architectures = tuple(
+                profile.architecture
+                for profile in RUNTIME_VALIDATION_ARTIFACTS
+                if (
+                    profile.architecture in architectures
+                    and profile.signature_state is SignatureTableState.ABSENT
+                )
+            )
+            secure_boot_note = (
+                "\n\nThe " + ", ".join(unsigned_architectures)
+                + " wrapper(s) are unsigned and require Secure Boot disabled."
+                if unsigned_architectures else
+                "\n\nThe signed x64/x86/ARM64 wrappers still depend on firmware "
+                "trust in Microsoft UEFI CA 2011 and current DBX policy."
+            )
+            answer = QMessageBox.question(
+                self,
+                "Prepare the boot-time corruption check?",
+                f"ISOpropyl will obtain the exact, release-pinned uefi-md5sum "
+                f"v{RUNTIME_VALIDATION_VERSION} EFI wrappers (or use their verified "
+                "cache), then verify size, SHA-256, PE architecture, and signature "
+                "table state before use.\n\n"
+                "At boot, they check an unsigned MD5 manifest for accidental media "
+                "damage. This is not image authentication: anyone able to rewrite "
+                "the USB can replace both files and manifest, and missing, malformed, "
+                "cancelled, or failed validation can chainload the original bootloader. "
+                "The check also adds boot time."
+                f"{secure_boot_note}\n\nContinue?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         working_parent = QFileDialog.getExistingDirectory(
             self,
             "Choose temporary working space for ISO mode",
@@ -4195,6 +4349,7 @@ class Window(QMainWindow):
             architecture,
             persistence_profile=persistence_profile,
             persistence_bytes=persistence_bytes,
+            runtime_validation_requested=runtime_validation_requested,
         )
         self.iso_staging_preparation_generation += 1
         operation = BackgroundPreparation()
@@ -4213,7 +4368,7 @@ class Window(QMainWindow):
                     raise IsoStagingCancelled("ISO staging-plan preparation was cancelled")
 
             try:
-                result: object = build_iso_staging_plan(
+                staging_plan = build_iso_staging_plan(
                     request.image,
                     Path(request.workspace.name) / "ready-media",
                     request.base_entries,
@@ -4223,6 +4378,17 @@ class Window(QMainWindow):
                     windows_customization=request.windows_customization,
                     windows_architecture=request.windows_architecture,
                 )
+                if request.runtime_validation_requested:
+                    prepared = prepare_runtime_validation(
+                        cancel_event=operation.cancel_event,
+                        progress=lambda done, total: self.bridge.progress.emit(
+                            done, total,
+                            f"Obtaining verified uefi-md5sum v{RUNTIME_VALIDATION_VERSION}",
+                        ),
+                    )
+                    result: object = (staging_plan, prepared)
+                else:
+                    result = staging_plan
             except Exception as error:
                 result = error
             self.bridge.iso_staging_preparation_finished.emit(token, result)
@@ -4253,6 +4419,21 @@ class Window(QMainWindow):
         self.iso_staging_preparer = None
         self.iso_staging_token = None
         self.progress.setRange(0, 1000)
+        prepared_runtime_validation: PreparedRuntimeValidation | None = None
+        if request.runtime_validation_requested:
+            if (
+                isinstance(result, tuple) and len(result) == 2
+                and type(result[0]) is IsoStagingPlan
+                and type(result[1]) is PreparedRuntimeValidation
+            ):
+                result, prepared_runtime_validation = result
+                try:
+                    validate_prepared_runtime_validation(
+                        prepared_runtime_validation
+                    )
+                except RuntimeValidationError as error:
+                    prepared_runtime_validation = None
+                    result = error
         current = False
         try:
             current = bool(
@@ -4263,6 +4444,10 @@ class Window(QMainWindow):
                 and self.archive_entries() == request.base_entries
                 and image_identity(request.image) == request.image_identity
                 and not path_is_on_device(request.workspace.name, request.device)
+                and (
+                    not request.runtime_validation_requested
+                    or not self.runtime_validation_exclusion_reason()
+                )
             )
         except OSError:
             current = False
@@ -4274,7 +4459,13 @@ class Window(QMainWindow):
             self.set_busy(False)
             self.status.setText("ISO staging-plan preparation cancelled")
             return
-        if not current or not isinstance(result, IsoStagingPlan):
+        if (
+            not current or type(result) is not IsoStagingPlan
+            or (
+                request.runtime_validation_requested
+                and prepared_runtime_validation is None
+            )
+        ):
             try:
                 request.workspace.cleanup()
             except OSError as error:
@@ -4327,6 +4518,7 @@ class Window(QMainWindow):
             staging_plan=result,
             persistence_profile=request.persistence_profile,
             persistence_bytes=request.persistence_bytes,
+            runtime_validation=prepared_runtime_validation,
         )
         self.set_busy(False)
         self._continue_prepared_iso_write(pending)
@@ -4582,6 +4774,73 @@ class Window(QMainWindow):
         assert write_plan.layout is not None
         strategy = write_plan.layout.boot_strategy
         persistence_enabled = pending.persistence_profile is not None
+        runtime_validation_enabled = pending.runtime_validation is not None
+        runtime_architectures = self.runtime_validation_architectures(
+            staging_plan.effective_entries
+        )
+        runtime_overlay_conflict = bool(
+            staging_plan.overlay is not None
+            and any(
+                member.entry.path.casefold() == "md5sum.txt"
+                for member in staging_plan.overlay.members
+            )
+        )
+        runtime_casper_conflict = any(
+            entry.path.split("/", 1)[0].casefold() == "casper"
+            for entry in staging_plan.effective_entries
+        )
+        runtime_reserved_originals = {
+            profile.original_path.casefold()
+            for profile in RUNTIME_VALIDATION_ARTIFACTS
+        }
+        runtime_reserved_conflict = any(
+            (
+                "/" not in entry.path
+                and entry.path.casefold() == "md5sum.txt"
+                and entry.path != "md5sum.txt"
+            )
+            or entry.path.casefold() in runtime_reserved_originals
+            for entry in staging_plan.effective_entries
+        )
+        if runtime_validation_enabled:
+            try:
+                assert pending.runtime_validation is not None
+                validate_prepared_runtime_validation(pending.runtime_validation)
+            except (AssertionError, RuntimeValidationError) as error:
+                try:
+                    workspace.cleanup()
+                except OSError as cleanup_error:
+                    self.logger.warning(
+                        "Could not remove ISO workspace: %s", cleanup_error,
+                    )
+                self.set_busy(False)
+                QMessageBox.warning(
+                    self,
+                    "Boot-time corruption check unavailable",
+                    f"The prepared uefi-md5sum payload set is invalid: {error}",
+                )
+                return
+        if runtime_validation_enabled and (
+            strategy is not BootStrategy.IMAGE_NATIVE
+            or write_plan.layout.main_filesystem.value != "fat32"
+            or persistence_enabled
+            or runtime_overlay_conflict
+            or runtime_casper_conflict
+            or runtime_reserved_conflict
+            or not runtime_architectures
+        ):
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "Boot-time corruption check unavailable",
+                "The frozen ISO-mode plan is no longer eligible for the first "
+                "native UEFI/FAT32 runtime-validation profile.",
+            )
+            return
         try:
             workspace_on_target = path_is_on_device(workspace.name, device)
         except OSError:
@@ -4706,6 +4965,33 @@ class Window(QMainWindow):
             mode_description = (
                 "UEFI-only · GPT · FAT32 · full file read-back verification"
             )
+        if runtime_validation_enabled:
+            unsigned_architectures = tuple(
+                profile.architecture
+                for profile in RUNTIME_VALIDATION_ARTIFACTS
+                if (
+                    profile.architecture in runtime_architectures
+                    and profile.signature_state is SignatureTableState.ABSENT
+                )
+            )
+            customization += (
+                "\nBoot-time check: uefi-md5sum "
+                f"v{RUNTIME_VALIDATION_VERSION} for "
+                f"{', '.join(runtime_architectures)}."
+                "\nIntegrity limit: unsigned MD5 accidental-corruption detection "
+                "only; not image authentication; missing, malformed, cancelled, "
+                "or failed validation can chainload the original loader."
+            )
+            if unsigned_architectures:
+                customization += (
+                    "\nSecure Boot: disabled is required for the unsigned "
+                    f"{', '.join(unsigned_architectures)} wrapper(s)."
+                )
+            else:
+                customization += (
+                    "\nSecure Boot: signed wrappers still depend on Microsoft UEFI "
+                    "CA 2011 third-party trust and current DBX policy."
+                )
         answer = QMessageBox.warning(
             self,
             "Erase drive and write in ISO mode?",
@@ -4773,6 +5059,8 @@ class Window(QMainWindow):
 
         self.iso_workspace = workspace
         self.iso_stager = IsoStagingExecutor()
+        runtime_validation_cancel_event = threading.Event()
+        self.runtime_validation_cancel_event = runtime_validation_cancel_event
         if persistence_enabled:
             self.casper_stager = CasperStagingExecutor()
             self.casper_writer = CasperMediaExecutor()
@@ -4814,6 +5102,10 @@ class Window(QMainWindow):
                     casper_staging = self.casper_stager.execute(
                         casper_staging_plan
                     )
+                    if runtime_validation_enabled:
+                        raise RuntimeError(
+                            "Runtime validation is not enabled for persistent media"
+                        )
                     target_plan = build_casper_media_plan(
                         staged.destination,
                         casper_staging,
@@ -4833,6 +5125,10 @@ class Window(QMainWindow):
                         ),
                     )
                 elif strategy is BootStrategy.UEFI_NTFS:
+                    if runtime_validation_enabled:
+                        raise RuntimeError(
+                            "Runtime validation is not enabled for UEFI:NTFS media"
+                        )
                     assert artifact is not None
                     assert self.uefi_ntfs_writer is not None
                     partition_table = FormatPartitionTable(
@@ -4860,6 +5156,22 @@ class Window(QMainWindow):
                     )
                 else:
                     assert self.constructed_writer is not None
+                    if runtime_validation_enabled:
+                        assert pending.runtime_validation is not None
+                        self.bridge.progress.emit(
+                            staged.bytes_staged,
+                            staged.bytes_staged,
+                            "Generating the boot-time corruption manifest",
+                        )
+                        runtime_stage = apply_runtime_validation(
+                            pending.runtime_validation,
+                            staged.destination,
+                            cancel_event=runtime_validation_cancel_event,
+                        )
+                        validate_runtime_validation_stage(
+                            runtime_stage,
+                            cancel_event=runtime_validation_cancel_event,
+                        )
                     partition_table = FormatPartitionTable(
                         write_plan.layout.partition_table.value
                     )
@@ -4879,10 +5191,14 @@ class Window(QMainWindow):
                             ),
                         ),
                     )
+                runtime_suffix = (
+                    " Boot-time corruption checking is enabled."
+                    if runtime_validation_enabled else ""
+                )
                 if result.powered_off:
                     message = (
                         "Your UEFI bootable USB is ready and safely powered off. "
-                        "You can remove it."
+                        f"You can remove it.{runtime_suffix}"
                     )
                 elif not result.unmounted:
                     detail = (
@@ -4892,17 +5208,17 @@ class Window(QMainWindow):
                     message = (
                         "The bootable USB was written, but it could not be cleanly "
                         f"unmounted. {detail}Close files using it, then eject it "
-                        "with your desktop."
+                        f"with your desktop.{runtime_suffix}"
                     )
                 else:
                     message = (
                         "Your UEFI bootable USB is ready. Eject it with your desktop "
-                        "before removing it."
+                        f"before removing it.{runtime_suffix}"
                     )
                 success = True
             except (
                 IsoStagingCancelled, ConstructedMediaCancelled, UefiNtfsCancelled,
-                CasperMediaCancelled,
+                CasperMediaCancelled, RuntimeValidationCancelled,
             ) as error:
                 self.logger.info("ISO-mode operation cancelled: %s", error)
                 message = str(error)

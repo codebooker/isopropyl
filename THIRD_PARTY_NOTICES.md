@@ -2,9 +2,10 @@
 
 ISOpropyl's application code is licensed under AGPL-3.0-or-later. The optional
 boot artifacts below are not part of the Python package. The package contains
-only pinned catalog metadata. UEFI:NTFS is obtained only after explicit user
-consent. The GRUB and Syslinux entries are dormant preparation inputs: normal
-writes do not download them and no BIOS executor consumes them yet.
+only pinned catalog metadata. UEFI:NTFS and the optional boot-time corruption
+validator are obtained only after explicit user consent. The GRUB and Syslinux
+entries are dormant preparation inputs: normal writes do not download them and
+no BIOS executor consumes them yet.
 
 ## Ubuntu CD Image signing key
 
@@ -39,6 +40,41 @@ when the user explicitly starts and confirms **Create UEFI Shell…**. Normal im
 writes never acquire them. The unmodified executables are not Secure Boot signed
 and require Secure Boot disabled; ISOpropyl does not claim certificate-chain or
 Secure Boot trust for them.
+
+## UEFI boot-time media validator
+
+- Upstream release: [uefi-md5sum v1.2](https://github.com/pbatard/uefi-md5sum/releases/tag/v1.2)
+- Exact source snapshot:
+  [`6195f2ef`](https://github.com/pbatard/uefi-md5sum/tree/6195f2ef754c2ad390bda6590628708f410d55f6)
+- License: GPL-2.0-or-later
+- `bootaa64_signed.efi`: 50,704 bytes, SHA-256
+  `799b64e8d32cbe5829b2f81c96a1a4936935da31df7ce70c0e6ae68ffdaf23bd`
+- `bootarm.efi`: 27,232 bytes, SHA-256
+  `10eadb8e80f446ebd62568f9275d6a328cfdc399ef8b2ee71857c3d2f7134f28`
+- `bootia32_signed.efi`: 40,280 bytes, SHA-256
+  `089190606ad0e16b58b208aa262533c941f11a9a27a48fade672efcca3a720c1`
+- `bootloongarch64.efi`: 35,712 bytes, SHA-256
+  `0085afb9ca64ac5f922b21d541344b3ff140e13acf596041ff6ce7b7d71c229e`
+- `bootriscv64.efi`: 38,656 bytes, SHA-256
+  `3e53e975fad71c7e30ac35bfc83ba5b31fad7e6d9deaaee14f77dab820ed2c7a`
+- `bootx64_signed.efi`: 40,536 bytes, SHA-256
+  `9b0b326ca3da0693fc99789f73e548c3dc69a2cd654bd7abcd1a92ba900878cc`
+
+The executables are downloaded only after the user explicitly enables and
+confirms boot-time corruption checking. They are frozen into immutable bytes
+after exact size, SHA-256, PE architecture, EFI subsystem, and signature-table
+state checks, and are never executed on Linux. The x64, x86, and ARM64 files are
+the upstream Secure-Boot-signed variants; firmware acceptance still depends on
+Microsoft UEFI CA 2011 third-party trust and revocation state. ARM32, RISC-V64,
+and LoongArch64 are unsigned and require Secure Boot disabled.
+
+The generated on-media `md5sum.txt` is intentionally compatible with upstream
+uefi-md5sum and detects accidental media damage at boot. MD5 and this unsigned
+local manifest do not authenticate the image, resist malicious replacement, or
+provide verified boot. Upstream validation can be cancelled, a reported
+mismatch can be bypassed by the person at the machine, and a missing or malformed
+manifest does not prevent chainloading. Corresponding source and build/test
+instructions are available at the exact source snapshot linked above.
 
 ## Python Authenticode analysis
 

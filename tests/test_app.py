@@ -47,6 +47,11 @@ from isopropyl.iso_staging import IsoStagingPlan
 from isopropyl.linux_downloads import DownloadedLinuxImage, available_linux_images
 from isopropyl.extraction import SafeIsoExtractor
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
+from isopropyl.runtime_validation import (
+    RUNTIME_VALIDATION_LICENSE, RUNTIME_VALIDATION_PROVENANCE_URL,
+    RUNTIME_VALIDATION_VERSION, PreparedRuntimeValidation,
+    RuntimeValidationCancelled,
+)
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
 from isopropyl.wim import WimEdition, WimInfo, WimSelection
@@ -196,6 +201,15 @@ def fake_iso_staging_plan(
         overlay=overlay,
         effective_entries=effective_entries,
         effective_catalog_digest=digest,
+    )
+
+
+def fake_runtime_validation() -> PreparedRuntimeValidation:
+    return PreparedRuntimeValidation(
+        RUNTIME_VALIDATION_VERSION,
+        (),
+        RUNTIME_VALIDATION_LICENSE,
+        RUNTIME_VALIDATION_PROVENANCE_URL,
     )
 
 
@@ -2905,6 +2919,444 @@ class WindowZipOverlayTests(unittest.TestCase):
         workspace.cleanup.assert_called_once_with()
         self.assertIn("workspace moved onto", warning.call_args.args[2])
         self.assertIsNone(self.window.iso_stager)
+
+
+class WindowRuntimeValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
+            self.window = Window()
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.image = Path(self.settings_home.name) / "windows.iso"
+        self.window.image.write_bytes(b"fixture")
+        status = self.window.image.stat()
+        self.identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        self.window.inspection = optical_windows_inspection()
+        self.window.inspection_identity = self.identity
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+    def tearDown(self) -> None:
+        self.window.iso_stager = None
+        self.window.constructed_writer = None
+        self.window.iso_workspace = None
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+        self.settings_home.cleanup()
+
+    def test_default_off_and_mode_changes_fail_closed(self):
+        self.assertFalse(self.window.runtime_validation.isChecked())
+        self.assertTrue(self.window.runtime_validation.isEnabled())
+        self.window.runtime_validation.setChecked(True)
+
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+
+        self.assertFalse(self.window.runtime_validation.isChecked())
+        self.assertFalse(self.window.runtime_validation.isEnabled())
+        self.assertIn("ISO mode", self.window.runtime_validation.toolTip())
+
+    def test_casper_catalog_is_excluded(self):
+        assert self.window.inspection is not None
+        self.window.inspection = replace(
+            self.window.inspection,
+            members=self.window.inspection.members
+            + (ImageMember("casper/filesystem.squashfs", 1024, "file"),),
+        )
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+        self.assertFalse(self.window.runtime_validation.isEnabled())
+        self.assertIn("Casper", self.window.runtime_validation.toolTip())
+
+    def test_reserved_manifest_alias_is_excluded_before_download(self):
+        assert self.window.inspection is not None
+        self.window.inspection = replace(
+            self.window.inspection,
+            members=self.window.inspection.members
+            + (ImageMember("MD5SUM.TXT", 10, "file"),),
+        )
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+        self.assertFalse(self.window.runtime_validation.isEnabled())
+        self.assertIn("case alias", self.window.runtime_validation.toolTip())
+
+    def test_selecting_persistence_clears_runtime_validation(self):
+        self.window.persistence_profile = Mock()
+        self.window.persistence_controls.setVisible(True)
+        self.window.persistence_checkbox.setEnabled(True)
+        self.window.runtime_validation.setChecked(True)
+
+        self.window.persistence_checkbox.setChecked(True)
+
+        self.assertFalse(self.window.runtime_validation.isChecked())
+        self.assertFalse(self.window.runtime_validation.isEnabled())
+        self.assertIn("persistence", self.window.runtime_validation.toolTip())
+
+    def test_uefi_ntfs_plan_is_excluded(self):
+        assert self.window.inspection is not None
+        self.window.inspection = replace(
+            self.window.inspection,
+            members=self.window.inspection.members
+            + (ImageMember("payload/oversized.bin", 4 * 1024**3 + 1, "file"),),
+        )
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+        self.assertFalse(self.window.runtime_validation.isEnabled())
+        self.assertIn("native UEFI/FAT32", self.window.runtime_validation.toolTip())
+
+    def test_overlay_manifest_name_is_excluded_but_nested_name_is_not(self):
+        root_overlay = make_zip_overlay(
+            Path(self.settings_home.name), "md5sum.txt",
+        )
+        self.window.zip_overlay_plan = root_overlay
+        self.window.zip_overlay_merge = merge_additive_overlay_entries(
+            self.window.archive_entries(),
+            (member.entry for member in root_overlay.members),
+        )
+        self.window.rebuild_write_recommendation()
+        self.assertFalse(self.window.runtime_validation.isEnabled())
+        self.assertIn("manifest", self.window.runtime_validation.toolTip())
+
+        self.window.zip_overlay_plan = None
+        self.window.zip_overlay_merge = None
+        nested_overlay = make_zip_overlay(
+            Path(self.settings_home.name), "docs/md5sum.txt",
+        )
+        self.window.zip_overlay_plan = nested_overlay
+        self.window.zip_overlay_merge = merge_additive_overlay_entries(
+            self.window.archive_entries(),
+            (member.entry for member in nested_overlay.members),
+        )
+        self.window.rebuild_write_recommendation()
+        self.assertTrue(self.window.runtime_validation.isEnabled())
+
+    def test_new_image_resets_the_option(self):
+        replacement = Path(self.settings_home.name) / "replacement.iso"
+        replacement.write_bytes(b"replacement")
+        self.window.runtime_validation.setChecked(True)
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                pass
+
+        with patch("isopropyl.app.threading.Thread", DeferredThread):
+            self.window.load_image(replacement)
+
+        self.assertFalse(self.window.runtime_validation.isChecked())
+        self.window.on_inspection_worker_finished()
+
+    def test_declining_network_consent_starts_no_preparation(self):
+        self.window.runtime_validation.setChecked(True)
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=self.identity),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ),
+            patch("isopropyl.app.QFileDialog.getExistingDirectory") as chooser,
+            patch("isopropyl.app.tempfile.TemporaryDirectory") as temporary,
+            patch("isopropyl.app.build_iso_staging_plan") as staging,
+            patch("isopropyl.app.prepare_runtime_validation") as prepare,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        chooser.assert_not_called()
+        temporary.assert_not_called()
+        staging.assert_not_called()
+        prepare.assert_not_called()
+
+    def test_consented_preparation_binds_exact_payload_to_pending_write(self):
+        self.window.runtime_validation.setChecked(True)
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        prepared = fake_runtime_validation()
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=self.identity),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch(
+                "isopropyl.app.build_iso_staging_plan",
+                side_effect=fake_iso_staging_plan,
+            ),
+            patch(
+                "isopropyl.app.prepare_runtime_validation",
+                return_value=prepared,
+            ) as prepare,
+            patch(
+                "isopropyl.app.validate_prepared_runtime_validation",
+                side_effect=lambda value: value,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        prepare.assert_called_once()
+        self.assertFalse(prepare.call_args.kwargs["cancel_event"].is_set())
+        pending = continuation.call_args.args[0]
+        self.assertIs(pending.runtime_validation, prepared)
+        pending.workspace.cleanup()
+
+    def test_malformed_background_payload_is_rejected_at_handoff(self):
+        self.window.runtime_validation.setChecked(True)
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=self.identity),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch(
+                "isopropyl.app.build_iso_staging_plan",
+                side_effect=fake_iso_staging_plan,
+            ),
+            patch(
+                "isopropyl.app.prepare_runtime_validation",
+                return_value=fake_runtime_validation(),
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        continuation.assert_not_called()
+        self.assertIn("not exact", warning.call_args.args[2])
+        self.assertFalse(self.window.operation_active)
+
+    def test_final_confirmation_discloses_md5_and_fail_open_limits(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        staging = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            plan,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging,
+            runtime_validation=fake_runtime_validation(),
+        )
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.validate_prepared_runtime_validation",
+                side_effect=lambda value: value,
+            ),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        confirmation = warning.call_args.args[2]
+        self.assertIn("unsigned MD5", confirmation)
+        self.assertIn("not image authentication", confirmation)
+        self.assertIn("chainload the original", confirmation)
+        self.assertIn("Secure Boot", confirmation)
+        workspace.cleanup.assert_called_once_with()
+
+    def test_malformed_prepared_payload_is_rejected_before_confirmation(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        staging = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            plan,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging,
+            runtime_validation=fake_runtime_validation(),
+        )
+        with patch("isopropyl.app.QMessageBox.warning") as warning:
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        self.assertIn("payload set is invalid", warning.call_args.args[2])
+        workspace.cleanup.assert_called_once_with()
+        self.assertIsNone(self.window.iso_stager)
+
+    def test_runtime_transform_precedes_final_plan_and_writer(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        root = Path(self.settings_home.name) / "ready-media"
+        staging_plan = fake_iso_staging_plan(
+            self.window.image, root, self.window.archive_entries(), plan,
+        )
+        prepared = fake_runtime_validation()
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging_plan, runtime_validation=prepared,
+        )
+        order = []
+        stager = Mock()
+        stager.execute.side_effect = lambda *_args: (
+            order.append("stage")
+            or SimpleNamespace(destination=root, bytes_staged=1024)
+        )
+        writer = Mock()
+        writer.execute.side_effect = lambda *_args: (
+            order.append("write")
+            or SimpleNamespace(powered_off=True, unmounted=True, cleanup_diagnostic="")
+        )
+        runtime_stage = object()
+        finished = Mock()
+        self.window.bridge.finished.disconnect()
+        self.window.bridge.finished.connect(finished)
+
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.validate_prepared_runtime_validation",
+                side_effect=lambda value: value,
+            ),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
+            patch("isopropyl.app.ConstructedMediaExecutor", return_value=writer),
+            patch(
+                "isopropyl.app.apply_runtime_validation",
+                side_effect=lambda *args, **kwargs: (
+                    order.append("apply") or runtime_stage
+                ),
+            ) as apply,
+            patch(
+                "isopropyl.app.validate_runtime_validation_stage",
+                side_effect=lambda *_args, **_kwargs: order.append("validate"),
+            ) as validate_stage,
+            patch(
+                "isopropyl.app.build_constructed_media_plan",
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("plan") or object()
+                ),
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        self.assertEqual(order, ["stage", "apply", "validate", "plan", "write"])
+        self.assertIs(apply.call_args.args[0], prepared)
+        self.assertEqual(apply.call_args.args[1], root)
+        self.assertIs(
+            apply.call_args.kwargs["cancel_event"],
+            self.window.runtime_validation_cancel_event,
+        )
+        self.assertIs(
+            validate_stage.call_args.kwargs["cancel_event"],
+            self.window.runtime_validation_cancel_event,
+        )
+        self.assertTrue(finished.call_args.args[0])
+
+    def test_cancellation_during_transform_never_builds_target_plan(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        root = Path(self.settings_home.name) / "ready-media"
+        staging_plan = fake_iso_staging_plan(
+            self.window.image, root, self.window.archive_entries(), plan,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging_plan,
+            runtime_validation=fake_runtime_validation(),
+        )
+        stager = Mock()
+        stager.execute.return_value = SimpleNamespace(
+            destination=root, bytes_staged=1024,
+        )
+        finished = Mock()
+        self.window.bridge.finished.disconnect()
+        self.window.bridge.finished.connect(finished)
+
+        def cancel_transform(*_args, **kwargs):
+            self.window.cancel()
+            self.assertTrue(kwargs["cancel_event"].is_set())
+            raise RuntimeValidationCancelled("cancelled")
+
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.validate_prepared_runtime_validation",
+                side_effect=lambda value: value,
+            ),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
+            patch("isopropyl.app.ConstructedMediaExecutor") as writer,
+            patch(
+                "isopropyl.app.apply_runtime_validation",
+                side_effect=cancel_transform,
+            ),
+            patch("isopropyl.app.build_constructed_media_plan") as build,
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        build.assert_not_called()
+        writer.return_value.execute.assert_not_called()
+        self.assertFalse(finished.call_args.args[0])
 
 
 class WindowPersistenceTests(unittest.TestCase):

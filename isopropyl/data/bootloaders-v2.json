@@ -135,6 +135,60 @@
       "sha256": "4ea080ddd576117cd04f5c02d16712ea5d9249c0752214d8e4055e460d7b11e0",
       "size": 1137728,
       "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-md5sum",
+      "version": "1.2",
+      "name": "bootaa64_signed.efi",
+      "url": "https://github.com/pbatard/uefi-md5sum/releases/download/v1.2/bootaa64_signed.efi",
+      "sha256": "799b64e8d32cbe5829b2f81c96a1a4936935da31df7ce70c0e6ae68ffdaf23bd",
+      "size": 50704,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-md5sum",
+      "version": "1.2",
+      "name": "bootarm.efi",
+      "url": "https://github.com/pbatard/uefi-md5sum/releases/download/v1.2/bootarm.efi",
+      "sha256": "10eadb8e80f446ebd62568f9275d6a328cfdc399ef8b2ee71857c3d2f7134f28",
+      "size": 27232,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-md5sum",
+      "version": "1.2",
+      "name": "bootia32_signed.efi",
+      "url": "https://github.com/pbatard/uefi-md5sum/releases/download/v1.2/bootia32_signed.efi",
+      "sha256": "089190606ad0e16b58b208aa262533c941f11a9a27a48fade672efcca3a720c1",
+      "size": 40280,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-md5sum",
+      "version": "1.2",
+      "name": "bootloongarch64.efi",
+      "url": "https://github.com/pbatard/uefi-md5sum/releases/download/v1.2/bootloongarch64.efi",
+      "sha256": "0085afb9ca64ac5f922b21d541344b3ff140e13acf596041ff6ce7b7d71c229e",
+      "size": 35712,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-md5sum",
+      "version": "1.2",
+      "name": "bootriscv64.efi",
+      "url": "https://github.com/pbatard/uefi-md5sum/releases/download/v1.2/bootriscv64.efi",
+      "sha256": "3e53e975fad71c7e30ac35bfc83ba5b31fad7e6d9deaaee14f77dab820ed2c7a",
+      "size": 38656,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
+    },
+    {
+      "family": "uefi-md5sum",
+      "version": "1.2",
+      "name": "bootx64_signed.efi",
+      "url": "https://github.com/pbatard/uefi-md5sum/releases/download/v1.2/bootx64_signed.efi",
+      "sha256": "9b0b326ca3da0693fc99789f73e548c3dc69a2cd654bd7abcd1a92ba900878cc",
+      "size": 40536,
+      "allowed_hosts": ["release-assets.githubusercontent.com"]
     }
   ],
   "bundles": [
@@ -209,6 +263,14 @@
       "artifacts": ["shellaa64.efi", "shellia32.efi", "shellloongarch64.efi", "shellriscv64.efi", "shellx64.efi"],
       "license": "BSD-2-Clause-Patent",
       "provenance_url": "https://github.com/pbatard/UEFI-Shell/releases/tag/26H1"
+    },
+    {
+      "family": "uefi-md5sum",
+      "version": "1.2",
+      "purpose": "runtime-media-validation",
+      "artifacts": ["bootaa64_signed.efi", "bootarm.efi", "bootia32_signed.efi", "bootloongarch64.efi", "bootriscv64.efi", "bootx64_signed.efi"],
+      "license": "GPL-2.0-or-later",
+      "provenance_url": "https://github.com/pbatard/uefi-md5sum/tree/6195f2ef754c2ad390bda6590628708f410d55f6"
     }
   ]
 }

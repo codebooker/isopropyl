@@ -155,7 +155,8 @@ issue requesting a private contact channel without disclosing the vulnerability.
 - The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
   dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
   2.06/2.12/2.14 blank-media research bundles, plus the exact upstream UEFI
-  Shell 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 release set. It records
+  Shell 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 release set and the exact
+  six-architecture `uefi-md5sum` v1.2 runtime-validation set. It records
   immutable upstream
   URLs, exact length, SHA-256, purpose-specific bundle membership, license, and
   provenance. Generic bundle preparation has cancellation, aggregate progress,
@@ -259,6 +260,49 @@ issue requesting a private contact channel without disclosing the vulnerability.
   required before the alpha label can be removed.
 - Diagnostics omit drive identifiers, mount paths, ISO member lists, and logs by
   default. ISOpropyl contains no telemetry.
+
+## Boot-time corruption-check boundary
+
+The default-off boot-time option is deliberately narrower than its payload
+bundle. The GUI enables it only for an executable native UEFI/FAT32 ISO plan
+with a recognized removable-media fallback loader. Casper/Ubuntu trees,
+persistence, UEFI:NTFS, and an additive overlay that supplies root
+`md5sum.txt` are excluded until separately certified. Declining the explicit
+network-and-limitations prompt aborts the requested write. At dispatch, an
+ineligible check that remains selected aborts rather than being silently
+omitted; ordinary mode or option changes visibly clear the now-incompatible
+checkbox.
+
+After extraction, overlays, WIM splitting, and Windows answer-file generation
+finish in a private tree, ISOpropyl freshly rescans that tree through no-follow
+directory descriptors. Links, special files, hardlinks, cross-device entries,
+case/Unicode aliases, unsafe names, parser-limit violations, identity drift,
+pre-existing chainload originals, and malformed or architecture-mismatched EFI
+fallback loaders fail closed. Every recognized loader is preserved as its
+canonical `boot*_original.efi`; the matching immutable v1.2 wrapper replaces
+the fallback name. A failure after the first mutation invalidates the entire
+private workspace, so no partial result can reach target planning.
+
+ISOpropyl then replaces lowercase root `md5sum.txt` with a deterministic final
+manifest. It covers ordinary final files and renamed original loaders, excludes
+the manifest and wrapper applications themselves, and treats uppercase
+`MD5SUMS` as an ordinary covered file. The implementation enforces the upstream
+64 MiB, 100,000-line, and path limits; hashes every covered file through a bound
+descriptor; performs a fresh post-hash tree rescan; verifies every recorded MD5
+again before returning a stage witness; and repeats that validation before the
+constructed-media planner rescans the tree. The finished USB still receives
+ISOpropyl's stronger mandatory per-file SHA-256 read-back.
+
+This feature is not verified boot or image authentication. MD5 is
+collision-broken, the manifest is unsigned and writable beside the content,
+and an attacker able to alter the USB can replace both. The firmware application
+also intentionally permits bypass/fail-open paths: missing or malformed
+manifests and user cancellation chainload the original loader, while validation
+errors can be continued past. Signed x64, x86, and ARM64 wrappers still depend
+on Microsoft UEFI CA 2011 third-party trust and current firmware/DBX policy;
+ARM, RISC-V64, and LoongArch64 wrappers are unsigned and require Secure Boot
+disabled. The option is useful only for detecting accidental damage on later
+boots and adds boot latency.
 
 ## UEFI:NTFS trust boundary
 

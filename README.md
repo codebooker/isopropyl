@@ -125,6 +125,14 @@ confirmations and expanded drive visibility are never persisted.
   Manjaro, Proxmox, and Pop!_OS member
   layouts known to need native image handling; these rules never use host filenames,
   volume labels, overlays, or network lookups.
+- **Boot-time corruption checking** is an explicit, default-off option for the
+  first native UEFI/FAT32 profile. ISOpropyl obtains the exact hash-pinned
+  `uefi-md5sum` v1.2 wrapper set, preserves every recognized fallback loader,
+  and generates a deterministic manifest from the final private tree before
+  the normal full SHA-256 destination read-back. The unsigned MD5 manifest is
+  useful for later accidental-damage detection, not authenticity: it is stored
+  beside the files it covers and firmware validation is bypassable/fail-open.
+  Casper/Ubuntu and UEFI:NTFS media remain excluded pending boot certification.
 - **Additive ZIP overlays** can add ordinary files and directories from one
   bounded stored/deflated archive in ISO mode. Identity, SHA-256, CRC, sizes, and
   the final private tree are checked; collisions, traversal, links, special
