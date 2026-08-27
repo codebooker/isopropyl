@@ -823,6 +823,7 @@ class IsoStagingTests(unittest.TestCase):
         customization = WindowsCustomization(
             hide_online_account=True,
             reduce_data_collection=True,
+            disable_fast_startup=True,
         )
         with tempfile.TemporaryDirectory() as directory:
             plan = self.make_plan(

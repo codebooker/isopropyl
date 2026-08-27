@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -22,9 +23,20 @@ from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 
 
 def main() -> int:
+    # Keep documentation rendering independent of a developer's real settings.
+    with tempfile.TemporaryDirectory(prefix="isopropyl-screenshot-") as config_dir:
+        os.environ["XDG_CONFIG_HOME"] = config_dir
+        return _render()
+
+
+def _render() -> int:
     application = QApplication([])
     application.setStyleSheet(STYLE)
-    app_module.list_devices = lambda _include_external=False: []
+    target = Device(
+        "/dev/sdb", 64_000_000_000, "DataTraveler 3.0", "Kingston", "usb",
+        "001122334455", "", "8:16", True, True, False, (), (),
+    )
+    app_module.list_devices = lambda _include_external=False: [target]
     window = Window()
 
     image_name = "Windows_11_24H2_English_x64.iso"
@@ -64,13 +76,6 @@ def main() -> int:
     window.iso_plan_button.setEnabled(True)
     window.checksum_button.setEnabled(True)
 
-    target = Device(
-        "/dev/sdb", 64_000_000_000, "DataTraveler 3.0", "Kingston", "usb",
-        "001122334455", "", "8:16", True, True, False, (), (),
-    )
-    window.devices = [target]
-    window.device_combo.clear()
-    window.device_combo.addItem(target.label)
     window.rebuild_write_recommendation(preserve_selection=False)
     window.status.setText("Ready when you are")
 

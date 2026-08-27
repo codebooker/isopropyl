@@ -75,6 +75,10 @@ from .iso_staging import (
     build_iso_staging_plan,
 )
 from .logging_setup import read_log, setup_logging
+from .linux_downloads import (
+    DownloadedLinuxImage, LinuxDownloadCancelled, LinuxImageRelease,
+    LinuxIsoDownloader, available_linux_images,
+)
 from .media_test import (
     MediaTestCancelled, MediaTestMode, MediaTestResult, MediaTestRunner,
     build_media_test_plan,
@@ -86,6 +90,10 @@ from .optical import (
 from .progress import ProgressEstimator, format_duration
 from .persistence import (
     ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES, CasperCompatibilityProfile,
+)
+from .settings import (
+    SettingsStore, application_settings, parse_application_arguments,
+    portable_settings_path, settings_sync_error, settings_sync_was_committed,
 )
 from .writer import ImageWriter, WriteCancelled
 from .virtual import (
@@ -202,6 +210,14 @@ class UefiShellPreparationToken:
     pending: PendingUefiShell
 
 
+@dataclass(frozen=True)
+class LinuxDownloadToken:
+    generation: int
+    operation: LinuxIsoDownloader
+    release: LinuxImageRelease
+    destination: Path
+
+
 class Bridge(QObject):
     # PyQt's plain `int` maps to a signed 32-bit C++ int. Disk images routinely
     # exceed that, so keep byte counters as Python objects across threads.
@@ -222,10 +238,11 @@ class Bridge(QObject):
     uefi_shell_preparation_finished = pyqtSignal(object, object, object)
     casper_preparation_finished = pyqtSignal(object, object, object)
     device_refresh_finished = pyqtSignal(object, object)
+    linux_download_finished = pyqtSignal(object, object, object)
 
 
 class Window(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: SettingsStore | None = None) -> None:
         super().__init__()
         self.image: Path | None = None
         self.inspection: ImageInspection | None = None
@@ -242,6 +259,9 @@ class Window(QMainWindow):
         self.checksum_busy = False
         self.checksum_generation = 0
         self.checksum_preparer: BackgroundPreparation | None = None
+        self.linux_download_generation = 0
+        self.linux_downloader: LinuxIsoDownloader | None = None
+        self.linux_download_token: LinuxDownloadToken | None = None
         self.zip_overlay_plan: ZipOverlayPlan | None = None
         self.zip_overlay_merge: AdditiveOverlayMerge | None = None
         self.zip_overlay_generation = 0
@@ -280,7 +300,9 @@ class Window(QMainWindow):
         self.windows_wim_editions: tuple[WimEdition, ...] = ()
         self.windows_wim_error = ""
         self.windows_metadata_generation = 0
-        self.settings = QSettings("codebooker", "ISOpropyl")
+        self.settings = settings if settings is not None else QSettings(
+            "codebooker", "ISOpropyl"
+        )
         try:
             self.size_unit_mode = SizeUnitMode(
                 str(self.settings.value("size_units", SizeUnitMode.SI.value))
@@ -325,6 +347,9 @@ class Window(QMainWindow):
             self.on_casper_preparation_finished
         )
         self.bridge.device_refresh_finished.connect(self.on_devices_refreshed)
+        self.bridge.linux_download_finished.connect(
+            self.on_linux_download_finished
+        )
         QShortcut(QKeySequence.StandardKey.Open, self, activated=self.choose_image)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_devices)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.show_log)
@@ -403,7 +428,13 @@ class Window(QMainWindow):
         self.image_label.setObjectName("muted")
         choose = QPushButton("Choose image…")
         choose.clicked.connect(self.choose_image)
+        self.linux_download_button = QPushButton("Download Linux…")
+        self.linux_download_button.setToolTip(
+            "Explicitly download an ISO from ISOpropyl's small signed Linux catalog."
+        )
+        self.linux_download_button.clicked.connect(self.download_linux_image)
         source_row.addWidget(self.image_label, 1)
+        source_row.addWidget(self.linux_download_button)
         source_row.addWidget(choose)
         self.source_card.layout().addLayout(source_row)
         image_tools = QHBoxLayout()
@@ -587,6 +618,197 @@ class Window(QMainWindow):
         )
         if filename:
             self.load_image(Path(filename))
+
+    def download_linux_image(self) -> None:
+        if self.operation_active or self.inspection_busy:
+            return
+        try:
+            releases = available_linux_images()
+        except Exception as error:
+            QMessageBox.critical(self, "Linux catalog unavailable", str(error))
+            return
+        if not releases:
+            QMessageBox.warning(
+                self, "Linux catalog unavailable", "No curated Linux images are available."
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Download a verified Linux ISO")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        notice = QLabel(
+            "Choose an image from the bundled catalog. Networking starts only after "
+            "you confirm a destination. ISOpropyl authenticates the distribution's "
+            "signed checksum metadata and verifies the complete ISO before publishing it."
+        )
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        choices = QComboBox()
+        choices.setObjectName("linuxDownloadRelease")
+        for release in releases:
+            choices.addItem(
+                f"{release.distribution} {release.release} · {release.edition} "
+                f"{release.architecture} · {self.display_size(release.size)}",
+                release,
+            )
+        layout.addWidget(choices)
+        details = QLabel()
+        details.setObjectName("muted")
+        details.setWordWrap(True)
+        layout.addWidget(details)
+
+        def update_details() -> None:
+            release = choices.currentData()
+            if isinstance(release, LinuxImageRelease):
+                details.setText(
+                    f"Official filename: {release.filename}\n"
+                    f"Signed SHA-256: {release.sha256}\n"
+                    f"Source: {release.provenance_url}"
+                )
+
+        choices.currentIndexChanged.connect(update_details)
+        update_details()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Choose destination…")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        release = choices.currentData()
+        if not isinstance(release, LinuxImageRelease) or release not in releases:
+            QMessageBox.critical(
+                self, "Linux catalog unavailable", "The selected catalog entry is invalid."
+            )
+            return
+
+        downloads = Path.home() / "Downloads"
+        starting_directory = downloads if downloads.is_dir() else Path.home()
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save verified Linux ISO",
+            str(starting_directory / release.filename),
+            "ISO images (*.iso)",
+        )
+        if not filename:
+            return
+        destination = Path(filename)
+        if destination.name != release.filename:
+            QMessageBox.warning(
+                self,
+                "Keep the official filename",
+                f"This catalog entry must be saved as {release.filename}. Choose the "
+                "destination again without renaming it.",
+            )
+            return
+        if not destination.is_absolute():
+            QMessageBox.warning(
+                self, "Choose an absolute destination", "Choose a normal local folder."
+            )
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "Download and verify Linux ISO?",
+            f"Download {release.distribution} {release.release} {release.edition} "
+            f"({release.architecture}) from:\n{release.provenance_url}\n\n"
+            f"Size: {self.display_size(release.size)}\n"
+            f"Destination: {destination}\n\n"
+            "A cancelled transfer remains in a private resumable directory beside "
+            "the destination. Downloaded bytes are never executed on Linux.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        downloader = LinuxIsoDownloader()
+        self.linux_download_generation += 1
+        token = LinuxDownloadToken(
+            self.linux_download_generation, downloader, release, destination,
+        )
+        self.linux_downloader = downloader
+        self.linux_download_token = token
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Authenticating signed Linux download metadata…")
+        self.logger.info(
+            "Confirmed Linux ISO download: release=%s destination=%s",
+            release.id, destination,
+        )
+
+        def work() -> None:
+            try:
+                result: object = downloader.download(
+                    release,
+                    destination,
+                    lambda done, total: self.bridge.progress.emit(
+                        done, total, f"Downloading {release.distribution} ISO",
+                    ),
+                )
+                error: object = None
+            except Exception as caught:
+                result = None
+                error = caught
+            self.bridge.linux_download_finished.emit(token, result, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_linux_download_finished(
+        self, token: LinuxDownloadToken, result: object, error: object,
+    ) -> None:
+        if (
+            token is not self.linux_download_token
+            or token.operation is not self.linux_downloader
+            or token.generation != self.linux_download_generation
+        ):
+            return
+        self.linux_downloader = None
+        self.linux_download_token = None
+        self.set_busy(False)
+        if error is not None:
+            if isinstance(error, LinuxDownloadCancelled) or token.operation.cancelled:
+                message = (
+                    "Linux ISO download cancelled. Choose the same destination later "
+                    "to authenticate the metadata again and resume safely."
+                )
+                self.logger.info(message)
+                self.status.setText(message)
+            else:
+                self.logger.warning("Linux ISO download failed: %s", error)
+                self.status.setText("Linux ISO download did not complete")
+                QMessageBox.critical(self, "Linux download failed", str(error))
+            return
+        if (
+            not isinstance(result, DownloadedLinuxImage)
+            or result.path != token.destination
+            or result.release_id != token.release.id
+            or result.size != token.release.size
+            or result.sha256 != token.release.sha256
+        ):
+            self.status.setText("Linux ISO download returned an invalid result")
+            QMessageBox.critical(
+                self,
+                "Linux download failed",
+                "The background downloader returned an invalid bound result.",
+            )
+            return
+        self.progress.setValue(1000)
+        self.status.setText("Verified Linux ISO downloaded")
+        self.logger.info(
+            "Verified Linux ISO downloaded: release=%s destination=%s sha256=%s",
+            result.release_id, result.path, result.sha256,
+        )
+        QMessageBox.information(
+            self,
+            "Linux ISO ready",
+            f"Downloaded and verified {token.release.distribution} "
+            f"{token.release.release}.\n\n{result.path}",
+        )
+        self.load_image(result.path)
 
     def load_image(self, path: Path) -> None:
         try:
@@ -1320,6 +1542,7 @@ class Window(QMainWindow):
             self.casper_writer,
             self.checksum_preparer,
             self.iso_staging_preparer,
+            self.linux_downloader,
         ))
 
     def confirm_write(self) -> None:
@@ -1831,6 +2054,7 @@ class Window(QMainWindow):
             self.windows_wim_extractor,
             self.checksum_preparer,
             self.iso_staging_preparer,
+            self.linux_downloader,
         )))
         if active:
             self.status.setText("Stopping…")
@@ -2455,7 +2679,32 @@ class Window(QMainWindow):
         # Persist an identity-oriented description, not a size rendered using
         # the display-unit preference that happened to be active at this time.
         ignored[device.stable_id] = f"{name} · {device.path}"
+        previous = str(self.settings.value("ignored_devices", "{}"))
         self.settings.setValue("ignored_devices", json.dumps(ignored, sort_keys=True))
+        persistence_error = settings_sync_error(self.settings)
+        if persistence_error:
+            if settings_sync_was_committed(self.settings):
+                QMessageBox.warning(
+                    self,
+                    "Ignored drive saved with a durability warning",
+                    "The drive was added to the persistent ignored-drive list, "
+                    "but the settings directory could not confirm durable storage.\n\n"
+                    f"{persistence_error}",
+                )
+                self.logger.warning(
+                    "Ignored-drive setting committed with a durability warning: %s",
+                    persistence_error,
+                )
+                self.refresh_devices()
+                return
+            self.settings.setValue("ignored_devices", previous)
+            QMessageBox.warning(
+                self,
+                "Could not save ignored drive",
+                "The drive was not added to the persistent ignored-drive list.\n\n"
+                f"{persistence_error}",
+            )
+            return
         self.logger.info("Added device to safety denylist: %s", device.stable_id)
         self.refresh_devices()
 
@@ -4772,6 +5021,13 @@ class Window(QMainWindow):
         def save() -> None:
             selected = str(theme.currentData())
             selected_units = SizeUnitMode(str(units.currentData()))
+            previous = {
+                "appearance": str(self.settings.value("appearance", "dark")),
+                "size_units": str(self.settings.value(
+                    "size_units", SizeUnitMode.SI.value,
+                )),
+                "ignored_devices": str(self.settings.value("ignored_devices", "{}")),
+            }
             if reset_requested:
                 self.settings.clear()
                 selected = "dark"
@@ -4781,6 +5037,27 @@ class Window(QMainWindow):
                 self.settings.setValue("size_units", selected_units.value)
             if clear_requested and not reset_requested:
                 self.settings.remove("ignored_devices")
+            persistence_error = settings_sync_error(self.settings)
+            if persistence_error:
+                if settings_sync_was_committed(self.settings):
+                    QMessageBox.warning(
+                        dialog,
+                        "Settings saved with a durability warning",
+                        "The new settings are active and were atomically published, "
+                        "but the settings directory could not confirm durable "
+                        "storage.\n\n"
+                        f"{persistence_error}",
+                    )
+                else:
+                    for key, value in previous.items():
+                        self.settings.setValue(key, value)
+                    QMessageBox.warning(
+                        dialog,
+                        "Settings were not saved",
+                        "ISOpropyl kept the previous settings for this session.\n\n"
+                        f"{persistence_error}",
+                    )
+                    return
             self.size_unit_mode = selected_units
             QApplication.instance().setStyleSheet(THEMES[selected])
             dialog.accept()
@@ -5073,6 +5350,14 @@ class Window(QMainWindow):
         )
         privacy = QCheckBox("Reduce setup data collection (skip Express privacy settings)")
         bitlocker = QCheckBox("Prevent automatic BitLocker device encryption")
+        fast_startup = QCheckBox(
+            "Disable Windows Fast Startup (use full shutdowns; startup may be slower)"
+        )
+        fast_startup.setObjectName("windowsDisableFastStartupCheckBox")
+        fast_startup.setToolTip(
+            "Writes the fixed HiberbootEnabled=0 machine setting during Windows "
+            "Setup. This avoids hybrid shutdown but may make startup slower."
+        )
         local = QCheckBox("Create a local administrator account")
         username = QLineEdit()
         username.setPlaceholderText("Local account name")
@@ -5089,7 +5374,7 @@ class Window(QMainWindow):
 
         local.toggled.connect(set_local_controls)
         for checkbox in (
-            bypass, online, offline_account, privacy, bitlocker, local,
+            bypass, online, offline_account, privacy, bitlocker, fast_startup, local,
         ):
             setup_layout.addWidget(checkbox)
         offline_account_note = QLabel()
@@ -5141,6 +5426,7 @@ class Window(QMainWindow):
         )
         privacy.setChecked(current.reduce_data_collection)
         bitlocker.setChecked(current.disable_automatic_bitlocker)
+        fast_startup.setChecked(current.disable_fast_startup)
         local.setChecked(bool(current.local_username))
         username.setText(current.local_username)
         password_change.setChecked(current.require_local_password_change)
@@ -5221,6 +5507,7 @@ class Window(QMainWindow):
                 local_username=username.text() if local.isChecked() else "",
                 reduce_data_collection=privacy.isChecked(),
                 disable_automatic_bitlocker=bitlocker.isChecked(),
+                disable_fast_startup=fast_startup.isChecked(),
                 input_locale=input_locale.text(),
                 system_locale=system_locale.text(),
                 ui_language=ui_language.text(),
@@ -5381,13 +5668,18 @@ def main() -> int:
             icon = QIcon(str(source_icon))
     if not icon.isNull():
         app.setWindowIcon(icon)
-    selected_theme = str(QSettings("codebooker", "ISOpropyl").value("appearance", "dark"))
+    try:
+        parsed_arguments = parse_application_arguments(app.arguments())
+        settings = application_settings(app.arguments())
+    except ValueError as error:
+        QMessageBox.critical(None, "Could not start ISOpropyl", str(error))
+        return 2
+    selected_theme = str(settings.value("appearance", "dark"))
     app.setStyleSheet(THEMES.get(selected_theme, STYLE))
-    window = Window()
+    window = Window(settings=settings)
     window.show()
-    positional = [Path(argument) for argument in app.arguments()[1:] if not argument.startswith("-")]
-    if positional:
-        QTimer.singleShot(0, lambda: window.load_image(positional[0]))
+    if parsed_arguments.image is not None:
+        QTimer.singleShot(0, lambda: window.load_image(parsed_arguments.image))
     return app.exec()
 
 

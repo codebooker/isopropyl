@@ -105,6 +105,12 @@ Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
 <kbd>Ctrl</kbd>+<kbd>R</kbd> refreshes targets,
 <kbd>Ctrl</kbd>+<kbd>L</kbd> opens the log, and <kbd>Esc</kbd> cancels.
 
+For a self-contained copy, launch `isopropyl --portable`. Preferences are kept
+in a singly linked `isopropyl.ini` beside the launcher (or beside the outer
+AppImage), and that file acts as the marker on later launches. ISOpropyl also
+honors an existing AppImage `<AppImage>.config` directory. Destructive
+confirmations and expanded drive visibility are never persisted.
+
 ## Features
 
 ### Write and verify
@@ -136,6 +142,10 @@ Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
 
 ### Inspect and customize
 
+- Download the curated Ubuntu 24.04.4 LTS Desktop amd64 ISO on demand. ISOpropyl
+  authenticates Ubuntu's signed checksum manifest with the pinned CD Image key,
+  verifies the complete ISO, supports safe resume, and atomically publishes
+  without overwriting an existing file. No downloaded byte is executed.
 - Validate MBR, extended partitions, protective/hybrid MBR, and reciprocal GPT
   metadata at supported sector sizes; malformed or incomplete evidence is shown
   instead of treated as bootable.
@@ -147,8 +157,9 @@ Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
   pasted checksum without guessing its algorithm.
 - Inspect recognized Windows WIM/ESD sources and editions. ISO mode can add a
   transparent `autounattend.xml` for setup-check bypasses, privacy/OOBE choices,
-  locale and time-zone settings, BitLocker-device-encryption prevention, and
-  carefully gated local/offline account paths.
+  locale and time-zone settings, BitLocker-device-encryption prevention,
+  opt-in Fast Startup suppression, and carefully gated local/offline account
+  paths.
 
 Windows customization is best-effort and intentionally conservative. Existing
 answer files are never silently combined or replaced; unsupported Home, S-mode,
@@ -166,6 +177,8 @@ paths. The exact gates and residual limitations are documented in the
   warned workflows; zero a whole device or only its boundary metadata regions.
 - Create a verified GPT/FAT32 UEFI Shell recovery drive for five architectures
   from exact upstream files after explicit networking consent.
+- Keep preferences beside a portable launcher or AppImage with `--portable`;
+  destructive confirmations and expanded drive visibility remain session-only.
 - Export privacy-conscious diagnostics, keep a rotating local activity log, and
   choose decimal or binary display units.
 

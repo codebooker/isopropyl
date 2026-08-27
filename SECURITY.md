@@ -171,6 +171,19 @@ issue requesting a private contact channel without disclosing the vulnerability.
   skips links, multiply linked files, and anything whose identity or metadata
   changes between inspection and unlink. Corrupt catalog-known regular files
   remain removable so a failed download cannot become permanent cache debris.
+- The curated Linux downloader is network-inactive until the user chooses
+  **Download Linux…**, a catalog entry, an exact destination filename, and final
+  consent. The initial catalog pins Ubuntu 24.04.4 LTS Desktop amd64 plus the
+  exact release URL, size, SHA-256, signed checksum manifest, detached signature,
+  and Ubuntu CD Image signing fingerprint. A fixed root-owned `gpgv` is invoked
+  through an inherited descriptor with a bundled hash-pinned official public
+  keyring; the signed manifest must name the exact ISO exactly once. HTTP status,
+  final URL, content encoding, lengths, and resume ranges are strict. A bounded
+  private `0700` stage retains only a `0600`, singly linked partial; free space,
+  cancellation, source/destination identities, a final full descriptor hash,
+  and no-overwrite publication are rechecked. Downloaded bytes are data only and
+  are never executed. Catalog expansion requires new distribution-owned signing
+  provenance rather than mirror trust or remote scripts.
 - Windows customization can be injected only through the UEFI ISO staging path;
   an existing answer file is never overwritten. A selected WIM/ESD index is
   re-inspected through one inherited no-follow descriptor and bound to its exact
@@ -188,6 +201,9 @@ issue requesting a private contact channel without disclosing the vulnerability.
   fail closed. WIM metadata cannot prove the absence of a localized or
   offline-serviced S-mode policy, so the GUI requires a separate explicit
   acknowledgment of that residual uncertainty before it can emit the command.
+  The separate Fast Startup option emits only the fixed machine-level
+  `HiberbootEnabled=0` registry command during `specialize`; it is default-off
+  and discloses that full shutdowns may make startup slower.
   This is an ISOpropyl construction invariant, not a claim that every unusual
   booted Windows Setup launch context has been physically certified. ISOpropyl
   never emits an automatic target-disk wipe instruction for Windows Setup.

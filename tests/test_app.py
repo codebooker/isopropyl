@@ -44,6 +44,7 @@ from isopropyl.iso import (
     merge_additive_overlay_entries,
 )
 from isopropyl.iso_staging import IsoStagingPlan
+from isopropyl.linux_downloads import DownloadedLinuxImage, available_linux_images
 from isopropyl.extraction import SafeIsoExtractor
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
@@ -1287,6 +1288,35 @@ class WindowWriteMethodTests(unittest.TestCase):
         with patch("isopropyl.app.QDialog.exec", new=verify_reopened):
             self.window.configure_windows()
 
+    def test_fast_startup_option_defaults_off_persists_and_cancel_preserves(self):
+        def enable_and_save(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsDisableFastStartupCheckBox",
+            )
+            assert checkbox is not None
+            self.assertFalse(checkbox.isChecked())
+            checkbox.setChecked(True)
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=enable_and_save):
+            self.window.configure_windows()
+        self.assertTrue(self.window.windows_options.disable_fast_startup)
+
+        def reject_changed_value(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsDisableFastStartupCheckBox",
+            )
+            assert checkbox is not None
+            self.assertTrue(checkbox.isChecked())
+            checkbox.setChecked(False)
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=reject_changed_value):
+            self.window.configure_windows()
+        self.assertTrue(self.window.windows_options.disable_fast_startup)
+
     def test_online_account_bypass_disables_unknown_later_build(self):
         source = ArchiveEntry("sources/install.wim", 16)
         edition = WimEdition(
@@ -1479,6 +1509,65 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.window.set_busy(False)
         self.assertTrue(self.window.settings_button.isEnabled())
 
+    def test_settings_save_failure_keeps_previous_runtime_values(self):
+        self.window.size_unit_mode = SizeUnitMode.SI
+
+        def choose_binary(dialog) -> int:
+            combo = next(
+                item for item in dialog.findChildren(QComboBox)
+                if item.findData(SizeUnitMode.IEC.value) >= 0
+            )
+            combo.setCurrentIndex(combo.findData(SizeUnitMode.IEC.value))
+            dialog.findChild(QDialogButtonBox).button(
+                QDialogButtonBox.StandardButton.Save
+            ).click()
+            return QDialog.DialogCode.Rejected
+
+        with (
+            patch("isopropyl.app.QDialog.exec", new=choose_binary),
+            patch("isopropyl.app.settings_sync_error", return_value="disk full"),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.show_settings()
+
+        self.assertEqual(self.window.size_unit_mode, SizeUnitMode.SI)
+        self.assertEqual(
+            self.window.settings.value("size_units"), SizeUnitMode.SI.value,
+        )
+        warning.assert_called_once()
+
+    def test_committed_settings_warning_keeps_new_runtime_values(self):
+        self.window.size_unit_mode = SizeUnitMode.SI
+
+        def choose_binary(dialog) -> int:
+            combo = next(
+                item for item in dialog.findChildren(QComboBox)
+                if item.findData(SizeUnitMode.IEC.value) >= 0
+            )
+            combo.setCurrentIndex(combo.findData(SizeUnitMode.IEC.value))
+            dialog.findChild(QDialogButtonBox).button(
+                QDialogButtonBox.StandardButton.Save
+            ).click()
+            return QDialog.DialogCode.Rejected
+
+        with (
+            patch("isopropyl.app.QDialog.exec", new=choose_binary),
+            patch(
+                "isopropyl.app.settings_sync_error",
+                return_value="committed but directory fsync failed",
+            ),
+            patch("isopropyl.app.settings_sync_was_committed", return_value=True),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.show_settings()
+
+        self.assertEqual(self.window.size_unit_mode, SizeUnitMode.IEC)
+        self.assertEqual(
+            self.window.settings.value("size_units"), SizeUnitMode.IEC.value,
+        )
+        warning.assert_called_once()
+        self.assertIn("durability warning", warning.call_args.args[1].casefold())
+
     def test_ignored_drive_description_is_independent_of_display_units(self):
         self.window.size_unit_mode = SizeUnitMode.IEC
         with (
@@ -1493,6 +1582,106 @@ class WindowWriteMethodTests(unittest.TestCase):
         description = self.window.ignored_devices()["serial:usb:serial"]
         self.assertEqual(description, "ISOpropyl Test Drive · /dev/sdz")
         self.assertNotIn("GiB", description)
+
+    def test_ignored_drive_save_failure_keeps_denylist_unchanged(self):
+        with (
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.settings_sync_error", return_value="read only"),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+            patch.object(self.window, "refresh_devices") as refresh,
+        ):
+            self.window.ignore_drive(self.window.devices[0])
+
+        self.assertEqual(self.window.ignored_devices(), {})
+        warning.assert_called_once()
+        refresh.assert_not_called()
+
+    def test_committed_ignored_drive_warning_keeps_denylist(self):
+        with (
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "isopropyl.app.settings_sync_error",
+                return_value="committed but directory fsync failed",
+            ),
+            patch("isopropyl.app.settings_sync_was_committed", return_value=True),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+            patch.object(self.window, "refresh_devices") as refresh,
+        ):
+            self.window.ignore_drive(self.window.devices[0])
+
+        self.assertIn("serial:usb:serial", self.window.ignored_devices())
+        warning.assert_called_once()
+        self.assertIn("durability warning", warning.call_args.args[1].casefold())
+        refresh.assert_called_once_with()
+
+    def test_curated_linux_download_requires_consent_then_loads_bound_result(self):
+        release = available_linux_images()[0]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.filename
+
+            class FakeDownloader:
+                cancelled = False
+
+                def __init__(self):
+                    self.calls = []
+
+                def cancel(self) -> None:
+                    self.cancelled = True
+
+                def download(self, selected, output, progress):
+                    self.calls.append((selected, output))
+                    progress(selected.size, selected.size)
+                    return DownloadedLinuxImage(
+                        output, selected.id, selected.size, selected.sha256,
+                    )
+
+            downloader = FakeDownloader()
+
+            def accept_catalog(dialog) -> int:
+                choices = dialog.findChild(QComboBox, "linuxDownloadRelease")
+                assert choices is not None
+                self.assertEqual(choices.currentData(), release)
+                return QDialog.DialogCode.Accepted
+
+            with (
+                patch("isopropyl.app.QDialog.exec", new=accept_catalog),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "ISO images (*.iso)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch("isopropyl.app.QMessageBox.information"),
+                patch("isopropyl.app.LinuxIsoDownloader", return_value=downloader),
+                patch("isopropyl.app.threading.Thread", ImmediateThread),
+                patch.object(self.window, "load_image") as load_image,
+            ):
+                self.window.download_linux_image()
+
+            self.assertEqual(downloader.calls, [(release, destination)])
+            load_image.assert_called_once_with(destination)
+            self.assertIsNone(self.window.linux_downloader)
+            self.assertEqual(self.window.progress.value(), 1000)
+
+    def test_curated_linux_catalog_dialog_is_network_inactive_when_cancelled(self):
+        with (
+            patch(
+                "isopropyl.app.QDialog.exec",
+                return_value=QDialog.DialogCode.Rejected,
+            ),
+            patch("isopropyl.app.LinuxIsoDownloader") as downloader,
+        ):
+            self.window.download_linux_image()
+
+        downloader.assert_not_called()
 
     def test_drive_backup_filter_selects_raw_vhd_or_vhdx_backend_and_suffix(self):
         invocations = []

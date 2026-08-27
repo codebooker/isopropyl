@@ -1,0 +1,25 @@
+{
+  "catalog_version": 1,
+  "images": [
+    {
+      "id": "ubuntu-24.04.4-desktop-amd64",
+      "distribution": "Ubuntu",
+      "release": "24.04.4 LTS",
+      "edition": "Desktop",
+      "architecture": "amd64",
+      "filename": "ubuntu-24.04.4-desktop-amd64.iso",
+      "size": 6655619072,
+      "sha256": "3a4c9877b483ab46d7c3fbe165a0db275e1ae3cfe56a5657e5a47c2f99a99d1e",
+      "image_url": "https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-desktop-amd64.iso",
+      "checksums_url": "https://releases.ubuntu.com/24.04.4/SHA256SUMS",
+      "checksums_size": 594,
+      "checksums_sha256": "2c7aeea36dd83c6eafa951ab2b26c037c8342975ca12950509240856b2605bc7",
+      "signature_url": "https://releases.ubuntu.com/24.04.4/SHA256SUMS.gpg",
+      "signature_size": 833,
+      "signature_sha256": "35299a7907a456fb2731af087d7ede11f9864d85b3585dbb1612fe2f442a2c0a",
+      "signing_fingerprint": "843938DF228D22F7B3742BC0D94AA3F0EFE21092",
+      "allowed_hosts": ["releases.ubuntu.com"],
+      "provenance_url": "https://releases.ubuntu.com/24.04.4/"
+    }
+  ]
+}

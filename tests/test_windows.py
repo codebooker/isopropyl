@@ -38,6 +38,60 @@ def install_selection(
 
 
 class WindowsCustomizationTests(unittest.TestCase):
+    def test_emits_fixed_fast_startup_command_in_specialize(self):
+        options = WindowsCustomization(disable_fast_startup=True)
+        self.assertTrue(options.enabled)
+        root = ET.fromstring(generate_autounattend(options, "amd64"))
+        specialize = [
+            item for item in root.findall("u:settings", NS)
+            if item.attrib.get("pass") == "specialize"
+        ]
+        self.assertEqual(len(specialize), 1)
+        components = specialize[0].findall("u:component", NS)
+        self.assertEqual(len(components), 1)
+        self.assertEqual(
+            components[0].attrib.get("name"), "Microsoft-Windows-Deployment",
+        )
+        commands = components[0].findall(
+            "u:RunSynchronous/u:RunSynchronousCommand", NS,
+        )
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0].findtext("u:Order", namespaces=NS), "1")
+        self.assertEqual(
+            commands[0].findtext("u:Path", namespaces=NS),
+            'reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Power" '
+            "/v HiberbootEnabled /t REG_DWORD /d 0 /f",
+        )
+        xml = ET.tostring(root, encoding="unicode")
+        self.assertNotIn("FirstLogonCommands", xml)
+        self.assertNotIn("powershell", xml.casefold())
+
+    def test_fast_startup_and_online_bypass_share_ordered_specialize_commands(self):
+        options = WindowsCustomization(
+            install_image=install_selection(),
+            bypass_online_account_requirement=True,
+            acknowledge_online_account_limitations=True,
+            disable_fast_startup=True,
+        )
+        root = ET.fromstring(generate_autounattend(options, "amd64"))
+        specialize = [
+            item for item in root.findall("u:settings", NS)
+            if item.attrib.get("pass") == "specialize"
+        ]
+        self.assertEqual(len(specialize), 1)
+        deployment = specialize[0].findall("u:component", NS)
+        self.assertEqual(len(deployment), 1)
+        commands = deployment[0].findall(
+            "u:RunSynchronous/u:RunSynchronousCommand", NS,
+        )
+        self.assertEqual(
+            [item.findtext("u:Order", namespaces=NS) for item in commands],
+            ["1", "2"],
+        )
+        paths = [item.findtext("u:Path", namespaces=NS) for item in commands]
+        self.assertIn("BypassNRO", paths[0] or "")
+        self.assertIn("HiberbootEnabled", paths[1] or "")
+
     def test_emits_one_fixed_version_gated_online_account_bypass_command(self):
         options = WindowsCustomization(
             install_image=install_selection(),

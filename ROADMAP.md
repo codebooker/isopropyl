@@ -35,6 +35,9 @@ evidence.
   after upstream payload and firmware evidence supports it.
 - Track Windows CA 2023, `SkuSiPolicy.p7b`, S Mode, and post-24H2 online-account
   behavior without silently extending the current exact-build `BypassNRO` policy.
+- Keep the implemented Fast Startup switch narrow, opt-in, and reversible;
+  evaluate other Rufus quality-of-life choices as separately disclosed settings
+  rather than one opaque debloating policy.
 
 ### Linux boot and persistence
 
@@ -72,8 +75,10 @@ evidence.
 - Firmware-test the implemented explicit-consent five-architecture UEFI Shell
   workflow and every fallback path with Secure Boot disabled. Add FreeDOS and
   advanced blank bootloader workflows with lawful, verified payload sources.
-- Add signed opt-in Microsoft ISO and curated Linux distribution downloads; never
-  execute remotely supplied scripts.
+- Expand the implemented signed, resumable Ubuntu LTS download profile only with
+  distribution-owned signing metadata and maintained release fixtures. Add a
+  signed opt-in Microsoft ISO downloader separately; never execute remotely
+  supplied scripts.
 
 ## Product quality
 
@@ -86,8 +91,9 @@ evidence.
   sizes, then consider exposing profile-safe sizing in ISO construction.
 - Additional filesystem, partition-layout, and volume-label controls where the
   selected boot profile can support them safely.
-- Flatpak/AppImage feasibility work, native distro packages, portable settings,
-  release signatures, SBOMs, and reproducibility attestations.
+- Flatpak/AppImage feasibility work, native distro packages, release signatures,
+  SBOMs, and reproducibility attestations. Portable settings already support
+  adjacent launchers and AppImage's `.config` convention.
 
 The exhaustive capability-by-capability status is maintained in
 [FEATURE_MATRIX.md](FEATURE_MATRIX.md).

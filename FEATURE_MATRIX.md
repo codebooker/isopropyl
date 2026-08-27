@@ -54,7 +54,7 @@ Status meanings:
 | MS-DOS boot media | **Research** | Microsoft binary acquisition/licensing constraints apply. |
 | Microsoft ISO downloader | **Planned** | Must use official metadata without executing remote Fido-style scripts. |
 | UEFI Shell downloader | **Partial** | An explicit-consent GUI acquires the exact upstream 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 release files as one no-partial-return bundle, rechecks independently pinned size/SHA-256 and PE architecture/subsystem, stages canonical fallback paths, and writes target-bound GPT/FAT32 media after typed confirmation with complete file read-back. The executables are unsigned and require Secure Boot disabled. Physical firmware certification remains. |
-| Curated Linux downloader | **Planned** | Distribution-owned URLs, signed metadata, resumability, and explicit consent. |
+| Curated Linux downloader | **Done** | The explicit **Download Linux…** flow currently pins Ubuntu 24.04.4 LTS Desktop amd64 from its distribution-owned HTTPS release path. It independently pins and authenticates the exact `SHA256SUMS`/signature pair with Ubuntu's CD Image signing key, requires the one signed filename/hash, validates exact response/range lengths, resumes only through a private bound partial, performs a final full descriptor hash, and atomically publishes without overwrite. The catalog is intentionally narrow and downloaded bytes are never executed. |
 
 ## Boot, filesystem, and trust analysis
 
@@ -95,12 +95,13 @@ Status meanings:
 | Locale, language, keyboard, time zone | **Done** | Explicit validated Linux-side fields, not host-Windows settings replication. |
 | Privacy-question/Express settings | **Done** | Opt-in OOBE privacy settings. |
 | Prevent automatic BitLocker encryption | **Done** | Transparent opt-in unattend/registry behavior. |
+| Disable Windows Fast Startup | **Done** | A standalone opt-in writes the fixed machine-level `HiberbootEnabled=0` setting during the `specialize` pass. The GUI discloses that full shutdown replaces hybrid shutdown and startup may be slower. |
 | Existing answer file protection | **Done** | Root `autounattend.xml` and `sources/$OEM$/$$/Panther/unattend.xml` are detected case-insensitively; customization refuses to combine with or replace either. The frozen staging plan binds the typed options and architecture, regenerates the answer file, and requires exact UTF-8 byte equality before extraction. |
 | Windows To Go | **Planned** | WIM apply, ESP/MSR/NTFS layout, offline BCD, SAN policy, and driver/hardware caveats. |
 | Internal disks offline for Windows To Go | **Planned** | Belongs to future offline SAN/BCD configuration. |
 | Windows CA 2023 / `SkuSiPolicy.p7b` | **Planned** | Security-sensitive, versioned validation required. |
 | S Mode-aware customization | **Partial** | UI warns first-logon commands do not run in S Mode; no complete alternative path. |
-| Quality-of-life/debloating options | **Research** | Subjective and fast-changing; separate install necessities from preferences. |
+| Quality-of-life/debloating options | **Research** | Fast Startup is implemented as a separate disclosed option. Package removal and other subjective, fast-changing preferences remain research items rather than a bundled policy. |
 | Silent install to first disk | **Research** | Future expert-only profile with severe target-PC warnings, never default. |
 | In-place upgrade bypass wrapper | **Research** | Not USB creation; high maintenance and security burden. |
 
@@ -133,7 +134,7 @@ Status meanings:
 | Drag-and-drop | **Done** | One local regular image while idle. |
 | Headless CLI writing | **Planned** | Must preserve all GUI identity and confirmation invariants. |
 | Update checks | **Research** | Prefer package-manager channels; portable builds need signed opt-in metadata. |
-| Portable settings | **Planned** | Needed for AppImage-style distribution. |
+| Portable settings | **Done** | `--portable` uses a singly linked `isopropyl.ini` beside the launched program (or outer AppImage), and that adjacent file remains the opt-in marker for later launches. An existing real `<AppImage>.config` directory follows the AppImage convention. Startup appearance and the window share one settings instance; risky drive visibility and confirmations remain deliberately session-only. |
 | ZIP overlay | **Done** | One bounded, identity- and SHA-256-bound stored/deflated ZIP can add ordinary files and directories through ISO mode. The asynchronous GUI selector, effective-catalog preview/replanning, target-residency checks, cancellable private staging, DD omission warning, and frozen final confirmation ship. Traversal, links, special files, encryption, parser disagreement, collisions, unexplained records, fallback `EFI/BOOT/BOOT*.EFI` loaders, and canonical Windows install WIM/ESD/SWM payload changes fail closed; no ISO file is overwritten. Physical installer testing remains. |
 | Preserve extracted timestamps | **Done** | A conservative timezone-safe FAT-compatible UTC range from the bounded 7-Zip catalog is carried through private extraction and the final FAT32/NTFS copy. Files and explicit directories are updated through already-open no-follow descriptors, transformed directories are restored deepest-first from their first observed workspace value, and staging representability is checked before any target change. Normalization must be smaller than one workspace/destination filesystem tick; subsequent read-back must exactly match that observed value. Malformed/out-of-range times and all link times are ignored or rejected; permissions and ownership are never imported. |
 | Decimal/binary unit preference | **Done** | Settings switches dynamic capacities, progress, rates, estimates, confirmations, and device labels between SI MB/GB/TB and IEC MiB/GiB/TiB. |

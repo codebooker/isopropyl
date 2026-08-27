@@ -6,6 +6,19 @@ only pinned catalog metadata. UEFI:NTFS is obtained only after explicit user
 consent. The GRUB and Syslinux entries are dormant preparation inputs: normal
 writes do not download them and no BIOS executor consumes them yet.
 
+## Ubuntu CD Image signing key
+
+ISOpropyl embeds the public `ubuntu-keyring-2012-cdimage.gpg` keyring solely to
+authenticate signed checksum metadata for its explicit curated Ubuntu ISO
+download. The keyring is taken byte-for-byte from Ubuntu's official
+[`ubuntu-keyring` 2023.11.28.1 source package](https://archive.ubuntu.com/ubuntu/pool/main/u/ubuntu-keyring/),
+whose copyright file states that the public keys in `keyrings` do not fall under
+copyright. Its SHA-256 is
+`192b3782ba2e00e05b6521371fbe67847efad3fdd1cfb87621882d833c8703fa`
+and the required signing fingerprint is
+`843938DF228D22F7B3742BC0D94AA3F0EFE21092`. The key is data, not executable
+code, and no downloaded image or script is executed.
+
 ## UEFI Shell release payloads
 
 - Upstream release: [UEFI Shell 26H1](https://github.com/pbatard/UEFI-Shell/releases/tag/26H1)

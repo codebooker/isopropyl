@@ -72,6 +72,8 @@ class WindowsCustomization:
     install_image_path: str = ""
     bypass_online_account_requirement: bool = False
     acknowledge_online_account_limitations: bool = False
+    # Appended to retain the positional argument order of the public dataclass.
+    disable_fast_startup: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -79,7 +81,8 @@ class WindowsCustomization:
             self.bypass_hardware_requirements, self.hide_online_account,
             self.bypass_online_account_requirement,
             bool(self.local_username), self.reduce_data_collection,
-            self.disable_automatic_bitlocker, bool(self.input_locale),
+            self.disable_automatic_bitlocker, self.disable_fast_startup,
+            bool(self.input_locale),
             bool(self.system_locale), bool(self.ui_language),
             bool(self.user_locale), bool(self.timezone), self.install_image is not None,
             bool(self.install_image_path),
@@ -324,14 +327,24 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
         ET.SubElement(metadata, "Key").text = "/IMAGE/INDEX"
         ET.SubElement(metadata, "Value").text = str(options.install_image.selected_index)
 
+    specialize_commands: list[tuple[str, str]] = []
     if options.bypass_online_account_requirement:
-        deployment = component("specialize", "Microsoft-Windows-Deployment")
-        synchronous = ET.SubElement(deployment, "RunSynchronous")
-        _command(
-            synchronous, 1, "Enable the Windows 11 offline-account setup path",
+        specialize_commands.append((
+            "Enable the Windows 11 offline-account setup path",
             'reg add "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\OOBE" '
             "/v BypassNRO /t REG_DWORD /d 1 /f",
-        )
+        ))
+    if options.disable_fast_startup:
+        specialize_commands.append((
+            "Disable Windows Fast Startup",
+            'reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Power" '
+            "/v HiberbootEnabled /t REG_DWORD /d 0 /f",
+        ))
+    if specialize_commands:
+        deployment = component("specialize", "Microsoft-Windows-Deployment")
+        synchronous = ET.SubElement(deployment, "RunSynchronous")
+        for order, (description, command) in enumerate(specialize_commands, 1):
+            _command(synchronous, order, description, command)
 
     international_values = (
         ("InputLocale", input_locale),
