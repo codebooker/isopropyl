@@ -189,6 +189,7 @@ Optional tools unlock additional workflows:
 | Additional ISO inspection | `xorriso` |
 | Zstandard-compressed images | Python `zstandard` module or `zstd` |
 | Legacy Unix `.Z` images | `gzip` |
+| Busy-drive process names after an unmount failure | `fuser` (psmisc) |
 
 ISO mode needs temporary free space for the extracted tree. Splitting a large
 WIM conservatively requires room for the extracted WIM and its split parts at
@@ -220,7 +221,7 @@ You can also launch the working tree directly:
 Install required host tools through your distribution's package manager. On
 Debian/Ubuntu-family systems, the relevant package names commonly include
 `p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `exfatprogs`,
-`udftools`, `e2fsprogs`, `ntfs-3g`, `wimtools`, and `qemu-utils`.
+`udftools`, `e2fsprogs`, `ntfs-3g`, `wimtools`, `qemu-utils`, and `psmisc`.
 
 The first UEFI:NTFS use asks permission to download a 1 MiB helper from its
 release-pinned Rufus source URL. ISOpropyl verifies the exact byte count and
@@ -281,7 +282,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite currently contains more than 570 tests. Device-facing tests mock block
+The suite currently contains more than 620 tests. Device-facing tests mock block
 devices and privileged commands; the automated suite never writes a real drive.
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes to a destructive
 path.

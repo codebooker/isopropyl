@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .devices import Device, parse_lsblk
+from .conflicts import conflict_diagnostic_suffix
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -281,17 +282,23 @@ def unmount_device(
     targets = current.partitions or ((current.path,) if current.mountpoints else ())
     for target in targets:
         cancel_check()
-        result = _run_checked(
-            runner,
-            [tools.udisksctl, "unmount", "--block-device", target],
-            timeout=30,
-        )
+        try:
+            result = _run_checked(
+                runner,
+                [tools.udisksctl, "unmount", "--block-device", target],
+                timeout=30,
+            )
+        except WriterError as error:
+            raise WriterError(
+                str(error) + conflict_diagnostic_suffix(target)
+            ) from error
         combined = (result.stdout or "") + (result.stderr or "")
         if result.returncode and not any(
             marker in combined.casefold()
             for marker in ("not mounted", "not a mounted filesystem")
         ):
-            raise WriterError(_bounded_message(combined, f"Could not unmount {target}"))
+            message = _bounded_message(combined, f"Could not unmount {target}")
+            raise WriterError(message + conflict_diagnostic_suffix(target))
     revalidate_device(
         expected, writable=writable, tools=tools, runner=runner,
         stat_func=stat_func, device_lookup=device_lookup,

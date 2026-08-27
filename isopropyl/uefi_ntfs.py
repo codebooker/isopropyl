@@ -846,9 +846,14 @@ class UefiNtfsExecutor:
                 plan.content, data_partition, content_progress, power_off=False,
             )
             if not content.unmounted:
+                detail = (
+                    f": {content.cleanup_diagnostic}"
+                    if content.cleanup_diagnostic else ""
+                )
                 raise UefiNtfsError(
                     "The NTFS data partition could not be cleanly unmounted; "
                     "the boot helper was not written"
+                    + detail
                 )
             self._verify_target(plan, partitions)
             progress(UefiNtfsProgress("Writing UEFI:NTFS bridge"))

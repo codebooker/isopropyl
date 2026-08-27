@@ -75,7 +75,7 @@ Status meanings:
 | DBX/SVN/CA 2023 revocation | **Planned** | Requires authenticated, versioned policy data and Windows-specific loader handling. |
 | Runtime UEFI media validation | **Planned** | No generation/update of image-specific firmware-time checksum manifests yet. |
 | Image/staging stored on target | **Done** | Refused before destructive work, then rechecked in constructed execution. |
-| Conflicting-process diagnostics | **Planned** | Current errors report unmount failure but do not identify the owning process. |
+| Conflicting-process diagnostics | **Done** | When an unmount fails, two bounded, read-only optional `fuser` snapshots identify stable visible owners by sanitized process name, PID, and numeric UID across raw writing, backup, restore, erase, media test, optical capture, ISO construction, persistence, and UEFI:NTFS paths. Pipe reads stop at the shared output/deadline ceiling; ISOpropyl never asks `fuser` to kill an owner, trusts no command-line arguments from `/proc`, and preserves the original failure when the probe is unavailable or incomplete. |
 | Distro-specific DD-only rules | **Planned** | Needs a versioned compatibility catalog and fixtures. |
 | Automatic GRUB/Syslinux downloads | **Planned** | Verified-download infrastructure exists, but there is no user-facing GRUB/Syslinux caller or release catalog yet. UEFI:NTFS uses the same underlying safety model but is a separate payload family. |
 

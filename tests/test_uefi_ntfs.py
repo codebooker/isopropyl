@@ -391,9 +391,10 @@ class FakeLayoutExecutor:
 
 
 class FakeContentExecutor:
-    def __init__(self, error=None, *, unmounted=True):
+    def __init__(self, error=None, *, unmounted=True, cleanup_diagnostic=""):
         self.error = error
         self.unmounted = unmounted
+        self.cleanup_diagnostic = cleanup_diagnostic
         self.calls = []
         self.cancelled = False
 
@@ -408,6 +409,7 @@ class FakeContentExecutor:
         return ConstructedMediaResult(
             plan.device.identity, partition, "/media/data",
             len(plan.files), plan.total_bytes, self.unmounted, False,
+            self.cleanup_diagnostic,
         )
 
     def cancel(self):
@@ -475,10 +477,14 @@ class ExecutorTests(unittest.TestCase):
     def make_executor(
         self, plan, *, readback=ARTIFACT_DATA, layout_error=None,
         content_error=None, content_unmounted=True, changed_device=False,
-        wrong_geometry=False,
+        wrong_geometry=False, cleanup_diagnostic="",
     ):
         layout = FakeLayoutExecutor(layout_error)
-        content = FakeContentExecutor(content_error, unmounted=content_unmounted)
+        content = FakeContentExecutor(
+            content_error,
+            unmounted=content_unmounted,
+            cleanup_diagnostic=cleanup_diagnostic,
+        )
         commands = []
         process_calls = []
 
@@ -578,9 +584,13 @@ class ExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, fixture_constants():
             plan = build_plan(staging_tree(Path(directory)))
             executor, _layout, _content, _commands, processes = self.make_executor(
-                plan, content_unmounted=False,
+                plan,
+                content_unmounted=False,
+                cleanup_diagnostic="udisksctl: device busy; Files (PID 42)",
             )
-            with self.assertRaisesRegex(UefiNtfsError, "cleanly unmounted"):
+            with self.assertRaisesRegex(
+                UefiNtfsError, "device busy.*Files.*PID 42",
+            ):
                 executor.execute(plan)
         self.assertEqual(processes, [])
 

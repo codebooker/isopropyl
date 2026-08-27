@@ -35,6 +35,7 @@ from .constructed import (
     build_constructed_media_plan,
     validate_constructed_media_plan,
 )
+from .conflicts import conflict_diagnostic_suffix
 from .devices import Device, parse_lsblk, path_is_on_device
 from .formatting import (
     DeviceChangedError,
@@ -1138,19 +1139,26 @@ class CasperMediaExecutor:
         for partition in partitions:
             self._verify_target(plan, partitions, formatted=True, unmounted=False)
             self._check_cancelled()
-            result = self._run(
-                [
-                    plan.tools.udisksctl, "unmount", "--block-device", partition,
-                    "--no-user-interaction",
-                ],
-                capture_output=True, text=True, timeout=30, shell=False,
-            )
+            try:
+                result = self._run(
+                    [
+                        plan.tools.udisksctl, "unmount", "--block-device", partition,
+                        "--no-user-interaction",
+                    ],
+                    capture_output=True, text=True, timeout=30, shell=False,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise CasperMediaError(
+                    _bounded(error, f"Could not unmount {partition}")
+                    + conflict_diagnostic_suffix(partition)
+                ) from error
             combined = ((result.stdout or "") + (result.stderr or "")).casefold()
             if result.returncode and not any(
                 text in combined for text in ("not mounted", "not a mounted filesystem")
             ):
                 raise CasperMediaError(
                     _bounded(combined, f"Could not unmount {partition}")
+                    + conflict_diagnostic_suffix(partition)
                 )
         self._verify_target(plan, partitions, formatted=True, unmounted=True)
 
@@ -1249,8 +1257,13 @@ class CasperMediaExecutor:
                 power_off=False,
             )
             if not content.unmounted:
+                detail = (
+                    f": {content.cleanup_diagnostic}"
+                    if content.cleanup_diagnostic else ""
+                )
                 raise CasperMediaError(
                     "The FAT32 data partition could not be cleanly unmounted"
+                    + detail
                 )
             self._check_cancelled()
             self._verify_target(plan, pair, formatted=True, unmounted=True)

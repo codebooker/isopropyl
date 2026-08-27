@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from .conflicts import conflict_diagnostic_suffix
+
 OPTICAL_SECTOR_BYTES = 2048
 OUTPUT_SPACE_RESERVE_BYTES = 16 * 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 16 * 1024
@@ -573,16 +575,18 @@ class OpticalCaptureRunner:
                 shell=False,
             )
         except (OSError, subprocess.SubprocessError) as error:
+            message = _bounded_message(error, f"Could not unmount {current.path}")
             raise OpticalSafetyError(
-                _bounded_message(error, f"Could not unmount {current.path}")
+                message + conflict_diagnostic_suffix(current.path)
             ) from error
         combined = (result.stdout or "") + (result.stderr or "")
         if result.returncode and not any(
             item in combined.casefold()
             for item in ("not mounted", "not a mounted filesystem")
         ):
+            message = _bounded_message(combined, f"Could not unmount {current.path}")
             raise OpticalSafetyError(
-                _bounded_message(combined, f"Could not unmount {current.path}")
+                message + conflict_diagnostic_suffix(current.path)
             )
 
     @staticmethod

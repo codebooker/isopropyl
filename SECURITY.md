@@ -49,6 +49,13 @@ issue requesting a private contact channel without disclosing the vulnerability.
   comparisons are explicitly the conventional assumed 512-byte interpretation.
 - Privileged commands use fixed argument arrays; ISOpropyl does not build shell
   text or run downloaded scripts.
+- A failed unmount may trigger an optional, unprivileged, three-second `fuser`
+  probe with a fixed argument vector. Two snapshots share one deadline and pipe
+  reads stop as soon as their combined output reaches 64 KiB. Results are limited
+  to stable visible PIDs plus descriptor-bound `/proc` process names and numeric
+  UIDs; command lines are not displayed, and ISOpropyl never asks `fuser` to
+  signal or kill an owner process. Probe failure never replaces the original
+  unmount error.
 - Destructive tools take a nonblocking BSD lock on the whole target for each
   command. This coordinates with systemd-udevd and other lock-aware storage
   software, but Linux locks are advisory: they do not exclude an uncooperative

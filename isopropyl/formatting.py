@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .devices import Device, parse_lsblk
+from .conflicts import conflict_diagnostic_suffix
 from .locking import (
     CooperativeLockError,
     add_native_sfdisk_lock,
@@ -2058,17 +2059,28 @@ class FormatExecutor:
         targets = device.partitions or ((device.path,) if device.mountpoints else ())
         for target in targets:
             self._check_cancelled()
-            result = self._run_probe(
-                [tools.udisksctl, "unmount", "--block-device", target],
-                purpose=f"Unmounting {target}",
-                timeout=_UNMOUNT_TIMEOUT_SECONDS,
-            )
+            try:
+                result = self._run_probe(
+                    [tools.udisksctl, "unmount", "--block-device", target],
+                    purpose=f"Unmounting {target}",
+                    timeout=_UNMOUNT_TIMEOUT_SECONDS,
+                )
+            except FormatCancelled:
+                raise
+            except (FormattingError, OSError, subprocess.SubprocessError) as error:
+                raise FormattingError(
+                    str(error or f"Could not unmount {target}")
+                    + conflict_diagnostic_suffix(target)
+                ) from error
             combined = ((result.stdout or "") + (result.stderr or "")).strip()
             if result.returncode and not any(
                 text in combined.casefold()
                 for text in ("not mounted", "not a mounted filesystem")
             ):
-                raise FormattingError(combined or f"Could not unmount {target}")
+                message = combined or f"Could not unmount {target}"
+                raise FormattingError(
+                    message + conflict_diagnostic_suffix(target)
+                )
 
     def _discover_partition(self, plan: FormatPlan, tools: FormatTools) -> str:
         for attempt in range(self._discovery_attempts):

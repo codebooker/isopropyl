@@ -642,13 +642,14 @@ class FakeLayout:
 class FakeContent:
     def __init__(
         self, events, *, unmounted=True, hook=None, error=None,
-        preflight_error=None,
+        preflight_error=None, cleanup_diagnostic="",
     ):
         self.events = events
         self.unmounted = unmounted
         self.hook = hook
         self.error = error
         self.preflight_error = preflight_error
+        self.cleanup_diagnostic = cleanup_diagnostic
         self.cancelled = False
         self.calls = []
 
@@ -671,6 +672,7 @@ class FakeContent:
         return ConstructedMediaResult(
             plan.device.identity, partition, "/media/data",
             len(plan.files), plan.total_bytes, self.unmounted, False,
+            self.cleanup_diagnostic,
         )
 
     def cancel(self):
@@ -692,6 +694,7 @@ class ExecutorTests(unittest.TestCase):
         layout_preflight_error=None,
         content_error=None,
         content_preflight_error=None,
+        cleanup_diagnostic="",
         current=None,
     ):
         events = events if events is not None else []
@@ -702,6 +705,7 @@ class ExecutorTests(unittest.TestCase):
             hook=content_hook,
             error=content_error,
             preflight_error=content_preflight_error,
+            cleanup_diagnostic=cleanup_diagnostic,
         )
         commands = []
         state = current or {"device": device()}
@@ -843,9 +847,13 @@ class ExecutorTests(unittest.TestCase):
             root = Path(directory).resolve()
             _profile, _staging, plan = media_plan(root)
             executor, _layout, _content, _commands, _events, _state = self.make_executor(
-                plan, content_unmounted=False,
+                plan,
+                content_unmounted=False,
+                cleanup_diagnostic="udisksctl: device busy; Files (PID 42)",
             )
-            with self.assertRaisesRegex(CasperMediaError, "cleanly unmounted"):
+            with self.assertRaisesRegex(
+                CasperMediaError, "device busy.*Files.*PID 42",
+            ):
                 executor.execute(plan)
             self.assertFalse(any(
                 command[1] == "power-off" for command, _ in _commands

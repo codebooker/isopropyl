@@ -34,6 +34,7 @@ from enum import Enum
 from typing import BinaryIO
 
 from .devices import Device, SizeUnitMode, format_size, parse_lsblk
+from .conflicts import conflict_diagnostic_suffix
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -508,16 +509,18 @@ class EraseRunner:
                     shell=False,
                 )
             except (OSError, subprocess.SubprocessError) as error:
+                message = _bounded_message(error, f"Could not unmount {target}")
                 raise EraseSafetyError(
-                    _bounded_message(error, f"Could not unmount {target}")
+                    message + conflict_diagnostic_suffix(target)
                 ) from error
             combined = (result.stdout or "") + (result.stderr or "")
             if result.returncode and not any(
                 item in combined.casefold()
                 for item in ("not mounted", "not a mounted filesystem")
             ):
+                message = _bounded_message(combined, f"Could not unmount {target}")
                 raise EraseSafetyError(
-                    _bounded_message(combined, f"Could not unmount {target}")
+                    message + conflict_diagnostic_suffix(target)
                 )
 
     @staticmethod

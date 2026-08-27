@@ -29,6 +29,7 @@ from enum import Enum
 from typing import BinaryIO
 
 from .devices import Device, SizeUnitMode, format_size, list_devices
+from .conflicts import conflict_diagnostic_suffix
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -515,11 +516,15 @@ class MediaTestRunner:
                     timeout=30,
                 )
             except (OSError, subprocess.SubprocessError) as error:
-                raise MediaTestSafetyError(f"Could not unmount {target}: {error}") from error
+                message = f"Could not unmount {target}: {error}"
+                raise MediaTestSafetyError(
+                    message + conflict_diagnostic_suffix(target)
+                ) from error
             combined = f"{result.stdout or ''}{result.stderr or ''}".lower()
             if result.returncode and "not mounted" not in combined:
+                message = combined.strip() or f"Could not unmount {target}"
                 raise MediaTestSafetyError(
-                    combined.strip() or f"Could not unmount {target}"
+                    message + conflict_diagnostic_suffix(target)
                 )
 
     @staticmethod

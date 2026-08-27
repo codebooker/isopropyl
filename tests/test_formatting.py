@@ -1819,8 +1819,17 @@ class FormatExecutorTests(unittest.TestCase):
             which=lambda name: f"/usr/bin/{name}", runner=runner,
             popen=lambda *_args, **_kwargs: self.fail("must not partition"),
         )
-        with self.assertRaisesRegex(FormattingError, "device is busy"):
+        with (
+            patch(
+                "isopropyl.formatting.conflict_diagnostic_suffix",
+                return_value=(
+                    " Processes currently using the target: Files (PID 42)."
+                ),
+            ) as diagnose,
+            self.assertRaisesRegex(FormattingError, "Files.*PID 42"),
+        ):
             executor.execute(self.device, self.plan)
+        diagnose.assert_called_once_with("/dev/sdz1")
 
     def test_unmount_timeout_is_bounded_before_partitioning(self):
         calls = []
@@ -1838,8 +1847,15 @@ class FormatExecutorTests(unittest.TestCase):
             device_lookup=lambda _path: self.device,
             which=lambda name: f"/usr/bin/{name}", runner=runner, popen=popen,
         )
-        with self.assertRaisesRegex(FormattingError, "Unmounting .* timed out"):
+        with (
+            patch(
+                "isopropyl.formatting.conflict_diagnostic_suffix",
+                return_value=" A recent snapshot found Files (PID 42).",
+            ) as diagnose,
+            self.assertRaisesRegex(FormattingError, "timed out.*PID 42"),
+        ):
             executor.execute(self.device, self.plan)
+        diagnose.assert_called_once_with("/dev/sdz1")
         self.assertEqual(calls[0][1]["timeout"], 15)
         self.assertEqual(calls[1][1]["timeout"], 30)
         popen.assert_not_called()

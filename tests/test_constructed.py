@@ -644,11 +644,16 @@ class ExecutorTests(unittest.TestCase):
                     return completed(1, stderr="busy")
                 return None
 
-            result = self.make_executor(
-                mountpoint, FakeFormatExecutor(), [], command_hook=hook,
-            ).execute(plan)
+            with patch(
+                "isopropyl.constructed.conflict_diagnostic_suffix",
+                return_value=" Processes currently using the target: Files (PID 42).",
+            ):
+                result = self.make_executor(
+                    mountpoint, FakeFormatExecutor(), [], command_hook=hook,
+                ).execute(plan)
             self.assertFalse(result.unmounted)
             self.assertFalse(result.powered_off)
+            self.assertIn("Files (PID 42)", result.cleanup_diagnostic)
 
     def test_cancel_before_execute_touches_nothing_and_executor_is_single_use(self):
         with tempfile.TemporaryDirectory() as directory:

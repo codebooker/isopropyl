@@ -65,7 +65,8 @@ evidence.
 - Continue applying the bounded-worker and stale-result pattern used by device
   discovery to any future host probes that could delay the UI.
 - Localization, system/high-contrast appearance, keyboard and screen-reader QA.
-- Conflicting-process diagnostics and narrowly bounded I/O retries.
+- Narrowly bounded I/O retries where idempotence can be proven; the shipped
+  read-only conflicting-process diagnostic must remain optional and non-killing.
 - Physically certify the implemented geometry-filtered restore allocation/block
   sizes, then consider exposing profile-safe sizing in ISO construction.
 - Additional filesystem, partition-layout, and volume-label controls where the

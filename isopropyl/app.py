@@ -3087,13 +3087,26 @@ class Window(QMainWindow):
                             ),
                         ),
                     )
-                message = (
-                    "Your UEFI bootable USB is ready and safely powered off. "
-                    "You can remove it."
-                    if result.powered_off else
-                    "Your UEFI bootable USB is ready. Eject it with your desktop "
-                    "before removing it."
-                )
+                if result.powered_off:
+                    message = (
+                        "Your UEFI bootable USB is ready and safely powered off. "
+                        "You can remove it."
+                    )
+                elif not result.unmounted:
+                    detail = (
+                        result.cleanup_diagnostic + " "
+                        if result.cleanup_diagnostic else ""
+                    )
+                    message = (
+                        "The bootable USB was written, but it could not be cleanly "
+                        f"unmounted. {detail}Close files using it, then eject it "
+                        "with your desktop."
+                    )
+                else:
+                    message = (
+                        "Your UEFI bootable USB is ready. Eject it with your desktop "
+                        "before removing it."
+                    )
                 success = True
             except (
                 IsoStagingCancelled, ConstructedMediaCancelled, UefiNtfsCancelled,

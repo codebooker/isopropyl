@@ -226,6 +226,34 @@ class WriterTests(unittest.TestCase):
             [call[0] for call in harness.run_calls],
         )
 
+    def test_unmount_timeout_keeps_busy_process_diagnostics(self):
+        harness = WriterHarness()
+
+        def runner(argv, **kwargs):
+            if argv[1] == "unmount":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return completed()
+
+        writer = ImageWriter(
+            which=trusted_tool,
+            runner=runner,
+            popen=harness.popen,
+            device_lookup=harness.lookup,
+            block_stat=lambda _path: block_status(),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "disk.img"
+            image.write_bytes(b"fixture")
+            with (
+                patch(
+                    "isopropyl.writer.conflict_diagnostic_suffix",
+                    return_value=" A recent snapshot found Files (PID 42).",
+                ) as diagnose,
+                self.assertRaisesRegex(WriterError, "timed out.*PID 42"),
+            ):
+                writer.write(image, harness.device, lambda _done, _total: None)
+        diagnose.assert_called_once_with("/dev/sdz1")
+
     def test_missing_or_untrusted_flock_fails_before_unmount(self):
         for value in (None, "flock", "/tmp/flock", "/usr/bin/../bin/flock"):
             with self.subTest(value=value):

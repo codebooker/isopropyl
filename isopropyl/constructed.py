@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .devices import Device, parse_lsblk, path_is_on_device
+from .conflicts import conflict_diagnostic_suffix
 from .formatting import (
     Filesystem,
     FormatCancelled,
@@ -158,6 +159,7 @@ class ConstructedMediaResult:
     bytes_copied: int
     unmounted: bool
     powered_off: bool
+    cleanup_diagnostic: str = ""
 
 
 Progress = Callable[[ConstructedProgress], None]
@@ -1084,8 +1086,9 @@ class ConstructedMediaExecutor:
         mounted: bool,
         *,
         power_off: bool = True,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, str]:
         unmounted = not mounted
+        cleanup_diagnostic = ""
         if partition and mounted:
             try:
                 result = self._run_command(
@@ -1100,11 +1103,22 @@ class ConstructedMediaExecutor:
                     item in combined.casefold()
                     for item in ("not mounted", "not a mounted filesystem")
                 )
-            except (OSError, subprocess.SubprocessError):
+                if not unmounted:
+                    cleanup_diagnostic = (
+                        _bounded_message(
+                            combined, f"Could not unmount {partition}",
+                        )
+                        + conflict_diagnostic_suffix(partition)
+                    )
+            except (OSError, subprocess.SubprocessError) as error:
                 unmounted = False
+                cleanup_diagnostic = (
+                    _bounded_message(error, f"Could not unmount {partition}")
+                    + conflict_diagnostic_suffix(partition)
+                )
         powered_off = False
         if not power_off:
-            return unmounted, powered_off
+            return unmounted, powered_off, cleanup_diagnostic
         try:
             result = self._run_command(
                 [
@@ -1116,7 +1130,7 @@ class ConstructedMediaExecutor:
             powered_off = result.returncode == 0
         except (OSError, subprocess.SubprocessError):
             pass
-        return unmounted, powered_off
+        return unmounted, powered_off, cleanup_diagnostic
 
     def _populate_partition(
         self,
@@ -1145,7 +1159,7 @@ class ConstructedMediaExecutor:
                 "Complete", "", plan.total_bytes, plan.total_bytes,
             ))
         finally:
-            unmounted, powered_off = self._best_effort_cleanup(
+            unmounted, powered_off, cleanup_diagnostic = self._best_effort_cleanup(
                 plan, partition, mounted, power_off=power_off,
             )
         assert mountpoint is not None
@@ -1157,6 +1171,7 @@ class ConstructedMediaExecutor:
             bytes_copied=plan.total_bytes,
             unmounted=unmounted,
             powered_off=powered_off,
+            cleanup_diagnostic=cleanup_diagnostic,
         )
 
     def populate_existing_partition(
