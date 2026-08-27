@@ -28,6 +28,7 @@ from .backup import (
     DriveImager, VirtualDriveImager, validate_virtual_backup_destination,
     virtual_backup_required_space,
 )
+from .authenticode import AuthenticodeIntegrityState
 from .bootloaders import (
     CatalogError, bundle_for_dependency, delete_cached_artifacts, inventory_cache,
 )
@@ -86,6 +87,7 @@ from .persistence import (
 )
 from .writer import ImageWriter, WriteCancelled
 from .virtual import VirtualConversionCancelled, VirtualDiskStager, inspect_virtual_disk
+from .uefi import SignatureTableState
 from .uefi_ntfs import (
     UEFI_NTFS_SIZE, BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
     build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
@@ -2617,12 +2619,33 @@ class Window(QMainWindow):
                     + "; ".join(self.inspection.eltorito_issues)
                 )
             if self.inspection.uefi_payloads:
-                detail_lines.append("UEFI payload structure (signatures are not trust-validated):")
-                detail_lines.extend(
-                    f"  {payload.path}: {payload.architecture}, "
-                    f"certificate {payload.signature_state.value}, SBAT {payload.sbat_state.value}"
-                    for payload in self.inspection.uefi_payloads[:8]
+                detail_lines.append(
+                    "UEFI payload signatures — integrity only; signer identity, "
+                    "certificate trust/revocation, timestamps, and Secure Boot "
+                    "acceptance are not evaluated:"
                 )
+                for payload in self.inspection.uefi_payloads[:8]:
+                    if payload.authenticode is not None:
+                        auth_state = {
+                            AuthenticodeIntegrityState.VALID_UNTRUSTED: (
+                                "Authenticode integrity passed (signer trust not evaluated)"
+                            ),
+                            AuthenticodeIntegrityState.INVALID: "Authenticode check failed",
+                            AuthenticodeIntegrityState.MALFORMED: "Authenticode data malformed",
+                            AuthenticodeIntegrityState.UNSUPPORTED: "Authenticode check unsupported",
+                            AuthenticodeIntegrityState.INDETERMINATE: (
+                                "Authenticode result indeterminate"
+                            ),
+                        }[payload.authenticode.state]
+                    elif payload.signature_state is SignatureTableState.ABSENT:
+                        auth_state = "Authenticode absent"
+                    else:
+                        auth_state = "Authenticode not checked"
+                    detail_lines.append(
+                        f"  {payload.path}: {payload.architecture}, certificate "
+                        f"{payload.signature_state.value}, {auth_state}, "
+                        f"SBAT {payload.sbat_state.value}"
+                    )
             if self.inspection.uefi_analysis_issues:
                 detail_lines.append(
                     f"UEFI inspection issues: {len(self.inspection.uefi_analysis_issues)}"

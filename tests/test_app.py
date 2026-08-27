@@ -22,6 +22,7 @@ from isopropyl.app import (
     BackgroundPreparation, ChecksumToken, PendingIsoWrite, PendingUefiShell,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
 )
+from isopropyl.authenticode import AuthenticodeIntegrityState, AuthenticodeResult
 from isopropyl.backup import VHD_MAX_SIZE
 from isopropyl.bootloaders import (
     BootloaderCacheDeletionResult, BootloaderCacheInventory, CacheDeletion,
@@ -831,6 +832,67 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("Partition structure: Malformed", tooltip)
         self.assertIn("MBR boot code: GRUB", tooltip)
         self.assertIn("primary: GPT header CRC32 is invalid.", tooltip)
+
+    def test_image_tooltip_reports_authenticode_integrity_without_claiming_trust(self):
+        authenticode = AuthenticodeResult(
+            AuthenticodeIntegrityState.VALID_UNTRUSTED,
+            "sha256", "CN=Untrusted Embedded Claim", "a" * 64, 1,
+        )
+        original = optical_windows_inspection(hybrid=True)
+        payload = replace(
+            original.uefi_payloads[0],
+            signature_state=SignatureTableState.PRESENT_UNVERIFIED,
+            authenticode=authenticode,
+        )
+        inspection = replace(original, uefi_payloads=(
+            payload,
+            replace(
+                payload, path="EFI/absent.efi",
+                signature_state=SignatureTableState.ABSENT, authenticode=None,
+            ),
+            replace(
+                payload, path="EFI/malformed.efi",
+                signature_state=SignatureTableState.MALFORMED, authenticode=None,
+            ),
+            replace(
+                payload, path="EFI/invalid.efi",
+                authenticode=AuthenticodeResult(
+                    AuthenticodeIntegrityState.INVALID, error="fixture",
+                ),
+            ),
+            replace(
+                payload, path="EFI/auth-malformed.efi",
+                authenticode=AuthenticodeResult(
+                    AuthenticodeIntegrityState.MALFORMED, error="fixture",
+                ),
+            ),
+            replace(
+                payload, path="EFI/unsupported.efi",
+                authenticode=AuthenticodeResult(
+                    AuthenticodeIntegrityState.UNSUPPORTED, error="fixture",
+                ),
+            ),
+            replace(
+                payload, path="EFI/indeterminate.efi",
+                authenticode=AuthenticodeResult(
+                    AuthenticodeIntegrityState.INDETERMINATE, error="fixture",
+                ),
+            ),
+        ))
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_inspection_finished((1, 2, 3, 4), inspection)
+
+        tooltip = self.window.image_detail.toolTip()
+        self.assertIn("Authenticode integrity passed (signer trust not evaluated)", tooltip)
+        self.assertIn("Secure Boot acceptance are not evaluated", tooltip)
+        self.assertIn("certificate absent, Authenticode absent", tooltip)
+        self.assertIn("certificate malformed, Authenticode not checked", tooltip)
+        self.assertIn("certificate present-unverified, Authenticode check failed", tooltip)
+        self.assertIn("Authenticode data malformed", tooltip)
+        self.assertIn("Authenticode check unsupported", tooltip)
+        self.assertIn("Authenticode result indeterminate", tooltip)
+        self.assertNotIn("Untrusted Embedded Claim", tooltip)
+        self.assertNotIn("valid signature", tooltip.casefold())
 
     def test_image_tooltip_marks_plain_mbr_sector_size_as_assumed(self):
         inspection = replace(

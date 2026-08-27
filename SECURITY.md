@@ -150,9 +150,34 @@ issue requesting a private contact channel without disclosing the vulnerability.
   and applies the chosen expiration policy, but Windows S mode does not run
   FirstLogonCommands and other setup policy can prevent it. The GUI therefore
   treats this account option as an explicit, warned, best-effort customization.
-- PE certificate-table and SBAT inspection is structural. ISOpropyl does not yet
-  cryptographically establish signer trust or check an authenticated DBX/SVN
-  revocation feed.
+- PE certificate-table and SBAT parsing remains structural. For exactly one
+  revision-2 PKCS#7 `WIN_CERTIFICATE`, ISOpropyl additionally passes the same
+  bounded in-memory PE bytes through a sealed Linux memory file to an isolated
+  Python worker. Before parsing arguments or PE bytes, that isolated interpreter
+  checks the exact pinned dependency set and lets oscrypto resolve the host
+  `libcrypto`; this cold-start step may use a short-lived local library probe.
+  During that trusted, single-threaded import only, ISOpropyl widens oscrypto
+  1.3.0's exact single-digit OpenSSL/LibreSSL version regex to accept multi-digit
+  numeric components. The standard regex functions are restored in a `finally`
+  block before any PE or PKCS#7 parsing, and every unrelated lookup is unchanged.
+  It then applies CPU, address-space, file, descriptor, and no-descendant-process
+  limits before accepting the PE. Verification is limited to 256 MiB PE input,
+  8 MiB PKCS#7 data, 32 embedded certificates, SHA-256/384/512, one
+  embedded/nested signature, eight seconds, and bounded output. Cancellation and
+  the ISO inspection's overall deadline terminate and reap it. The limited
+  worker independently revalidates the PE Security Directory and
+  `WIN_CERTIFICATE` framing before Signify checks the file digest, signer
+  signature, current certificate validity, code-signing EKU, and optional
+  digital-signature key usage.
+- A successful check is always `integrity-valid-untrusted`. Its temporary
+  certificate store contains only certificates embedded in that signature;
+  Signify's Microsoft root store is never consulted, network fetching is
+  disabled, and countersignatures/signing timestamps and revocation are not
+  evaluated. The result is presentation-only and cannot change the structural
+  `present-unverified` state, ISO plan, payload trust class, Secure Boot warning,
+  unsigned-payload consent, or write authorization. ISOpropyl does not yet
+  authenticate Microsoft/firmware roots or a DBX/SVN revocation feed, and a
+  matching integrity result does not predict firmware acceptance.
 - Automated device-facing tests use mocks and regular files. Hardware-backed
   write, boot, Secure Boot, cancellation, and failure-recovery testing is still
   required before the alpha label can be removed.

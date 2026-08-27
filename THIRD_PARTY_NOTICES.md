@@ -24,8 +24,32 @@ writes do not download them and no BIOS executor consumes them yet.
 The Python package includes metadata only; the optional executables are acquired
 when the user explicitly starts and confirms **Create UEFI Shell…**. Normal image
 writes never acquire them. The unmodified executables are not Secure Boot signed
-and require Secure Boot disabled; ISOpropyl does not claim Authenticode or
-certificate-chain validation for them.
+and require Secure Boot disabled; ISOpropyl does not claim certificate-chain or
+Secure Boot trust for them.
+
+## Python Authenticode analysis
+
+- [Signify 0.9.2](https://pypi.org/project/signify/), licensed MIT, is used to
+  parse and verify Authenticode integrity in the isolated analysis worker. The
+  complete resolved backend is pinned: `asn1crypto` 1.5.1, `certvalidator`
+  0.11.1, and `oscrypto` 1.3.0 are MIT; `typing_extensions` 4.16.0 is PSF-2.0;
+  and `mscerts` 2026.7.1 is MPL-2.0.
+- Dependency license files must be retained by downstream bundles. Because the
+  `certvalidator` 0.11.1 wheel omits its license file, ISOpropyl carries the
+  upstream copyright and MIT text in
+  [`licenses/CERTVALIDATOR-MIT.txt`](licenses/CERTVALIDATOR-MIT.txt).
+- ISOpropyl applies a narrow runtime compatibility shim while importing the
+  pinned `oscrypto` 1.3.0 backend. It changes only that release's exact
+  single-digit OpenSSL/LibreSSL version-pattern lookup so host versions such as
+  OpenSSL 3.0.16 and LibreSSL 3.10.2 can be recognized, then restores Python's
+  standard regex functions before parsing any inspected data. No oscrypto source
+  file is redistributed or modified in place.
+
+Signify normally offers a Microsoft certificate store through `mscerts`, but
+ISOpropyl never passes that store to verification. It supplies only the
+certificates embedded in the inspected signature, disables fetching, and labels
+success as integrity-valid-untrusted. This is not a Microsoft, firmware,
+revocation, timestamp, DBX, or Secure Boot trust decision.
 
 ## UEFI:NTFS boot helper
 

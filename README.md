@@ -68,7 +68,11 @@ installer customization, verification, backups, formatting, and media tools.
   partition metadata instead of treating a signature alone as a valid disk.
 - Parse El Torito boot catalogs and report their BIOS/UEFI boot entries.
 - Inspect removable-media EFI executables, PE architecture, certificate-table
-  presence, and SBAT structure without pretending that structure equals trust.
+  framing, and SBAT structure. A sealed, resource-limited worker checks one
+  embedded Authenticode signature's SHA-256/384/512 file integrity and signer
+  signature, while clearly labeling the result untrusted: Microsoft/firmware
+  trust, revocation, signing timestamps, DBX policy, and Secure Boot acceptance
+  are not evaluated and never influence write authorization.
 - Detect Windows installer media and exact GRUB/Syslinux payload identities when
   the image contains enough evidence.
 - Calculate MD5, SHA-1, SHA-256, and SHA-512 in one cancellable pass over a
@@ -194,6 +198,9 @@ architecture/firmware profiles are tracked in the
 ## Requirements
 
 - Linux with Python 3.10 or newer and PyQt 6.5 or newer.
+- The Python installation resolves the exact pinned Signify/Authenticode
+  analysis backend automatically. A directly launched, otherwise uninstalled
+  working tree stays usable but reports cryptographic analysis as unsupported.
 - `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`
   for normal device work.
 - 7-Zip (`7z`) for ISO cataloging and safe extraction.

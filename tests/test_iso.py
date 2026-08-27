@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
+from isopropyl.authenticode import AuthenticodeIntegrityState, AuthenticodeResult
 from isopropyl.images import ImageInspection
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.iso import (
@@ -49,6 +50,23 @@ def inspection(
 
 
 class PlanTests(unittest.TestCase):
+    def test_authenticode_analysis_is_presentation_only_for_write_planning(self):
+        image = inspection()
+        entries = [ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 32)]
+        baseline = build_write_plan(image, entries)
+        for state in AuthenticodeIntegrityState:
+            result = (
+                AuthenticodeResult(state, "sha256", "CN=Claim", "a" * 64, 1)
+                if state is AuthenticodeIntegrityState.VALID_UNTRUSTED
+                else AuthenticodeResult(state, error="fixture")
+            )
+            payload = replace(image.uefi_payloads[0], authenticode=result)
+            with self.subTest(state=state):
+                self.assertEqual(
+                    build_write_plan(replace(image, uefi_payloads=(payload,)), entries),
+                    baseline,
+                )
+
     def test_auto_selects_dd_for_raw_image(self):
         plan = build_write_plan(inspection(iso=False))
         self.assertEqual(plan.mode, WriteMode.DD)

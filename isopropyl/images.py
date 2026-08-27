@@ -754,6 +754,7 @@ def inspect_image(
         if inspection_fd >= 0 and "UEFI" in modes:
             uefi_analysis = inspect_iso_uefi_payloads(
                 path, [member.path for member in members], image_fd=inspection_fd,
+                cancel_check=check_inspection,
             )
             uefi_payloads = uefi_analysis.payloads
             uefi_issues = uefi_analysis.issues

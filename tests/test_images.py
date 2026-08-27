@@ -25,6 +25,7 @@ from isopropyl.sources import ExpandedImageTooLarge
 from isopropyl.timestamps import (
     MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
 )
+from isopropyl.uefi import ImageUefiAnalysis
 from isopropyl.eltorito import (
     BootEntry, BootPlatform, ElToritoError, ElToritoInspection,
     ElToritoNotFound, EmulationType, ValidationEntry,
@@ -366,6 +367,47 @@ Folder = -
             data[offset + 1:offset + 6] = b"CD001"
             path.write_bytes(data)
             self.assertFalse(inspect_image(path).raw_compatible)
+
+    def test_image_inspection_forwards_cancellation_to_uefi_analysis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uefi.iso"
+            data = bytearray(18 * 2048)
+            offset = 16 * 2048
+            data[offset + 1:offset + 6] = b"CD001"
+            path.write_bytes(data)
+            callback_checks = 0
+            observed: list[object] = []
+
+            def outer_cancel() -> None:
+                nonlocal callback_checks
+                callback_checks += 1
+
+            def inspect_uefi(*_args, **kwargs):
+                observed.append(kwargs.get("cancel_check"))
+                kwargs["cancel_check"]()
+                return ImageUefiAnalysis(())
+
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    return_value=([ImageMember(
+                        "EFI/BOOT/BOOTX64.EFI", 1, "file",
+                    )], True),
+                ),
+                patch(
+                    "isopropyl.images.inspect_iso_uefi_payloads",
+                    side_effect=inspect_uefi,
+                ),
+                patch(
+                    "isopropyl.images.inspect_eltorito_file",
+                    side_effect=ElToritoNotFound("fixture"),
+                ),
+            ):
+                inspect_image(path, cancel_check=outer_cancel)
+
+            self.assertEqual(len(observed), 1)
+            self.assertTrue(callable(observed[0]))
+            self.assertGreater(callback_checks, 1)
 
     def test_inspects_the_expanded_layout_and_size_of_compressed_images(self):
         with tempfile.TemporaryDirectory() as directory:

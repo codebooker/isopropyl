@@ -401,7 +401,7 @@ def _trusted_7z() -> str | None:
 
 def read_archive_member_with_7z(
     image: Path, member: str, *, timeout: float = 15.0,
-    image_fd: int | None = None,
+    image_fd: int | None = None, cancel_check: Callable[[], None] | None = None,
 ) -> bytes:
     """Read one exact member with the host 7z tool, with time and size caps."""
 
@@ -421,6 +421,8 @@ def read_archive_member_with_7z(
     output = bytearray()
     try:
         while True:
+            if cancel_check is not None:
+                cancel_check()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"Timed out reading {member}")
@@ -435,6 +437,8 @@ def read_archive_member_with_7z(
             output.extend(block)
             if len(output) > MAX_BOOT_BLOB_SIZE:
                 raise ValueError(f"{member} exceeds the inspection size limit")
+        if cancel_check is not None:
+            cancel_check()
         returncode = process.wait(timeout=1)
         if returncode:
             raise OSError(f"7z could not read {member}")

@@ -52,8 +52,10 @@ evidence.
 
 ### Trust, formats, and advanced media
 
-- Cryptographically verify Authenticode signers and authenticated DBX/SBAT/SVN
-  revocation data; keep runtime media validation distinct from static analysis.
+- Extend the implemented integrity-only Authenticode check with independently
+  authenticated Microsoft/firmware trust policy, signing-time validation, and
+  DBX/SBAT/SVN revocation data; keep runtime media validation distinct from
+  static analysis and never promote an embedded-only result into boot trust.
 - Add Windows To Go through `wimlib` apply, offline BCD/SAN policy, and explicit
   internal-disk behavior.
 - Add FFU/VTSI/direct WIM/ESD input and FFU/UDF-image authoring output only after

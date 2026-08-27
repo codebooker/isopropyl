@@ -6,9 +6,10 @@ from __future__ import annotations
 
 This module parses enough PE metadata to identify architecture, EFI subsystem,
 the Authenticode certificate-table container, and an optional ``.sbat``
-section.  It does not perform certificate-chain or Authenticode validation.
-Consequently, a structurally sound certificate table is reported as
-``PRESENT_UNVERIFIED`` and never as a valid signature.
+section.  An isolated, resource-bounded backend can validate the Authenticode
+file digest and embedded signer signature, but it does not establish Microsoft,
+firmware, revocation, or signing-time trust.  Consequently, a structurally sound
+certificate table remains ``PRESENT_UNVERIFIED`` even when integrity matches.
 """
 
 import csv
@@ -24,6 +25,14 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from collections.abc import Callable, Iterable
 
+from .authenticode import (
+    WORKER_TIMEOUT_SECONDS,
+    AuthenticodeIntegrityState,
+    AuthenticodeResult,
+    CertificateTableFacts,
+    WinCertificateFacts,
+    verify_authenticode,
+)
 from .boot_identity import read_archive_member_with_7z
 
 MAX_PE_SIZE = 256 * 1024 * 1024
@@ -139,6 +148,7 @@ class UefiInspection:
     certificate_table: CertificateTable
     sbat: SbatMetadata
     warnings: tuple[str, ...] = ()
+    authenticode: AuthenticodeResult | None = None
 
     @property
     def is_uefi_image(self) -> bool:
@@ -154,6 +164,7 @@ class ImageUefiPayload:
     signature_state: SignatureTableState
     sbat_state: SbatState
     warnings: tuple[str, ...]
+    authenticode: AuthenticodeResult | None = None
 
 
 @dataclass(frozen=True)
@@ -255,6 +266,11 @@ def _parse_certificate_table(blob: bytes, file_offset: int, size: int) -> Certif
                 SignatureTableState.MALFORMED, file_offset, size, tuple(entries),
                 "WIN_CERTIFICATE alignment exceeds the certificate table",
             )
+        if any(blob[cursor + length:cursor + aligned_length]):
+            return CertificateTable(
+                SignatureTableState.MALFORMED, file_offset, size, tuple(entries),
+                "WIN_CERTIFICATE alignment padding must be zero",
+            )
         cursor += aligned_length
 
     return CertificateTable(
@@ -349,7 +365,16 @@ def _parse_sbat_section(blob: bytes, sections: tuple[PeSection, ...]) -> SbatMet
     )
 
 
-def inspect_pe_bytes(blob: bytes) -> UefiInspection:
+AuthenticodeVerifier = Callable[..., AuthenticodeResult]
+
+
+def inspect_pe_bytes(
+    blob: bytes,
+    *,
+    authenticode_timeout: float = WORKER_TIMEOUT_SECONDS,
+    authenticode_verifier: AuthenticodeVerifier = verify_authenticode,
+    authenticode_cancel_check: Callable[[], None] | None = None,
+) -> UefiInspection:
     """Inspect a complete PE/COFF payload without modifying it."""
 
     if len(blob) > MAX_PE_SIZE:
@@ -435,13 +460,44 @@ def inspect_pe_bytes(blob: bytes) -> UefiInspection:
             )
 
     sbat = _parse_sbat_section(blob, tuple(sections))
+    authenticode: AuthenticodeResult | None = None
+    if certificate_table.state is SignatureTableState.PRESENT_UNVERIFIED:
+        facts = CertificateTableFacts(
+            certificate_table.file_offset,
+            certificate_table.size,
+            tuple(
+                WinCertificateFacts(
+                    entry.file_offset, entry.length, entry.revision,
+                    entry.certificate_type,
+                )
+                for entry in certificate_table.entries
+            ),
+        )
+        authenticode = authenticode_verifier(
+            blob, facts, timeout=authenticode_timeout,
+            cancel_check=authenticode_cancel_check,
+        )
     warnings: list[str] = []
     if machine not in MACHINE_ARCHITECTURES:
         warnings.append(f"unknown PE machine type 0x{machine:04x}")
     if subsystem not in EFI_SUBSYSTEMS:
         warnings.append(f"PE subsystem {subsystem} is not a UEFI subsystem")
     if certificate_table.state is SignatureTableState.PRESENT_UNVERIFIED:
-        warnings.append("certificate table is present but its signature is not cryptographically verified")
+        if (
+            authenticode is not None
+            and authenticode.state is AuthenticodeIntegrityState.VALID_UNTRUSTED
+        ):
+            warnings.append(
+                "Authenticode integrity matches; signer trust, revocation, "
+                "signing time, and Secure Boot acceptance were not evaluated"
+            )
+        elif authenticode is not None:
+            warnings.append(
+                f"Authenticode integrity {authenticode.state.value}: "
+                f"{authenticode.error or 'no diagnostic was returned'}"
+            )
+        else:
+            warnings.append("Authenticode integrity was not checked")
     elif certificate_table.state is SignatureTableState.MALFORMED:
         warnings.append(f"malformed certificate table: {certificate_table.error}")
     if sbat.state is SbatState.MALFORMED:
@@ -450,7 +506,7 @@ def inspect_pe_bytes(blob: bytes) -> UefiInspection:
     return UefiInspection(
         machine, MACHINE_ARCHITECTURES.get(machine, f"unknown (0x{machine:04x})"),
         pe_kind, subsystem, EFI_SUBSYSTEMS.get(subsystem, f"subsystem {subsystem}"),
-        tuple(sections), certificate_table, sbat, tuple(warnings),
+        tuple(sections), certificate_table, sbat, tuple(warnings), authenticode,
     )
 
 
@@ -521,6 +577,8 @@ def inspect_iso_uefi_payloads(
     reader: ArchiveReader | None = None,
     timeout: float = 30.0,
     image_fd: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    authenticode_verifier: AuthenticodeVerifier = verify_authenticode,
 ) -> ImageUefiAnalysis:
     """Read selected EFI members without privilege and inspect their PE structure."""
     if image_fd is None:
@@ -532,6 +590,8 @@ def inspect_iso_uefi_payloads(
     payloads: list[ImageUefiPayload] = []
     issues: list[str] = []
     for member in uefi_member_paths(member_paths):
+        if cancel_check is not None:
+            cancel_check()
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
             issues.append("UEFI payload inspection reached its overall time limit")
@@ -542,10 +602,32 @@ def inspect_iso_uefi_payloads(
                 if reader is not None
                 else read_archive_member_with_7z(
                     image, member, timeout=min(15.0, remaining), image_fd=image_fd,
+                    cancel_check=cancel_check,
                 )
             )
-            parsed = inspect_pe_bytes(blob)
+            if cancel_check is not None:
+                cancel_check()
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                issues.append("UEFI payload inspection reached its overall time limit")
+                break
+            parsed = inspect_pe_bytes(
+                blob,
+                authenticode_timeout=min(WORKER_TIMEOUT_SECONDS, remaining),
+                authenticode_verifier=authenticode_verifier,
+                authenticode_cancel_check=cancel_check,
+            )
+            if cancel_check is not None:
+                cancel_check()
+            if timeout - (time.monotonic() - started) <= 0:
+                issues.append("UEFI payload inspection reached its overall time limit")
+                break
         except (OSError, TimeoutError, ValueError) as error:
+            # A cancellation/deadline callback can intentionally use one of
+            # these exception types.  Recheck it before treating a payload
+            # parser failure as a nonfatal analysis issue.
+            if cancel_check is not None:
+                cancel_check()
             issues.append(f"{member}: {error}")
             continue
         payloads.append(ImageUefiPayload(
@@ -556,6 +638,7 @@ def inspect_iso_uefi_payloads(
             parsed.certificate_table.state,
             parsed.sbat.state,
             parsed.warnings,
+            parsed.authenticode,
         ))
     return ImageUefiAnalysis(tuple(payloads), tuple(issues))
 

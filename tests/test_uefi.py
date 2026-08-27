@@ -4,9 +4,14 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from isopropyl.authenticode import (
+    AuthenticodeIntegrityState, AuthenticodeResult, CertificateTableFacts,
+)
 from isopropyl.uefi import (
-    PeFormatError, PolicyState, SbatRequirement, SbatState, SignatureTableState,
+    CertificateTable, ImageUefiPayload, PeFormatError, PolicyState, SbatMetadata,
+    SbatRequirement, SbatState, SignatureTableState, UefiInspection,
     evaluate_sbat_policy, inspect_iso_uefi_payloads, inspect_pe_bytes, inspect_pe_file,
     uefi_member_paths,
 )
@@ -69,6 +74,131 @@ def make_pe(
 
 
 class UefiInspectionTests(unittest.TestCase):
+    @staticmethod
+    def auth_result(state: AuthenticodeIntegrityState) -> AuthenticodeResult:
+        if state is AuthenticodeIntegrityState.VALID_UNTRUSTED:
+            return AuthenticodeResult(
+                state, "sha256", "CN=Embedded Claim", "a" * 64, 1,
+            )
+        return AuthenticodeResult(state, error="fixture result")
+
+    def test_authenticode_is_additive_and_never_changes_structural_state(self):
+        certificate = struct.pack("<IHH", 16, 0x0200, 0x0002) + b"12345678"
+        blob = make_pe(certificate=certificate)
+        for state in AuthenticodeIntegrityState:
+            observed: list[tuple[bytes, CertificateTableFacts, float, object]] = []
+
+            def verifier(data, facts, *, timeout, cancel_check):
+                observed.append((data, facts, timeout, cancel_check))
+                return self.auth_result(state)
+
+            with self.subTest(state=state):
+                result = inspect_pe_bytes(blob, authenticode_verifier=verifier)
+                self.assertEqual(
+                    result.certificate_table.state,
+                    SignatureTableState.PRESENT_UNVERIFIED,
+                )
+                self.assertFalse(result.certificate_table.cryptographically_verified)
+                self.assertIs(result.authenticode.state, state)
+                self.assertEqual(observed[0][0], blob)
+                self.assertEqual(observed[0][1].file_offset, result.certificate_table.file_offset)
+                self.assertEqual(observed[0][1].size, result.certificate_table.size)
+                self.assertEqual(len(observed[0][1].entries), 1)
+
+    def test_absent_and_structurally_malformed_tables_never_start_verifier(self):
+        verifier = Mock()
+        absent = inspect_pe_bytes(make_pe(), authenticode_verifier=verifier)
+        malformed_certificate = (
+            struct.pack("<IHH", 9, 0x0200, 0x0002) + b"x" + b"\x01" * 7
+        )
+        malformed = inspect_pe_bytes(
+            make_pe(certificate=malformed_certificate),
+            authenticode_verifier=verifier,
+        )
+        verifier.assert_not_called()
+        self.assertIsNone(absent.authenticode)
+        self.assertIsNone(malformed.authenticode)
+
+    def test_authenticode_result_propagates_through_iso_without_authorizing_trust(self):
+        certificate = struct.pack("<IHH", 16, 0x0200, 0x0002) + b"12345678"
+        valid = self.auth_result(AuthenticodeIntegrityState.VALID_UNTRUSTED)
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "fixture.iso"
+            image.write_bytes(b"fixture")
+            analysis = inspect_iso_uefi_payloads(
+                image, ("EFI/BOOT/BOOTX64.EFI",),
+                reader=lambda *_args: make_pe(certificate=certificate),
+                authenticode_verifier=lambda *_args, **_kwargs: valid,
+            )
+        payload = analysis.payloads[0]
+        self.assertIs(payload.authenticode, valid)
+        self.assertEqual(payload.signature_state, SignatureTableState.PRESENT_UNVERIFIED)
+        self.assertFalse(payload.authenticode.trust_evaluated)
+
+    def test_iso_deadline_and_cancellation_prevent_or_stop_verification(self):
+        certificate = struct.pack("<IHH", 16, 0x0200, 0x0002) + b"12345678"
+        verifier = Mock(return_value=self.auth_result(
+            AuthenticodeIntegrityState.INDETERMINATE,
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "fixture.iso"
+            image.write_bytes(b"fixture")
+            with patch("isopropyl.uefi.time.monotonic", side_effect=(0.0, 0.1, 2.0)):
+                analysis = inspect_iso_uefi_payloads(
+                    image, ("EFI/BOOT/BOOTX64.EFI",), timeout=1.0,
+                    reader=lambda *_args: make_pe(certificate=certificate),
+                    authenticode_verifier=verifier,
+                )
+            self.assertFalse(analysis.payloads)
+            self.assertIn("overall time limit", analysis.issues[0])
+            verifier.assert_not_called()
+
+            with patch(
+                "isopropyl.uefi.time.monotonic",
+                side_effect=(0.0, 0.1, 0.2, 1.1),
+            ):
+                after_worker = inspect_iso_uefi_payloads(
+                    image, ("EFI/BOOT/BOOTX64.EFI",), timeout=1.0,
+                    reader=lambda *_args: make_pe(certificate=certificate),
+                    authenticode_verifier=verifier,
+                )
+            self.assertFalse(after_worker.payloads)
+            self.assertIn("overall time limit", after_worker.issues[0])
+            verifier.assert_called_once()
+
+            checks = 0
+
+            def cancelled() -> None:
+                nonlocal checks
+                checks += 1
+                if checks >= 3:
+                    raise OSError("fixture inspection cancellation")
+
+            def cancelling_verifier(*_args, **kwargs):
+                kwargs["cancel_check"]()
+                raise AssertionError("cancel callback should have raised")
+
+            with self.assertRaisesRegex(OSError, "inspection cancellation"):
+                inspect_iso_uefi_payloads(
+                    image, ("EFI/BOOT/BOOTX64.EFI",),
+                    reader=lambda *_args: make_pe(certificate=certificate),
+                    cancel_check=cancelled,
+                    authenticode_verifier=cancelling_verifier,
+                )
+
+    def test_existing_positional_models_retain_compatible_defaults(self):
+        table = CertificateTable(SignatureTableState.ABSENT)
+        sbat = SbatMetadata(SbatState.ABSENT)
+        inspection = UefiInspection(
+            0x8664, "x64", "PE32+", 10, "EFI application", (), table, sbat, (),
+        )
+        payload = ImageUefiPayload(
+            "EFI/BOOT/BOOTX64.EFI", "x64", "EFI application", True,
+            SignatureTableState.ABSENT, SbatState.ABSENT, (),
+        )
+        self.assertIsNone(inspection.authenticode)
+        self.assertIsNone(payload.authenticode)
+
     def test_iso_member_selection_prioritizes_fallback_loaders_and_is_safe(self):
         selected = uefi_member_paths((
             "EFI/vendor/tool.efi", "EFI/BOOT/BOOTX64.EFI", "../escape.efi",
@@ -91,7 +221,8 @@ class UefiInspectionTests(unittest.TestCase):
         payload = analysis.payloads[0]
         self.assertEqual(payload.architecture, "x64")
         self.assertEqual(payload.signature_state, SignatureTableState.PRESENT_UNVERIFIED)
-        self.assertTrue(any("not cryptographically verified" in warning for warning in payload.warnings))
+        self.assertTrue(any("Authenticode integrity" in warning for warning in payload.warnings))
+        self.assertFalse(any("trusted" in warning.casefold() for warning in payload.warnings))
 
     def test_parses_pe32_plus_architecture_and_efi_subsystem(self):
         result = inspect_pe_bytes(make_pe())
@@ -115,7 +246,8 @@ class UefiInspectionTests(unittest.TestCase):
         self.assertEqual(len(table.entries), 1)
         self.assertEqual(table.entries[0].certificate_type, 0x0002)
         self.assertFalse(table.cryptographically_verified)
-        self.assertTrue(any("not cryptographically verified" in item for item in result.warnings))
+        self.assertTrue(any("Authenticode integrity" in item for item in result.warnings))
+        self.assertFalse(any("trusted" in item.casefold() for item in result.warnings))
 
     def test_out_of_bounds_or_invalid_certificate_table_is_malformed(self):
         out_of_bounds = inspect_pe_bytes(make_pe(security_override=(0x800, 0x1000)))
@@ -125,6 +257,13 @@ class UefiInspectionTests(unittest.TestCase):
         short_entry = struct.pack("<IHH", 7, 0x0200, 0x0002)
         malformed = inspect_pe_bytes(make_pe(certificate=short_entry))
         self.assertEqual(malformed.certificate_table.state, SignatureTableState.MALFORMED)
+
+        nonzero_padding = (
+            struct.pack("<IHH", 9, 0x0200, 0x0002) + b"x" + b"\x01" * 7
+        )
+        padded = inspect_pe_bytes(make_pe(certificate=nonzero_padding))
+        self.assertEqual(padded.certificate_table.state, SignatureTableState.MALFORMED)
+        self.assertIn("padding", padded.certificate_table.error)
 
         overlapping = inspect_pe_bytes(make_pe(
             sbat=struct.pack("<IHH", 16, 0x0200, 0x0002) + b"12345678",

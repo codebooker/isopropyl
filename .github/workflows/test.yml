@@ -16,9 +16,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: sudo apt-get update && sudo apt-get install -y desktop-file-utils appstream
+      - run: sudo apt-get update && sudo apt-get install -y desktop-file-utils appstream binutils openssl sbsigntool
       - run: python -m pip install --disable-pip-version-check .
       - run: python -m unittest discover -s tests -v
+        env:
+          ISOPROPYL_REQUIRE_AUTHENTICODE_FIXTURE: "1"
       - run: python -m compileall -q isopropyl tests
       - run: desktop-file-validate data/io.github.codebooker.isopropyl.desktop
       - run: appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
+      - run: python -m json.tool isopropyl/data/bootloaders-v2.json > /dev/null
+      - run: python -m pip wheel --no-deps . --wheel-dir /tmp/isopropyl-wheel
+      - run: python -c "import glob,zipfile; n=zipfile.ZipFile(glob.glob('/tmp/isopropyl-wheel/*.whl')[0]).namelist(); assert any(x.endswith('/THIRD_PARTY_NOTICES.md') for x in n); assert any(x.endswith('/CERTVALIDATOR-MIT.txt') for x in n)"
