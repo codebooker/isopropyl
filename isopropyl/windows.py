@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .wim import WimSelection, validate_wim_selection
+from .windows_paths import validate_install_image_member_path
 
 UNATTEND_NS = "urn:schemas-microsoft-com:unattend"
 WCM_NS = "http://schemas.microsoft.com/WMIConfig/2002/State"
@@ -50,6 +51,7 @@ class WindowsCustomization:
     require_local_password_change: bool = True
     local_password_never_expires: bool = True
     install_image: WimSelection | None = None
+    install_image_path: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -59,6 +61,7 @@ class WindowsCustomization:
             self.disable_automatic_bitlocker, bool(self.input_locale),
             bool(self.system_locale), bool(self.ui_language),
             bool(self.user_locale), bool(self.timezone), self.install_image is not None,
+            bool(self.install_image_path),
         ))
 
 
@@ -117,6 +120,27 @@ def validate_timezone(value: str) -> str:
     return normalized
 
 
+def validate_install_wim_path(value: str) -> str:
+    """Validate a canonical, media-relative install.wim member path.
+
+    Catalog member names use forward slashes.  Keeping one accepted spelling
+    avoids Windows drive, UNC, alternate-data-stream, and traversal semantics;
+    the answer-file generator converts separators only when serializing Path.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError("The Windows image path must be text")
+    if value == "":
+        return ""
+    try:
+        validated = validate_install_image_member_path(value)
+    except ValueError as error:
+        raise ValueError("The Windows image path is not a safe catalog member path") from error
+    if validated.image_format != "wim":
+        raise ValueError("The selected Windows image path must name install.wim")
+    return validated.path
+
+
 def _settings(root: ET.Element, passes: dict[str, ET.Element], name: str) -> ET.Element:
     settings = passes.get(name)
     if settings is None:
@@ -165,6 +189,7 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
     ui_language = validate_language_tag(options.ui_language, "UI language")
     user_locale = validate_language_tag(options.user_locale, "User locale")
     timezone = validate_timezone(options.timezone)
+    install_image_path = validate_install_wim_path(options.install_image_path)
     if architecture not in {"amd64", "arm64", "x86"}:
         raise ValueError(f"Unsupported Windows architecture: {architecture}")
     if username and not options.require_local_password_change:
@@ -178,6 +203,12 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
             raise ValueError(
                 "The selected Windows image architecture does not match Windows Setup"
             )
+        if install_image_path and install_image_path != options.install_image.source_name:
+            raise ValueError(
+                "The Windows image path does not match the selected WIM source"
+            )
+    elif install_image_path:
+        raise ValueError("A Windows image path requires an explicitly selected image index")
 
     root = ET.Element(f"{{{UNATTEND_NS}}}unattend")
     passes: dict[str, ET.Element] = {}
@@ -209,6 +240,8 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
         image_install = ET.SubElement(setup, "ImageInstall")
         os_image = ET.SubElement(image_install, "OSImage")
         install_from = ET.SubElement(os_image, "InstallFrom")
+        if install_image_path:
+            ET.SubElement(install_from, "Path").text = install_image_path.replace("/", "\\")
         metadata = ET.SubElement(install_from, "MetaData", {
             f"{{{WCM_NS}}}action": "add",
         })
@@ -378,6 +411,46 @@ def answer_file_install_index(
     if index <= 0:
         raise ValueError("The Windows answer file has an invalid image index")
     return index
+
+
+def answer_file_install_path(
+    xml: str, expected_architecture: str | None = None,
+) -> str | None:
+    """Return and strictly validate the optional source-specific WIM path."""
+
+    index = answer_file_install_index(xml, expected_architecture)
+    try:
+        root = ET.fromstring(xml)
+    except (ET.ParseError, ValueError) as error:
+        raise ValueError("The Windows answer file is not valid XML") from error
+    install_from_nodes = list(root.iter(f"{{{UNATTEND_NS}}}InstallFrom"))
+    if index is None:
+        if install_from_nodes:
+            raise ValueError("The Windows image source path has no image index")
+        return None
+    if len(install_from_nodes) != 1:
+        raise ValueError("The Windows image source binding is ambiguous")
+    install_from = install_from_nodes[0]
+    paths = install_from.findall(f"{{{UNATTEND_NS}}}Path")
+    metadata = install_from.findall(f"{{{UNATTEND_NS}}}MetaData")
+    if not paths:
+        if len(metadata) != 1 or list(install_from) != [metadata[0]]:
+            raise ValueError("The Windows image source binding has unexpected children")
+        return None
+    if (
+        len(paths) != 1
+        or len(metadata) != 1
+        or list(install_from) != [paths[0], metadata[0]]
+    ):
+        raise ValueError("The Windows image source path is misplaced or ambiguous")
+    serialized = paths[0].text or ""
+    if not serialized or "/" in serialized:
+        raise ValueError("The Windows image source path is not canonical")
+    catalog_path = serialized.replace("\\", "/")
+    validated = validate_install_wim_path(catalog_path)
+    if validated.replace("/", "\\") != serialized:
+        raise ValueError("The Windows image source path is not canonical")
+    return validated
 
 
 def windows_architecture(architectures: tuple[str, ...]) -> str:

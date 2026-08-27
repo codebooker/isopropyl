@@ -46,7 +46,9 @@ from isopropyl.wim import (
     WimSplitPlan,
     WimSplitResult,
 )
-from isopropyl.windows import WindowsCustomization, answer_file_install_index
+from isopropyl.windows import (
+    WindowsCustomization, answer_file_install_index, answer_file_install_path,
+)
 
 
 SEVEN_ZIP = "/usr/bin/7z"
@@ -90,7 +92,10 @@ def inspected_wim(path: Path, editions: tuple[WimEdition, ...]) -> WimInfo:
     info = path.stat()
     return WimInfo(
         str(path.resolve()), info.st_size, editions,
-        (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns),
+        (
+            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_nlink,
+        ),
     )
 
 
@@ -196,7 +201,10 @@ def fake_split_plan(source: Path, destination: Path, tool: str) -> WimSplitPlan:
     info = source.stat()
     return WimSplitPlan(
         source=str(source.resolve()),
-        source_identity=(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns),
+        source_identity=(
+            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_nlink,
+        ),
         destination_directory=str(destination),
         part_size_mib=DEFAULT_SPLIT_PART_MIB,
         wimlib_imagex=tool,
@@ -327,6 +335,32 @@ class IsoStagingTests(unittest.TestCase):
             self.assertFalse(plan.needs_wim_split)
             self.assertIsNone(plan.wimlib_imagex)
             validate_iso_staging_plan(plan)
+
+    def test_fat32_plan_cannot_split_a_nested_install_wim(self):
+        entries = basic_entries() + (
+            ArchiveEntry("x64/sources/install.wim", FAT32_MAX_FILE_SIZE + 1),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "cannot be safely transformed",
+            ):
+                self.make_plan(
+                    Path(directory), entries,
+                    write_plan=write_plan(entries),
+                )
+
+    def test_fat32_plan_cannot_split_wim_when_an_esd_source_coexists(self):
+        entries = windows_entries() + (
+            ArchiveEntry("sources/install.esd", 7),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "cannot be safely transformed",
+            ):
+                self.make_plan(
+                    Path(directory), entries,
+                    write_plan=write_plan(entries),
+                )
 
     def test_requires_absolute_absent_destination_and_unchanged_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -493,6 +527,161 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual(inspected[0][1], WIMLIB)
             self.assertTrue((result.destination / "sources/install.esd").is_file())
 
+    def test_selected_nested_wim_path_is_bound_and_unselected_wim_is_preserved(self):
+        entries = basic_entries() + (
+            ArchiveEntry("x64/sources/install.wim", 7),
+            ArchiveEntry("x86/sources/install.wim", 9),
+        )
+        selection = replace(
+            selected_esd(), source_name="x64/sources/install.wim", source_size=7,
+        )
+        customization = WindowsCustomization(
+            install_image=selection,
+            install_image_path=selection.source_name,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.make_plan(
+                root, entries,
+                write_plan=write_plan(entries),
+                windows_customization=customization,
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            self.assertEqual(
+                answer_file_install_path(plan.autounattend_xml or "", "amd64"),
+                selection.source_name,
+            )
+
+            def inspector(source: Path, _tool: str, _cancel_event) -> WimInfo:
+                self.assertEqual(
+                    source.relative_to(source.parents[2]).as_posix(),
+                    selection.source_name,
+                )
+                return inspected_wim(source, selection.editions)
+
+            result = IsoStagingExecutor(
+                extractor=FakeExtractor(), wim_inspector=inspector,
+            ).execute(plan)
+            self.assertTrue(result.autounattend_added)
+            self.assertEqual(
+                (result.destination / "x64/sources/install.wim").stat().st_size,
+                7,
+            )
+            self.assertEqual(
+                (result.destination / "x86/sources/install.wim").stat().st_size,
+                9,
+            )
+
+    def test_multi_source_wim_selection_requires_an_explicit_answer_path(self):
+        entries = basic_entries() + (
+            ArchiveEntry("x64/sources/install.wim", 7),
+            ArchiveEntry("x86/sources/install.wim", 9),
+        )
+        selection = replace(
+            selected_esd(), source_name="x64/sources/install.wim", source_size=7,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(IsoStagingSafetyError, "explicit answer-file"):
+                self.make_plan(
+                    Path(directory), entries,
+                    write_plan=write_plan(entries),
+                    windows_customization=WindowsCustomization(
+                        install_image=selection,
+                    ),
+                    windows_architecture="amd64",
+                    wimlib_resolver=lambda: WIMLIB,
+                )
+
+    def test_nested_wim_selection_requires_an_explicit_answer_path(self):
+        entries = basic_entries() + (
+            ArchiveEntry("x64/sources/install.wim", 7),
+        )
+        selection = replace(
+            selected_esd(), source_name="x64/sources/install.wim", source_size=7,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(IsoStagingSafetyError, "explicit answer-file"):
+                self.make_plan(
+                    Path(directory), entries,
+                    write_plan=write_plan(entries),
+                    windows_customization=WindowsCustomization(
+                        install_image=selection,
+                    ),
+                    windows_architecture="amd64",
+                    wimlib_resolver=lambda: WIMLIB,
+                )
+
+    def test_canonical_single_wim_selection_can_use_index_only(self):
+        entries = basic_entries() + (
+            ArchiveEntry("sources/install.wim", 7),
+        )
+        selection = replace(
+            selected_esd(), source_name="sources/install.wim", source_size=7,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), entries,
+                write_plan=write_plan(entries),
+                windows_customization=WindowsCustomization(
+                    install_image=selection,
+                ),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+        self.assertIsNone(
+            answer_file_install_path(plan.autounattend_xml or "", "amd64"),
+        )
+
+    def test_selection_refuses_more_than_four_wim_sources(self):
+        entries = basic_entries() + tuple(
+            ArchiveEntry(f"edition-{index}/sources/install.wim", 7)
+            for index in range(5)
+        )
+        selection = replace(
+            selected_esd(), source_name=entries[-1].path, source_size=7,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(IsoStagingSafetyError, "at most four"):
+                self.make_plan(
+                    Path(directory), entries,
+                    write_plan=write_plan(entries),
+                    windows_customization=WindowsCustomization(
+                        install_image=selection,
+                        install_image_path=selection.source_name,
+                    ),
+                    windows_architecture="amd64",
+                    wimlib_resolver=lambda: WIMLIB,
+                )
+
+    def test_forged_answer_file_cannot_redirect_to_another_wim_source(self):
+        entries = basic_entries() + (
+            ArchiveEntry("x64/sources/install.wim", 7),
+            ArchiveEntry("x86/sources/install.wim", 9),
+        )
+        selection = replace(
+            selected_esd(), source_name="x64/sources/install.wim", source_size=7,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), entries,
+                write_plan=write_plan(entries),
+                windows_customization=WindowsCustomization(
+                    install_image=selection,
+                    install_image_path=selection.source_name,
+                ),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            forged_xml = (plan.autounattend_xml or "").replace(
+                "x64\\sources\\install.wim", "x86\\sources\\install.wim",
+            )
+            self.assertNotEqual(forged_xml, plan.autounattend_xml)
+            with self.assertRaisesRegex(IsoStagingSafetyError, "does not match"):
+                validate_iso_staging_plan(
+                    replace(plan, autounattend_xml=forged_xml),
+                )
+
     def test_changed_or_ambiguous_selected_wim_metadata_never_publishes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -542,7 +731,7 @@ class IsoStagingTests(unittest.TestCase):
 
         entries = selected_esd_entries() + (ArchiveEntry("sources/install.wim", 4),)
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(IsoStagingSafetyError, "unambiguous"):
+            with self.assertRaisesRegex(IsoStagingSafetyError, "sole install source"):
                 self.make_plan(
                     Path(directory), entries,
                     write_plan=write_plan(entries),

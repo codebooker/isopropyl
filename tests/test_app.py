@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPlainTextEdit, QPushButton,
 )
 
-from isopropyl.app import PendingIsoWrite, Window
+from isopropyl.app import PendingIsoWrite, Window, WindowsMetadataToken
 from isopropyl.backup import VHD_MAX_SIZE
 from isopropyl.bootloaders import (
     BootloaderCacheDeletionResult, BootloaderCacheInventory, CacheDeletion,
@@ -29,9 +29,12 @@ from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
 )
 from isopropyl.images import ImageInspection, ImageMember
-from isopropyl.iso import WriteMode
+from isopropyl.iso import ArchiveEntry, WriteMode
+from isopropyl.extraction import SafeIsoExtractor
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
+from isopropyl.wim import WimEdition, WimInfo, WimSelection
+from isopropyl.windows import WindowsCustomization
 
 
 def device(size: int = 8 * 1024**3) -> Device:
@@ -651,6 +654,162 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("Exact boot payload: 6.04-pre1", tooltip)
         self.assertIn("hash-pinned matching payload bundle is cataloged", tooltip)
         self.assertIn("BIOS installation remains disabled", tooltip)
+
+    def test_multi_source_windows_iso_requires_an_explicit_source_choice(self):
+        inspection = replace(
+            optical_windows_inspection(),
+            members=(
+                ImageMember("EFI/BOOT/BOOTX64.EFI", 8, "file"),
+                ImageMember("x64/sources/install.wim", 16, "file"),
+                ImageMember("x86/sources/install.wim", 12, "file"),
+            ),
+        )
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_inspection_finished((1, 2, 3, 4), inspection)
+
+        self.assertEqual(
+            tuple(item.path for item in self.window.windows_wim_candidates),
+            ("x64/sources/install.wim", "x86/sources/install.wim"),
+        )
+        self.assertIsNone(self.window.windows_wim_member)
+        self.assertIn("Choose one of 2", self.window.windows_button.toolTip())
+
+        def choose_second_source(dialog) -> int:
+            source = dialog.findChild(QComboBox, "windowsSourceCombo")
+            self.assertIsNotNone(source)
+            assert source is not None
+            source.setCurrentIndex(source.findData("x86/sources/install.wim"))
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=choose_second_source):
+            self.window.configure_windows()
+        self.assertEqual(
+            self.window.windows_wim_member,
+            ArchiveEntry("x86/sources/install.wim", 12),
+        )
+
+    def test_canonical_wim_path_binding_tracks_whether_source_is_sole(self):
+        source = ArchiveEntry("sources/install.wim", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26100, 0,
+        )
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_install_source_count = 1
+        self.window.windows_wim_member = source
+        self.window.windows_wim_editions = (edition,)
+
+        def choose_edition(dialog) -> int:
+            combo = dialog.findChild(QComboBox, "windowsEditionCombo")
+            assert combo is not None
+            combo.setCurrentIndex(combo.findData(edition.index))
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=choose_edition):
+            self.window.configure_windows()
+        self.assertIsNotNone(self.window.windows_options.install_image)
+        self.assertEqual(self.window.windows_options.install_image_path, "")
+
+        self.window.windows_install_source_count = 2
+        with patch("isopropyl.app.QDialog.exec", new=choose_edition):
+            self.window.configure_windows()
+        self.assertEqual(
+            self.window.windows_options.install_image_path, source.path,
+        )
+
+    def test_nested_wim_edition_records_its_exact_source_path(self):
+        source = ArchiveEntry("x64/sources/install.wim", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26100, 0,
+        )
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_install_source_count = 1
+        self.window.windows_wim_member = source
+        self.window.windows_wim_editions = (edition,)
+
+        def choose_edition(dialog) -> int:
+            combo = dialog.findChild(QComboBox, "windowsEditionCombo")
+            assert combo is not None
+            combo.setCurrentIndex(combo.findData(edition.index))
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=choose_edition):
+            self.window.configure_windows()
+        self.assertIsNotNone(self.window.windows_options.install_image)
+        self.assertEqual(
+            self.window.windows_options.install_image_path, source.path,
+        )
+
+    def test_stale_windows_metadata_cannot_clear_a_newer_operation(self):
+        source = ArchiveEntry("x64/sources/install.wim", 16)
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_wim_member = source
+        self.window.windows_metadata_generation = 2
+        old = SafeIsoExtractor()
+        current = SafeIsoExtractor()
+        self.window.windows_wim_extractor = current
+        token = WindowsMetadataToken(1, (1, 2, 3, 4), source, old)
+
+        self.window.on_windows_metadata_finished(
+            token, source.path, RuntimeError("stale fixture"),
+        )
+
+        self.assertIs(self.window.windows_wim_extractor, current)
+        self.assertEqual(self.window.windows_wim_error, "")
+        self.window.windows_wim_extractor = None
+
+    def test_stale_windows_metadata_progress_cannot_overwrite_current_status(self):
+        source = ArchiveEntry("x64/sources/install.wim", 16)
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_wim_member = source
+        self.window.windows_metadata_generation = 2
+        old = SafeIsoExtractor()
+        current = SafeIsoExtractor()
+        self.window.windows_wim_extractor = current
+        token = WindowsMetadataToken(1, (1, 2, 3, 4), source, old)
+        self.window.status.setText("Current operation")
+        self.window.progress.setValue(321)
+
+        self.window.on_windows_metadata_progress(token, 8, 16)
+
+        self.assertEqual(self.window.status.text(), "Current operation")
+        self.assertEqual(self.window.progress.value(), 321)
+        self.window.windows_wim_extractor = None
+
+    def test_windows_metadata_result_is_bound_to_the_source_size(self):
+        source = ArchiveEntry("x64/sources/install.wim", 16)
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_wim_member = source
+        self.window.windows_metadata_generation = 1
+        extractor = SafeIsoExtractor()
+        self.window.windows_wim_extractor = extractor
+        token = WindowsMetadataToken(
+            1, (1, 2, 3, 4), source, extractor,
+        )
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26100, 0,
+        )
+        selection = WimSelection(source.path, source.size, (edition,), 1)
+        self.window.windows_options = WindowsCustomization(
+            install_image=selection, install_image_path=source.path,
+        )
+        info = WimInfo("/tmp/install.wim", 17, (edition,), (1, 2, 17, 4, 5, 1))
+
+        with patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)):
+            self.window.on_windows_metadata_finished(token, source.path, info)
+
+        self.assertEqual(self.window.windows_wim_editions, ())
+        self.assertIn("different catalog size", self.window.windows_wim_error)
+        self.assertIsNone(self.window.windows_options.install_image)
+        self.assertEqual(self.window.windows_options.install_image_path, "")
 
     def test_settings_persist_binary_units_and_refresh_device_label(self):
         self.window.size_unit_mode = SizeUnitMode.SI

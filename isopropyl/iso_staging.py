@@ -54,6 +54,7 @@ from .iso import (
     validate_extraction_entries,
 )
 from .wim import (
+    FileIdentity as WimFileIdentity,
     WimCancelled,
     WimError,
     WimInfo,
@@ -74,6 +75,7 @@ from .windows import (
     WindowsCustomization,
     add_autounattend_to_staging,
     answer_file_install_index,
+    answer_file_install_path,
     generate_autounattend,
 )
 
@@ -109,6 +111,15 @@ _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _WIM_PART = re.compile(r"install(?:(?P<number>[2-9][0-9]*))?\.swm", re.IGNORECASE)
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
+
+
+def _is_install_wim_path(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return (
+        len(parts) >= 2
+        and parts[-1].casefold() == "install.wim"
+        and parts[-2].casefold() == "sources"
+    )
 
 
 @dataclass(frozen=True)
@@ -169,14 +180,17 @@ def _identity(path: Path) -> FileIdentity:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
-def _wim_identity(path: Path) -> FileIdentity:
+def _wim_identity(path: Path) -> WimFileIdentity:
     try:
         info = os.lstat(path)
     except OSError as error:
         raise IsoStagingSafetyError("The selected WIM/ESD disappeared") from error
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size <= 0:
         raise IsoStagingSafetyError("The selected WIM/ESD is no longer a safe regular file")
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+    return (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+        info.st_ctime_ns, info.st_nlink,
+    )
 
 
 def _case_key(path: str) -> tuple[str, ...]:
@@ -247,13 +261,19 @@ def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> st
         tuple(entry for entry in files if entry.size > FAT32_MAX_FILE_SIZE)
         if fat32_layout else ()
     )
+    install_sources = tuple(
+        entry for entry in files
+        if _is_install_wim_path(entry.path)
+        or entry.path.casefold() == "sources/install.esd"
+    )
     eligible = tuple(
         entry for entry in oversized
-        if entry.path.casefold() == "sources/install.wim"
+        if len(install_sources) == 1
+        and entry.path.casefold() == "sources/install.wim"
     )
     if any(entry not in eligible for entry in oversized):
         raise IsoStagingSafetyError(
-            "The ISO contains a non-WIM file that cannot be represented on FAT32"
+            "The ISO contains a file that cannot be safely transformed for FAT32"
         )
     requires_split = fat32_layout and bool(eligible)
     expected_transformations = (
@@ -325,18 +345,36 @@ def _validate_wim_selection_catalog(
         validate_wim_selection(selection)
     except WimValidationError as error:
         raise IsoStagingSafetyError(str(error)) from error
-    candidates = tuple(
+    wim_sources = tuple(
         entry for entry in entries
-        if entry.kind is EntryKind.FILE and entry.path.casefold() in {
-            "sources/install.wim", "sources/install.esd",
-        }
+        if entry.kind is EntryKind.FILE and _is_install_wim_path(entry.path)
     )
-    if len(candidates) != 1:
+    canonical_esd = tuple(
+        entry for entry in entries
+        if entry.kind is EntryKind.FILE
+        and entry.path.casefold() == "sources/install.esd"
+    )
+    if len(wim_sources) > 4:
         raise IsoStagingSafetyError(
-            "A selected Windows image requires one unambiguous install.wim or install.esd"
+            "Windows image selection supports at most four install.wim sources"
         )
-    source = candidates[0]
-    if source.path != selection.source_name or source.size != selection.source_size:
+    if (
+        selection.source_name.casefold() == "sources/install.esd"
+        and len(wim_sources) + len(canonical_esd) != 1
+    ):
+        raise IsoStagingSafetyError(
+            "A canonical install.esd can be selected only when it is the sole install source"
+        )
+    matches = tuple(
+        entry for entry in entries
+        if entry.kind is EntryKind.FILE and entry.path == selection.source_name
+    )
+    if len(matches) != 1:
+        raise IsoStagingSafetyError(
+            "The selected Windows image must occur exactly once in the ISO catalog"
+        )
+    source = matches[0]
+    if source.size != selection.source_size:
         raise IsoStagingSafetyError(
             "The selected Windows image is not bound to this ISO catalog"
         )
@@ -416,6 +454,37 @@ def build_iso_staging_plan(
             raise IsoStagingSafetyError(
                 "The Windows answer file is not bound to the selected image index"
             )
+        try:
+            answer_path = answer_file_install_path(
+                answer_file, windows_architecture,
+            )
+        except ValueError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        install_source_count = sum(
+            entry.kind is EntryKind.FILE and (
+                _is_install_wim_path(entry.path)
+                or entry.path.casefold() == "sources/install.esd"
+            )
+            for entry in safe_entries
+        )
+        if wim_selection is not None:
+            selected_is_wim = _is_install_wim_path(wim_selection.source_name)
+            if answer_path is not None and answer_path != wim_selection.source_name:
+                raise IsoStagingSafetyError(
+                    "The Windows answer file path does not match the selected source"
+                )
+            if (
+                selected_is_wim
+                and (
+                    install_source_count > 1
+                    or wim_selection.source_name.casefold() != "sources/install.wim"
+                )
+                and answer_path is None
+            ):
+                raise IsoStagingSafetyError(
+                    "A nested or multi-source Windows image requires an explicit "
+                    "answer-file WIM path"
+                )
 
     try:
         extraction = build_extraction_plan(
@@ -502,6 +571,41 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
             raise IsoStagingSafetyError(
                 "The answer file image index does not match the staging plan"
             )
+        try:
+            answer_path = answer_file_install_path(
+                plan.autounattend_xml,
+                (
+                    plan.wim_selection.edition.architecture
+                    if plan.wim_selection is not None else None
+                ),
+            )
+        except ValueError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        install_source_count = sum(
+            entry.kind is EntryKind.FILE and (
+                _is_install_wim_path(entry.path)
+                or entry.path.casefold() == "sources/install.esd"
+            )
+            for entry in entries
+        )
+        if plan.wim_selection is not None:
+            selected_is_wim = _is_install_wim_path(plan.wim_selection.source_name)
+            if answer_path is not None and answer_path != plan.wim_selection.source_name:
+                raise IsoStagingSafetyError(
+                    "The answer-file WIM path does not match the staging plan"
+                )
+            if (
+                selected_is_wim
+                and (
+                    install_source_count > 1
+                    or plan.wim_selection.source_name.casefold()
+                    != "sources/install.wim"
+                )
+                and answer_path is None
+            ):
+                raise IsoStagingSafetyError(
+                    "The staging plan does not bind its nested or multi-source WIM path"
+                )
         existing_answer_file = _existing_windows_answer_file(entries)
         if existing_answer_file is not None:
             raise IsoStagingSafetyError(
@@ -841,7 +945,7 @@ class IsoStagingExecutor:
             _verify_extracted_catalog(tree, plan.entries)
 
             selected_wim_path: Path | None = None
-            selected_wim_identity: FileIdentity | None = None
+            selected_wim_identity: WimFileIdentity | None = None
             if plan.wim_selection is not None:
                 self._check_cancelled()
                 selection = plan.wim_selection
@@ -862,11 +966,7 @@ class IsoStagingExecutor:
                     validate_wim_editions(info.editions)
                 except WimError as error:
                     raise IsoStagingSafetyError(str(error)) from error
-                source_status = source.stat()
-                source_identity = (
-                    source_status.st_dev, source_status.st_ino,
-                    source_status.st_size, source_status.st_mtime_ns,
-                )
+                source_identity = _wim_identity(source)
                 if (
                     info.path != str(source.resolve())
                     or info.size != selection.source_size
@@ -917,17 +1017,7 @@ class IsoStagingExecutor:
                 # The splitter itself binds this identity.  Rechecking before
                 # removal closes the window between its return and our private
                 # transformation.
-                source_info = os.lstat(source)
-                if (
-                    not stat.S_ISREG(source_info.st_mode)
-                    or source_info.st_nlink != 1
-                    or (
-                        source_info.st_dev,
-                        source_info.st_ino,
-                        source_info.st_size,
-                        source_info.st_mtime_ns,
-                    ) != split_plan.source_identity
-                ):
+                if _wim_identity(source) != split_plan.source_identity:
                     raise IsoStagingSafetyError("install.wim changed during splitting")
                 original = private_root / "original-install.wim"
                 os.rename(source, original)
@@ -960,7 +1050,7 @@ class IsoStagingExecutor:
                 if (
                     selected_wim_path is not None
                     and selected_wim_identity is not None
-                    and plan.wim_source is None
+                    and plan.wim_source != plan.wim_selection.source_name
                     and _wim_identity(selected_wim_path) != selected_wim_identity
                 ):
                     raise IsoStagingSafetyError(
@@ -1014,7 +1104,7 @@ class IsoStagingExecutor:
             if (
                 selected_wim_path is not None
                 and selected_wim_identity is not None
-                and plan.wim_source is None
+                and plan.wim_source != plan.wim_selection.source_name
                 and _wim_identity(selected_wim_path) != selected_wim_identity
             ):
                 raise IsoStagingSafetyError(

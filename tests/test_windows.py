@@ -2,13 +2,15 @@
 import unittest
 import xml.etree.ElementTree as ET
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 from isopropyl.wim import WimEdition, WimSelection
 from isopropyl.windows import (
     UNATTEND_NS, WCM_NS, WindowsCustomization, add_autounattend_to_staging,
-    answer_file_install_index, generate_autounattend,
-    validate_input_locale, validate_language_tag, validate_timezone,
+    answer_file_install_index, answer_file_install_path, generate_autounattend,
+    validate_input_locale, validate_install_wim_path, validate_language_tag,
+    validate_timezone,
     validate_username, windows_architecture,
 )
 
@@ -90,6 +92,7 @@ class WindowsCustomizationTests(unittest.TestCase):
             root.findtext(".//u:InstallFrom/u:MetaData/u:Value", namespaces=NS),
             "6",
         )
+        self.assertIsNone(root.find(".//u:InstallFrom/u:Path", NS))
         setup_components = [
             item for item in root.findall(".//u:component", NS)
             if item.attrib.get("name") == "Microsoft-Windows-Setup"
@@ -97,6 +100,109 @@ class WindowsCustomizationTests(unittest.TestCase):
         self.assertEqual(len(setup_components), 1)
         self.assertIsNone(root.find(".//u:InstallTo", NS))
         self.assertIsNone(root.find(".//u:WillWipeDisk", NS))
+
+    def test_explicit_relative_install_wim_path_is_emitted_with_the_index(self):
+        options = WindowsCustomization(
+            install_image=replace(
+                install_selection(), source_name="x64/sources/install.wim",
+            ),
+            install_image_path="x64/sources/install.wim",
+        )
+        self.assertTrue(options.enabled)
+        xml = generate_autounattend(options, "amd64")
+        root = ET.fromstring(xml)
+        self.assertEqual(
+            root.findtext(".//u:InstallFrom/u:Path", namespaces=NS),
+            r"x64\sources\install.wim",
+        )
+        self.assertEqual(answer_file_install_index(xml, "amd64"), 6)
+        self.assertEqual(
+            answer_file_install_path(xml, "amd64"),
+            "x64/sources/install.wim",
+        )
+        install_from = root.find(".//u:InstallFrom", NS)
+        self.assertIsNotNone(install_from)
+        self.assertEqual(
+            [child.tag for child in install_from],
+            [f"{{{UNATTEND_NS}}}Path", f"{{{UNATTEND_NS}}}MetaData"],
+        )
+
+    def test_validates_canonical_relative_install_wim_member_paths(self):
+        self.assertEqual(validate_install_wim_path(""), "")
+        self.assertEqual(
+            validate_install_wim_path("amd64/sources/INSTALL.WIM"),
+            "amd64/sources/INSTALL.WIM",
+        )
+        invalid = (
+            "/sources/install.wim",
+            "//server/share/install.wim",
+            "C:/sources/install.wim",
+            "sources/install.wim:payload",
+            "sources/%configsetroot%/install.wim",
+            "../sources/install.wim",
+            "x/../sources/install.wim",
+            "./sources/install.wim",
+            "x//sources/install.wim",
+            r"x\sources\install.wim",
+            "sources/install.esd",
+            "sources/custom.wim",
+            "sources/install.wim/child",
+            "sources/CON/install.wim",
+            "sources/CONIN$/install.wim",
+            "sources/CONOUT$.txt/install.wim",
+            "sources/COM¹/install.wim",
+            "sources/LPT².log/install.wim",
+            "sources/trailing./install.wim",
+            "sources/ leading/install.wim",
+            "sources/trailing /install.wim",
+            " sources/install.wim",
+            "sources/install.wim ",
+            "sources/install\n.wim",
+            "sources/\x85/install.wim",
+            "sources/inst\u202eall.wim",
+            "sources/\ud800/install.wim",
+            "sources/e\u0301/install.wim",
+            f"{'a' * 256}/sources/install.wim",
+            f"{'/'.join(['a' * 200] * 6)}/sources/install.wim",
+            f"{'/'.join(['a'] * 15)}/sources/install.wim",
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_install_wim_path(value)
+
+    def test_install_wim_path_requires_an_explicit_image_index(self):
+        options = WindowsCustomization(install_image_path="sources/install.wim")
+        self.assertTrue(options.enabled)
+        with self.assertRaisesRegex(ValueError, "selected image index"):
+            generate_autounattend(options)
+
+    def test_install_wim_path_must_match_the_selected_catalog_member(self):
+        options = WindowsCustomization(
+            install_image=install_selection(),
+            install_image_path="x64/sources/install.wim",
+        )
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            generate_autounattend(options)
+
+    def test_answer_file_source_path_parser_rejects_ambiguous_or_misplaced_paths(self):
+        options = WindowsCustomization(
+            install_image=replace(
+                install_selection(), source_name="x64/sources/install.wim",
+            ),
+            install_image_path="x64/sources/install.wim",
+        )
+        xml = generate_autounattend(options, "amd64")
+        for forged in (
+            xml.replace(
+                r"<Path>x64\sources\install.wim</Path>",
+                r"<Path>x64\sources\install.wim</Path>"
+                r"<Path>x86\sources\install.wim</Path>",
+            ),
+            xml.replace(r"x64\sources\install.wim", "../sources/install.wim"),
+            xml.replace(r"x64\sources\install.wim", "x64/sources/install.wim"),
+        ):
+            with self.subTest(forged=forged), self.assertRaises(ValueError):
+                answer_file_install_path(forged, "amd64")
 
     def test_selected_image_architecture_and_answer_index_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "architecture"):

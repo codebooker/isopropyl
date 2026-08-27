@@ -59,7 +59,7 @@ from .formatting import (
 )
 from .images import (
     ImageInspection, ImageInspectionCancelled, calculate_checksums,
-    compare_expected_checksum, inspect_image,
+    classify_windows_installer_members, compare_expected_checksum, inspect_image,
 )
 from .iso import (
     ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget, WriteMode, WritePlan,
@@ -90,7 +90,9 @@ from .uefi_ntfs import (
     build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
     probe_uefi_ntfs_logical_sector_size,
 )
-from .wim import WimEdition, WimInfo, WimSelection, inspect_wim
+from .wim import (
+    WimEdition, WimInfo, WimSelection, inspect_wim, validate_wim_editions,
+)
 from .windows import (
     WindowsCustomization, generate_autounattend, windows_architecture,
 )
@@ -123,6 +125,14 @@ class PendingIsoWrite:
     persistence_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class WindowsMetadataToken:
+    generation: int
+    image_identity: object
+    source: ArchiveEntry
+    extractor: SafeIsoExtractor
+
+
 class Bridge(QObject):
     # PyQt's plain `int` maps to a signed 32-bit C++ int. Disk images routinely
     # exceed that, so keep byte counters as Python objects across threads.
@@ -133,6 +143,7 @@ class Bridge(QObject):
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
     media_finished = pyqtSignal(object)
+    windows_metadata_progress = pyqtSignal(object, object, object)
     windows_metadata_finished = pyqtSignal(object, object, object)
     uefi_preparation_finished = pyqtSignal(object, object, object)
     casper_preparation_finished = pyqtSignal(object, object, object)
@@ -173,9 +184,12 @@ class Window(QMainWindow):
         self.pending_iso_write: PendingIsoWrite | None = None
         self.iso_workspace: tempfile.TemporaryDirectory[str] | None = None
         self.windows_options = WindowsCustomization()
+        self.windows_wim_candidates: tuple[ArchiveEntry, ...] = ()
+        self.windows_install_source_count = 0
         self.windows_wim_member: ArchiveEntry | None = None
         self.windows_wim_editions: tuple[WimEdition, ...] = ()
         self.windows_wim_error = ""
+        self.windows_metadata_generation = 0
         self.settings = QSettings("codebooker", "ISOpropyl")
         try:
             self.size_unit_mode = SizeUnitMode(
@@ -197,6 +211,9 @@ class Window(QMainWindow):
         self.bridge.status_changed.connect(self.status.setText)
         self.bridge.media_progress.connect(self.on_media_progress)
         self.bridge.media_finished.connect(self.on_media_finished)
+        self.bridge.windows_metadata_progress.connect(
+            self.on_windows_metadata_progress
+        )
         self.bridge.windows_metadata_finished.connect(
             self.on_windows_metadata_finished
         )
@@ -440,6 +457,11 @@ class Window(QMainWindow):
         self.persistence_checkbox.blockSignals(False)
         self.persistence_controls.setVisible(False)
         self.windows_options = WindowsCustomization()
+        if self.windows_wim_extractor is not None:
+            self.windows_wim_extractor.cancel()
+        self.windows_metadata_generation += 1
+        self.windows_wim_candidates = ()
+        self.windows_install_source_count = 0
         self.windows_wim_member = None
         self.windows_wim_editions = ()
         self.windows_wim_error = ""
@@ -2192,24 +2214,45 @@ class Window(QMainWindow):
                 )
             if self.inspection.has_windows_installer:
                 detail_lines.append("Windows installer image detected")
-                candidates = tuple(
-                    member for member in self.inspection.members
-                    if member.kind == "file" and member.path.casefold() in {
-                        "sources/install.wim", "sources/install.esd",
-                    }
+                classified = classify_windows_installer_members(
+                    self.inspection.members,
                 )
+                selected_paths = (
+                    classified.wim_paths
+                    if classified.wim_paths else (
+                        (classified.esd_path,) if classified.esd_path else ()
+                    )
+                ) if classified.valid else ()
+                self.windows_install_source_count = (
+                    len(classified.wim_paths)
+                    + (1 if classified.esd_path is not None else 0)
+                    if classified.valid else 0
+                )
+                by_path = {member.path: member for member in self.inspection.members}
+                candidates = tuple(
+                    ArchiveEntry(path, by_path[path].size)
+                    for path in selected_paths if path in by_path
+                )
+                self.windows_wim_candidates = candidates
                 if len(candidates) == 1:
                     member = candidates[0]
-                    self.windows_wim_member = ArchiveEntry(member.path, member.size)
+                    self.windows_wim_member = member
                     self.windows_wim_error = ""
                     self.windows_button.setToolTip(
                         f"Inspect {member.path} to list its Windows image indexes"
                     )
+                elif candidates:
+                    self.windows_wim_member = None
+                    self.windows_wim_error = ""
+                    self.windows_button.setToolTip(
+                        f"Choose one of {len(candidates)} install.wim sources to inspect"
+                    )
                 else:
+                    self.windows_wim_candidates = ()
                     self.windows_wim_member = None
                     self.windows_wim_error = (
-                        "The ISO catalog does not contain exactly one "
-                        "sources/install.wim or sources/install.esd."
+                        "The ISO catalog does not contain a safe, bounded Windows "
+                        "install.wim source or one canonical sources/install.esd."
                     )
                     self.windows_button.setToolTip(self.windows_wim_error)
             if self.inspection.eltorito is not None:
@@ -2252,6 +2295,23 @@ class Window(QMainWindow):
             self.rebuild_write_recommendation(preserve_selection=False)
         self.update_ready()
 
+    def select_windows_wim_source(self, member: ArchiveEntry | None) -> None:
+        if member is not None and member not in self.windows_wim_candidates:
+            raise ValueError("The selected Windows image source is not in this ISO catalog")
+        if member == self.windows_wim_member:
+            return
+        self.windows_metadata_generation += 1
+        self.windows_wim_member = member
+        self.windows_wim_editions = ()
+        self.windows_wim_error = ""
+        if (
+            self.windows_options.install_image is not None
+            or self.windows_options.install_image_path
+        ):
+            self.windows_options = replace(
+                self.windows_options, install_image=None, install_image_path="",
+            )
+
     def start_windows_wim_inspection(self) -> None:
         image = self.image
         member = self.windows_wim_member
@@ -2262,7 +2322,12 @@ class Window(QMainWindow):
         except OSError as error:
             self.windows_wim_error = str(error)
             return
-        self.windows_wim_extractor = SafeIsoExtractor()
+        extractor = SafeIsoExtractor()
+        self.windows_wim_extractor = extractor
+        self.windows_metadata_generation += 1
+        token = WindowsMetadataToken(
+            self.windows_metadata_generation, identity, member, extractor,
+        )
         self.set_busy(True)
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
@@ -2275,18 +2340,16 @@ class Window(QMainWindow):
                 with tempfile.TemporaryDirectory(prefix=".isopropyl-wim-info-") as directory:
                     destination = Path(directory) / "image"
                     plan = build_extraction_plan(image, destination, (member,))
-                    assert self.windows_wim_extractor is not None
-                    self.windows_wim_extractor.execute(
+                    extractor.execute(
                         plan,
-                        lambda update: self.bridge.progress.emit(
-                            update.bytes_done, update.total_bytes,
-                            "Extracting Windows image metadata source",
+                        lambda update: self.bridge.windows_metadata_progress.emit(
+                            token, update.bytes_done, update.total_bytes,
                         ),
                     )
                     source = destination.joinpath(*Path(member.path).parts)
                     info = inspect_wim(
                         source,
-                        cancel_event=self.windows_wim_extractor.cancel_event,
+                        cancel_event=extractor.cancel_event,
                     )
                     if info.size != member.size:
                         raise RuntimeError(
@@ -2297,34 +2360,62 @@ class Window(QMainWindow):
                     result = info
             except Exception as error:
                 result = error
-            self.bridge.windows_metadata_finished.emit(identity, member.path, result)
+            self.bridge.windows_metadata_finished.emit(token, member.path, result)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_windows_metadata_finished(
-        self, identity: object, source_name: object, result: object,
+    def on_windows_metadata_progress(
+        self, token_object: object, done: object, total: object,
     ) -> None:
+        if not isinstance(token_object, WindowsMetadataToken):
+            return
+        token = token_object
+        if (
+            token.extractor is not self.windows_wim_extractor
+            or token.generation != self.windows_metadata_generation
+            or token.source != self.windows_wim_member
+            or type(done) is not int
+            or type(total) is not int
+        ):
+            return
+        self.on_progress(done, total, "Extracting Windows image metadata source")
+
+    def on_windows_metadata_finished(
+        self, token_object: object, source_name: object, result: object,
+    ) -> None:
+        if not isinstance(token_object, WindowsMetadataToken):
+            return
+        token = token_object
+        if token.extractor is not self.windows_wim_extractor:
+            return
+        current = False
+        if self.image is not None:
+            try:
+                current_identity = image_identity(self.image)
+            except OSError:
+                current_identity = None
+            current = (
+                token.generation == self.windows_metadata_generation
+                and token.image_identity == current_identity
+                and token.source == self.windows_wim_member
+                and source_name == token.source.path
+            )
         self.windows_wim_extractor = None
         self.windows_button.setText("Windows options…")
         self.progress.setValue(0)
-        self.set_busy(False)
-        self.update_ready()
-        if self.image is None or self.windows_wim_member is None:
-            return
-        try:
-            current_identity = image_identity(self.image)
-        except OSError:
-            return
-        if (
-            identity != current_identity
-            or source_name != self.windows_wim_member.path
-        ):
+        if not self.inspection_busy and not self.operation_active:
+            self.set_busy(False)
+            self.update_ready()
+        if not current or self.image is None or self.windows_wim_member is None:
             return
         if isinstance(result, Exception) or not isinstance(result, WimInfo):
             self.windows_wim_editions = ()
-            if self.windows_options.install_image is not None:
+            if (
+                self.windows_options.install_image is not None
+                or self.windows_options.install_image_path
+            ):
                 self.windows_options = replace(
-                    self.windows_options, install_image=None,
+                    self.windows_options, install_image=None, install_image_path="",
                 )
             self.windows_wim_error = (
                 str(result) if isinstance(result, Exception)
@@ -2338,6 +2429,38 @@ class Window(QMainWindow):
             )
             return
         info = result
+        try:
+            validate_wim_editions(info.editions)
+        except Exception as error:
+            self.windows_wim_editions = ()
+            if (
+                self.windows_options.install_image is not None
+                or self.windows_options.install_image_path
+            ):
+                self.windows_options = replace(
+                    self.windows_options, install_image=None, install_image_path="",
+                )
+            self.windows_wim_error = str(error)
+            self.windows_button.setToolTip(
+                f"Windows edition metadata unavailable: {self.windows_wim_error}"
+            )
+            return
+        if info.size != token.source.size:
+            self.windows_wim_editions = ()
+            if (
+                self.windows_options.install_image is not None
+                or self.windows_options.install_image_path
+            ):
+                self.windows_options = replace(
+                    self.windows_options, install_image=None, install_image_path="",
+                )
+            self.windows_wim_error = (
+                "The WIM inspector returned metadata for a different catalog size"
+            )
+            self.windows_button.setToolTip(
+                f"Windows edition metadata unavailable: {self.windows_wim_error}"
+            )
+            return
         self.windows_wim_editions = info.editions
         self.windows_wim_error = ""
         current_selection = self.windows_options.install_image
@@ -2346,7 +2469,9 @@ class Window(QMainWindow):
             or current_selection.source_size != self.windows_wim_member.size
             or current_selection.editions != info.editions
         ):
-            self.windows_options = replace(self.windows_options, install_image=None)
+            self.windows_options = replace(
+                self.windows_options, install_image=None, install_image_path="",
+            )
         labels = "\n".join(edition.display_label for edition in info.editions)
         self.windows_button.setToolTip(labels)
         self.status.setText(
@@ -2485,7 +2610,8 @@ class Window(QMainWindow):
             lines.append("Transformation: split sources/install.wim for FAT32")
         if self.windows_options.install_image is not None:
             lines.append(
-                f"Windows image: {self.windows_options.install_image.display_label}"
+                f"Windows image: {self.windows_options.install_image.display_label} · "
+                f"{self.windows_options.install_image.source_name}"
             )
         lines.extend(("", "Dependencies:"))
         lines.extend(
@@ -2941,7 +3067,8 @@ class Window(QMainWindow):
         if self.windows_options.install_image is not None:
             customization += (
                 "\nWindows image: "
-                f"{self.windows_options.install_image.display_label}."
+                f"{self.windows_options.install_image.display_label} from "
+                f"{self.windows_options.install_image.source_name}."
             )
         if persistence_enabled:
             assert pending.persistence_profile is not None
@@ -3492,30 +3619,52 @@ class Window(QMainWindow):
         tabs.addTab(regional_tab, "Region and keyboard")
         layout.addWidget(tabs)
 
+        current = self.windows_options
+        source_heading = QLabel("Windows image source")
+        source_heading.setObjectName("cardTitle")
+        source_combo = QComboBox()
+        source_combo.setObjectName("windowsSourceCombo")
+        if len(self.windows_wim_candidates) != 1:
+            source_combo.addItem("Choose an install.wim source…", None)
+        for candidate in self.windows_wim_candidates:
+            source_combo.addItem(
+                f"{candidate.path} · {self.display_size(candidate.size)}",
+                candidate.path,
+            )
+        preferred_source = (
+            current.install_image.source_name
+            if current.install_image is not None else (
+                self.windows_wim_member.path
+                if self.windows_wim_member is not None else None
+            )
+        )
+        if preferred_source is not None:
+            row = source_combo.findData(preferred_source)
+            if row >= 0:
+                source_combo.setCurrentIndex(row)
+
         image_heading = QLabel("Windows edition")
         image_heading.setObjectName("cardTitle")
         image_combo = QComboBox()
-        image_combo.addItem("Ask during Windows Setup (no preselection)", None)
-        current = self.windows_options
-        available_editions = self.windows_wim_editions
-        if (
-            not available_editions and current.install_image is not None
-            and self.windows_wim_member is not None
-            and current.install_image.source_name == self.windows_wim_member.path
-            and current.install_image.source_size == self.windows_wim_member.size
-        ):
-            available_editions = current.install_image.editions
-        for edition in available_editions:
-            image_combo.addItem(edition.display_label, edition.index)
-        image_combo.setEnabled(bool(available_editions))
-        if current.install_image is not None:
-            selected_row = image_combo.findData(current.install_image.selected_index)
-            image_combo.setCurrentIndex(max(0, selected_row))
+        image_combo.setObjectName("windowsEditionCombo")
         image_detail = QLabel()
         image_detail.setWordWrap(True)
         image_detail.setObjectName("muted")
+        inspect_editions = QPushButton("Inspect WIM/ESD editions…")
+        available_editions: tuple[WimEdition, ...] = ()
+
+        def selected_source() -> ArchiveEntry | None:
+            path = source_combo.currentData()
+            return next(
+                (
+                    candidate for candidate in self.windows_wim_candidates
+                    if candidate.path == path
+                ),
+                None,
+            )
 
         def update_image_detail() -> None:
+            member = selected_source()
             index = image_combo.currentData()
             edition = next(
                 (item for item in available_editions if item.index == index), None,
@@ -3528,14 +3677,14 @@ class Window(QMainWindow):
                     f"build {edition.version}"
                     + (f"\n{edition.description}" if edition.description else "")
                 )
-            elif self.windows_wim_error:
+            elif member == self.windows_wim_member and self.windows_wim_error:
                 image_detail.setText(
                     f"Edition metadata is unavailable: {self.windows_wim_error}"
                 )
-            elif self.windows_wim_member is not None and not available_editions:
+            elif member is not None and not available_editions:
                 image_detail.setText(
                     f"Inspecting editions temporarily extracts "
-                    f"{self.display_size(self.windows_wim_member.size)} from the ISO. "
+                    f"{self.display_size(member.size)} from {member.path}. "
                     "The private copy is deleted immediately afterward."
                 )
             else:
@@ -3543,24 +3692,58 @@ class Window(QMainWindow):
                     "No edition is preselected; Windows Setup will ask when applicable."
                 )
 
-        image_combo.currentIndexChanged.connect(update_image_detail)
-        inspect_editions = QPushButton(
-            "Refresh edition metadata…" if available_editions
-            else "Inspect WIM/ESD editions…"
-        )
-        inspect_editions.setEnabled(self.windows_wim_member is not None)
-        if self.windows_wim_member is not None:
-            inspect_editions.setToolTip(
-                f"Temporarily extract {self.display_size(self.windows_wim_member.size)} from "
-                "the ISO, inspect it with trusted wimlib-imagex, then delete the copy."
+        def rebuild_editions() -> None:
+            nonlocal available_editions
+            member = selected_source()
+            available_editions = ()
+            selected_index = None
+            if member is not None and member == self.windows_wim_member:
+                available_editions = self.windows_wim_editions
+            if (
+                current.install_image is not None
+                and member is not None
+                and current.install_image.source_name == member.path
+                and current.install_image.source_size == member.size
+            ):
+                if not available_editions:
+                    available_editions = current.install_image.editions
+                selected_index = current.install_image.selected_index
+            image_combo.blockSignals(True)
+            image_combo.clear()
+            image_combo.addItem("Ask during Windows Setup (no preselection)", None)
+            for edition in available_editions:
+                image_combo.addItem(edition.display_label, edition.index)
+            image_combo.setEnabled(bool(available_editions))
+            if selected_index is not None:
+                selected_row = image_combo.findData(selected_index)
+                image_combo.setCurrentIndex(max(0, selected_row))
+            image_combo.blockSignals(False)
+            inspect_editions.setEnabled(member is not None)
+            inspect_editions.setText(
+                "Refresh edition metadata…" if available_editions
+                else "Inspect WIM/ESD editions…"
             )
-        elif self.windows_wim_error:
-            inspect_editions.setToolTip(self.windows_wim_error)
+            if member is not None:
+                inspect_editions.setToolTip(
+                    f"Temporarily extract {self.display_size(member.size)} from "
+                    f"{member.path}, inspect it with trusted wimlib-imagex, then "
+                    "delete the private copy."
+                )
+            elif self.windows_wim_error:
+                inspect_editions.setToolTip(self.windows_wim_error)
+            else:
+                inspect_editions.setToolTip("Choose a Windows image source first")
+            update_image_detail()
+
+        source_combo.currentIndexChanged.connect(rebuild_editions)
+        image_combo.currentIndexChanged.connect(update_image_detail)
+        setup_layout.addWidget(source_heading)
+        setup_layout.addWidget(source_combo)
         setup_layout.addWidget(image_heading)
         setup_layout.addWidget(image_combo)
         setup_layout.addWidget(image_detail)
         setup_layout.addWidget(inspect_editions)
-        update_image_detail()
+        rebuild_editions()
 
         bypass = QCheckBox("Remove Windows 11 RAM, Secure Boot, and TPM 2.0 setup checks")
         online = QCheckBox("Hide the online Microsoft account screen")
@@ -3642,16 +3825,26 @@ class Window(QMainWindow):
 
         def selected() -> WindowsCustomization:
             install_image = None
+            install_image_path = ""
+            member = selected_source()
             selected_index = image_combo.currentData()
             if selected_index is not None:
-                if self.windows_wim_member is None or not available_editions:
+                if member is None or not available_editions:
                     raise ValueError("Windows edition metadata is no longer available")
                 install_image = WimSelection(
-                    self.windows_wim_member.path,
-                    self.windows_wim_member.size,
+                    member.path,
+                    member.size,
                     available_editions,
                     int(selected_index),
                 )
+                if (
+                    member.path.casefold().endswith("/sources/install.wim")
+                    or (
+                        member.path.casefold() == "sources/install.wim"
+                        and self.windows_install_source_count > 1
+                    )
+                ):
+                    install_image_path = member.path
             return WindowsCustomization(
                 bypass_hardware_requirements=bypass.isChecked(),
                 hide_online_account=online.isChecked(),
@@ -3666,6 +3859,7 @@ class Window(QMainWindow):
                 require_local_password_change=password_change.isChecked(),
                 local_password_never_expires=password_never_expires.isChecked(),
                 install_image=install_image,
+                install_image_path=install_image_path,
             )
 
         def profile_architecture(options: WindowsCustomization) -> str:
@@ -3722,11 +3916,19 @@ class Window(QMainWindow):
                 return
             if not confirm_local_account(options):
                 return
+            self.select_windows_wim_source(selected_source())
             self.windows_options = options
             self.logger.info("Windows customization profile updated: %s", options)
             dialog.accept()
 
         def inspect_metadata() -> None:
+            member = selected_source()
+            if member is None:
+                QMessageBox.warning(
+                    dialog, "Choose a Windows image source",
+                    "Choose the install.wim or install.esd source to inspect.",
+                )
+                return
             try:
                 options = selected()
                 generate_autounattend(options, profile_architecture(options))
@@ -3735,6 +3937,7 @@ class Window(QMainWindow):
                 return
             if not confirm_local_account(options):
                 return
+            self.select_windows_wim_source(member)
             self.windows_options = options
             dialog.accept()
             QTimer.singleShot(0, self.start_windows_wim_inspection)

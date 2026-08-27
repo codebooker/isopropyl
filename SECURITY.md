@@ -98,9 +98,14 @@ issue requesting a private contact channel without disclosing the vulnerability.
   remain removable so a failed download cannot become permanent cache debris.
 - Windows customization can be injected only through the UEFI ISO staging path;
   an existing answer file is never overwritten. A selected WIM/ESD index is
-  re-inspected and bound to its source catalog, size, architecture, and edition
-  set before `/IMAGE/INDEX` metadata is emitted; ISOpropyl never emits an
-  automatic target-disk wipe instruction for Windows Setup.
+  re-inspected through one inherited no-follow descriptor and bound to its exact
+  source catalog path, size, architecture, edition set, ctime, and link count
+  before `/IMAGE/INDEX` metadata is emitted. Nested or multi-source WIM answer
+  files also receive an `InstallFrom/Path` value validated against that catalog;
+  a forged path, alias, stale result, or ambiguous ESD selection fails closed.
+  This is an ISOpropyl construction invariant, not a claim that every unusual
+  booted Windows Setup launch context has been physically certified. ISOpropyl
+  never emits an automatic target-disk wipe instruction for Windows Setup.
 - A generated local administrator initially has a blank password. ISOpropyl
   emits one sequential first-logon command that requests password replacement
   and applies the chosen expiration policy, but Windows S mode does not run

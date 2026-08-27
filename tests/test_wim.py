@@ -137,12 +137,18 @@ class WimInfoTests(unittest.TestCase):
         self.assertEqual(info.path, str(source.resolve()))
         self.assertEqual(len(info.editions), 2)
         self.assertEqual(info.source_identity[2], 3)
-        self.assertEqual(calls[0][0], [TOOL, "info", str(source.resolve()), "--xml"])
+        self.assertEqual(calls[0][0][:2], [TOOL, "info"])
+        self.assertRegex(calls[0][0][2], r"^/proc/self/fd/[0-9]+$")
+        self.assertEqual(calls[0][0][3], "--xml")
+        self.assertEqual(
+            calls[0][1]["pass_fds"],
+            (int(calls[0][0][2].rsplit("/", 1)[1]),),
+        )
         self.assertEqual(calls[0][1]["max_output"], 4 * 1024 * 1024)
 
     def test_selection_binds_catalog_metadata_and_has_a_gui_label(self):
         editions = parse_wim_info_xml(INFO_XML)
-        info = WimInfo("/tmp/install.esd", 123, editions, (1, 2, 123, 4))
+        info = WimInfo("/tmp/install.esd", 123, editions, (1, 2, 123, 4, 5, 1))
         selection = info.select("sources/install.esd", 2, expected_size=123)
         validate_wim_selection(selection)
         self.assertEqual(selection.edition.edition_id, "Professional")
@@ -155,10 +161,38 @@ class WimInfoTests(unittest.TestCase):
         for forged in (
             replace(selection, selected_index=99),
             replace(selection, source_name="sources/boot.wim"),
+            replace(selection, source_name="../sources/install.wim"),
+            replace(selection, source_name="C:/sources/install.wim"),
+            replace(selection, source_name="x64/sources/install.wim:stream"),
+            replace(selection, source_name="x64/sources/install.esd"),
+            replace(selection, source_name="x64%name/sources/install.wim"),
+            replace(selection, source_name="x64/CONIN$/sources/install.wim"),
+            replace(selection, source_name="x64/CONOUT$.txt/sources/install.wim"),
+            replace(selection, source_name="x64/COM¹/sources/install.wim"),
+            replace(selection, source_name="x64/LPT².log/sources/install.wim"),
+            replace(selection, source_name="x64/ leading/sources/install.wim"),
+            replace(selection, source_name="x64/trailing /sources/install.wim"),
+            replace(selection, source_name="x64/\x85/sources/install.wim"),
+            replace(selection, source_name="x64/\u2066/sources/install.wim"),
+            replace(selection, source_name="x64/\ud800/sources/install.wim"),
+            replace(selection, source_name="x64/e\u0301/sources/install.wim"),
+            replace(selection, source_name=f"{'a' * 256}/sources/install.wim"),
+            replace(
+                selection,
+                source_name=f"{'/'.join(['a' * 200] * 6)}/sources/install.wim",
+            ),
+            replace(
+                selection,
+                source_name=f"{'/'.join(['a'] * 15)}/sources/install.wim",
+            ),
             replace(selection, editions=(editions[0], editions[0])),
         ):
             with self.subTest(forged=forged), self.assertRaises(WimValidationError):
                 validate_wim_selection(forged)
+
+        nested = replace(selection, source_name="x64/sources/install.wim")
+        validate_wim_selection(nested)
+        self.assertEqual(nested.source_name, "x64/sources/install.wim")
 
     def test_inspection_rejects_source_identity_change_during_command(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -171,6 +205,45 @@ class WimInfoTests(unittest.TestCase):
 
             with self.assertRaisesRegex(WimValidationError, "changed"):
                 inspect_wim(source, which=trusted, runner=runner)
+
+    def test_inspection_rejects_same_size_rewrite_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "install.wim"
+            source.write_bytes(b"GOOD")
+            before = source.stat()
+
+            def runner(_argv, **_kwargs):
+                source.write_bytes(b"EVIL")
+                os.utime(
+                    source,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+                return CommandResult(0, INFO_XML, b"")
+
+            with self.assertRaisesRegex(WimValidationError, "changed"):
+                inspect_wim(source, which=trusted, runner=runner)
+
+    def test_inspection_uses_bound_descriptor_during_path_rebind(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "install.wim"
+            source.write_bytes(b"GOOD")
+            original = source.with_name("original.wim")
+            observed = []
+
+            def runner(argv, **kwargs):
+                self.assertEqual(
+                    kwargs["pass_fds"], (int(argv[2].rsplit("/", 1)[1]),),
+                )
+                source.rename(original)
+                source.write_bytes(b"EVIL")
+                observed.append(Path(argv[2]).read_bytes())
+                source.unlink()
+                original.rename(source)
+                return CommandResult(0, INFO_XML, b"")
+
+            with self.assertRaisesRegex(WimValidationError, "changed"):
+                inspect_wim(source, which=trusted, runner=runner)
+            self.assertEqual(observed, [b"GOOD"])
 
     def test_inspection_propagates_cancellation_to_bounded_command(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -241,6 +314,20 @@ class WimInfoTests(unittest.TestCase):
             self.assertEqual(calls, [])
             with self.assertRaisesRegex(WimCommandError, "broken metadata"):
                 inspect_wim(source, which=trusted, runner=runner)
+
+    def test_inspection_rejects_symlink_and_multiply_linked_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.wim"
+            source.write_bytes(b"wim")
+            symlink = root / "symlink.wim"
+            symlink.symlink_to(source)
+            hardlink = root / "hardlink.wim"
+            os.link(source, hardlink)
+            for candidate in (symlink, source, hardlink):
+                with self.subTest(candidate=candidate):
+                    with self.assertRaises(WimValidationError):
+                        inspect_wim(candidate, which=trusted)
 
     @patch("isopropyl.wim.shutil.which")
     def test_resolution_ignores_session_path_and_rejects_untrusted_paths(self, which):
@@ -350,7 +437,14 @@ class WimSplitTests(unittest.TestCase):
         self.assertEqual(result.total_size, len(b"part one") + len(b"part two"))
         self.assertTrue(all(Path(part).is_file() for part in result.parts))
         self.assertFalse(processes[0].kwargs["shell"])
-        self.assertEqual(processes[0].argv, split_command(plan, Path(processes[0].argv[3])))
+        expected_command = split_command(plan, Path(processes[0].argv[3]))
+        expected_command[2] = processes[0].argv[2]
+        self.assertEqual(processes[0].argv, expected_command)
+        self.assertRegex(processes[0].argv[2], r"^/proc/self/fd/[0-9]+$")
+        self.assertEqual(
+            processes[0].kwargs["pass_fds"],
+            (int(processes[0].argv[2].rsplit("/", 1)[1]),),
+        )
         self.assertEqual(stages[-1], "Complete")
         self.assertEqual(list(self.root.glob(".split-media.*.partial")), [])
 
@@ -363,6 +457,31 @@ class WimSplitTests(unittest.TestCase):
         with self.assertRaisesRegex(WimValidationError, "changed"):
             executor.execute(plan)
         self.assertEqual(called, [])
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.root.glob(".split-media.*.partial")), [])
+
+    def test_splitter_reads_bound_descriptor_and_rejects_path_rebind(self):
+        plan = self.plan()
+        original = self.source.with_name("original-install.wim")
+        observed = []
+
+        def popen(argv, **kwargs):
+            self.source.rename(original)
+            with self.source.open("wb") as stream:
+                stream.write(b"EVIL")
+                stream.truncate(plan.source_identity[2])
+            with Path(argv[2]).open("rb") as stream:
+                observed.append(stream.read(4))
+            self.source.unlink()
+            original.rename(self.source)
+            first = Path(argv[3])
+            first.write_bytes(b"part one")
+            first.with_name("install2.swm").write_bytes(b"part two")
+            return FakeProcess(argv, **kwargs)
+
+        with self.assertRaisesRegex(WimValidationError, "changed"):
+            WimSplitExecutor(popen=popen).execute(plan)
+        self.assertEqual(observed, [b"\0\0\0\0"])
         self.assertFalse(self.destination.exists())
         self.assertEqual(list(self.root.glob(".split-media.*.partial")), [])
 

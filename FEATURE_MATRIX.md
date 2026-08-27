@@ -83,8 +83,8 @@ Status meanings:
 
 | Rufus Windows feature | Status | ISOpropyl evidence and remaining work |
 |---|---:|---|
-| Detect WIM edition/build/architecture/index | **Partial** | Strict bounded `wimlib-imagex info --xml` inspection is integrated and identity-bound, but the GUI still requires exactly one `install.wim`/`install.esd`; Rufus can select among multiple source images. |
-| Split `install.wim` over FAT32 limit | **Done** | Integrated private `wimlib-imagex split`, validates complete numbered parts, atomically commits staging. |
+| Detect WIM edition/build/architecture/index | **Done** | Strict bounded `wimlib-imagex info --xml` inspection is identity-bound. The GUI supports an explicit choice among up to four exact regular canonical/nested `install.wim` sources, or the sole canonical `sources/install.esd`, then scopes editions to that source. Stale asynchronous results cannot replace or tear down a newer inspection. |
+| Split `install.wim` over FAT32 limit | **Done** | Integrated private `wimlib-imagex split` for a sole conventional `sources/install.wim`, validates complete numbered parts, and atomically commits staging. Nested or multi-source oversized WIMs remain path-stable on NTFS. |
 | UEFI-only install media | **Partial** | Executable GPT/FAT32 and GPT/NTFS+UEFI:NTFS paths with per-file verification; physical firmware and Secure Boot testing remain. |
 | BIOS-only and dual BIOS+UEFI | **Planned** | Exact Windows/GRUB/Syslinux boot code and layouts required. |
 | UEFI:NTFS / dual partition | **Partial** | Exact 512-byte-sector GPT/MBR geometry, NTFS data partition, pinned 1 MiB upstream FAT12 helper image, x64/x86/ARM64 payload validation, conditional CA2011 warning, raw and file read-back verification, identity rechecks, and cancellation. ARM32 and RISC-V64 require an explicit unsigned-payload consent with Secure Boot disabled; LoongArch64 remains incomplete. Physical certification remains. |

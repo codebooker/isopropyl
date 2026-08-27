@@ -156,6 +156,76 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(plan.needs_wim_split)
         self.assertEqual(plan.layout.main_filesystem, FileSystem.NTFS)
 
+    def test_single_nested_oversized_windows_wim_is_preserved_on_ntfs(self):
+        plan = build_write_plan(
+            inspection(windows=True, boot_modes=("UEFI",)),
+            [
+                ArchiveEntry("x64/sources/install.wim", FAT32_MAX_FILE_SIZE + 1),
+                ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10),
+            ],
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertEqual(plan.layout.main_filesystem, FileSystem.NTFS)
+        self.assertFalse(plan.needs_wim_split)
+        with self.assertRaisesRegex(PlanError, "FAT32 cannot hold"):
+            build_write_plan(
+                inspection(windows=True, boot_modes=("UEFI",)),
+                [
+                    ArchiveEntry(
+                        "x64/sources/install.wim", FAT32_MAX_FILE_SIZE + 1,
+                    ),
+                    ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10),
+                ],
+                firmware_target=FirmwareTarget.UEFI_ONLY,
+                requested_filesystem=FileSystem.FAT32,
+            )
+
+    def test_multiple_small_windows_wims_remain_fat32_without_splitting(self):
+        plan = build_write_plan(
+            inspection(windows=True, boot_modes=("UEFI",)),
+            [
+                ArchiveEntry("x64/sources/install.wim", 1024),
+                ArchiveEntry("x86/sources/install.wim", 2048),
+                ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10),
+            ],
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertEqual(plan.layout.main_filesystem, FileSystem.FAT32)
+        self.assertFalse(plan.needs_wim_split)
+
+    def test_multiple_windows_wims_with_one_large_source_use_ntfs(self):
+        entries = [
+            ArchiveEntry("x64/sources/install.wim", FAT32_MAX_FILE_SIZE + 1),
+            ArchiveEntry("x86/sources/install.wim", 2048),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10),
+        ]
+        plan = build_write_plan(
+            inspection(windows=True, boot_modes=("UEFI",)), entries,
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertEqual(plan.layout.main_filesystem, FileSystem.NTFS)
+        self.assertEqual(plan.layout.boot_strategy, BootStrategy.UEFI_NTFS)
+        self.assertFalse(plan.needs_wim_split)
+        with self.assertRaisesRegex(PlanError, "FAT32 cannot hold"):
+            build_write_plan(
+                inspection(windows=True, boot_modes=("UEFI",)), entries,
+                firmware_target=FirmwareTarget.UEFI_ONLY,
+                requested_filesystem=FileSystem.FAT32,
+            )
+
+    def test_large_canonical_wim_with_esd_source_is_preserved_on_ntfs(self):
+        entries = [
+            ArchiveEntry("sources/install.wim", FAT32_MAX_FILE_SIZE + 1),
+            ArchiveEntry("sources/install.esd", 2048),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10),
+        ]
+        plan = build_write_plan(
+            inspection(windows=True, boot_modes=("UEFI",)), entries,
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertEqual(plan.layout.main_filesystem, FileSystem.NTFS)
+        self.assertFalse(plan.needs_wim_split)
+
     def test_non_wim_over_fat32_limit_uses_ntfs_and_uefi_boot_partition(self):
         plan = build_write_plan(inspection(), [
             ArchiveEntry("live/filesystem.squashfs", FAT32_MAX_FILE_SIZE + 1),

@@ -11,19 +11,19 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from isopropyl.images import (
-    ImageInspectionCancelled, ImageInspectionTimedOut, NON_RAW_SUFFIXES,
-    RAW_IMAGE_SUFFIXES,
+    ImageInspectionCancelled, ImageInspectionTimedOut, ImageMember,
+    NON_RAW_SUFFIXES, RAW_IMAGE_SUFFIXES,
     boot_identity_fields,
-    calculate_checksums, classify_boot_paths, compare_expected_checksum,
-    inspect_image, parse_7z_listing, parse_expected_checksum,
+    calculate_checksums, classify_boot_paths, classify_windows_installer_members,
+    compare_expected_checksum, inspect_image, parse_7z_listing, parse_expected_checksum,
     scan_image_contents,
 )
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.partition_tables import PartitionTableInspection
 from isopropyl.sources import ExpandedImageTooLarge
 from isopropyl.eltorito import (
-    BootEntry, BootPlatform, ElToritoError, ElToritoInspection, EmulationType,
-    ValidationEntry,
+    BootEntry, BootPlatform, ElToritoError, ElToritoInspection,
+    ElToritoNotFound, EmulationType, ValidationEntry,
 )
 
 
@@ -458,6 +458,156 @@ Folder = -
         self.assertEqual(architectures, ("x64",))
         self.assertEqual(bootloader, "Windows Boot Manager")
         self.assertTrue(windows)
+
+    def test_classifies_up_to_four_total_canonical_and_nested_regular_wims(self):
+        paths = (
+            "sources/install.wim",
+            "editions/home/sources/install.wim",
+            "editions/pro/sources/INSTALL.WIM",
+            "recovery/arm64/sources/install.wim",
+        )
+        result = classify_windows_installer_members(tuple(
+            ImageMember(path, index + 1, "file")
+            for index, path in enumerate(paths)
+        ))
+
+        self.assertTrue(result.valid)
+        self.assertTrue(result.has_installer)
+        self.assertEqual(result.wim_paths, paths)
+        self.assertIsNone(result.esd_path)
+
+        _, _, _, detected = classify_boot_paths(
+            list(paths),
+            members=tuple(
+                ImageMember(path, index + 1, "file")
+                for index, path in enumerate(paths)
+            ),
+        )
+        self.assertTrue(detected)
+
+    def test_retains_only_canonical_install_esd_detection(self):
+        canonical = classify_windows_installer_members((
+            ImageMember("SoUrCeS/INSTALL.ESD", 12, "file"),
+        ))
+        nested = classify_windows_installer_members((
+            ImageMember("edition/sources/install.esd", 12, "file"),
+        ))
+
+        self.assertTrue(canonical.has_installer)
+        self.assertEqual(canonical.esd_path, "SoUrCeS/INSTALL.ESD")
+        self.assertTrue(nested.valid)
+        self.assertFalse(nested.has_installer)
+
+    def test_fifth_or_non_regular_wim_fails_closed(self):
+        five = tuple(
+            ImageMember(f"edition-{index}/sources/install.wim", 1, "file")
+            for index in range(5)
+        )
+        self.assertFalse(classify_windows_installer_members(five).valid)
+        for kind, link in (("directory", ""), ("symlink", "target")):
+            with self.subTest(kind=kind):
+                result = classify_windows_installer_members((
+                    ImageMember("edition/sources/install.wim", 1, kind, link),
+                ))
+                self.assertFalse(result.valid)
+                self.assertFalse(result.has_installer)
+
+    def test_unsafe_or_casefold_unicode_alias_wim_fails_closed(self):
+        unsafe = (
+            "/sources/install.wim",
+            "../sources/install.wim",
+            "C:/sources/install.wim",
+            r"edition\sources\install.wim",
+            "edition/../sources/install.wim",
+            "edition\x00/sources/install.wim",
+            "edition%name/sources/install.wim",
+            "edition/CONIN$/sources/install.wim",
+            "edition/CONOUT$.txt/sources/install.wim",
+            "edition/COM¹/sources/install.wim",
+            "edition/LPT³.log/sources/install.wim",
+            "edition/ leading/sources/install.wim",
+            "edition/trailing /sources/install.wim",
+            "edition/\x85/sources/install.wim",
+            "edition/\u2066/sources/install.wim",
+            "edition/\ud800/sources/install.wim",
+            "cafe\u0301/sources/install.wim",
+            f"{'a' * 256}/sources/install.wim",
+            f"{'/'.join(['a' * 200] * 6)}/sources/install.wim",
+            f"{'/'.join(['a'] * 15)}/sources/install.wim",
+        )
+        for path in unsafe:
+            with self.subTest(path=path):
+                result = classify_windows_installer_members((
+                    ImageMember(path, 1, "file"),
+                ))
+                self.assertFalse(result.valid)
+
+        aliases = (
+            (
+                ImageMember("Edition/sources/install.wim", 1, "file"),
+                ImageMember("edition/SOURCES/INSTALL.WIM", 1, "file"),
+            ),
+            (
+                ImageMember("café/sources/install.wim", 1, "file"),
+                ImageMember("cafe\u0301/sources/install.wim", 1, "file"),
+            ),
+            (
+                ImageMember("Straße/sources/install.wim", 1, "file"),
+                ImageMember("STRASSE/sources/install.wim", 1, "file"),
+            ),
+        )
+        for members in aliases:
+            with self.subTest(members=members):
+                result = classify_windows_installer_members(members)
+                self.assertFalse(result.valid)
+                self.assertEqual(result.wim_paths, ())
+
+    def test_path_only_classification_does_not_authorize_nested_wim(self):
+        _, _, _, canonical = classify_boot_paths(["sources/install.wim"])
+        _, _, _, nested = classify_boot_paths(["edition/sources/install.wim"])
+        self.assertTrue(canonical)
+        self.assertFalse(nested)
+
+    def test_inspection_detects_safe_nested_wims_but_not_a_fifth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "windows.iso"
+            payload = bytearray(18 * 2048)
+            offset = 16 * 2048
+            payload[offset + 1:offset + 6] = b"CD001"
+            path.write_bytes(payload)
+
+            accepted = [
+                ImageMember(f"edition-{index}/sources/install.wim", 1, "file")
+                for index in range(4)
+            ]
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    return_value=(accepted, True),
+                ),
+                patch(
+                    "isopropyl.images.inspect_eltorito_file",
+                    side_effect=ElToritoNotFound,
+                ),
+            ):
+                result = inspect_image(path)
+            self.assertTrue(result.contents_scanned)
+            self.assertTrue(result.has_windows_installer)
+
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    return_value=(accepted + [
+                        ImageMember("edition-4/sources/install.wim", 1, "file"),
+                    ], True),
+                ),
+                patch(
+                    "isopropyl.images.inspect_eltorito_file",
+                    side_effect=ElToritoNotFound,
+                ),
+            ):
+                result = inspect_image(path)
+            self.assertFalse(result.has_windows_installer)
 
     def test_classifies_grub_arm64(self):
         modes, architectures, bootloader, windows = classify_boot_paths([

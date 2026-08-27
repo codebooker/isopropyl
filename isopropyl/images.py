@@ -12,7 +12,7 @@ import stat
 import subprocess
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +29,7 @@ from .eltorito import (
 )
 from .uefi import ImageUefiPayload, inspect_iso_uefi_payloads
 from .virtual import inspect_virtual_disk
+from .windows_paths import validate_install_image_member_path
 
 Progress = Callable[[int, int], None]
 
@@ -46,6 +47,7 @@ _TRUSTED_7Z_PATH = "/usr/bin:/bin"
 _TRUSTED_7Z_DIRECTORIES = frozenset(_TRUSTED_7Z_PATH.split(":"))
 MAX_7Z_CATALOG_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_MEMBERS = 65_536
+MAX_WINDOWS_WIM_CANDIDATES = 4
 
 
 class ImageInspectionCancelled(Exception):
@@ -62,6 +64,23 @@ class ImageMember:
     size: int
     kind: str
     link_target: str = ""
+
+
+@dataclass(frozen=True)
+class WindowsInstallerCandidates:
+    """Bounded Windows installer payload candidates from one member catalog.
+
+    ``valid`` is false when installer-looking members are unsafe, aliased, or
+    exceed the supported WIM bound.  Callers must then ignore every candidate.
+    """
+
+    wim_paths: tuple[str, ...] = ()
+    esd_path: str | None = None
+    valid: bool = True
+
+    @property
+    def has_installer(self) -> bool:
+        return self.valid and bool(self.wim_paths or self.esd_path)
 
 
 @dataclass(frozen=True)
@@ -166,7 +185,71 @@ def _looks_like_windows(path: Path, volume_label: str) -> bool:
     ))
 
 
-def classify_boot_paths(paths: list[str]) -> tuple[tuple[str, ...], tuple[str, ...], str, bool]:
+def classify_windows_installer_members(
+    members: Sequence[ImageMember],
+) -> WindowsInstallerCandidates:
+    """Classify a small, unambiguous set of regular Windows installer images.
+
+    The canonical ``sources/install.wim`` and up to three additional nested
+    ``*/sources/install.wim`` paths may coexist, for a total maximum of four.
+    Only the canonical ``sources/install.esd`` remains recognized.  Any unsafe
+    installer-looking path, non-regular candidate, alias, or fifth WIM makes the
+    complete result invalid so later workflows cannot act on a partial catalog.
+    """
+
+    wim_paths: list[str] = []
+    wim_keys: set[tuple[str, ...]] = set()
+    esd_path: str | None = None
+    esd_key: tuple[str, ...] | None = None
+
+    if len(members) > MAX_IMAGE_MEMBERS:
+        return WindowsInstallerCandidates(valid=False)
+    for member in members:
+        if not isinstance(member, ImageMember) or not isinstance(member.path, str):
+            return WindowsInstallerCandidates(valid=False)
+        rough = member.path.replace("\\", "/").casefold()
+        looks_wim = rough == "sources/install.wim" or rough.endswith(
+            "/sources/install.wim"
+        )
+        looks_esd = rough == "sources/install.esd"
+        if not (looks_wim or looks_esd):
+            continue
+        try:
+            validated = validate_install_image_member_path(member.path)
+        except ValueError:
+            return WindowsInstallerCandidates(valid=False)
+        normalized, key = validated.path, validated.alias_key
+        canonical_wim = key == ("sources", "install.wim")
+        nested_wim = len(key) >= 3 and key[-2:] == ("sources", "install.wim")
+        canonical_esd = key == ("sources", "install.esd")
+        if not (canonical_wim or nested_wim or canonical_esd):
+            continue
+        if (
+            member.kind != "file"
+            or member.link_target
+            or type(member.size) is not int
+            or member.size <= 0
+        ):
+            return WindowsInstallerCandidates(valid=False)
+        if canonical_esd:
+            if esd_key is not None:
+                return WindowsInstallerCandidates(valid=False)
+            esd_key = key
+            esd_path = normalized
+            continue
+        if key in wim_keys:
+            return WindowsInstallerCandidates(valid=False)
+        wim_keys.add(key)
+        wim_paths.append(normalized)
+        if len(wim_paths) > MAX_WINDOWS_WIM_CANDIDATES:
+            return WindowsInstallerCandidates(valid=False)
+
+    return WindowsInstallerCandidates(tuple(wim_paths), esd_path, True)
+
+
+def classify_boot_paths(
+    paths: list[str], *, members: Sequence[ImageMember] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], str, bool]:
     normalized = {path.replace("\\", "/").casefold().lstrip("/") for path in paths}
     architecture_files = {
         "efi/boot/bootx64.efi": "x64",
@@ -194,7 +277,19 @@ def classify_boot_paths(paths: list[str]) -> tuple[tuple[str, ...], tuple[str, .
         bootloader = "Windows Boot Manager"
     else:
         bootloader = "Unknown"
-    windows_installer = "sources/install.wim" in normalized or "sources/install.esd" in normalized
+    if members is None:
+        # Preserve the original path-only API for canonical sources. Nested WIM
+        # candidates require member kinds and therefore remain disabled unless
+        # the complete catalog is supplied by inspection.
+        canonical = tuple(
+            ImageMember(path, 1, "file") for path in paths
+            if path.replace("\\", "/").casefold() in {
+                "sources/install.wim", "sources/install.esd",
+            }
+        )
+        windows_installer = classify_windows_installer_members(canonical).has_installer
+    else:
+        windows_installer = classify_windows_installer_members(members).has_installer
     return modes, architectures, bootloader, windows_installer
 
 
@@ -574,7 +669,7 @@ def inspect_image(
             if inspection_fd >= 0 else ([], False)
         )
         modes, architectures, bootloader, windows_installer = classify_boot_paths(
-            [member.path for member in members]
+            [member.path for member in members], members=members,
         )
         eltorito: ElToritoInspection | None = None
         eltorito_issues: tuple[str, ...] = ()

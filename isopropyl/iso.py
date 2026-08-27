@@ -169,6 +169,15 @@ _SPECIAL_KINDS = {
 }
 
 
+def _is_install_wim_path(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return (
+        len(parts) >= 2
+        and parts[-1].casefold() == "install.wim"
+        and parts[-2].casefold() == "sources"
+    )
+
+
 def _portable_component(component: str, member: str) -> str:
     if not component or component in {".", ".."}:
         raise UnsafeArchiveError(f"Unsafe path component in archive member: {member!r}")
@@ -432,15 +441,30 @@ def build_write_plan(
         entry for entry in safe_entries
         if entry.kind is EntryKind.FILE and entry.size > FAT32_MAX_FILE_SIZE
     )
+    install_sources = tuple(
+        entry for entry in safe_entries
+        if entry.kind is EntryKind.FILE and (
+            _is_install_wim_path(entry.path)
+            or entry.path.casefold() == "sources/install.esd"
+        )
+    )
+    # Windows Setup knows how to consume split SWM parts at the conventional
+    # sources/install.wim location.  A nested source may be referenced by an
+    # answer-file Path; splitting it would remove that exact path and is not a
+    # semantics-preserving transformation.  Preserve nested and multi-source
+    # media unchanged on NTFS instead.
     large_wims = tuple(
-        entry for entry in oversized if entry.path.casefold() == "sources/install.wim"
+        entry for entry in oversized
+        if len(install_sources) == 1
+        and entry.path.casefold() == "sources/install.wim"
     )
     non_wim_oversized = tuple(entry for entry in oversized if entry not in large_wims)
 
     transformations: list[Transformation] = []
     if requested_filesystem is FileSystem.FAT32 and non_wim_oversized:
+        blocked = non_wim_oversized[0]
         raise PlanError(
-            f"FAT32 cannot hold {non_wim_oversized[0].path!r}; its per-file limit is 4 GiB minus 1 byte"
+            f"FAT32 cannot hold {blocked.path!r}; its per-file limit is 4 GiB minus 1 byte"
         )
     if requested_filesystem is not None:
         filesystem = requested_filesystem
@@ -503,7 +527,7 @@ def build_write_plan(
     if transformations:
         requirements.append(_requirement(
             "wim-splitter", ("wimlib-imagex",), RequirementSource.SYSTEM,
-            f"Split sources/install.wim into parts no larger than {WIM_SPLIT_PART_SIZE} bytes.",
+            f"Split the sole install.wim into parts no larger than {WIM_SPLIT_PART_SIZE} bytes.",
         ))
     requirements.extend(_boot_requirements(inspection, layout))
 

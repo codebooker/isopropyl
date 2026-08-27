@@ -15,6 +15,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .windows_paths import validate_install_image_member_path
+
 FAT32_MAX_FILE_SIZE = (4 * 1024 * 1024 * 1024) - 1
 MIB = 1024 * 1024
 DEFAULT_SPLIT_PART_MIB = 3800
@@ -86,7 +88,7 @@ class WimEdition:
         )
 
 
-FileIdentity = tuple[int, int, int, int]
+FileIdentity = tuple[int, int, int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -172,21 +174,74 @@ def resolve_wimlib(
     return _validate_wimlib_path(which("wimlib-imagex") or "")
 
 
-def _regular_file(path: str | os.PathLike[str]) -> tuple[Path, os.stat_result]:
-    try:
-        resolved = Path(path).expanduser().resolve(strict=True)
-        status = resolved.stat()
-    except (OSError, RuntimeError) as error:
-        raise WimValidationError(f"WIM/ESD source is unavailable: {path}") from error
-    if not stat.S_ISREG(status.st_mode):
-        raise WimValidationError("The WIM/ESD source must be a regular file")
-    if status.st_size <= 0:
-        raise WimValidationError("The WIM/ESD source is empty")
-    return resolved, status
+_SOURCE_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 def _identity(status: os.stat_result) -> FileIdentity:
-    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+    return (
+        status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,
+        status.st_ctime_ns, status.st_nlink,
+    )
+
+
+def _open_regular_file(
+    path: str | os.PathLike[str],
+) -> tuple[Path, int, os.stat_result]:
+    descriptor = -1
+    try:
+        raw = Path(path).expanduser()
+        parent = raw.parent.resolve(strict=True)
+        resolved = parent / raw.name
+        descriptor = os.open(resolved, _SOURCE_FLAGS)
+        status = os.fstat(descriptor)
+        linked = os.lstat(resolved)
+    except (OSError, RuntimeError) as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise WimValidationError(f"WIM/ESD source is unavailable: {path}") from error
+    try:
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or (status.st_dev, status.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise WimValidationError(
+                "The WIM/ESD source must be one no-follow regular file"
+            )
+        if status.st_size <= 0:
+            raise WimValidationError("The WIM/ESD source is empty")
+        return resolved, descriptor, status
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _regular_file(path: str | os.PathLike[str]) -> tuple[Path, os.stat_result]:
+    resolved, descriptor, status = _open_regular_file(path)
+    os.close(descriptor)
+    return resolved, status
+
+
+def _descriptor_path(descriptor: int) -> str:
+    return f"/proc/self/fd/{descriptor}"
+
+
+def _descriptor_still_bound(
+    path: Path, descriptor: int, expected: FileIdentity,
+) -> bool:
+    try:
+        descriptor_status = os.fstat(descriptor)
+        path_status = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(descriptor_status.st_mode)
+        and stat.S_ISREG(path_status.st_mode)
+        and _identity(descriptor_status) == expected
+        and _identity(path_status) == expected
+    )
 
 
 def _bounded_reader(
@@ -231,6 +286,7 @@ def run_bounded_command(
     cancel_event: threading.Event | None = None,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    pass_fds: Sequence[int] = (),
 ) -> CommandResult:
     """Run fixed argv without a shell while bounding time and captured output."""
 
@@ -242,11 +298,14 @@ def run_bounded_command(
         raise WimValidationError("Command output bound must be between 1 byte and 16 MiB")
     if cancel_event is not None and cancel_event.is_set():
         raise WimCancelled("WIM operation was cancelled")
+    bound_fds = tuple(pass_fds)
+    if any(type(descriptor) is not int or descriptor < 0 for descriptor in bound_fds):
+        raise WimValidationError("Inherited WIM descriptors must be non-negative integers")
 
     try:
         process = popen(
             list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL, shell=False,
+            stdin=subprocess.DEVNULL, shell=False, pass_fds=bound_fds,
         )
     except OSError as error:
         raise WimCommandError("Could not start wimlib-imagex") from error
@@ -405,14 +464,12 @@ def validate_wim_editions(editions: tuple[WimEdition, ...]) -> None:
 def validate_wim_selection(selection: WimSelection) -> None:
     if not isinstance(selection, WimSelection):
         raise WimValidationError("A WIM image selection is required")
-    if (
-        not isinstance(selection.source_name, str)
-        or selection.source_name.casefold() not in {
-            "sources/install.wim", "sources/install.esd",
-        }
-        or "\\" in selection.source_name
-    ):
-        raise WimValidationError("The selection must name sources/install.wim or install.esd")
+    try:
+        validate_install_image_member_path(selection.source_name)
+    except ValueError as error:
+        raise WimValidationError(
+            "The selection must name a safe */sources/install.wim or canonical install.esd"
+        ) from error
     if (
         not isinstance(selection.source_size, int)
         or isinstance(selection.source_size, bool)
@@ -516,24 +573,30 @@ def inspect_wim(
     timeout_seconds: float = 20,
     cancel_event: threading.Event | None = None,
 ) -> WimInfo:
-    source, status = _regular_file(path)
-    tool = resolve_wimlib(which)
-    result = runner(
-        [tool, "info", str(source), "--xml"],
-        timeout_seconds=timeout_seconds,
-        max_output=MAX_INFO_OUTPUT,
-        cancel_event=cancel_event,
-    )
-    if len(result.stdout) > MAX_INFO_OUTPUT or len(result.stderr) > MAX_INFO_OUTPUT:
-        raise WimCommandError("wimlib-imagex produced too much output")
-    if result.returncode:
-        detail = _error_text(result.stderr)
-        raise WimCommandError(detail or "wimlib-imagex could not inspect the image")
-    editions = parse_wim_info_xml(result.stdout)
-    current, current_status = _regular_file(source)
-    if current != source or _identity(current_status) != _identity(status):
-        raise WimValidationError("The WIM/ESD source changed while metadata was inspected")
-    return WimInfo(str(source), status.st_size, editions, _identity(status))
+    source, descriptor, status = _open_regular_file(path)
+    source_identity = _identity(status)
+    try:
+        tool = resolve_wimlib(which)
+        result = runner(
+            [tool, "info", _descriptor_path(descriptor), "--xml"],
+            timeout_seconds=timeout_seconds,
+            max_output=MAX_INFO_OUTPUT,
+            cancel_event=cancel_event,
+            pass_fds=(descriptor,),
+        )
+        if len(result.stdout) > MAX_INFO_OUTPUT or len(result.stderr) > MAX_INFO_OUTPUT:
+            raise WimCommandError("wimlib-imagex produced too much output")
+        if result.returncode:
+            detail = _error_text(result.stderr)
+            raise WimCommandError(detail or "wimlib-imagex could not inspect the image")
+        editions = parse_wim_info_xml(result.stdout)
+        if not _descriptor_still_bound(source, descriptor, source_identity):
+            raise WimValidationError(
+                "The WIM/ESD source changed while metadata was inspected"
+            )
+        return WimInfo(str(source), status.st_size, editions, source_identity)
+    finally:
+        os.close(descriptor)
 
 
 def requires_fat32_split(size: int) -> bool:
@@ -599,7 +662,7 @@ def validate_split_plan(plan: WimSplitPlan) -> None:
     ):
         raise WimValidationError("Split plan contains an invalid part size")
     if (
-        not isinstance(plan.source_identity, tuple) or len(plan.source_identity) != 4
+        not isinstance(plan.source_identity, tuple) or len(plan.source_identity) != 6
         or any(not isinstance(value, int) for value in plan.source_identity)
     ):
         raise WimValidationError("Split plan contains an invalid source identity")
@@ -702,32 +765,43 @@ class WimSplitExecutor:
         validate_split_plan(plan)
         self._check_cancelled()
 
-        source, status = _regular_file(plan.source)
+        source, source_descriptor, status = _open_regular_file(plan.source)
         if str(source) != plan.source or _identity(status) != plan.source_identity:
+            os.close(source_descriptor)
             raise WimValidationError("install.wim changed after the split was planned")
         if not requires_fat32_split(status.st_size):
+            os.close(source_descriptor)
             raise WimValidationError("install.wim no longer requires splitting")
-        destination = _destination_path(plan.destination_directory)
-        staging = Path(tempfile.mkdtemp(
-            prefix=f".{destination.name}.", suffix=".partial", dir=destination.parent,
-        ))
+        staging: Path | None = None
         try:
+            destination = _destination_path(plan.destination_directory)
+            staging = Path(tempfile.mkdtemp(
+                prefix=f".{destination.name}.", suffix=".partial",
+                dir=destination.parent,
+            ))
             self._check_cancelled()
             stage("Splitting install.wim")
             first_part = staging / "install.swm"
+            command = split_command(plan, first_part)
+            command[2] = _descriptor_path(source_descriptor)
             result = run_bounded_command(
-                split_command(plan, first_part),
+                command,
                 timeout_seconds=self._timeout_seconds,
                 max_output=MAX_COMMAND_OUTPUT,
                 cancel_event=self._cancelled,
                 popen=self._popen,
                 process_started=self._process_started,
+                pass_fds=(source_descriptor,),
             )
             with self._lock:
                 self._process = None
             if result.returncode:
                 detail = _error_text(result.stderr)
                 raise WimCommandError(detail or "wimlib-imagex could not split install.wim")
+            if not _descriptor_still_bound(
+                source, source_descriptor, plan.source_identity,
+            ):
+                raise WimValidationError("install.wim changed while it was being split")
             self._check_cancelled()
             stage("Validating split parts")
             parts, total_size = _validate_staged_parts(staging)
@@ -750,10 +824,11 @@ class WimSplitExecutor:
                 pass
             return WimSplitResult(str(destination), committed_parts, total_size)
         finally:
+            os.close(source_descriptor)
             with self._lock:
                 process = self._process
                 self._process = None
             if process is not None:
                 _stop_process(process)
-            if staging.exists():
+            if staging is not None and staging.exists():
                 shutil.rmtree(staging)

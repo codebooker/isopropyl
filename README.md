@@ -38,7 +38,8 @@ installer customization, verification, backups, formatting, and media tools.
 - **DD mode** for hybrid ISOs and raw disk images, with cancellation and
   byte-for-byte read-back verification.
 - **ISO mode** for supported UEFI media: safely extract the ISO, choose FAT32
-  or NTFS automatically, split an oversized Windows `install.wim` when useful,
+  or NTFS automatically, split a sole conventional Windows
+  `sources/install.wim` when useful,
   optionally add `autounattend.xml`, and SHA-256 verify every copied file from
   the USB. Large-file NTFS media use an exact, read-back-verified UEFI:NTFS
   bridge obtained from a version-and-hash-pinned upstream artifact.
@@ -75,10 +76,14 @@ installer customization, verification, backups, formatting, and media tools.
 
 ### Customize Windows installation media
 
-ISOpropyl inspects `install.wim` and `install.esd`, shows each edition, index,
-architecture, version, and build, and can bind Windows Setup to the selected
-image—or leave the choice to Setup. It can also generate and apply a transparent
-Windows answer file with options for:
+ISOpropyl inspects a sole canonical `sources/install.esd` or up to four exact,
+regular `install.wim` sources, including safe nested architecture/edition
+layouts. The source picker shows each edition, index, architecture, version, and
+build, then generates a source-scoped answer-file selection using the image
+index and, for nested or multi-source media, the exact catalog path—or leaves
+the choice to Setup. Booted Windows Setup certification for uncommon nested and
+multi-source launch layouts remains open. ISOpropyl can also generate and apply
+a transparent Windows answer file with options for:
 
 - Windows 11 RAM, TPM 2.0, and Secure Boot setup-check bypasses;
 - local administrator creation and Microsoft-account screen suppression;
@@ -174,8 +179,9 @@ architecture/firmware profiles are tracked in the
 - `sfdisk` and `mkfs.vfat` for FAT32 ISO mode; `mkfs.ntfs` (usually supplied by
   `ntfs-3g`) for large-file UEFI:NTFS media.
 - `wimlib-imagex` (commonly packaged as `wimtools`) to inspect or select Windows
-  WIM/ESD editions, and to split `sources/install.wim` when it exceeds FAT32's
-  per-file limit.
+  WIM/ESD editions, and to split a sole conventional `sources/install.wim` when
+  it exceeds FAT32's per-file limit. Nested or multi-source oversized WIM media
+  remain unchanged on NTFS so source paths stay valid.
 
 Optional tools unlock additional workflows:
 
@@ -265,9 +271,11 @@ meet even the candidate gate, so ISOpropyl deliberately hides the option for
 them instead of producing media that only appears persistent.
 
 For supported Windows media, configure **Windows options…** before starting ISO
-mode. You can choose a specific WIM/ESD edition or let Windows Setup ask. Windows
-customization is applied only in ISO mode; choosing DD mode produces an explicit
-warning instead of silently discarding the profile.
+mode. If the ISO contains several supported `install.wim` sources, first choose
+the exact source and then its edition; otherwise you can choose a specific
+WIM/ESD edition or let Windows Setup ask. Windows customization is applied only
+in ISO mode; choosing DD mode produces an explicit warning instead of silently
+discarding the profile.
 
 Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
 <kbd>Ctrl</kbd>+<kbd>R</kbd> refreshes targets,
