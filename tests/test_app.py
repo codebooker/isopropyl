@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,8 +20,10 @@ from PyQt6.QtWidgets import (
 )
 
 from isopropyl.app import (
-    BackgroundPreparation, ChecksumToken, PendingIsoWrite, PendingUefiShell,
+    BackgroundPreparation, ChecksumToken, IsoStagingPreparationRequest,
+    IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
+    ZipOverlayPlanningToken,
 )
 from isopropyl.authenticode import AuthenticodeIntegrityState, AuthenticodeResult
 from isopropyl.backup import VHD_MAX_SIZE
@@ -35,13 +38,18 @@ from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
 )
 from isopropyl.images import ChecksumCancelled, ImageInspection, ImageMember
-from isopropyl.iso import ArchiveEntry, WriteMode, build_write_plan
+from isopropyl.iso import (
+    ArchiveEntry, EntryKind, WriteMode, build_write_plan,
+    merge_additive_overlay_entries,
+)
+from isopropyl.iso_staging import IsoStagingPlan
 from isopropyl.extraction import SafeIsoExtractor
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
 from isopropyl.wim import WimEdition, WimInfo, WimSelection
 from isopropyl.windows import WindowsCustomization
+from isopropyl.zip_overlay import ZipOverlayPlan, build_zip_overlay_plan
 
 
 def device(size: int = 8 * 1024**3) -> Device:
@@ -124,6 +132,68 @@ class ImmediateThread:
 
     def start(self) -> None:
         self.target()
+
+
+def make_zip_overlay(root: Path, path: str = "extras/readme.txt") -> ZipOverlayPlan:
+    archive = root / "extras.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr(path, b"overlay")
+    return build_zip_overlay_plan(archive)
+
+
+def fake_iso_staging_plan(
+    image: Path,
+    destination: Path,
+    entries,
+    write_plan,
+    *,
+    overlay=None,
+    windows_customization=None,
+    windows_architecture="amd64",
+    **_kwargs,
+) -> IsoStagingPlan:
+    base_entries = tuple(entries)
+    effective_entries = base_entries
+    if overlay is not None:
+        effective_entries = merge_additive_overlay_entries(
+            base_entries, (member.entry for member in overlay.members),
+        ).merged_entries
+    image_status = image.stat()
+    parent_status = destination.parent.stat()
+    content_bytes = sum(
+        entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
+    )
+    digest = "a" * 64
+    return IsoStagingPlan(
+        image=image,
+        image_identity=(
+            image_status.st_dev, image_status.st_ino,
+            image_status.st_size, image_status.st_mtime_ns,
+        ),
+        destination=destination,
+        destination_parent_identity=(parent_status.st_dev, parent_status.st_ino),
+        entries=base_entries,
+        catalog_digest=digest,
+        write_plan=write_plan,
+        seven_zip="/usr/bin/7z",
+        content_bytes=content_bytes,
+        required_free_bytes=content_bytes + 64 * 1024**2,
+        wim_source=None,
+        wim_selection=None,
+        wimlib_imagex=None,
+        autounattend_xml=None,
+        windows_customization=(
+            windows_customization if windows_customization and windows_customization.enabled
+            else None
+        ),
+        windows_architecture=(
+            windows_architecture
+            if windows_customization and windows_customization.enabled else None
+        ),
+        overlay=overlay,
+        effective_entries=effective_entries,
+        effective_catalog_digest=digest,
+    )
 
 
 class RestoreFilesystemDialogTests(unittest.TestCase):
@@ -1703,6 +1773,542 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertEqual(self.window.selected_device(), replacement)
 
 
+class WindowZipOverlayTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
+            self.window = Window()
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.image = Path(self.settings_home.name) / "windows.iso"
+        self.window.image.write_bytes(b"fixture")
+        status = self.window.image.stat()
+        self.identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        self.window.inspection = optical_windows_inspection()
+        self.window.inspection_identity = self.identity
+        self.window.inspection_generation = 4
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        self.overlay = make_zip_overlay(Path(self.settings_home.name))
+        self.window.update_zip_overlay_controls()
+
+    def tearDown(self) -> None:
+        self.window.iso_staging_preparer = None
+        self.window.iso_staging_token = None
+        self.window.zip_overlay_preparer = None
+        self.window.zip_overlay_token = None
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+        self.settings_home.cleanup()
+
+    def select_overlay(self) -> None:
+        with (
+            patch(
+                "isopropyl.app.QFileDialog.getOpenFileName",
+                return_value=(str(self.overlay.archive), "ZIP archives (*.zip)"),
+            ),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.build_zip_overlay_plan",
+                return_value=self.overlay,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.choose_zip_overlay()
+
+    def test_overlay_selector_is_iso_catalog_gated(self):
+        self.assertTrue(self.window.zip_overlay_choose_button.isEnabled())
+        self.window.inspection = replace(
+            self.window.inspection, is_iso9660=False, kind="Raw disk image",
+        )
+        self.window.update_zip_overlay_controls()
+        self.assertFalse(self.window.zip_overlay_choose_button.isEnabled())
+        self.window.inspection = replace(
+            optical_windows_inspection(), contents_scanned=False,
+        )
+        self.window.update_zip_overlay_controls()
+        self.assertFalse(self.window.zip_overlay_choose_button.isEnabled())
+
+    def test_background_selection_replans_effective_catalog(self):
+        before = self.window.write_recommendation.iso_plan.minimum_content_bytes
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+
+        self.assertIs(self.window.zip_overlay_plan, self.overlay)
+        self.assertIsNotNone(self.window.zip_overlay_merge)
+        self.assertEqual(
+            self.window.write_recommendation.iso_plan.minimum_content_bytes,
+            before + self.overlay.content_bytes,
+        )
+        self.assertIn(self.overlay.archive.name, self.window.zip_overlay_label.text())
+        self.assertTrue(self.window.write_button.isEnabled())
+        with patch(
+            "isopropyl.app.merge_additive_overlay_entries",
+            side_effect=AssertionError("GUI recomputed a large merge"),
+        ):
+            self.window.rebuild_write_recommendation()
+            self.assertTrue(self.window.effective_archive_entries())
+
+    def test_clear_invalidates_a_deferred_result(self):
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon=False):
+                threads.append(target)
+
+            def start(self):
+                pass
+
+        with (
+            patch(
+                "isopropyl.app.QFileDialog.getOpenFileName",
+                return_value=(str(self.overlay.archive), "ZIP archives (*.zip)"),
+            ),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.build_zip_overlay_plan",
+                return_value=self.overlay,
+            ),
+            patch("isopropyl.app.threading.Thread", DeferredThread),
+        ):
+            self.window.choose_zip_overlay()
+        operation = self.window.zip_overlay_preparer
+        self.assertIsNotNone(operation)
+        self.assertFalse(self.window.write_button.isEnabled())
+        self.assertTrue(self.window.target_card.isEnabled())
+        self.window.clear_zip_overlay()
+        self.assertTrue(operation.cancelled)
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            threads[0]()
+        self.assertIsNone(self.window.zip_overlay_plan)
+        self.assertIsNone(self.window.zip_overlay_preparer)
+
+    def test_selecting_a_new_image_clears_the_bound_overlay(self):
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+        replacement = Path(self.settings_home.name) / "replacement.iso"
+        replacement.write_bytes(b"replacement")
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                pass
+
+        with patch("isopropyl.app.threading.Thread", DeferredThread):
+            self.window.load_image(replacement)
+
+        self.assertIsNone(self.window.zip_overlay_plan)
+        self.assertIsNone(self.window.zip_overlay_merge)
+        self.assertIn("No ZIP overlay", self.window.zip_overlay_label.text())
+
+    def test_stale_overlay_token_cannot_replace_current_plan(self):
+        current_operation = BackgroundPreparation()
+        stale_operation = BackgroundPreparation()
+        base = self.window.archive_entries()
+        current = ZipOverlayPlanningToken(
+            2, self.window.inspection_generation, self.identity,
+            self.overlay.archive, base, current_operation,
+        )
+        stale = replace(current, generation=1, operation=stale_operation)
+        self.window.zip_overlay_generation = 2
+        self.window.zip_overlay_preparer = current_operation
+        self.window.zip_overlay_token = current
+        merged = merge_additive_overlay_entries(
+            base, (member.entry for member in self.overlay.members),
+        )
+
+        self.window.on_zip_overlay_finished(stale, (self.overlay, merged))
+
+        self.assertIs(self.window.zip_overlay_token, current)
+        self.assertIs(self.window.zip_overlay_preparer, current_operation)
+        self.assertIsNone(self.window.zip_overlay_plan)
+
+    def test_target_resident_overlay_is_refused_and_later_blocks_readiness(self):
+        with (
+            patch(
+                "isopropyl.app.QFileDialog.getOpenFileName",
+                return_value=(str(self.overlay.archive), "ZIP archives (*.zip)"),
+            ),
+            patch("isopropyl.app.path_is_on_device", return_value=True),
+            patch("isopropyl.app.build_zip_overlay_plan") as builder,
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.choose_zip_overlay()
+        builder.assert_not_called()
+        warning.assert_called_once()
+        self.assertIsNone(self.window.zip_overlay_plan)
+
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+        with patch("isopropyl.app.path_is_on_device", return_value=True):
+            self.window.update_ready()
+        self.assertFalse(self.window.write_button.isEnabled())
+        self.assertIn("move", self.window.status.text().casefold())
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        with patch("isopropyl.app.path_is_on_device", return_value=True):
+            self.window.update_ready()
+        self.assertTrue(self.window.write_button.isEnabled())
+        self.assertIn("ZIP omitted", self.window.write_button.text())
+
+    def test_dd_requires_explicit_overlay_omission_acknowledgment(self):
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+        self.window.write_method.setCurrentIndex(
+            self.window.write_method.findData(WriteMode.DD.value)
+        )
+        self.assertIn("ZIP omitted", self.window.write_button.text())
+        with (
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+            patch.object(self.window, "start_write") as start,
+        ):
+            self.window.confirm_write()
+        self.assertEqual(warning.call_args.args[1], "ZIP overlay will not be written")
+        start.assert_not_called()
+
+    def test_preview_uses_effective_catalog_and_labels_original_extraction(self):
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+        observed = {}
+
+        def inspect(dialog: QDialog) -> int:
+            observed["text"] = dialog.findChild(QPlainTextEdit).toPlainText()
+            observed["buttons"] = tuple(
+                button.text() for button in dialog.findChildren(QPushButton)
+            )
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            self.window.preview_iso_plan()
+
+        self.assertIn(f"ZIP overlay: {self.overlay.archive.name}", observed["text"])
+        self.assertIn(self.overlay.archive_sha256, observed["text"])
+        self.assertIn("additive only", observed["text"])
+        self.assertIn("Extract original ISO…", observed["buttons"])
+
+    def test_async_staging_preparation_passes_base_entries_and_exact_overlay(self):
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        captured = []
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+
+        def builder(*args, **kwargs):
+            captured.append((args, kwargs))
+            return fake_iso_staging_plan(*args, **kwargs)
+
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=self.identity),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch("isopropyl.app.build_iso_staging_plan", side_effect=builder),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), recommendation.iso_plan,
+            )
+
+        args, kwargs = captured[0]
+        self.assertEqual(tuple(args[2]), self.window.archive_entries())
+        self.assertIs(args[3], recommendation.iso_plan)
+        self.assertIs(kwargs["overlay"], self.overlay)
+        self.assertTrue(callable(kwargs["cancel_check"]))
+        continuation.assert_called_once()
+        pending = continuation.call_args.args[0]
+        self.assertIs(pending.staging_plan.overlay, self.overlay)
+        pending.workspace.cleanup()
+
+    def test_staging_completion_rejects_different_windows_snapshot(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        workspace.name = str(Path(self.settings_home.name) / "forged-workspace")
+        Path(workspace.name).mkdir()
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+
+        def forged_builder(*args, **kwargs):
+            plan = fake_iso_staging_plan(*args, **kwargs)
+            return replace(
+                plan,
+                windows_customization=WindowsCustomization(
+                    hide_online_account=True,
+                ),
+                windows_architecture="amd64",
+            )
+
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=self.identity),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch("isopropyl.app.tempfile.TemporaryDirectory", return_value=workspace),
+            patch("isopropyl.app.build_iso_staging_plan", side_effect=forged_builder),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), recommendation.iso_plan,
+            )
+
+        continuation.assert_not_called()
+        workspace.cleanup.assert_called_once_with()
+        self.assertIn("does not match", warning.call_args.args[2])
+
+    def test_working_directory_on_target_is_rejected_before_workspace_creation(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=self.identity),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch("isopropyl.app.path_is_on_device", return_value=True),
+            patch("isopropyl.app.tempfile.TemporaryDirectory") as temporary,
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), recommendation.iso_plan,
+            )
+
+        temporary.assert_not_called()
+        self.assertIn("another disk", warning.call_args.args[1].casefold())
+
+    def test_stale_staging_completion_cleans_only_its_workspace(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        stale_workspace = Mock()
+        current_workspace = Mock()
+        common = dict(
+            image=self.window.image,
+            image_identity=self.identity,
+            inspection=self.window.inspection,
+            device=self.window.devices[0],
+            base_entries=self.window.archive_entries(),
+            write_plan=recommendation.iso_plan,
+            overlay=None,
+            windows_customization=WindowsCustomization(),
+            windows_architecture="amd64",
+            persistence_profile=None,
+            persistence_bytes=0,
+        )
+        stale_request = IsoStagingPreparationRequest(
+            workspace=stale_workspace, **common,
+        )
+        current_request = IsoStagingPreparationRequest(
+            workspace=current_workspace, **common,
+        )
+        stale = IsoStagingPreparationToken(
+            1, BackgroundPreparation(), stale_request,
+        )
+        current = IsoStagingPreparationToken(
+            2, BackgroundPreparation(), current_request,
+        )
+        self.window.iso_staging_preparation_generation = 2
+        self.window.iso_staging_preparer = current.operation
+        self.window.iso_staging_token = current
+
+        self.window.on_iso_staging_preparation_finished(stale, RuntimeError("stale"))
+
+        stale_workspace.cleanup.assert_called_once_with()
+        current_workspace.cleanup.assert_not_called()
+        self.assertIs(self.window.iso_staging_token, current)
+        self.assertIs(self.window.iso_staging_preparer, current.operation)
+
+    def test_cancel_during_staging_plan_preparation_cleans_without_confirmation(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        workspace.name = str(Path(self.settings_home.name) / "plan-workspace")
+        Path(workspace.name).mkdir()
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+
+        def cancel_builder(*_args, **kwargs):
+            self.window.cancel()
+            kwargs["cancel_check"]()
+
+        with (
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=self.identity),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch("isopropyl.app.tempfile.TemporaryDirectory", return_value=workspace),
+            patch("isopropyl.app.build_iso_staging_plan", side_effect=cancel_builder),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), recommendation.iso_plan,
+            )
+
+        workspace.cleanup.assert_called_once_with()
+        continuation.assert_not_called()
+        warning.assert_not_called()
+        self.assertIsNone(self.window.iso_staging_preparer)
+        self.assertIn("cancel", self.window.status.text().casefold())
+
+    def test_final_confirmation_uses_pending_overlay_facts(self):
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        plan = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            recommendation.iso_plan,
+            overlay=self.overlay,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            recommendation.iso_plan, workspace, plan,
+        )
+        self.window.zip_overlay_plan = None
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+        confirmation = warning.call_args.args[2]
+        self.assertIn(self.overlay.archive.name, confirmation)
+        self.assertIn(self.overlay.archive_sha256, confirmation)
+        self.assertIn("additive only", confirmation)
+        workspace.cleanup.assert_called_once_with()
+
+    def test_overlay_moving_onto_target_during_consent_aborts_before_staging(self):
+        with patch("isopropyl.app.image_identity", return_value=self.identity):
+            self.select_overlay()
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        plan = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            recommendation.iso_plan,
+            overlay=self.overlay,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            recommendation.iso_plan, workspace, plan,
+        )
+
+        def answer(_parent, title, *_args, **_kwargs):
+            return (
+                QMessageBox.StandardButton.Yes
+                if title == "Erase drive and write in ISO mode?" else
+                QMessageBox.StandardButton.Cancel
+            )
+
+        overlay_checks = iter((False, True))
+
+        def residency(path, _device):
+            if path == workspace.name:
+                return False
+            return next(overlay_checks, True)
+
+        with (
+            patch(
+                "isopropyl.app.path_is_on_device",
+                side_effect=residency,
+            ),
+            patch("isopropyl.app.QMessageBox.warning", side_effect=answer) as warning,
+            patch("isopropyl.app.IsoStagingExecutor") as executor,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        executor.assert_not_called()
+        workspace.cleanup.assert_called_once_with()
+        self.assertIn("moved onto", warning.call_args.args[2])
+        self.assertIsNone(self.window.iso_stager)
+
+    def test_workspace_moving_onto_target_during_consent_aborts_before_staging(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        plan = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            recommendation.iso_plan,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            recommendation.iso_plan, workspace, plan,
+        )
+
+        def answer(_parent, title, *_args, **_kwargs):
+            return (
+                QMessageBox.StandardButton.Yes
+                if title == "Erase drive and write in ISO mode?" else
+                QMessageBox.StandardButton.Cancel
+            )
+
+        workspace_checks = iter((False, True))
+
+        def residency(path, _device):
+            if path == workspace.name:
+                return next(workspace_checks, True)
+            return False
+
+        with (
+            patch("isopropyl.app.path_is_on_device", side_effect=residency),
+            patch("isopropyl.app.QMessageBox.warning", side_effect=answer) as warning,
+            patch("isopropyl.app.IsoStagingExecutor") as executor,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        executor.assert_not_called()
+        workspace.cleanup.assert_called_once_with()
+        self.assertIn("workspace moved onto", warning.call_args.args[2])
+        self.assertIsNone(self.window.iso_stager)
+
+
 class WindowPersistenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1920,7 +2526,7 @@ class WindowPersistenceTests(unittest.TestCase):
         assert recommendation is not None and recommendation.iso_plan is not None
         workspace = Mock()
         workspace.name = str(Path(self.settings_home.name) / "private-workspace")
-        staging_plan = Mock()
+        Path(workspace.name).mkdir()
         starter = Mock()
         self.window.start_casper_preparation = starter
 
@@ -1931,7 +2537,12 @@ class WindowPersistenceTests(unittest.TestCase):
                 return_value=self.settings_home.name,
             ),
             patch("isopropyl.app.tempfile.TemporaryDirectory", return_value=workspace),
-            patch("isopropyl.app.build_iso_staging_plan", return_value=staging_plan),
+            patch(
+                "isopropyl.app.build_iso_staging_plan",
+                side_effect=fake_iso_staging_plan,
+            ),
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
             patch("isopropyl.app.QMessageBox.warning") as warning,
         ):
             self.window.start_constructed_iso_write(
@@ -1947,7 +2558,7 @@ class WindowPersistenceTests(unittest.TestCase):
         self.assertEqual(pending.device, self.window.devices[0])
         self.assertIs(pending.write_plan, recommendation.iso_plan)
         self.assertIs(pending.workspace, workspace)
-        self.assertIs(pending.staging_plan, staging_plan)
+        self.assertIsInstance(pending.staging_plan, IsoStagingPlan)
         self.assertEqual(pending.persistence_profile, self.window.persistence_profile)
         self.assertEqual(pending.persistence_bytes, MIN_PERSISTENCE_BYTES)
 

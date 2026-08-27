@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,7 @@ description = "A capable, safety-first USB image writer for Linux"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*"]
 authors = [{name = "ISOpropyl contributors"}]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -37,9 +38,6 @@ isopropyl = "isopropyl.app:main"
 
 [tool.setuptools.packages.find]
 include = ["isopropyl*"]
-
-[tool.setuptools]
-license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*"]
 
 [tool.setuptools.package-data]
 isopropyl = ["data/*.json", "data/*.svg"]

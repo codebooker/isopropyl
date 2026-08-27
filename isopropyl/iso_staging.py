@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Prepare an ISO as an atomically published UEFI staging tree.
+"""Prepare an ISO and optional additive ZIP as an atomic UEFI staging tree.
 
 This module deliberately stops at a regular, unprivileged directory.  It does
 not mount, format, inspect, or write a block device.  The published directory
@@ -51,6 +51,7 @@ from .iso import (
     UnsafeArchiveError,
     WriteMode,
     WritePlan,
+    merge_additive_overlay_entries,
     validate_extraction_entries,
 )
 from .timestamps import (
@@ -84,6 +85,17 @@ from .windows import (
     answer_file_install_path,
     generate_autounattend,
 )
+from .zip_overlay import (
+    ZipOverlayChanged,
+    ZipOverlayDeadlineExceeded,
+    ZipOverlayError,
+    ZipOverlayPlan,
+    ZipOverlayProgress,
+    ZipOverlayResult,
+    ZipOverlaySafetyError,
+    apply_zip_overlay,
+    validate_zip_overlay_plan,
+)
 
 
 class IsoStagingError(RuntimeError):
@@ -108,6 +120,7 @@ Progress = Callable[["IsoStagingProgress"], None]
 Publisher = Callable[[Path, Path, int], None]
 SplitPlanBuilder = Callable[[Path, Path, str], WimSplitPlan]
 WimInspector = Callable[[Path, str, threading.Event], WimInfo]
+OverlayApplier = Callable[..., ZipOverlayResult]
 
 _DIR_FLAGS = (
     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -146,6 +159,9 @@ class IsoStagingPlan:
     autounattend_xml: str | None
     windows_customization: WindowsCustomization | None = None
     windows_architecture: str | None = None
+    overlay: ZipOverlayPlan | None = None
+    effective_entries: tuple[ArchiveEntry, ...] = ()
+    effective_catalog_digest: str = ""
 
     @property
     def needs_wim_split(self) -> bool:
@@ -224,6 +240,71 @@ def _catalog_digest(entries: Sequence[ArchiveEntry]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _merge_effective_catalog(
+    entries: Sequence[ArchiveEntry],
+    overlay: ZipOverlayPlan | None,
+) -> tuple[tuple[ArchiveEntry, ...], tuple[ArchiveEntry, ...]]:
+    """Return the final catalog and archive-member-aligned extraction targets."""
+
+    if overlay is None:
+        return tuple(entries), ()
+    if not isinstance(overlay, ZipOverlayPlan):
+        raise IsoStagingSafetyError("The ZIP overlay plan is invalid")
+    try:
+        merged = merge_additive_overlay_entries(
+            entries, (member.entry for member in overlay.members),
+        )
+    except (UnsafeArchiveError, ValueError) as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    if len(merged.overlay_targets) != len(overlay.members):
+        raise IsoStagingSafetyError(
+            "The ZIP overlay is not bound to the effective catalog"
+        )
+    return merged.merged_entries, merged.overlay_targets
+
+
+def _validate_overlay(
+    overlay: ZipOverlayPlan | None,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
+    if overlay is None:
+        return
+    if not isinstance(overlay, ZipOverlayPlan):
+        raise IsoStagingSafetyError("The ZIP overlay plan is invalid")
+    try:
+        validate_zip_overlay_plan(overlay, cancel_check=cancel_check)
+    except (ZipOverlayChanged, ZipOverlaySafetyError) as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    except ZipOverlayDeadlineExceeded as error:
+        raise IsoStagingError(str(error)) from error
+    except ZipOverlayError as error:
+        raise IsoStagingError(str(error)) from error
+
+
+def _validate_staging_scalar_bindings(plan: IsoStagingPlan) -> None:
+    for name, value in (
+        ("content bytes", plan.content_bytes),
+        ("required free bytes", plan.required_free_bytes),
+    ):
+        if type(value) is not int or value < 0:
+            raise IsoStagingSafetyError(f"The staging plan {name} value is invalid")
+    identities = (
+        ("image identity", plan.image_identity, 4),
+        ("destination parent identity", plan.destination_parent_identity, 2),
+    )
+    for name, identity, length in identities:
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != length
+            or any(type(value) is not int or value < 0 for value in identity)
+            or identity[1] <= 0
+        ):
+            raise IsoStagingSafetyError(f"The staging plan {name} is invalid")
+    if plan.image_identity[2] <= 0:
+        raise IsoStagingSafetyError("The staging plan image identity is invalid")
 
 
 def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> str | None:
@@ -417,31 +498,39 @@ def build_iso_staging_plan(
     write_plan: WritePlan,
     *,
     seven_zip: str | None = None,
+    overlay: ZipOverlayPlan | None = None,
+    cancel_check: Callable[[], None] | None = None,
     windows_customization: WindowsCustomization | None = None,
     windows_architecture: str = "amd64",
     wimlib_resolver: Callable[[], str] = resolve_wimlib,
 ) -> IsoStagingPlan:
-    """Bind a validated catalog and UEFI/FAT32 write plan to a new output path."""
+    """Bind validated ISO/overlay catalogs and a write plan to a new output path."""
 
+    if cancel_check is not None:
+        cancel_check()
     try:
         safe_entries = validate_extraction_entries(entries)
     except (UnsafeArchiveError, ValueError) as error:
         raise IsoStagingSafetyError(str(error)) from error
     if not safe_entries:
         raise IsoStagingSafetyError("The ISO member catalog is empty")
-    wim_source = _validate_write_plan(write_plan, safe_entries)
-    _validate_catalog_shape(safe_entries, wim_source)
+    _validate_overlay(overlay, cancel_check=cancel_check)
+    effective_entries, _overlay_targets = _merge_effective_catalog(
+        safe_entries, overlay,
+    )
+    wim_source = _validate_write_plan(write_plan, effective_entries)
+    _validate_catalog_shape(effective_entries, wim_source)
     wim_selection = (
         windows_customization.install_image
         if windows_customization is not None else None
     )
-    _validate_wim_selection_catalog(safe_entries, wim_selection)
+    _validate_wim_selection_catalog(effective_entries, wim_selection)
 
     answer_file: str | None = None
     bound_windows_customization: WindowsCustomization | None = None
     bound_windows_architecture: str | None = None
     if windows_customization is not None and windows_customization.enabled:
-        existing_answer_file = _existing_windows_answer_file(safe_entries)
+        existing_answer_file = _existing_windows_answer_file(effective_entries)
         if existing_answer_file is not None:
             raise IsoStagingSafetyError(
                 f"The ISO already contains the Windows answer file "
@@ -476,7 +565,7 @@ def build_iso_staging_plan(
                 _is_install_wim_path(entry.path)
                 or entry.path.casefold() == "sources/install.esd"
             )
-            for entry in safe_entries
+            for entry in effective_entries
         )
         if wim_selection is not None:
             selected_is_wim = _is_install_wim_path(wim_selection.source_name)
@@ -519,9 +608,17 @@ def build_iso_staging_plan(
             raise IsoStagingUnavailable(str(error)) from error
 
     split_extra = next(
-        (entry.size for entry in safe_entries if entry.path == wim_source), 0,
+        (entry.size for entry in effective_entries if entry.path == wim_source), 0,
     )
-    required_free = extraction.content_bytes + split_extra + OUTPUT_SPACE_RESERVE
+    content_bytes = sum(
+        entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
+    )
+    overlay_bytes = overlay.content_bytes if overlay is not None else 0
+    if content_bytes != extraction.content_bytes + overlay_bytes:
+        raise IsoStagingSafetyError(
+            "The ZIP overlay expanded-size accounting is inconsistent"
+        )
+    required_free = content_bytes + split_extra + OUTPUT_SPACE_RESERVE
     try:
         if shutil.disk_usage(extraction.destination.parent).free < required_free:
             raise IsoStagingSafetyError(
@@ -539,7 +636,7 @@ def build_iso_staging_plan(
         catalog_digest=_catalog_digest(safe_entries),
         write_plan=write_plan,
         seven_zip=extraction.seven_zip,
-        content_bytes=extraction.content_bytes,
+        content_bytes=content_bytes,
         required_free_bytes=required_free,
         wim_source=wim_source,
         wim_selection=wim_selection,
@@ -547,23 +644,42 @@ def build_iso_staging_plan(
         windows_customization=bound_windows_customization,
         windows_architecture=bound_windows_architecture,
         autounattend_xml=answer_file,
+        overlay=overlay,
+        effective_entries=effective_entries,
+        effective_catalog_digest=_catalog_digest(effective_entries),
     )
 
 
-def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
+def validate_iso_staging_plan(
+    plan: IsoStagingPlan,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
     """Rebuild all externally observable planning facts for a frozen plan."""
 
+    if cancel_check is not None:
+        cancel_check()
     if not isinstance(plan, IsoStagingPlan):
         raise IsoStagingSafetyError("An IsoStagingPlan is required")
+    _validate_staging_scalar_bindings(plan)
     try:
         entries = validate_extraction_entries(plan.entries)
     except (UnsafeArchiveError, ValueError) as error:
         raise IsoStagingSafetyError(str(error)) from error
     if entries != plan.entries or _catalog_digest(entries) != plan.catalog_digest:
         raise IsoStagingSafetyError("The ISO catalog binding is invalid")
-    wim_source = _validate_write_plan(plan.write_plan, entries)
-    _validate_catalog_shape(entries, wim_source)
-    _validate_wim_selection_catalog(entries, plan.wim_selection)
+    _validate_overlay(plan.overlay, cancel_check=cancel_check)
+    effective_entries, _overlay_targets = _merge_effective_catalog(
+        entries, plan.overlay,
+    )
+    if (
+        effective_entries != plan.effective_entries
+        or _catalog_digest(effective_entries) != plan.effective_catalog_digest
+    ):
+        raise IsoStagingSafetyError("The effective staging catalog binding is invalid")
+    wim_source = _validate_write_plan(plan.write_plan, effective_entries)
+    _validate_catalog_shape(effective_entries, wim_source)
+    _validate_wim_selection_catalog(effective_entries, plan.wim_selection)
     if wim_source != plan.wim_source:
         raise IsoStagingSafetyError("The plan contains inconsistent WIM transformation data")
     if plan.autounattend_xml is not None and not isinstance(
@@ -605,7 +721,7 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
                 _is_install_wim_path(entry.path)
                 or entry.path.casefold() == "sources/install.esd"
             )
-            for entry in entries
+            for entry in effective_entries
         )
         if plan.wim_selection is not None:
             selected_is_wim = _is_install_wim_path(plan.wim_selection.source_name)
@@ -625,7 +741,7 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
                 raise IsoStagingSafetyError(
                     "The staging plan does not bind its nested or multi-source WIM path"
                 )
-        existing_answer_file = _existing_windows_answer_file(entries)
+        existing_answer_file = _existing_windows_answer_file(effective_entries)
         if existing_answer_file is not None:
             raise IsoStagingSafetyError(
                 f"The generated answer file conflicts with existing ISO content at "
@@ -688,9 +804,17 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
     if (
         rebuilt.image_identity != plan.image_identity
         or rebuilt.destination_parent_identity != plan.destination_parent_identity
-        or rebuilt.content_bytes != plan.content_bytes
     ):
         raise IsoStagingSafetyError("The ISO, destination, or content binding changed")
+    overlay_bytes = plan.overlay.content_bytes if plan.overlay is not None else 0
+    expected_content = rebuilt.content_bytes + overlay_bytes
+    catalog_content = sum(
+        entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
+    )
+    if plan.content_bytes != expected_content or expected_content != catalog_content:
+        raise IsoStagingSafetyError(
+            "The ISO and ZIP overlay expanded-size accounting is invalid"
+        )
     if wim_source is None and plan.wim_selection is None:
         if plan.wimlib_imagex is not None:
             raise IsoStagingSafetyError("The plan contains an unnecessary WIM tool")
@@ -703,7 +827,9 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
             raise IsoStagingUnavailable(str(error)) from error
         if resolved != plan.wimlib_imagex:
             raise IsoStagingSafetyError("The plan contains inconsistent WIM tool data")
-    split_extra = next((entry.size for entry in entries if entry.path == wim_source), 0)
+    split_extra = next(
+        (entry.size for entry in effective_entries if entry.path == wim_source), 0,
+    )
     expected_free = plan.content_bytes + split_extra + OUTPUT_SPACE_RESERVE
     if plan.required_free_bytes != expected_free:
         raise IsoStagingSafetyError("The plan contains invalid free-space accounting")
@@ -1068,12 +1194,14 @@ class IsoStagingExecutor:
         wim_splitter: WimSplitExecutor | None = None,
         split_plan_builder: SplitPlanBuilder = _default_split_plan_builder,
         wim_inspector: WimInspector = _default_wim_inspector,
+        overlay_applier: OverlayApplier = apply_zip_overlay,
         publisher: Publisher = _rename_noreplace,
     ) -> None:
         self._extractor = extractor or SafeIsoExtractor()
         self._wim_splitter = wim_splitter
         self._split_plan_builder = split_plan_builder
         self._wim_inspector = wim_inspector
+        self._overlay_applier = overlay_applier
         self._publisher = publisher
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
@@ -1106,10 +1234,30 @@ class IsoStagingExecutor:
             self._check_cancelled()
 
     def _update_from_extraction(
-        self, update: ExtractionProgress, progress: Progress,
+        self,
+        update: ExtractionProgress,
+        progress: Progress,
+        total_bytes: int,
     ) -> None:
         progress(IsoStagingProgress(
-            "Extracting ISO", update.member, update.bytes_done, update.total_bytes,
+            "Extracting ISO", update.member, update.bytes_done, total_bytes,
+        ))
+        self._check_cancelled()
+
+    def _update_from_overlay(
+        self,
+        update: ZipOverlayProgress,
+        progress: Progress,
+        base_bytes: int,
+        total_bytes: int,
+    ) -> None:
+        if not isinstance(update, ZipOverlayProgress):
+            raise IsoStagingSafetyError("The ZIP overlay reported invalid progress")
+        progress(IsoStagingProgress(
+            "Adding ZIP overlay",
+            update.member,
+            base_bytes + update.bytes_done,
+            total_bytes,
         ))
         self._check_cancelled()
 
@@ -1121,7 +1269,7 @@ class IsoStagingExecutor:
         if self._used:
             raise IsoStagingSafetyError("An ISO staging executor can only be used once")
         self._used = True
-        validate_iso_staging_plan(plan)
+        validate_iso_staging_plan(plan, cancel_check=self._check_cancelled)
         self._check_cancelled()
 
         parent_fd = os.open(plan.destination.parent, _DIR_FLAGS)
@@ -1147,7 +1295,9 @@ class IsoStagingExecutor:
             self._set_active(self._extractor)
             self._extractor.execute(
                 extraction_plan,
-                lambda update: self._update_from_extraction(update, progress),
+                lambda update: self._update_from_extraction(
+                    update, progress, plan.content_bytes,
+                ),
             )
             self._set_active(None)
             self._check_cancelled()
@@ -1157,6 +1307,50 @@ class IsoStagingExecutor:
             bound_directory_mtimes = _bind_catalog_directory_mtimes(
                 tree, plan.entries, self._check_cancelled,
             )
+
+            if plan.overlay is not None:
+                self._check_cancelled()
+                effective_entries, overlay_targets = _merge_effective_catalog(
+                    plan.entries, plan.overlay,
+                )
+                if effective_entries != plan.effective_entries:
+                    raise IsoStagingSafetyError(
+                        "The effective staging catalog changed before ZIP extraction"
+                    )
+                base_bytes = sum(
+                    entry.size for entry in plan.entries
+                    if entry.kind is EntryKind.FILE
+                )
+                progress(IsoStagingProgress(
+                    "Adding ZIP overlay", "", base_bytes, plan.content_bytes,
+                ))
+                try:
+                    overlay_result = self._overlay_applier(
+                        plan.overlay,
+                        tree,
+                        overlay_targets,
+                        cancel_check=self._check_cancelled,
+                        progress=lambda update: self._update_from_overlay(
+                            update, progress, base_bytes, plan.content_bytes,
+                        ),
+                    )
+                except (ZipOverlayChanged, ZipOverlaySafetyError) as error:
+                    raise IsoStagingSafetyError(str(error)) from error
+                except ZipOverlayDeadlineExceeded as error:
+                    raise IsoStagingError(str(error)) from error
+                except ZipOverlayError as error:
+                    raise IsoStagingError(str(error)) from error
+                if (
+                    not isinstance(overlay_result, ZipOverlayResult)
+                    or overlay_result.bytes_written != plan.overlay.content_bytes
+                    or overlay_result.archive_sha256 != plan.overlay.archive_sha256
+                    or overlay_result.catalog_digest != plan.overlay.catalog_digest
+                ):
+                    raise IsoStagingSafetyError(
+                        "The ZIP overlay result does not match its staging plan"
+                    )
+                self._check_cancelled()
+                _verify_extracted_catalog(tree, plan.effective_entries)
 
             selected_wim_path: Path | None = None
             selected_wim_identity: WimFileIdentity | None = None
@@ -1196,7 +1390,7 @@ class IsoStagingExecutor:
             wim_parts: tuple[str, ...] = ()
             expected_files = {
                 _case_key(entry.path): _ScannedFile(entry.path, entry.size)
-                for entry in plan.entries if entry.kind is EntryKind.FILE
+                for entry in plan.effective_entries if entry.kind is EntryKind.FILE
             }
             if plan.wim_source is not None:
                 self._check_cancelled()
@@ -1307,7 +1501,7 @@ class IsoStagingExecutor:
                 raise IsoStagingSafetyError(
                     "The final staging files do not match the transformed ISO catalog"
                 )
-            expected_directories = _expected_directories(plan.entries)
+            expected_directories = _expected_directories(plan.effective_entries)
             actual_directories = {_case_key(item.path): item.path for item in directories}
             if actual_directories != expected_directories:
                 raise IsoStagingSafetyError(
@@ -1319,6 +1513,13 @@ class IsoStagingExecutor:
                 raise IsoStagingSafetyError("The ISO catalog changed during staging")
             if _catalog_digest(plan.entries) != plan.catalog_digest:
                 raise IsoStagingSafetyError("The ISO catalog binding changed during staging")
+            if (
+                _catalog_digest(plan.effective_entries)
+                != plan.effective_catalog_digest
+            ):
+                raise IsoStagingSafetyError(
+                    "The effective catalog binding changed during staging"
+                )
             if (
                 selected_wim_path is not None
                 and selected_wim_identity is not None
@@ -1339,7 +1540,7 @@ class IsoStagingExecutor:
             result = IsoStagingResult(
                 destination=plan.destination,
                 image_identity=plan.image_identity,
-                catalog_digest=plan.catalog_digest,
+                catalog_digest=plan.effective_catalog_digest,
                 directories=len(directories),
                 files=len(files),
                 bytes_staged=total_bytes,

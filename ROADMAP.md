@@ -12,7 +12,8 @@ evidence.
    where supported, USB flash drives, SD readers, and explicitly enabled USB
    SSDs.
 2. Test unplug, cancellation, authentication refusal, short writes, full disks,
-   mount conflicts, and cleanup failures without weakening identity checks.
+   mount conflicts, overlay mutation/CRC/decompression failure, target-resident
+   overlay refusal, and cleanup failures without weakening identity checks.
 3. Evolve the shipped fail-fast, per-command cooperative whole-device locks into
    a privileged broker/private-namespace design that can retain ownership across
    the complete destructive transaction. Continue describing Linux BSD locks as
@@ -61,6 +62,10 @@ evidence.
 - Add FFU/VTSI/direct WIM/ESD input and FFU/UDF-image authoring output only after
   format parsers and size/platform checks fail closed. Continue hardening and
   physically certifying the implemented VHD/VHDX drive-backup path.
+- Hardware-test additive overlays with representative Windows and Linux installer
+  layouts. Additional archive formats or multiple ordered overlays remain out of
+  scope until they preserve the same bounded, no-overwrite namespace and exact-byte
+  binding.
 - Firmware-test the implemented explicit-consent five-architecture UEFI Shell
   workflow and every fallback path with Secure Boot disabled. Add FreeDOS and
   advanced blank bootloader workflows with lawful, verified payload sources.

@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import unittest
+import zipfile
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,7 @@ from isopropyl.iso import (
     Transformation,
     WriteMode,
     WritePlan,
+    merge_additive_overlay_entries,
 )
 from isopropyl.iso_staging import (
     IsoStagingCancelled,
@@ -50,6 +52,10 @@ from isopropyl.wim import (
 )
 from isopropyl.windows import (
     WindowsCustomization, answer_file_install_index, answer_file_install_path,
+)
+from isopropyl.zip_overlay import (
+    apply_zip_overlay,
+    build_zip_overlay_plan,
 )
 
 
@@ -140,6 +146,30 @@ def write_plan(
         content_constraints_checked=True,
         blockers=blockers,
     )
+
+
+def make_overlay(
+    root: Path,
+    members: tuple[tuple[str, bytes | None], ...] = (
+        ("efi/", None),
+        ("efi/tools/", None),
+        ("efi/tools/diagnostic.txt", b"hello"),
+    ),
+):
+    archive = root / "overlay.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for name, payload in members:
+            output.writestr(name, b"" if payload is None else payload)
+    return build_zip_overlay_plan(archive)
+
+
+def overlay_write_plan(
+    entries: tuple[ArchiveEntry, ...], overlay,
+) -> WritePlan:
+    merged = merge_additive_overlay_entries(
+        entries, (member.entry for member in overlay.members),
+    )
+    return write_plan(merged.merged_entries)
 
 
 class FakeExtractor:
@@ -304,6 +334,51 @@ class IsoStagingTests(unittest.TestCase):
             with self.assertRaisesRegex(IsoStagingSafetyError, "catalog binding"):
                 validate_iso_staging_plan(replace(plan, entries=forged_entries))
 
+    def test_plan_rejects_nonintegral_boolean_negative_and_malformed_bindings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(Path(directory))
+            forged = (
+                replace(plan, content_bytes=True),
+                replace(plan, content_bytes=13.0),
+                replace(plan, content_bytes=-1),
+                replace(plan, required_free_bytes=False),
+                replace(plan, required_free_bytes=float(plan.required_free_bytes)),
+                replace(plan, required_free_bytes=-1),
+                replace(plan, image_identity=(True, 1, 1, 1)),
+                replace(plan, image_identity=(1, 1, 0, 1)),
+                replace(plan, image_identity=(1, 1, 1.0, 1)),
+                replace(plan, destination_parent_identity=(1, 0)),
+                replace(plan, destination_parent_identity=(1, 2.0)),
+                replace(plan, destination_parent_identity=(1,)),
+            )
+            for candidate in forged:
+                with self.subTest(candidate=candidate), self.assertRaises(
+                    IsoStagingSafetyError,
+                ):
+                    validate_iso_staging_plan(candidate)
+
+    def test_precancelled_overlay_validation_never_rehashes_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root, (("efi/tools/diagnostic.txt", b"hello"),),
+            )
+            plan = self.make_plan(
+                root,
+                overlay=overlay,
+                write_plan=overlay_write_plan(basic_entries(), overlay),
+            )
+
+            def cancelled() -> None:
+                raise IsoStagingCancelled("cancelled before validation")
+
+            with (
+                patch("isopropyl.iso_staging.validate_zip_overlay_plan") as validator,
+                self.assertRaises(IsoStagingCancelled),
+            ):
+                validate_iso_staging_plan(plan, cancel_check=cancelled)
+            validator.assert_not_called()
+
     def test_success_atomically_publishes_constructed_media_staging(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -320,6 +395,202 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual(updates[-1].stage, "Complete")
             self.assertEqual(updates[-1].fraction, 1.0)
             self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_overlay_uses_canonical_targets_for_explicit_and_implicit_base_dirs(self):
+        entries = (
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 8),
+            ArchiveEntry("README.txt", 5),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(root)
+            plan = self.make_plan(
+                root,
+                entries,
+                overlay=overlay,
+                write_plan=overlay_write_plan(entries, overlay),
+            )
+            self.assertEqual(plan.content_bytes, 18)
+            self.assertEqual(
+                tuple(member.path for member in plan.effective_entries),
+                (
+                    "EFI/BOOT/BOOTX64.EFI",
+                    "README.txt",
+                    "EFI/tools",
+                    "EFI/tools/diagnostic.txt",
+                ),
+            )
+            received_targets = []
+
+            def canonical_apply(overlay_plan, tree, targets, **kwargs):
+                received_targets.extend(entry.path for entry in targets)
+                return apply_zip_overlay(overlay_plan, tree, targets, **kwargs)
+
+            updates = []
+            result = IsoStagingExecutor(
+                extractor=FakeExtractor(), overlay_applier=canonical_apply,
+            ).execute(plan, updates.append)
+
+            self.assertEqual(
+                received_targets,
+                ["EFI", "EFI/tools", "EFI/tools/diagnostic.txt"],
+            )
+            self.assertEqual(
+                (result.destination / "EFI/tools/diagnostic.txt").read_bytes(),
+                b"hello",
+            )
+            self.assertEqual((result.files, result.bytes_staged), (3, 18))
+            self.assertEqual(result.catalog_digest, plan.effective_catalog_digest)
+            overlay_updates = [
+                update for update in updates
+                if update.stage == "Adding ZIP overlay" and update.relative_path
+            ]
+            self.assertTrue(overlay_updates)
+            self.assertTrue(all(update.total_bytes == 18 for update in overlay_updates))
+
+    def test_overlay_plan_binds_effective_catalog_write_plan_and_space(self):
+        entries = basic_entries()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root, (("efi/tools/diagnostic.txt", b"hello"),),
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "bound"):
+                self.make_plan(root, entries, overlay=overlay)
+
+            plan = self.make_plan(
+                root,
+                entries,
+                overlay=overlay,
+                write_plan=overlay_write_plan(entries, overlay),
+            )
+            self.assertEqual(plan.content_bytes, 13 + overlay.content_bytes)
+            self.assertEqual(
+                plan.required_free_bytes,
+                plan.content_bytes + iso_staging.OUTPUT_SPACE_RESERVE,
+            )
+            validate_iso_staging_plan(plan)
+
+            extractors = []
+            for forged in (
+                replace(plan, effective_catalog_digest="0" * 64),
+                replace(plan, effective_entries=plan.entries),
+                replace(plan, content_bytes=plan.content_bytes + 1),
+                replace(plan, required_free_bytes=plan.required_free_bytes + 1),
+            ):
+                extractor = FakeExtractor()
+                extractors.append(extractor)
+                with self.subTest(forged=forged), self.assertRaises(
+                    IsoStagingSafetyError,
+                ):
+                    IsoStagingExecutor(extractor=extractor).execute(forged)
+            self.assertTrue(all(extractor.calls == [] for extractor in extractors))
+
+    def test_base_catalog_is_verified_before_overlay_and_failures_never_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root, (("efi/tools/diagnostic.txt", b"hello"),),
+            )
+            plan = self.make_plan(
+                root,
+                overlay=overlay,
+                write_plan=overlay_write_plan(basic_entries(), overlay),
+            )
+            calls = []
+
+            def must_not_apply(*args, **kwargs):
+                calls.append((args, kwargs))
+                raise AssertionError("overlay ran before exact base validation")
+
+            def corrupt_base(tree: Path, _image: Path) -> None:
+                (tree / "README.txt").write_bytes(b"wrong-size")
+
+            with self.assertRaisesRegex(IsoStagingSafetyError, "ISO catalog"):
+                IsoStagingExecutor(
+                    extractor=FakeExtractor(mutate=corrupt_base),
+                    overlay_applier=must_not_apply,
+                ).execute(plan)
+            self.assertEqual(calls, [])
+            self.assertFalse(plan.destination.exists())
+            self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root, (("efi/tools/diagnostic.txt", b"hello"),),
+            )
+            plan = self.make_plan(
+                root,
+                overlay=overlay,
+                write_plan=overlay_write_plan(basic_entries(), overlay),
+            )
+
+            def forged_result(overlay_plan, tree, targets, **kwargs):
+                result = apply_zip_overlay(
+                    overlay_plan, tree, targets, **kwargs,
+                )
+                return replace(result, bytes_written=result.bytes_written + 1)
+
+            with self.assertRaisesRegex(IsoStagingSafetyError, "result"):
+                IsoStagingExecutor(
+                    extractor=FakeExtractor(), overlay_applier=forged_result,
+                ).execute(plan)
+            self.assertFalse(plan.destination.exists())
+            self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_overlay_cancellation_cleans_private_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root, (("efi/tools/diagnostic.txt", b"hello"),),
+            )
+            plan = self.make_plan(
+                root,
+                overlay=overlay,
+                write_plan=overlay_write_plan(basic_entries(), overlay),
+            )
+            executor = IsoStagingExecutor(extractor=FakeExtractor())
+
+            def cancel_during_overlay(update) -> None:
+                if update.stage == "Adding ZIP overlay" and update.relative_path:
+                    executor.cancel()
+
+            with self.assertRaises(IsoStagingCancelled):
+                executor.execute(plan, cancel_during_overlay)
+            self.assertFalse(plan.destination.exists())
+            self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_changed_or_colliding_overlay_fails_before_base_extraction(self):
+        entries = basic_entries()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            collision = make_overlay(
+                root, (("readme.TXT", b"replacement"),),
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "collides"):
+                self.make_plan(
+                    root,
+                    overlay=collision,
+                    write_plan=write_plan(entries),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root, (("efi/tools/diagnostic.txt", b"hello"),),
+            )
+            plan = self.make_plan(
+                root,
+                overlay=overlay,
+                write_plan=overlay_write_plan(entries, overlay),
+            )
+            overlay.archive.write_bytes(b"changed")
+            extractor = FakeExtractor()
+            with self.assertRaises(IsoStagingSafetyError):
+                IsoStagingExecutor(extractor=extractor).execute(plan)
+            self.assertEqual(extractor.calls, [])
+            self.assertFalse(plan.destination.exists())
 
     def test_refuses_wrong_or_unexecutable_write_plans_and_catalog_mismatch(self):
         entries = basic_entries()
@@ -658,6 +929,10 @@ class IsoStagingTests(unittest.TestCase):
                 plan,
                 entries=forged_entries,
                 catalog_digest=iso_staging._catalog_digest(forged_entries),
+                effective_entries=forged_entries,
+                effective_catalog_digest=iso_staging._catalog_digest(
+                    forged_entries,
+                ),
                 write_plan=write_plan(forged_entries),
             )
             with self.assertRaisesRegex(IsoStagingSafetyError, "conflicts"):

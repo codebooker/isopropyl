@@ -19,6 +19,7 @@ from isopropyl.timestamps import (
 # individual file is therefore one byte smaller than 4 GiB.
 FAT32_MAX_FILE_SIZE = (4 * 1024**3) - 1
 WIM_SPLIT_PART_SIZE = 3800 * 1024**2
+ISO_OVERLAY_EFFECTIVE_MEMBER_MAX_COUNT = 65_536
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
 _FALLBACK_ARCHITECTURES = {
     "bootia32.efi": "x86",
@@ -96,10 +97,14 @@ class ArchiveEntry:
     modified_ns: int | None = None
 
     def __post_init__(self) -> None:
-        if self.size < 0:
-            raise ValueError("Archive entry sizes cannot be negative")
+        if type(self.path) is not str:
+            raise ValueError("Archive entry paths must be text")
+        if type(self.size) is not int or self.size < 0:
+            raise ValueError("Archive entry sizes must be non-negative integers")
+        if type(self.kind) is not EntryKind:
+            raise ValueError("Archive entry kinds must be EntryKind values")
         if self.kind in {EntryKind.SYMLINK, EntryKind.HARDLINK}:
-            if not self.link_target:
+            if type(self.link_target) is not str or not self.link_target:
                 raise ValueError(f"{self.kind.value} entries require a link target")
         elif self.link_target is not None:
             raise ValueError("Only link entries may have a link target")
@@ -178,6 +183,13 @@ _WINDOWS_DRIVE = re.compile(r"^[a-zA-Z]:")
 _WINDOWS_DEVICE = re.compile(
     r"^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$", re.IGNORECASE,
 )
+_FAT_RESERVED_STEM = re.compile(
+    r"^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])$", re.IGNORECASE,
+)
+_FAT_FORBIDDEN_CHARACTERS = frozenset('<>:"\\|?*')
+FAT_MAX_COMPONENT_UTF16_UNITS = 255
+FAT_MAX_PATH_DEPTH = 64
+FAT_MAX_PATH_UTF8_BYTES = 1024
 _SPECIAL_KINDS = {
     EntryKind.BLOCK_DEVICE,
     EntryKind.CHARACTER_DEVICE,
@@ -302,6 +314,225 @@ def validate_extraction_entries(entries: Iterable[ArchiveEntry]) -> tuple[Archiv
             raise UnsafeArchiveError(f"{message}: {entry.path!r}")
 
     return tuple(validated)
+
+
+@dataclass(frozen=True)
+class AdditiveOverlayMerge:
+    """A validated additive namespace ready for a later staging executor.
+
+    ``overlay_entries`` contains only entries that staging still needs to add.
+    Overlay directories that already exist in the base namespace are harmless
+    merge points and are omitted. Paths below base directories use the base
+    namespace's exact spelling. ``merged_entries`` is the complete, revalidated
+    catalog after those no-op directory merges have been removed.
+    ``overlay_targets`` is aligned one-to-one with the validated input overlay
+    catalog and retains canonicalized no-op directories for staging lookup.
+    """
+
+    base_entries: tuple[ArchiveEntry, ...]
+    overlay_entries: tuple[ArchiveEntry, ...]
+    merged_entries: tuple[ArchiveEntry, ...]
+    overlay_targets: tuple[ArchiveEntry, ...]
+
+
+def _utf16_units(value: str, path: str) -> int:
+    try:
+        return len(value.encode("utf-16-le", errors="strict")) // 2
+    except UnicodeEncodeError as error:
+        raise UnsafeArchiveError(
+            f"FAT path contains invalid Unicode: {path!r}"
+        ) from error
+
+
+def validate_portable_fat_entries(
+    entries: Iterable[ArchiveEntry],
+) -> tuple[ArchiveEntry, ...]:
+    """Validate and NFC-normalize a catalog for a portable FAT namespace.
+
+    The policy is intentionally stricter than any one Linux FAT driver. It
+    models the portable intersection needed for removable installation media,
+    and performs no filesystem access.
+    """
+
+    candidates = tuple(entries)
+    for entry in candidates:
+        if "\\" in entry.path:
+            raise UnsafeArchiveError(
+                f"Backslashes are forbidden in portable FAT paths: {entry.path!r}"
+            )
+    validated = validate_extraction_entries(candidates)
+
+    for entry in validated:
+        parts = PurePosixPath(entry.path).parts
+        if len(parts) > FAT_MAX_PATH_DEPTH:
+            raise UnsafeArchiveError(
+                f"FAT path exceeds {FAT_MAX_PATH_DEPTH} components: {entry.path!r}"
+            )
+        for component in parts:
+            if any(ord(character) < 0x20 or ord(character) == 0x7F for character in component):
+                raise UnsafeArchiveError(
+                    f"Control characters are forbidden in FAT paths: {entry.path!r}"
+                )
+            if any(character in _FAT_FORBIDDEN_CHARACTERS for character in component):
+                raise UnsafeArchiveError(
+                    f"FAT-forbidden characters <>:\"/\\|?* appear in: {entry.path!r}"
+                )
+            if component.endswith((" ", ".")):
+                raise UnsafeArchiveError(
+                    f"Trailing dot or space is forbidden in FAT paths: {entry.path!r}"
+                )
+            stem = component.split(".", 1)[0].rstrip(" .")
+            if _FAT_RESERVED_STEM.fullmatch(stem):
+                raise UnsafeArchiveError(
+                    f"Reserved DOS device stem in FAT path: {entry.path!r}"
+                )
+            if _utf16_units(component, entry.path) > FAT_MAX_COMPONENT_UTF16_UNITS:
+                raise UnsafeArchiveError(
+                    "FAT path component exceeds "
+                    f"{FAT_MAX_COMPONENT_UTF16_UNITS} UTF-16 units: {entry.path!r}"
+                )
+        try:
+            encoded_path = entry.path.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as error:
+            raise UnsafeArchiveError(
+                f"FAT path contains invalid Unicode: {entry.path!r}"
+            ) from error
+        if len(encoded_path) > FAT_MAX_PATH_UTF8_BYTES:
+            raise UnsafeArchiveError(
+                f"FAT path exceeds {FAT_MAX_PATH_UTF8_BYTES} UTF-8 bytes: {entry.path!r}"
+            )
+    return validated
+
+
+def _directory_spellings(
+    entries: tuple[ArchiveEntry, ...], *, namespace: str,
+) -> dict[tuple[str, ...], tuple[str, ...]]:
+    """Return canonical spellings for explicit and implied directories."""
+
+    spellings: dict[tuple[str, ...], tuple[str, ...]] = {}
+    for entry in entries:
+        parts = PurePosixPath(entry.path).parts
+        prefix_count = len(parts) if entry.kind is EntryKind.DIRECTORY else len(parts) - 1
+        for length in range(1, prefix_count + 1):
+            prefix = parts[:length]
+            key = _case_key(prefix)
+            previous = spellings.get(key)
+            if previous is not None and previous != prefix:
+                previous_path = PurePosixPath(*previous).as_posix()
+                prefix_path = PurePosixPath(*prefix).as_posix()
+                raise UnsafeArchiveError(
+                    f"Inconsistent {namespace} directory spellings: "
+                    f"{previous_path!r} and {prefix_path!r}"
+                )
+            spellings[key] = prefix
+    return spellings
+
+
+def _reserved_overlay_path(parts: tuple[str, ...]) -> bool:
+    folded = tuple(part.casefold() for part in parts)
+    if (
+        len(folded) >= 3
+        and folded[:2] == ("efi", "boot")
+        and folded[2].startswith("boot")
+        and folded[2].endswith(".efi")
+    ):
+        return True
+    if len(folded) >= 2 and folded[0] == "sources":
+        name = folded[1]
+        return name in {"install.wim", "install.esd"} or (
+            name.startswith("install") and name.endswith(".swm")
+        )
+    return False
+
+
+def _entry_with_path(entry: ArchiveEntry, parts: tuple[str, ...]) -> ArchiveEntry:
+    return ArchiveEntry(
+        PurePosixPath(*parts).as_posix(), entry.size, entry.kind,
+        entry.link_target, entry.modified_ns,
+    )
+
+
+def merge_additive_overlay_entries(
+    base_entries: Iterable[ArchiveEntry],
+    overlay_entries: Iterable[ArchiveEntry],
+) -> AdditiveOverlayMerge:
+    """Merge an untrusted overlay into an extracted-image namespace.
+
+    This is a pure planning operation. Directories may merge with directories;
+    every other case-insensitive/NFC full-path collision is rejected. Files and
+    links may not become ancestors on either side. Reserved boot and canonical
+    Windows installation payload paths are controlled exclusively by the base.
+    """
+
+    base = validate_portable_fat_entries(base_entries)
+    overlay = validate_portable_fat_entries(overlay_entries)
+    base_by_key = {
+        _case_key(PurePosixPath(entry.path).parts): entry for entry in base
+    }
+    base_directories = _directory_spellings(base, namespace="base")
+    # This rejects ambiguous overlay aliases before base spelling is adopted.
+    _directory_spellings(overlay, namespace="overlay")
+
+    additions: list[ArchiveEntry] = []
+    targets: list[ArchiveEntry] = []
+    for entry in overlay:
+        parts = PurePosixPath(entry.path).parts
+        if _reserved_overlay_path(parts):
+            raise UnsafeArchiveError(
+                f"Overlay path is reserved for boot or installer payloads: {entry.path!r}"
+            )
+        key = _case_key(parts)
+        rewritten = list(parts)
+        prefix_count = len(parts) if entry.kind is EntryKind.DIRECTORY else len(parts) - 1
+        for length in range(1, prefix_count + 1):
+            base_spelling = base_directories.get(_case_key(parts[:length]))
+            if base_spelling is not None:
+                rewritten[:length] = base_spelling
+        target = _entry_with_path(entry, tuple(rewritten))
+
+        base_entry = base_by_key.get(key)
+        if base_entry is not None:
+            if (
+                base_entry.kind is EntryKind.DIRECTORY
+                and entry.kind is EntryKind.DIRECTORY
+            ):
+                targets.append(target)
+                continue
+            raise UnsafeArchiveError(
+                f"Overlay path collides with the base image: {entry.path!r}"
+            )
+
+        # A non-directory at an implied base-directory key would become an
+        # ancestor of existing base content. An explicit overlay directory at
+        # that key is the same harmless directory merge as above.
+        if key in base_directories:
+            if entry.kind is EntryKind.DIRECTORY:
+                targets.append(target)
+                continue
+            raise UnsafeArchiveError(
+                f"Overlay file would be an ancestor of base content: {entry.path!r}"
+            )
+
+        for length in range(1, len(parts)):
+            ancestor = base_by_key.get(_case_key(parts[:length]))
+            if ancestor is not None and ancestor.kind is not EntryKind.DIRECTORY:
+                raise UnsafeArchiveError(
+                    f"Base file would be an ancestor of overlay content: {entry.path!r}"
+                )
+
+        targets.append(target)
+        additions.append(target)
+
+    # Re-run both general extraction validation and the complete FAT policy on
+    # the final namespace; callers never need to trust the merge implementation.
+    if len(base) + len(additions) > ISO_OVERLAY_EFFECTIVE_MEMBER_MAX_COUNT:
+        raise UnsafeArchiveError(
+            "The combined ISO and ZIP overlay catalog contains too many members"
+        )
+    merged = validate_portable_fat_entries((*base, *additions))
+    normalized_additions = validate_portable_fat_entries(additions)
+    normalized_targets = validate_portable_fat_entries(targets)
+    return AdditiveOverlayMerge(base, normalized_additions, merged, normalized_targets)
 
 
 def select_write_mode(inspection: ImageInspection, requested: WriteMode | None = None) -> WriteMode:

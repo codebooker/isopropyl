@@ -76,6 +76,21 @@ issue requesting a private contact channel without disclosing the vulnerability.
   copies through an independently identity-bound plan. It supports either one
   FAT32 partition or an exact NTFS plus raw UEFI:NTFS helper layout on
   512-byte-logical-sector media.
+- ZIP overlays are untrusted installer/media content, not authenticated
+  software. SHA-256 binds the exact selected archive across planning and staging
+  but establishes no publisher or provenance trust; its files can intentionally
+  alter the resulting booted environment.
+- One no-follow, singly linked regular overlay ZIP is limited to 8 GiB compressed
+  and expanded, 4,096 members, 16 MiB central/local metadata, and a 65,536-entry
+  effective catalog. Only classic/ZIP64 stored or deflated files/directories are
+  accepted. Encryption, multidisk/SFX archives, NUL/parser disagreement,
+  overlaps, unexplained records, traversal, links, special files, FAT-unsafe
+  aliases, collisions, and reserved fallback/install payloads fail closed.
+  Directories may merge; files never overwrite. Extraction uses canonical target
+  paths, no-follow descriptors, exclusive creation, CRC/size/source-identity
+  checks, and a final exact staging scan. Permissions, ownership, links, and ZIP
+  timestamps are not imported. Cancellation and deadlines are cooperative
+  between decoder reads; one in-process deflate read is not preempted.
 - ISO/UDF modification times are untrusted metadata. ISOpropyl accepts only a
   conservative timezone-safe FAT-compatible UTC range from the bounded catalog,
   carries the value in the catalog digest, and applies file and explicit-directory

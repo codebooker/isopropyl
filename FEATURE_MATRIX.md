@@ -124,7 +124,7 @@ Status meanings:
 | Progress, speed, ETA, cancellation | **Done** | 64-bit counters, stage-aware rolling rate/ETA, cross-thread cancellation. |
 | Recoverable I/O retries | **Planned** | Never retry identity changes or ambiguous device failures. |
 | Activity log | **Done** | Rotating local log with copy and diagnostics export. |
-| Privacy-conscious diagnostics | **Done** | Sensitive identifiers, mount paths, member lists, and log require explicit opt-in. |
+| Privacy-conscious diagnostics | **Done** | Volume labels, image member paths, member-scoped issues, and UEFI payload details are always reduced to structural counts. Serial/WWN, mount/partition paths, and the activity log require explicit opt-in. |
 | Dark/light appearance | **Done** | Persistent palettes. System/high-contrast following remains polish. |
 | Settings persistence/reset | **Done** | Appearance, display-unit family, and denylist persist; risky visibility/confirmations reset; full reset ships. |
 | Keyboard shortcuts | **Done** | Open, refresh, log, cancel. |
@@ -133,7 +133,7 @@ Status meanings:
 | Headless CLI writing | **Planned** | Must preserve all GUI identity and confirmation invariants. |
 | Update checks | **Research** | Prefer package-manager channels; portable builds need signed opt-in metadata. |
 | Portable settings | **Planned** | Needed for AppImage-style distribution. |
-| ZIP overlay | **Planned** | Must reuse no-traversal/collision validation. |
+| ZIP overlay | **Done** | One bounded, identity- and SHA-256-bound stored/deflated ZIP can add ordinary files and directories through ISO mode. The asynchronous GUI selector, effective-catalog preview/replanning, target-residency checks, cancellable private staging, DD omission warning, and frozen final confirmation ship. Traversal, links, special files, encryption, parser disagreement, collisions, unexplained records, fallback `EFI/BOOT/BOOT*.EFI` loaders, and canonical Windows install WIM/ESD/SWM payload changes fail closed; no ISO file is overwritten. Physical installer testing remains. |
 | Preserve extracted timestamps | **Done** | A conservative timezone-safe FAT-compatible UTC range from the bounded 7-Zip catalog is carried through private extraction and the final FAT32/NTFS copy. Files and explicit directories are updated through already-open no-follow descriptors, transformed directories are restored deepest-first from their first observed workspace value, and staging representability is checked before any target change. Normalization must be smaller than one workspace/destination filesystem tick; subsequent read-back must exactly match that observed value. Malformed/out-of-range times and all link times are ignored or rejected; permissions and ownership are never imported. |
 | Decimal/binary unit preference | **Done** | Settings switches dynamic capacities, progress, rates, estimates, confirmations, and device labels between SI MB/GB/TB and IEC MiB/GiB/TiB. |
 | Old-BIOS fixes | **Research** | Requires precise Linux equivalents and real hardware fixtures. |

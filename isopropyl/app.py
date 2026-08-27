@@ -65,8 +65,9 @@ from .images import (
     compare_expected_checksum, inspect_image,
 )
 from .iso import (
-    ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget, WriteMode, WritePlan,
-    WriteMethodRecommendation, build_write_plan, partition_sector_mismatch,
+    AdditiveOverlayMerge, ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget,
+    WriteMode, WritePlan, WriteMethodRecommendation, build_write_plan,
+    merge_additive_overlay_entries, partition_sector_mismatch,
     partition_sector_unverified, recommend_write_method,
 )
 from .iso_staging import (
@@ -105,6 +106,9 @@ from .wim import (
 from .windows import (
     WindowsCustomization, generate_autounattend,
     online_account_bypass_compatibility, windows_architecture,
+)
+from .zip_overlay import (
+    ZipOverlayPlan, build_zip_overlay_plan,
 )
 
 
@@ -151,6 +155,39 @@ class ChecksumToken:
 
 
 @dataclass(frozen=True)
+class ZipOverlayPlanningToken:
+    generation: int
+    inspection_generation: int
+    image_identity: object
+    archive: Path
+    base_entries: tuple[ArchiveEntry, ...]
+    operation: BackgroundPreparation
+
+
+@dataclass(frozen=True)
+class IsoStagingPreparationRequest:
+    image: Path
+    image_identity: object
+    inspection: ImageInspection
+    device: Device
+    base_entries: tuple[ArchiveEntry, ...]
+    write_plan: WritePlan
+    overlay: ZipOverlayPlan | None
+    workspace: tempfile.TemporaryDirectory[str]
+    windows_customization: WindowsCustomization
+    windows_architecture: str
+    persistence_profile: CasperCompatibilityProfile | None
+    persistence_bytes: int
+
+
+@dataclass(frozen=True)
+class IsoStagingPreparationToken:
+    generation: int
+    operation: BackgroundPreparation
+    request: IsoStagingPreparationRequest
+
+
+@dataclass(frozen=True)
 class PendingUefiShell:
     device: Device
     workspace: tempfile.TemporaryDirectory[str]
@@ -170,6 +207,8 @@ class Bridge(QObject):
     inspection_finished = pyqtSignal(object, object, object)
     checksum_progress = pyqtSignal(object, object, object)
     checksums_finished = pyqtSignal(object, object)
+    zip_overlay_finished = pyqtSignal(object, object)
+    iso_staging_preparation_finished = pyqtSignal(object, object)
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
     media_finished = pyqtSignal(object)
@@ -197,6 +236,14 @@ class Window(QMainWindow):
         self.checksum_busy = False
         self.checksum_generation = 0
         self.checksum_preparer: BackgroundPreparation | None = None
+        self.zip_overlay_plan: ZipOverlayPlan | None = None
+        self.zip_overlay_merge: AdditiveOverlayMerge | None = None
+        self.zip_overlay_generation = 0
+        self.zip_overlay_preparer: BackgroundPreparation | None = None
+        self.zip_overlay_token: ZipOverlayPlanningToken | None = None
+        self.iso_staging_preparation_generation = 0
+        self.iso_staging_preparer: BackgroundPreparation | None = None
+        self.iso_staging_token: IsoStagingPreparationToken | None = None
         self.devices: list[Device] = []
         self.writer: ImageWriter | None = None
         self.imager: DriveImager | VirtualDriveImager | None = None
@@ -241,6 +288,10 @@ class Window(QMainWindow):
         self.bridge.inspection_finished.connect(self.on_inspection_finished)
         self.bridge.checksum_progress.connect(self.on_checksum_progress)
         self.bridge.checksums_finished.connect(self.on_checksums_finished)
+        self.bridge.zip_overlay_finished.connect(self.on_zip_overlay_finished)
+        self.bridge.iso_staging_preparation_finished.connect(
+            self.on_iso_staging_preparation_finished
+        )
         self.setWindowTitle("ISOpropyl")
         self.setMinimumSize(720, 700)
         self.setAcceptDrops(True)
@@ -369,6 +420,32 @@ class Window(QMainWindow):
         self.persistence_checkbox.toggled.connect(self.on_persistence_changed)
         self.persistence_slider.valueChanged.connect(self.on_persistence_changed)
         self.source_card.layout().addWidget(self.persistence_controls)
+        self.zip_overlay_controls = QWidget()
+        overlay_layout = QHBoxLayout(self.zip_overlay_controls)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_title = QLabel("Additional files")
+        overlay_title.setObjectName("muted")
+        self.zip_overlay_label = QLabel("No ZIP overlay selected")
+        self.zip_overlay_label.setObjectName("muted")
+        self.zip_overlay_label.setWordWrap(True)
+        self.zip_overlay_choose_button = QPushButton("Add ZIP…")
+        self.zip_overlay_choose_button.setObjectName("zipOverlayChooseButton")
+        self.zip_overlay_choose_button.setToolTip(
+            "Add files from a bounded ZIP archive in filesystem-aware ISO mode. "
+            "Existing ISO files, fallback loaders, and canonical Windows install "
+            "payloads cannot be replaced."
+        )
+        self.zip_overlay_choose_button.clicked.connect(self.choose_zip_overlay)
+        self.zip_overlay_choose_button.setEnabled(False)
+        self.zip_overlay_clear_button = QPushButton("Clear")
+        self.zip_overlay_clear_button.setObjectName("zipOverlayClearButton")
+        self.zip_overlay_clear_button.clicked.connect(self.clear_zip_overlay)
+        self.zip_overlay_clear_button.setEnabled(False)
+        overlay_layout.addWidget(overlay_title)
+        overlay_layout.addWidget(self.zip_overlay_label, 1)
+        overlay_layout.addWidget(self.zip_overlay_choose_button)
+        overlay_layout.addWidget(self.zip_overlay_clear_button)
+        self.source_card.layout().addWidget(self.zip_overlay_controls)
         self.checksum_button = QPushButton("Checksums…")
         self.checksum_button.setEnabled(False)
         self.checksum_button.clicked.connect(self.calculate_image_checksums)
@@ -486,6 +563,7 @@ class Window(QMainWindow):
         except OSError as error:
             QMessageBox.critical(self, "Image unavailable", str(error))
             return
+        self._reset_zip_overlay(rebuild=False)
         checksum_was_active = self.checksum_preparer is not None
         if self.checksum_preparer is not None:
             self.checksum_preparer.cancel()
@@ -666,6 +744,231 @@ class Window(QMainWindow):
             for member in self.inspection.members
         )
 
+    def effective_archive_entries(self) -> tuple[ArchiveEntry, ...]:
+        base_entries = self.archive_entries()
+        if self.zip_overlay_plan is None:
+            return base_entries
+        merged = self.zip_overlay_merge
+        if merged is None or merged.base_entries != base_entries:
+            raise ValueError("The ZIP overlay no longer matches the inspected ISO catalog")
+        return merged.merged_entries
+
+    def _zip_overlay_is_on_target(self, device: Device | None = None) -> bool:
+        plan = self.zip_overlay_plan
+        target = device if device is not None else self.selected_device()
+        if plan is None or target is None:
+            return False
+        try:
+            return path_is_on_device(str(plan.archive), target)
+        except OSError:
+            return True
+
+    def update_zip_overlay_controls(self) -> None:
+        eligible = bool(
+            self.inspection is not None
+            and self.inspection.is_iso9660
+            and self.inspection.contents_scanned
+        )
+        planning = self.zip_overlay_preparer is not None
+        self.zip_overlay_choose_button.setEnabled(
+            eligible and not planning and not self.operation_active
+        )
+        self.zip_overlay_clear_button.setEnabled(
+            (planning or self.zip_overlay_plan is not None) and not self.operation_active
+        )
+        self.iso_plan_button.setEnabled(
+            eligible and not planning and not self.operation_active
+        )
+        if planning and self.zip_overlay_token is not None:
+            self.zip_overlay_label.setText(
+                f"Inspecting {self.zip_overlay_token.archive.name}…"
+            )
+        elif self.zip_overlay_plan is not None:
+            warning = (
+                " · stored on selected target — move it first"
+                if self._zip_overlay_is_on_target() else ""
+            )
+            if self.selected_write_mode() is WriteMode.DD:
+                warning += " · not applied in DD mode"
+            self.zip_overlay_label.setText(
+                f"{self.zip_overlay_plan.archive.name} · "
+                f"{self.display_size(self.zip_overlay_plan.content_bytes)} expanded"
+                f"{warning}"
+            )
+            self.zip_overlay_label.setToolTip(
+                f"{self.zip_overlay_plan.archive}\n"
+                f"SHA-256: {self.zip_overlay_plan.archive_sha256}"
+            )
+        else:
+            self.zip_overlay_label.setText("No ZIP overlay selected")
+            self.zip_overlay_label.setToolTip("")
+
+    def _reset_zip_overlay(self, *, rebuild: bool) -> None:
+        if self.zip_overlay_preparer is not None:
+            self.zip_overlay_preparer.cancel()
+        self.zip_overlay_generation += 1
+        self.zip_overlay_preparer = None
+        self.zip_overlay_token = None
+        self.zip_overlay_plan = None
+        self.zip_overlay_merge = None
+        self.update_zip_overlay_controls()
+        if rebuild and self.inspection is not None:
+            self.rebuild_write_recommendation()
+        else:
+            self.update_ready()
+
+    def clear_zip_overlay(self, _checked: bool = False) -> None:
+        self._reset_zip_overlay(rebuild=True)
+
+    def choose_zip_overlay(self) -> None:
+        if not (
+            self.inspection is not None
+            and self.inspection.is_iso9660
+            and self.inspection.contents_scanned
+            and self.image is not None
+            and self.inspection_identity is not None
+            and not self.operation_active
+        ):
+            return
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose an additive ZIP overlay",
+            str(Path.home()),
+            "ZIP archives (*.zip);;All files (*)",
+        )
+        if not filename:
+            return
+        archive = Path(filename).absolute()
+        device = self.selected_device()
+        if device is not None:
+            try:
+                on_target = path_is_on_device(str(archive), device)
+            except OSError:
+                on_target = True
+            if on_target:
+                QMessageBox.warning(
+                    self,
+                    "Move the ZIP overlay first",
+                    "The selected ZIP overlay is stored on the target drive. "
+                    "Move it to another disk before using it in ISO mode.",
+                )
+                return
+
+        if self.zip_overlay_preparer is not None:
+            self.zip_overlay_preparer.cancel()
+        self.zip_overlay_generation += 1
+        operation = BackgroundPreparation()
+        token = ZipOverlayPlanningToken(
+            self.zip_overlay_generation,
+            self.inspection_generation,
+            self.inspection_identity,
+            archive,
+            self.archive_entries(),
+            operation,
+        )
+        self.zip_overlay_plan = None
+        self.zip_overlay_merge = None
+        self.zip_overlay_preparer = operation
+        self.zip_overlay_token = token
+        self.update_zip_overlay_controls()
+        self.update_ready()
+        self.status.setText("Inspecting the ZIP overlay safely…")
+
+        def work() -> None:
+            def check_cancelled() -> None:
+                if operation.cancelled:
+                    raise IsoStagingCancelled("ZIP overlay inspection was cancelled")
+
+            try:
+                plan = build_zip_overlay_plan(
+                    archive, cancel_check=check_cancelled,
+                )
+                merged = merge_additive_overlay_entries(
+                    token.base_entries,
+                    (member.entry for member in plan.members),
+                )
+                result: object = (plan, merged)
+            except Exception as error:
+                result = error
+            self.bridge.zip_overlay_finished.emit(token, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_zip_overlay_finished(self, token: object, result: object) -> None:
+        if not isinstance(token, ZipOverlayPlanningToken):
+            return
+        if (
+            token is not self.zip_overlay_token
+            or token.operation is not self.zip_overlay_preparer
+            or token.generation != self.zip_overlay_generation
+        ):
+            return
+        self.zip_overlay_preparer = None
+        self.zip_overlay_token = None
+        current = False
+        try:
+            current = bool(
+                self.image is not None
+                and token.inspection_generation == self.inspection_generation
+                and token.image_identity == self.inspection_identity
+                and token.image_identity == image_identity(self.image)
+                and token.base_entries == self.archive_entries()
+            )
+        except OSError:
+            current = False
+        if not current:
+            self.update_zip_overlay_controls()
+            self.update_ready()
+            return
+        if token.operation.cancelled or isinstance(result, IsoStagingCancelled):
+            self.status.setText("ZIP overlay inspection cancelled")
+            self.update_zip_overlay_controls()
+            self.update_ready()
+            return
+        if isinstance(result, Exception):
+            self.status.setText("ZIP overlay was not selected")
+            self.update_zip_overlay_controls()
+            self.update_ready()
+            QMessageBox.warning(self, "ZIP overlay unavailable", str(result))
+            return
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], ZipOverlayPlan)
+            or not isinstance(result[1], AdditiveOverlayMerge)
+            or result[0].archive != token.archive
+        ):
+            self.status.setText("ZIP overlay was not selected")
+            self.update_zip_overlay_controls()
+            self.update_ready()
+            QMessageBox.warning(
+                self,
+                "ZIP overlay unavailable",
+                "The background ZIP inspection returned an invalid result.",
+            )
+            return
+        plan, merged = result
+        if (
+            merged.base_entries != token.base_entries
+            or len(merged.overlay_targets) != len(plan.members)
+        ):
+            QMessageBox.warning(
+                self,
+                "ZIP overlay unavailable",
+                "The background ZIP merge returned inconsistent catalog data.",
+            )
+            self.update_zip_overlay_controls()
+            self.update_ready()
+            return
+        self.zip_overlay_plan = plan
+        self.zip_overlay_merge = merged
+        if self._zip_overlay_is_on_target():
+            self.status.setText("Move the ZIP overlay off the selected target drive")
+        else:
+            self.status.setText("ZIP overlay selected; ISO plans now include its files")
+        self.update_zip_overlay_controls()
+        self.rebuild_write_recommendation()
+
     def selected_write_mode(self) -> WriteMode | None:
         value = self.write_method.currentData()
         try:
@@ -751,7 +1054,7 @@ class Window(QMainWindow):
         try:
             recommendation = recommend_write_method(
                 inspection,
-                self.archive_entries(),
+                self.effective_archive_entries(),
                 target_size=device.size if device is not None else None,
                 target_logical_sector_size=(
                     device.logical_sector_size if device is not None else None
@@ -828,6 +1131,8 @@ class Window(QMainWindow):
         self.verify.setEnabled(not self.operation_active and not iso_mode)
         self.write_button.setText(
             "Write in ISO mode" if iso_mode else
+            "Write in DD mode (ZIP omitted)"
+            if mode is WriteMode.DD and self.zip_overlay_plan is not None else
             "Write in DD mode" if mode is WriteMode.DD else
             "Choose write method"
         )
@@ -852,8 +1157,16 @@ class Window(QMainWindow):
             and plan.minimum_target_bytes + self.selected_persistence_bytes()
             <= device.size
         )
+        overlay_ready = (
+            self.zip_overlay_preparer is None
+            and (
+                mode is WriteMode.DD
+                or not self._zip_overlay_is_on_target(device)
+            )
+        )
         self.write_button.setEnabled(
-            enough_space and not self.operation_active and self.inspection is not None
+            enough_space and overlay_ready
+            and not self.operation_active and self.inspection is not None
             and not self.checksum_busy and not self.device_refresh_busy
         )
         self.tools_button.setEnabled(
@@ -870,7 +1183,15 @@ class Window(QMainWindow):
             )
         else:
             self.device_detail.setText("Connect a removable drive, then refresh")
-        if self.image and device and plan is not None and not enough_space:
+        self.update_zip_overlay_controls()
+        if self.zip_overlay_preparer is not None:
+            self.status.setText("Inspecting the ZIP overlay safely…")
+        elif (
+            mode is WriteMode.EXTRACTED_ISO
+            and self._zip_overlay_is_on_target(device)
+        ):
+            self.status.setText("Move the ZIP overlay off the selected target drive")
+        elif self.image and device and plan is not None and not enough_space:
             self.status.setText(
                 "The selected target is too small for this write method"
             )
@@ -894,6 +1215,7 @@ class Window(QMainWindow):
             self.casper_stager,
             self.casper_writer,
             self.checksum_preparer,
+            self.iso_staging_preparer,
         ))
 
     def confirm_write(self) -> None:
@@ -910,6 +1232,18 @@ class Window(QMainWindow):
                 "Choose an available write method before continuing.",
             )
             return
+        if self.zip_overlay_plan is not None:
+            omission = QMessageBox.warning(
+                self,
+                "ZIP overlay will not be written",
+                f"DD mode copies {self.image.name} byte-for-byte. The selected ZIP "
+                f"overlay {self.zip_overlay_plan.archive.name} will not be applied.\n\n"
+                "Continue with the base image only?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if omission != QMessageBox.StandardButton.Yes:
+                return
         try:
             current_identity = image_identity(self.image)
         except OSError as error:
@@ -1047,8 +1381,9 @@ class Window(QMainWindow):
                 "The image changed after inspection. Select it again before writing.",
             )
             return
-        entries = self.archive_entries()
+        base_entries = self.archive_entries()
         try:
+            entries = self.effective_archive_entries()
             recommendation = recommend_write_method(
                 inspection, entries, target_size=device.size,
                 target_logical_sector_size=device.logical_sector_size,
@@ -1074,7 +1409,7 @@ class Window(QMainWindow):
             "Dispatching fresh ISO-mode plan: image=%s target=%s identity=%s",
             image, device.path, device.identity,
         )
-        self.start_constructed_iso_write(list(entries), plan)
+        self.start_constructed_iso_write(list(base_entries), plan)
 
     def start_write(
         self,
@@ -1202,6 +1537,8 @@ class Window(QMainWindow):
         self.extractor = None
         self.virtual_stager = None
         self.iso_stager = None
+        self.iso_staging_preparer = None
+        self.iso_staging_token = None
         self.windows_wim_extractor = None
         self.constructed_writer = None
         self.uefi_ntfs_writer = None
@@ -1261,6 +1598,7 @@ class Window(QMainWindow):
         self.iso_plan_button.setEnabled(
             not busy and bool(self.inspection and self.inspection.is_iso9660)
         )
+        self.update_zip_overlay_controls()
         self.write_button.setEnabled(not busy)
         self.cancel_button.setVisible(busy)
         self.cancel_button.setEnabled(busy)
@@ -1270,6 +1608,13 @@ class Window(QMainWindow):
 
     def cancel(self) -> None:
         was_inspecting = self.inspection_busy
+        was_planning_overlay = self.zip_overlay_preparer is not None
+        if self.zip_overlay_preparer is not None:
+            self.zip_overlay_preparer.cancel()
+            self.zip_overlay_generation += 1
+            self.zip_overlay_preparer = None
+            self.zip_overlay_token = None
+            self.update_zip_overlay_controls()
         self.inspection_cancel_event.set()
         self.inspection_busy = False
         active = tuple(filter(None, (
@@ -1282,6 +1627,7 @@ class Window(QMainWindow):
             self.casper_preparer, self.casper_stager, self.casper_writer,
             self.windows_wim_extractor,
             self.checksum_preparer,
+            self.iso_staging_preparer,
         )))
         if active:
             self.status.setText("Stopping…")
@@ -1294,10 +1640,15 @@ class Window(QMainWindow):
             self.write_method_reason.setText(
                 "Select the image again to restart inspection."
             )
+        elif was_planning_overlay:
+            self.status.setText("ZIP overlay inspection cancelled")
+            self.update_ready()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self.operation_active:
             self.inspection_cancel_event.set()
+            if self.zip_overlay_preparer is not None:
+                self.zip_overlay_preparer.cancel()
             event.accept()
             return
         answer = QMessageBox.warning(
@@ -3037,20 +3388,9 @@ class Window(QMainWindow):
     def preview_iso_plan(self) -> None:
         if not self.inspection or not self.inspection.is_iso9660:
             return
-        kind = {
-            "file": EntryKind.FILE,
-            "directory": EntryKind.DIRECTORY,
-            "symlink": EntryKind.SYMLINK,
-        }
-        entries = [
-            ArchiveEntry(
-                member.path, member.size, kind.get(member.kind, EntryKind.FILE),
-                member.link_target or None,
-                member.modified_ns,
-            )
-            for member in self.inspection.members
-        ]
+        base_entries = self.archive_entries()
         try:
+            entries = self.effective_archive_entries()
             plan = build_write_plan(
                 self.inspection, entries, requested_mode=WriteMode.EXTRACTED_ISO,
                 firmware_target=FirmwareTarget.UEFI_ONLY,
@@ -3067,10 +3407,25 @@ class Window(QMainWindow):
             f"Partitions: {plan.layout.partition_count}",
             f"Firmware: {'BIOS ' if plan.layout.bios_bootable else ''}"
             f"{'UEFI' if plan.layout.uefi_bootable else ''}".strip(),
-            f"Cataloged files: {len(entries)}",
+            f"Catalog entries: {len(entries)}",
             f"File content: {self.display_size(plan.minimum_content_bytes)}",
             f"Conservative target minimum: {self.display_size(plan.minimum_target_bytes)}",
         ]
+        if self.zip_overlay_plan is not None:
+            merge = self.zip_overlay_merge
+            added = merge.overlay_entries if merge is not None else ()
+            lines.extend((
+                "",
+                f"ZIP overlay: {self.zip_overlay_plan.archive.name}",
+                f"ZIP SHA-256: {self.zip_overlay_plan.archive_sha256}",
+                f"ZIP expanded content: "
+                f"{self.display_size(self.zip_overlay_plan.content_bytes)}",
+                f"Overlay catalog: {len(self.zip_overlay_plan.members)} members · "
+                f"{len(added)} new paths",
+                f"Final catalog: {len(base_entries)} base entries → "
+                f"{len(entries)} effective entries",
+                "Merge policy: additive only; existing ISO files are never replaced.",
+            ))
         if plan.needs_wim_split:
             lines.append("Transformation: split sources/install.wim for FAT32")
         if self.windows_options.install_image is not None:
@@ -3086,7 +3441,7 @@ class Window(QMainWindow):
         lines.extend(("", "Execution blockers:"))
         lines.extend(f"• {blocker}" for blocker in plan.blockers)
         dialog = QDialog(self)
-        dialog.setWindowTitle("Extracted ISO plan")
+        dialog.setWindowTitle("Filesystem-aware ISO-mode plan")
         dialog.resize(720, 560)
         layout = QVBoxLayout(dialog)
         text = QPlainTextEdit()
@@ -3097,7 +3452,11 @@ class Window(QMainWindow):
         copy_button = buttons.addButton("Copy", QDialogButtonBox.ButtonRole.ActionRole)
         copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text.toPlainText()))
         extract_button = buttons.addButton(
-            "Extract safely…", QDialogButtonBox.ButtonRole.ActionRole
+            "Extract original ISO…", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        extract_button.setToolTip(
+            "Extract only the selected ISO. ZIP overlay files are included only by "
+            "the private ISO-mode staging and USB-writing workflow."
         )
 
         def extract() -> None:
@@ -3110,7 +3469,9 @@ class Window(QMainWindow):
             destination = Path(parent) / f"{self.image.stem}-extracted"
             dialog.accept()
             QTimer.singleShot(
-                0, lambda: self.start_iso_extraction(entries, destination)
+                0, lambda: self.start_iso_extraction(
+                    list(base_entries), destination,
+                )
             )
 
         extract_button.clicked.connect(extract)
@@ -3119,6 +3480,7 @@ class Window(QMainWindow):
         )
         write_iso_button.setEnabled(
             plan.executable and self.selected_device() is not None
+            and not self._zip_overlay_is_on_target()
         )
         if plan.executable:
             if plan.layout.boot_strategy is BootStrategy.UEFI_NTFS:
@@ -3138,7 +3500,9 @@ class Window(QMainWindow):
         def write_iso() -> None:
             dialog.accept()
             QTimer.singleShot(
-                0, lambda: self.start_constructed_iso_write(entries, plan)
+                0, lambda: self.start_constructed_iso_write(
+                    list(base_entries), plan,
+                )
             )
 
         write_iso_button.clicked.connect(write_iso)
@@ -3164,6 +3528,32 @@ class Window(QMainWindow):
                 "Move it to another disk before using ISO mode.",
             )
             return
+        overlay = self.zip_overlay_plan
+        if overlay is not None:
+            try:
+                overlay_on_target = path_is_on_device(str(overlay.archive), device)
+            except OSError:
+                overlay_on_target = True
+            if overlay_on_target:
+                QMessageBox.critical(
+                    self,
+                    "Move the ZIP overlay first",
+                    "The selected ZIP overlay is stored on the target drive and "
+                    "cannot be used for this write.",
+                )
+                return
+        try:
+            current_identity = image_identity(image)
+        except OSError as error:
+            QMessageBox.critical(self, "Image unavailable", str(error))
+            return
+        if current_identity != self.inspection_identity:
+            QMessageBox.warning(
+                self,
+                "Image changed",
+                "The image changed after inspection. Select it again before writing.",
+            )
+            return
         if not device.removable:
             warning = QMessageBox.warning(
                 self, "External hard drive or SSD selected",
@@ -3181,51 +3571,30 @@ class Window(QMainWindow):
         )
         if not working_parent:
             return
-        workspace: tempfile.TemporaryDirectory[str] | None = None
         try:
-            workspace = tempfile.TemporaryDirectory(
-                prefix=".isopropyl-iso-", dir=working_parent,
+            working_on_target = path_is_on_device(working_parent, device)
+        except OSError:
+            working_on_target = True
+        if working_on_target:
+            QMessageBox.warning(
+                self,
+                "Choose working space on another disk",
+                "ISOpropyl cannot stage the ISO on the target drive that will be erased.",
             )
-            staging_destination = Path(workspace.name) / "ready-media"
-            staging_plan = build_iso_staging_plan(
-                image,
-                staging_destination,
-                entries,
-                write_plan,
-                windows_customization=self.windows_options,
-                windows_architecture=(
-                    self.windows_options.install_image.edition.architecture
-                    if self.windows_options.install_image is not None else
-                    windows_architecture(inspection.architectures)
-                ),
-            )
-        except Exception as error:
-            if workspace is not None:
-                try:
-                    workspace.cleanup()
-                except OSError as cleanup_error:
-                    self.logger.warning(
-                        "Could not remove rejected ISO workspace: %s", cleanup_error,
-                    )
-            QMessageBox.warning(self, "ISO mode unavailable", str(error))
             return
-
-        assert write_plan.layout is not None
-        strategy = write_plan.layout.boot_strategy
+        base_entries = tuple(entries)
         persistence_bytes = self.selected_persistence_bytes()
         persistence_profile = (
             supported_casper_profile(inspection) if persistence_bytes else None
         )
+        assert write_plan.layout is not None
+        strategy = write_plan.layout.boot_strategy
         if persistence_bytes and (
             persistence_profile is None
             or strategy is not BootStrategy.IMAGE_NATIVE
             or write_plan.layout.main_filesystem.value != "fat32"
             or write_plan.minimum_target_bytes + persistence_bytes > device.size
         ):
-            try:
-                workspace.cleanup()
-            except OSError as error:
-                self.logger.warning("Could not remove ISO workspace: %s", error)
             QMessageBox.warning(
                 self,
                 "Persistent storage unavailable",
@@ -3234,16 +3603,175 @@ class Window(QMainWindow):
                 "selection before trying again.",
             )
             return
-        pending = PendingIsoWrite(
-            image=image,
-            inspection=inspection,
-            device=device,
-            write_plan=write_plan,
-            workspace=workspace,
-            staging_plan=staging_plan,
+        try:
+            workspace = tempfile.TemporaryDirectory(
+                prefix=".isopropyl-iso-", dir=working_parent,
+            )
+        except OSError as error:
+            QMessageBox.warning(self, "ISO mode unavailable", str(error))
+            return
+        customization = self.windows_options
+        architecture = (
+            customization.install_image.edition.architecture
+            if customization.install_image is not None else
+            windows_architecture(inspection.architectures)
+        )
+        request = IsoStagingPreparationRequest(
+            image,
+            current_identity,
+            inspection,
+            device,
+            base_entries,
+            write_plan,
+            overlay,
+            workspace,
+            customization,
+            architecture,
             persistence_profile=persistence_profile,
             persistence_bytes=persistence_bytes,
         )
+        self.iso_staging_preparation_generation += 1
+        operation = BackgroundPreparation()
+        token = IsoStagingPreparationToken(
+            self.iso_staging_preparation_generation, operation, request,
+        )
+        self.iso_staging_preparer = operation
+        self.iso_staging_token = token
+        self.set_busy(True)
+        self.progress.setRange(0, 0)
+        self.status.setText("Validating the ISO and ZIP overlay plan…")
+
+        def work() -> None:
+            def check_cancelled() -> None:
+                if operation.cancelled:
+                    raise IsoStagingCancelled("ISO staging-plan preparation was cancelled")
+
+            try:
+                result: object = build_iso_staging_plan(
+                    request.image,
+                    Path(request.workspace.name) / "ready-media",
+                    request.base_entries,
+                    request.write_plan,
+                    overlay=request.overlay,
+                    cancel_check=check_cancelled,
+                    windows_customization=request.windows_customization,
+                    windows_architecture=request.windows_architecture,
+                )
+            except Exception as error:
+                result = error
+            self.bridge.iso_staging_preparation_finished.emit(token, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_iso_staging_preparation_finished(
+        self, token: object, result: object,
+    ) -> None:
+        if not isinstance(token, IsoStagingPreparationToken):
+            return
+        request = token.request
+        if (
+            token is not self.iso_staging_token
+            or token.operation is not self.iso_staging_preparer
+            or token.generation != self.iso_staging_preparation_generation
+        ):
+            workspace_is_owned = (
+                self.pending_iso_write is not None
+                and self.pending_iso_write.workspace is request.workspace
+            ) or self.iso_workspace is request.workspace
+            if not workspace_is_owned:
+                try:
+                    request.workspace.cleanup()
+                except OSError as error:
+                    self.logger.warning("Could not remove stale ISO workspace: %s", error)
+            return
+        self.iso_staging_preparer = None
+        self.iso_staging_token = None
+        self.progress.setRange(0, 1000)
+        current = False
+        try:
+            current = bool(
+                self.image == request.image
+                and self.inspection == request.inspection
+                and self.selected_device() == request.device
+                and self.zip_overlay_plan == request.overlay
+                and self.archive_entries() == request.base_entries
+                and image_identity(request.image) == request.image_identity
+                and not path_is_on_device(request.workspace.name, request.device)
+            )
+        except OSError:
+            current = False
+        if token.operation.cancelled or isinstance(result, IsoStagingCancelled):
+            try:
+                request.workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove cancelled ISO workspace: %s", error)
+            self.set_busy(False)
+            self.status.setText("ISO staging-plan preparation cancelled")
+            return
+        if not current or not isinstance(result, IsoStagingPlan):
+            try:
+                request.workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove rejected ISO workspace: %s", error)
+            self.set_busy(False)
+            message = (
+                str(result) if isinstance(result, Exception) else
+                "The image, target, or ZIP overlay changed during preparation."
+                if not current else
+                "The background staging planner returned an invalid result."
+            )
+            self.status.setText("ISO mode is not active")
+            QMessageBox.warning(self, "ISO mode unavailable", message)
+            return
+        expected_destination = Path(request.workspace.name) / "ready-media"
+        if (
+            result.image != request.image
+            or result.destination != expected_destination
+            or result.entries != request.base_entries
+            or result.write_plan != request.write_plan
+            or result.overlay != request.overlay
+            or result.windows_customization != (
+                request.windows_customization
+                if request.windows_customization.enabled else None
+            )
+            or result.windows_architecture != (
+                request.windows_architecture
+                if request.windows_customization.enabled else None
+            )
+            or result.wim_selection != request.windows_customization.install_image
+        ):
+            try:
+                request.workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove rejected ISO workspace: %s", error)
+            self.set_busy(False)
+            self.status.setText("ISO mode is not active")
+            QMessageBox.warning(
+                self,
+                "ISO mode unavailable",
+                "The background staging plan does not match the selected inputs.",
+            )
+            return
+        pending = PendingIsoWrite(
+            image=request.image,
+            inspection=request.inspection,
+            device=request.device,
+            write_plan=request.write_plan,
+            workspace=request.workspace,
+            staging_plan=result,
+            persistence_profile=request.persistence_profile,
+            persistence_bytes=request.persistence_bytes,
+        )
+        self.set_busy(False)
+        self._continue_prepared_iso_write(pending)
+
+    def _continue_prepared_iso_write(self, pending: PendingIsoWrite) -> None:
+        inspection = pending.inspection
+        write_plan = pending.write_plan
+        workspace = pending.workspace
+        assert write_plan.layout is not None
+        strategy = write_plan.layout.boot_strategy
+        persistence_profile = pending.persistence_profile
         if persistence_profile is not None:
             self.start_casper_preparation(pending)
             return
@@ -3488,6 +4016,42 @@ class Window(QMainWindow):
         assert write_plan.layout is not None
         strategy = write_plan.layout.boot_strategy
         persistence_enabled = pending.persistence_profile is not None
+        try:
+            workspace_on_target = path_is_on_device(workspace.name, device)
+        except OSError:
+            workspace_on_target = True
+        if workspace_on_target:
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "Choose working space on another disk",
+                "The private ISO staging workspace is now on the target drive.",
+            )
+            return
+        if staging_plan.overlay is not None:
+            try:
+                overlay_on_target = path_is_on_device(
+                    str(staging_plan.overlay.archive), device,
+                )
+            except OSError:
+                overlay_on_target = True
+            if overlay_on_target:
+                try:
+                    workspace.cleanup()
+                except OSError as error:
+                    self.logger.warning("Could not remove ISO workspace: %s", error)
+                self.set_busy(False)
+                QMessageBox.warning(
+                    self,
+                    "Move the ZIP overlay first",
+                    "The ZIP overlay is now stored on the target drive. Move it "
+                    "elsewhere and prepare the ISO-mode write again.",
+                )
+                return
         if strategy is BootStrategy.UEFI_NTFS and (
             artifact is None or logical_sector_size != 512
         ):
@@ -3527,13 +4091,26 @@ class Window(QMainWindow):
 
         customization = (
             "\nWindows customization: autounattend.xml will be added."
-            if self.windows_options.enabled else ""
+            if staging_plan.windows_customization is not None else ""
         )
-        if self.windows_options.install_image is not None:
+        if staging_plan.wim_selection is not None:
             customization += (
                 "\nWindows image: "
-                f"{self.windows_options.install_image.display_label} from "
-                f"{self.windows_options.install_image.source_name}."
+                f"{staging_plan.wim_selection.display_label} from "
+                f"{staging_plan.wim_selection.source_name}."
+            )
+        if staging_plan.overlay is not None:
+            final_files = sum(
+                entry.kind is EntryKind.FILE
+                for entry in staging_plan.effective_entries
+            )
+            customization += (
+                f"\nZIP overlay: {staging_plan.overlay.archive.name} · "
+                f"{self.display_size(staging_plan.overlay.content_bytes)} expanded."
+                f"\nZIP SHA-256: {staging_plan.overlay.archive_sha256}."
+                f"\nEffective input catalog: {final_files} files · "
+                f"{self.display_size(staging_plan.content_bytes)} of ISO/overlay file data."
+                "\nOverlay policy: additive only; no existing ISO file is replaced."
             )
         if persistence_enabled:
             assert pending.persistence_profile is not None
@@ -3586,6 +4163,47 @@ class Window(QMainWindow):
             self.set_busy(False)
             self.status.setText("ISO mode is not active")
             return
+
+        try:
+            workspace_on_target = path_is_on_device(workspace.name, device)
+        except OSError:
+            workspace_on_target = True
+        if workspace_on_target:
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning("Could not remove ISO workspace: %s", error)
+            self.set_busy(False)
+            self.status.setText("ISO mode is not active")
+            QMessageBox.warning(
+                self,
+                "Choose working space on another disk",
+                "The private ISO staging workspace moved onto the target drive "
+                "during confirmation. No staging or device write was started.",
+            )
+            return
+
+        if staging_plan.overlay is not None:
+            try:
+                overlay_on_target = path_is_on_device(
+                    str(staging_plan.overlay.archive), device,
+                )
+            except OSError:
+                overlay_on_target = True
+            if overlay_on_target:
+                try:
+                    workspace.cleanup()
+                except OSError as error:
+                    self.logger.warning("Could not remove ISO workspace: %s", error)
+                self.set_busy(False)
+                self.status.setText("ISO mode is not active")
+                QMessageBox.warning(
+                    self,
+                    "Move the ZIP overlay first",
+                    "The ZIP overlay moved onto the target drive during confirmation. "
+                    "No staging or device write was started.",
+                )
+                return
 
         self.iso_workspace = workspace
         self.iso_stager = IsoStagingExecutor()

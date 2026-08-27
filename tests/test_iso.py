@@ -2,11 +2,14 @@
 
 import unittest
 from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
+from unittest.mock import patch
 
 from isopropyl.authenticode import AuthenticodeIntegrityState, AuthenticodeResult
 from isopropyl.images import ImageInspection
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.iso import (
+    AdditiveOverlayMerge,
     FAT32_MAX_FILE_SIZE,
     ArchiveEntry,
     BootStrategy,
@@ -20,8 +23,10 @@ from isopropyl.iso import (
     UnsafeArchiveError,
     WriteMode,
     build_write_plan,
+    merge_additive_overlay_entries,
     recommend_write_method,
     validate_extraction_entries,
+    validate_portable_fat_entries,
 )
 from isopropyl.timestamps import (
     MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
@@ -587,6 +592,16 @@ class WriteMethodRecommendationTests(unittest.TestCase):
 
 
 class ExtractionSafetyTests(unittest.TestCase):
+    def test_archive_entry_size_requires_an_exact_nonnegative_integer(self):
+        for size in (True, False, 1.0, -1):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                ArchiveEntry("file", size)  # type: ignore[arg-type]
+
+        with self.assertRaises(ValueError):
+            ArchiveEntry(Path("file"))  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            ArchiveEntry("file", kind="file")  # type: ignore[arg-type]
+
     def assert_unsafe(self, *entries: ArchiveEntry) -> None:
         with self.assertRaises(UnsafeArchiveError):
             validate_extraction_entries(entries)
@@ -646,6 +661,204 @@ class ExtractionSafetyTests(unittest.TestCase):
 
     def test_rejects_file_used_as_directory(self):
         self.assert_unsafe(ArchiveEntry("boot"), ArchiveEntry("boot/grub.cfg"))
+
+
+class AdditiveOverlayTests(unittest.TestCase):
+    def assert_overlay_unsafe(
+        self,
+        base: list[ArchiveEntry],
+        overlay: list[ArchiveEntry],
+    ) -> None:
+        with self.assertRaises(UnsafeArchiveError):
+            merge_additive_overlay_entries(base, overlay)
+
+    def test_merges_directories_and_adopts_exact_base_prefix_spelling(self):
+        modified_ns = 1_709_210_096_123_456_789
+        base = [
+            ArchiveEntry("EFI", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("EFI/Tools", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("EFI/Tools/base.txt", 4),
+            ArchiveEntry("docs/base.txt", 5),
+        ]
+        overlay = [
+            ArchiveEntry("efi", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("efi/tools", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("efi/tools/New.txt", 6, modified_ns=modified_ns),
+            ArchiveEntry("DOCS", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("DOCS/new.txt", 7),
+        ]
+
+        result = merge_additive_overlay_entries(base, overlay)
+
+        self.assertIsInstance(result, AdditiveOverlayMerge)
+        self.assertEqual(
+            [entry.path for entry in result.overlay_entries],
+            ["EFI/Tools/New.txt", "docs/new.txt"],
+        )
+        self.assertEqual(
+            [entry.path for entry in result.overlay_targets],
+            ["EFI", "EFI/Tools", "EFI/Tools/New.txt", "docs", "docs/new.txt"],
+        )
+        self.assertEqual(len(result.overlay_targets), len(overlay))
+        self.assertEqual(result.overlay_entries[0].modified_ns, modified_ns)
+        self.assertEqual(
+            result.merged_entries,
+            validate_extraction_entries((*result.base_entries, *result.overlay_entries)),
+        )
+        with self.assertRaises(FrozenInstanceError):
+            result.overlay_entries = ()  # type: ignore[misc]
+
+    def test_rejects_every_non_directory_full_path_collision(self):
+        collisions = (
+            (ArchiveEntry("Thing"), ArchiveEntry("thing")),
+            (
+                ArchiveEntry("Thing"),
+                ArchiveEntry("thing", kind=EntryKind.DIRECTORY),
+            ),
+            (
+                ArchiveEntry("Thing", kind=EntryKind.DIRECTORY),
+                ArchiveEntry("thing"),
+            ),
+            (
+                ArchiveEntry("Thing", kind=EntryKind.SYMLINK, link_target="target"),
+                ArchiveEntry("thing", kind=EntryKind.DIRECTORY),
+            ),
+        )
+        for base_entry, overlay_entry in collisions:
+            with self.subTest(base=base_entry.kind, overlay=overlay_entry.kind):
+                self.assert_overlay_unsafe([base_entry], [overlay_entry])
+
+        merged_directories = merge_additive_overlay_entries(
+            [ArchiveEntry("Thing", kind=EntryKind.DIRECTORY)],
+            [ArchiveEntry("thing", kind=EntryKind.DIRECTORY)],
+        )
+        self.assertEqual(merged_directories.overlay_entries, ())
+
+    def test_rejects_file_ancestors_from_either_namespace(self):
+        self.assert_overlay_unsafe(
+            [ArchiveEntry("tree")],
+            [ArchiveEntry("TREE/child.txt")],
+        )
+        self.assert_overlay_unsafe(
+            [ArchiveEntry("tree/child.txt")],
+            [ArchiveEntry("TREE")],
+        )
+        self.assert_overlay_unsafe(
+            [],
+            [ArchiveEntry("tree"), ArchiveEntry("tree/child.txt")],
+        )
+
+    def test_nfc_casefold_keys_detect_collisions_and_adopt_spelling(self):
+        composed = "Caf\N{LATIN SMALL LETTER E WITH ACUTE}"
+        decomposed_upper = "CAFE\N{COMBINING ACUTE ACCENT}"
+        base = [ArchiveEntry(f"{composed}/base.txt")]
+
+        result = merge_additive_overlay_entries(
+            base,
+            [ArchiveEntry(f"{decomposed_upper}/new.txt")],
+        )
+        self.assertEqual(result.overlay_entries[0].path, f"{composed}/new.txt")
+        self.assert_overlay_unsafe(
+            base,
+            [ArchiveEntry(f"{decomposed_upper}/BASE.TXT")],
+        )
+
+    def test_rejects_inconsistent_directory_spellings(self):
+        self.assert_overlay_unsafe(
+            [],
+            [ArchiveEntry("Docs/a.txt"), ArchiveEntry("docs/b.txt")],
+        )
+        self.assert_overlay_unsafe(
+            [ArchiveEntry("Docs/a.txt"), ArchiveEntry("docs/b.txt")],
+            [],
+        )
+
+    def test_rejects_nonportable_fat_components(self):
+        paths = (
+            "dir/bad\x01.txt",
+            "dir/bad\x7f.txt",
+            "dir/bad<name",
+            "dir/bad>name",
+            "dir/bad:name",
+            'dir/bad"name',
+            "dir/bad|name",
+            "dir/bad?name",
+            "dir/bad*name",
+            "dir\\bad",
+            "dir/AUX.txt",
+            "dir/COM1.log",
+            "dir/CON .txt",
+            "dir/trailing.",
+            "dir/trailing ",
+        )
+        for path in paths:
+            with self.subTest(path=path), self.assertRaises(UnsafeArchiveError):
+                validate_portable_fat_entries([ArchiveEntry(path)])
+
+    def test_enforces_utf16_component_depth_and_utf8_path_bounds(self):
+        validate_portable_fat_entries([ArchiveEntry("a" * 255)])
+        validate_portable_fat_entries([
+            ArchiveEntry("/".join(["d"] * 63 + ["f"])),
+        ])
+        validate_portable_fat_entries([
+            ArchiveEntry("/".join(["a" * 204] * 5)),
+        ])
+
+        rejected = (
+            "a" * 256,
+            "\N{GRINNING FACE}" * 128,
+            "/".join(["d"] * 64 + ["f"]),
+            "/".join(["a" * 205] * 5),
+        )
+        for path in rejected:
+            with self.subTest(length=len(path)), self.assertRaises(UnsafeArchiveError):
+                validate_portable_fat_entries([ArchiveEntry(path)])
+
+    def test_rejects_reserved_boot_and_windows_payload_paths(self):
+        reserved = (
+            "EFI/BOOT/BOOTX64.EFI",
+            "efi/boot/boot.efi",
+            "EFI/BOOT/BOOTCUSTOM.EFI/child",
+            "sources/install.wim",
+            "SOURCES/INSTALL.ESD",
+            "sources/install.swm",
+            "sources/install2.swm",
+            "sources/install99.SWM/child",
+        )
+        for path in reserved:
+            with self.subTest(path=path):
+                self.assert_overlay_unsafe([], [ArchiveEntry(path)])
+
+        allowed = (
+            "EFI/vendor/BOOTX64.EFI",
+            "EFI/BOOT/grubx64.efi",
+            "x64/sources/install.wim",
+            "sources/install.wim.bak",
+            "sources/myinstall.swm",
+        )
+        result = merge_additive_overlay_entries(
+            [], [ArchiveEntry(path) for path in allowed],
+        )
+        self.assertEqual(
+            tuple(entry.path for entry in result.overlay_entries),
+            allowed,
+        )
+
+    def test_caps_the_combined_effective_catalog(self):
+        with (
+            patch("isopropyl.iso.ISO_OVERLAY_EFFECTIVE_MEMBER_MAX_COUNT", 1),
+            self.assertRaisesRegex(UnsafeArchiveError, "too many members"),
+        ):
+            merge_additive_overlay_entries(
+                [ArchiveEntry("base")], [ArchiveEntry("addition")],
+            )
+
+        with patch("isopropyl.iso.ISO_OVERLAY_EFFECTIVE_MEMBER_MAX_COUNT", 1):
+            merged = merge_additive_overlay_entries(
+                [ArchiveEntry("shared", kind=EntryKind.DIRECTORY)],
+                [ArchiveEntry("SHARED", kind=EntryKind.DIRECTORY)],
+            )
+        self.assertEqual(len(merged.merged_entries), 1)
 
 
 if __name__ == "__main__":

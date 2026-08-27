@@ -92,7 +92,9 @@ launchers are also available:
 2. Choose **ISO mode — filesystem-aware, UEFI-only** and open **Plan details…**.
 3. For recognized Windows media, optionally configure **Windows options…** and
    inspect the generated answer file.
-4. Review the filesystem, transformations, firmware limitations, temporary-space
+4. Optionally choose **Add ZIP…** to include new files from one bounded archive.
+   Review its expanded size and SHA-256; it cannot replace existing ISO content.
+5. Review the filesystem, transformations, firmware limitations, temporary-space
    requirement, and exact target identity before confirming.
 
 Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
@@ -109,6 +111,12 @@ Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
   handles a sole conventional oversized Windows WIM when possible, and verifies
   every destination file. NTFS media use a release-and-hash-pinned UEFI:NTFS
   bridge after explicit download consent.
+- **Additive ZIP overlays** can add ordinary files and directories from one
+  bounded stored/deflated archive in ISO mode. Identity, SHA-256, CRC, sizes, and
+  the final private tree are checked; collisions, traversal, links, special
+  files, encryption, fallback `EFI/BOOT/BOOT*.EFI` loaders, and canonical Windows
+  install WIM/ESD/SWM payloads are rejected. The digest binds the selected bytes
+  but does not authenticate their author.
 - Compressed `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, legacy `.Z`, and single-file
   ZIP images stream without an expanded copy. VHD, VHDX, QCOW, and QCOW2 inputs
   use an identity-checked `qemu-img` staging step.
@@ -159,6 +167,7 @@ For the implementation-level capability audit and Rufus comparison, see
 |---|---|---|
 | Hybrid `.iso` | DD mode | Preserves the image's existing layout exactly. |
 | Eligible UEFI `.iso` | ISO mode | UEFI-only; FAT32 or verified UEFI:NTFS depending on file sizes and architecture. |
+| Optional `.zip` overlay | Additive ISO mode | One bounded stored/deflated archive; additions only, no overwrites. |
 | `.img`, `.raw`, `.usb`, `.wic` | DD mode | Treated as raw disk images, not structured installers. |
 | Compressed raw image | Streaming DD | ZIP must contain exactly one regular image. |
 | VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; encrypted containers and backing files are rejected. |
@@ -210,7 +219,8 @@ Optional tools unlock additional workflows:
 | Legacy Unix `.Z` images | `gzip` |
 | Busy-drive process names | `fuser` (`psmisc`) |
 
-ISO mode also needs temporary space for its private extracted tree. WIM edition
+ISO mode also needs temporary space for its private extracted tree, including
+the overlay's complete expanded size when one is selected. WIM edition
 inspection or splitting can require several additional gigabytes. Missing
 optional tools disable the relevant path rather than weakening its checks.
 
