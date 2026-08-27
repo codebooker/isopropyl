@@ -332,7 +332,16 @@ class Window(QMainWindow):
             self.device_combo.setItemText(index, self.display_device(device))
         if self.image is not None:
             try:
-                if self.inspection is not None and self.inspection.compression != "none":
+                if (
+                    self.inspection is not None
+                    and self.inspection.sparse_format == "VTSI"
+                ):
+                    text = (
+                        f"{self.image.name}  ·  "
+                        f"{self.display_size(self.inspection.size)} expanded disk "
+                        f"({self.display_size(self.inspection.container_size)} sparse file)"
+                    )
+                elif self.inspection is not None and self.inspection.compression != "none":
                     text = (
                         f"{self.image.name}  ·  "
                         f"{self.display_size(self.inspection.size)} expanded"
@@ -552,7 +561,7 @@ class Window(QMainWindow):
     def choose_image(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self, "Choose a disk image", str(Path.home()),
-            "Disk images (*.iso *.img *.raw *.usb *.wic *.vhd *.vhdx *.qcow *.qcow2 *.gz *.gzip *.bz2 *.bzip2 *.xz *.lzma *.zst *.zstd *.Z *.z *.zip);;All files (*)",
+            "Disk images (*.iso *.img *.raw *.usb *.wic *.vtsi *.vhd *.vhdx *.qcow *.qcow2 *.gz *.gzip *.bz2 *.bzip2 *.xz *.lzma *.zst *.zstd *.Z *.z *.zip);;All files (*)",
         )
         if filename:
             self.load_image(Path(filename))
@@ -976,6 +985,17 @@ class Window(QMainWindow):
         except ValueError:
             return None
 
+    def verification_is_mandatory(self) -> bool:
+        mode = self.selected_write_mode()
+        return bool(
+            mode is WriteMode.EXTRACTED_ISO
+            or (
+                mode is WriteMode.DD
+                and self.inspection is not None
+                and self.inspection.sparse_format == "VTSI"
+            )
+        )
+
     def selected_persistence_bytes(self) -> int:
         if (
             self.persistence_profile is not None
@@ -1080,7 +1100,11 @@ class Window(QMainWindow):
             else recommendation.recommended_mode
         )
         labels = {
-            WriteMode.DD: "DD mode — exact byte-for-byte copy",
+            WriteMode.DD: (
+                "VTSI restore — expand sparse disk image"
+                if inspection.sparse_format == "VTSI" else
+                "DD mode — exact byte-for-byte copy"
+            ),
             WriteMode.EXTRACTED_ISO: "ISO mode — filesystem-aware, UEFI-only",
         }
         self.write_method.blockSignals(True)
@@ -1122,15 +1146,30 @@ class Window(QMainWindow):
         if self.inspection is not None:
             label = (
                 "ISO mode" if mode is WriteMode.EXTRACTED_ISO else
+                "VTSI restore" if (
+                    mode is WriteMode.DD
+                    and self.inspection.sparse_format == "VTSI"
+                ) else
                 "DD mode" if mode is WriteMode.DD else
                 "Choose a write method"
             )
             self.image_detail.setText(f"{label} · {self.inspection.summary}")
         iso_mode = mode is WriteMode.EXTRACTED_ISO
-        self.verify.setChecked(True if iso_mode else self.verify.isChecked())
-        self.verify.setEnabled(not self.operation_active and not iso_mode)
+        vtsi_mode = bool(
+            mode is WriteMode.DD
+            and self.inspection is not None
+            and self.inspection.sparse_format == "VTSI"
+        )
+        mandatory_verification = self.verification_is_mandatory()
+        self.verify.setChecked(
+            True if mandatory_verification else self.verify.isChecked()
+        )
+        self.verify.setEnabled(
+            not self.operation_active and not mandatory_verification
+        )
         self.write_button.setText(
             "Write in ISO mode" if iso_mode else
+            "Restore VTSI image" if vtsi_mode else
             "Write in DD mode (ZIP omitted)"
             if mode is WriteMode.DD and self.zip_overlay_plan is not None else
             "Write in DD mode" if mode is WriteMode.DD else
@@ -1156,6 +1195,11 @@ class Window(QMainWindow):
             and mode in recommendation.available_modes  # type: ignore[union-attr]
             and plan.minimum_target_bytes + self.selected_persistence_bytes()
             <= device.size
+            and (
+                self.inspection is None
+                or self.inspection.sparse_format != "VTSI"
+                or device.size == self.inspection.size
+            )
         )
         overlay_ready = (
             self.zip_overlay_preparer is None
@@ -1194,6 +1238,22 @@ class Window(QMainWindow):
         elif self.image and device and plan is not None and not enough_space:
             self.status.setText(
                 "The selected target is too small for this write method"
+            )
+        elif (
+            self.image and device and self.inspection is not None
+            and self.inspection.sparse_format == "VTSI"
+            and device.size != self.inspection.size
+        ):
+            self.status.setText(
+                "VTSI restore requires a target with the exact expanded capacity"
+            )
+        elif (
+            self.image and device and self.inspection is not None
+            and self.inspection.sparse_format == "VTSI"
+            and device.logical_sector_size != 512
+        ):
+            self.status.setText(
+                "VTSI restore requires a drive that reports 512-byte sectors"
             )
         elif not self.operation_active:
             self.status.setText("Ready when you are")
@@ -1335,10 +1395,15 @@ class Window(QMainWindow):
             )
             if warning != QMessageBox.StandardButton.Yes:
                 return
+        method_description = (
+            "Ventoy sparse image restore · expanded zero/data stream"
+            if self.inspection.sparse_format == "VTSI"
+            else "DD mode · exact byte-for-byte copy"
+        )
         answer = QMessageBox.warning(
             self, "Erase removable drive?",
             f"Everything on {self.display_device(device)} will be permanently erased.\n\n"
-            f"Image: {self.image.name}\nMethod: DD mode · exact byte-for-byte copy\n"
+            f"Image: {self.image.name}\nMethod: {method_description}\n"
             f"Layout: {self.inspection.layout}\n"
             f"Target: {device.path}\nSerial: {device.serial or device.wwn or 'not reported'}\n\n"
             "Check the target carefully before continuing.",
@@ -1580,9 +1645,10 @@ class Window(QMainWindow):
             self.progress_estimator.reset()
         self.source_card.setEnabled(not busy)
         self.target_card.setEnabled(not busy)
-        self.verify.setEnabled(
-            not busy and self.selected_write_mode() is not WriteMode.EXTRACTED_ISO
-        )
+        mandatory_verification = self.verification_is_mandatory()
+        if mandatory_verification:
+            self.verify.setChecked(True)
+        self.verify.setEnabled(not busy and not mandatory_verification)
         self.show_external.setEnabled(not busy)
         self.tools_button.setEnabled(not busy and self.selected_device() is not None)
         self.uefi_shell_button.setEnabled(
@@ -2811,7 +2877,13 @@ class Window(QMainWindow):
             self.inspection_identity = identity
             self.persistence_profile = supported_casper_profile(self.inspection)
             self.logger.info("Image inspection: %s", self.inspection.summary)
-            if self.inspection.compression != "none":
+            if self.inspection.sparse_format == "VTSI":
+                self.image_label.setText(
+                    f"{self.image.name}  ·  "
+                    f"{self.display_size(self.inspection.size)} expanded disk "
+                    f"({self.display_size(self.inspection.container_size)} sparse file)"
+                )
+            elif self.inspection.compression != "none":
                 self.image_label.setText(
                     f"{self.image.name}  ·  "
                     f"{self.display_size(self.inspection.size)} expanded"

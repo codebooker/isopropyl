@@ -23,12 +23,118 @@ from isopropyl.sources import (
     ExpandedImageTooLarge, ImageSourceError, SourceChanged, open_image_source,
 )
 from isopropyl.writer import ImageWriter, verify_image
+from isopropyl.vtsi import VtsiChanged
 
 
 PAYLOAD = (b"ISOPROPYL disk image\0" + bytes(range(256))) * 4096
 
 
+def vtsi_fixture(expanded: bytes, stored_ranges: tuple[tuple[int, int], ...]) -> bytes:
+    if len(expanded) % 512:
+        raise ValueError("expanded VTSI fixture must contain complete sectors")
+    signature = int.from_bytes(expanded[440:444], "little")
+    data = bytearray()
+    records = bytearray()
+    for start_sector, sector_count in stored_ranges:
+        disk_offset = start_sector * 512
+        byte_count = sector_count * 512
+        records.extend(struct.pack("<QQQ", start_sector, sector_count, len(data)))
+        data.extend(expanded[disk_offset:disk_offset + byte_count])
+    if not data or len(data) % 512:
+        raise ValueError("stored VTSI fixture data must be nonempty and aligned")
+    table_checksum = (~sum(records)) & 0xFFFFFFFF
+    padded_records = records + b"\0" * ((-len(records)) % 512)
+    footer = bytearray(512)
+    struct.pack_into(
+        "<8sHHQIIIIQ", footer, 0, b"VENTOY\0\0", 1, 0, len(expanded),
+        signature, 0, len(stored_ranges), table_checksum, len(data),
+    )
+    struct.pack_into("<I", footer, 24, (~sum(footer)) & 0xFFFFFFFF)
+    return bytes(data + padded_records + footer)
+
+
 class SourceTests(unittest.TestCase):
+    def test_vtsi_measure_is_constant_space_and_stream_expands_sparse_ranges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.vtsi"
+            expanded = bytearray(8 * 512)
+            expanded[:512] = b"A" * 512
+            expanded[4 * 512:5 * 512] = b"B" * 512
+            path.write_bytes(vtsi_fixture(bytes(expanded), ((0, 1), (4, 1))))
+
+            with patch("isopropyl.sources.iter_vtsi_chunks") as iterator:
+                source = open_image_source(path)
+                self.assertEqual(source.measure(), len(expanded))
+                iterator.assert_not_called()
+            source.close()
+
+            with open_image_source(path) as reopened:
+                self.assertEqual(reopened.sparse_format, "vtsi")
+                self.assertTrue(reopened.requires_exact_target_size)
+                self.assertEqual(reopened.required_logical_sector_size, 512)
+                self.assertFalse(reopened.compressed)
+                self.assertEqual(
+                    b"".join(reopened.chunks(expected_size=len(expanded))),
+                    bytes(expanded),
+                )
+                with self.assertRaises(ExpandedImageTooLarge):
+                    reopened.measure(maximum=len(expanded) - 1)
+
+    def test_vtsi_open_and_stream_preserve_exact_cancellation_exception(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.vtsi"
+            expanded = b"A" * (4 * 512)
+            path.write_bytes(vtsi_fixture(expanded, ((0, 1),)))
+            checks = 0
+
+            def cancel_open() -> None:
+                nonlocal checks
+                checks += 1
+                if checks >= 2:
+                    raise RuntimeError("cancel VTSI open")
+
+            with self.assertRaisesRegex(RuntimeError, "cancel VTSI open"):
+                open_image_source(path, cancel_check=cancel_open)
+
+            source = open_image_source(path)
+
+            def cancel_stream() -> None:
+                raise OSError("cancel VTSI stream")
+
+            with self.assertRaisesRegex(OSError, "cancel VTSI stream"):
+                next(source.chunks(cancel_check=cancel_stream))
+            source.close()
+
+            exact = VtsiChanged("caller-owned cancellation")
+
+            def cancel_with_backend_type() -> None:
+                raise exact
+
+            with self.assertRaises(VtsiChanged) as caught:
+                open_image_source(path, cancel_check=cancel_with_backend_type)
+            self.assertIs(caught.exception, exact)
+
+    def test_vtsi_identity_change_is_rejected_before_measure_or_sparse_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.vtsi"
+            expanded = b"A" * (4 * 512)
+            path.write_bytes(vtsi_fixture(expanded, ((0, 1),)))
+            source = open_image_source(path)
+            path.write_bytes(path.read_bytes()[:-1] + b"X")
+
+            with self.assertRaises(SourceChanged):
+                source.measure()
+            with self.assertRaises(SourceChanged):
+                source.read_sparse_at(0, 512)
+            source.close()
+
+    def test_vtsi_fifo_is_rejected_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.vtsi"
+            os.mkfifo(path)
+            with self.assertRaisesRegex(ImageSourceError, "regular file"):
+                open_image_source(path)
+
     def test_bzip2_alias_streams_the_expanded_image(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "disk.img.bzip2"
@@ -453,6 +559,61 @@ class SourceTests(unittest.TestCase):
             )
             self.assertEqual(command[8], "/usr/bin/dd")
             self.assertNotIn(f"if={path}", command)
+
+    def test_writer_streams_vtsi_expanded_disk_in_lba_order(self):
+        class NonClosingBuffer(io.BytesIO):
+            def close(self) -> None:
+                pass
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdin = NonClosingBuffer()
+                self.stderr = io.BytesIO()
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+        class NoUnmountWriter(ImageWriter):
+            def unmount(self, device: Device) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.vtsi"
+            expanded = bytearray(8 * 512)
+            expanded[1 * 512:2 * 512] = b"A" * 512
+            expanded[5 * 512:7 * 512] = b"B" * (2 * 512)
+            # Source payloads follow catalog order, while the expanded output
+            # must follow disk-LBA order.
+            path.write_bytes(
+                vtsi_fixture(bytes(expanded), ((5, 2), (1, 1)))
+            )
+            device = Device(
+                "/dev/sdz", len(expanded), "Test", "", "usb", "S", "", "8:99",
+                True, True, False, (), (), 512,
+            )
+            process = FakeProcess()
+            updates: list[tuple[int, int]] = []
+            with patch("isopropyl.writer.subprocess.Popen", return_value=process):
+                NoUnmountWriter(
+                    which=lambda name: f"/usr/bin/{name}",
+                    device_lookup=lambda _path: device,
+                    block_stat=lambda _path: SimpleNamespace(
+                        st_mode=stat.S_IFBLK, st_rdev=os.makedev(8, 99),
+                    ),
+                ).write(
+                    path, device,
+                    lambda done, total: updates.append((done, total)),
+                )
+
+            self.assertEqual(process.stdin.getvalue(), bytes(expanded))
+            self.assertEqual(updates[-1], (len(expanded), len(expanded)))
 
     def test_writer_streams_plain_bytes_without_reopening_the_path_in_dd(self):
         class NonClosingBuffer(io.BytesIO):

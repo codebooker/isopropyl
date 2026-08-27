@@ -13,7 +13,8 @@ evidence.
    SSDs.
 2. Test unplug, cancellation, authentication refusal, short writes, full disks,
    mount conflicts, overlay mutation/CRC/decompression failure, target-resident
-   overlay refusal, and cleanup failures without weakening identity checks.
+   overlay refusal, VTSI expansion and exact-capacity restore, and cleanup failures
+   without weakening identity checks.
 3. Evolve the shipped fail-fast, per-command cooperative whole-device locks into
    a privileged broker/private-namespace design that can retain ownership across
    the complete destructive transaction. Continue describing Linux BSD locks as
@@ -59,9 +60,11 @@ evidence.
   static analysis and never promote an embedded-only result into boot trust.
 - Add Windows To Go through `wimlib` apply, offline BCD/SAN policy, and explicit
   internal-disk behavior.
-- Add FFU/VTSI/direct WIM/ESD input and FFU/UDF-image authoring output only after
-  format parsers and size/platform checks fail closed. Continue hardening and
-  physically certifying the implemented VHD/VHDX drive-backup path.
+- Physically certify the strict VTSI v1.0 restore path on representative Ventoy
+  media; keep its exact-capacity and 512-byte logical-sector requirements. Add
+  FFU/direct WIM/ESD input and FFU/UDF-image authoring output only after format
+  parsers and size/platform checks fail closed. Continue hardening and physically
+  certifying the implemented VHD/VHDX drive-backup path.
 - Hardware-test additive overlays with representative Windows and Linux installer
   layouts. Additional archive formats or multiple ordered overlays remain out of
   scope until they preserve the same bounded, no-overwrite namespace and exact-byte

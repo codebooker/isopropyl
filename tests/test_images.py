@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 from isopropyl.images import (
     ChecksumCancelled, ImageInspectionCancelled, ImageInspectionTimedOut,
     ImageMember,
-    NON_RAW_SUFFIXES, RAW_IMAGE_SUFFIXES,
+    NON_RAW_SUFFIXES, RAW_IMAGE_SUFFIXES, SPARSE_SUFFIXES,
     boot_identity_fields,
     calculate_checksums, classify_boot_paths, classify_windows_installer_members,
     compare_expected_checksum, inspect_image, parse_7z_listing, parse_expected_checksum,
@@ -21,7 +21,7 @@ from isopropyl.images import (
 )
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.partition_tables import PartitionTableInspection
-from isopropyl.sources import ExpandedImageTooLarge
+from isopropyl.sources import ExpandedImageTooLarge, ImageSourceError
 from isopropyl.timestamps import (
     MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
 )
@@ -67,6 +67,26 @@ def add_valid_mbr(data: bytearray, sector_size: int = 512) -> None:
         b"\0\0\0", 1, sectors - 1,
     )
     data[510:512] = b"\x55\xaa"
+
+
+def vtsi_fixture(expanded: bytes, stored_ranges: tuple[tuple[int, int], ...]) -> bytes:
+    signature = int.from_bytes(expanded[440:444], "little")
+    data = bytearray()
+    records = bytearray()
+    for start_sector, sector_count in stored_ranges:
+        disk_offset = start_sector * 512
+        byte_count = sector_count * 512
+        records.extend(struct.pack("<QQQ", start_sector, sector_count, len(data)))
+        data.extend(expanded[disk_offset:disk_offset + byte_count])
+    table_checksum = (~sum(records)) & 0xFFFFFFFF
+    padded_records = records + b"\0" * ((-len(records)) % 512)
+    footer = bytearray(512)
+    struct.pack_into(
+        "<8sHHQIIIIQ", footer, 0, b"VENTOY\0\0", 1, 0, len(expanded),
+        signature, 0, len(stored_ranges), table_checksum, len(data),
+    )
+    struct.pack_into("<I", footer, 24, (~sum(footer)) & 0xFFFFFFFF)
+    return bytes(data + padded_records + footer)
 
 
 class ImageTests(unittest.TestCase):
@@ -422,6 +442,71 @@ Folder = -
             self.assertEqual(result.compression, "gzip")
             self.assertTrue(result.raw_compatible)
 
+    def test_vtsi_inspection_uses_sparse_prefix_tail_and_reports_both_sizes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.vtsi"
+            expanded = bytearray(256 * 512)
+            add_valid_mbr(expanded)
+            expanded[-512:] = b"T" * 512
+            path.write_bytes(vtsi_fixture(
+                bytes(expanded), ((0, 1), (len(expanded) // 512 - 1, 1)),
+            ))
+            stored_size = path.stat().st_size
+
+            from isopropyl.vtsi import read_vtsi_at as real_read_vtsi_at
+            with (
+                patch(
+                    "isopropyl.sources.read_vtsi_at",
+                    wraps=real_read_vtsi_at,
+                ) as sparse_read,
+                patch("isopropyl.sources.iter_vtsi_chunks") as iterator,
+                patch("isopropyl.images.scan_image_contents") as catalog,
+            ):
+                result = inspect_image(path)
+
+            self.assertEqual(result.size, len(expanded))
+            self.assertEqual(result.container_size, stored_size)
+            self.assertEqual(result.sparse_format, "VTSI")
+            self.assertEqual(result.virtual_format, "")
+            self.assertEqual(result.kind, "Sparse disk image (VTSI)")
+            self.assertEqual(result.layout, "Sparse VTSI disk image")
+            self.assertTrue(result.has_mbr)
+            self.assertTrue(result.raw_compatible)
+            iterator.assert_not_called()
+            catalog.assert_not_called()
+            self.assertEqual(len(sparse_read.call_args_list), 2)
+            self.assertTrue(all(
+                call.args[3] <= max(17 * 2048, 16 * 1024 * 1024 + 3 * 4096)
+                for call in sparse_read.call_args_list
+            ))
+
+    def test_vtsi_inspection_limit_and_cancellation_fail_before_expanded_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.vtsi"
+            expanded = bytearray(16 * 512)
+            add_valid_mbr(expanded)
+            path.write_bytes(vtsi_fixture(bytes(expanded), ((0, 1),)))
+
+            with (
+                patch("isopropyl.sources.iter_vtsi_chunks") as iterator,
+                self.assertRaises(ExpandedImageTooLarge),
+            ):
+                inspect_image(path, maximum_expanded_bytes=len(expanded) - 1)
+            iterator.assert_not_called()
+
+            checks = 0
+
+            def cancel() -> None:
+                nonlocal checks
+                checks += 1
+                if checks >= 3:
+                    raise ImageInspectionCancelled("cancel VTSI inspection")
+
+            with self.assertRaisesRegex(
+                ImageInspectionCancelled, "cancel VTSI inspection",
+            ):
+                inspect_image(path, cancel_check=cancel)
+
     def test_compressed_inspection_enforces_an_expanded_size_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "disk.img.gz"
@@ -492,7 +577,7 @@ Folder = -
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in (
-                "install.wim", "install.esd", "capture.ffu", "image.vtsi",
+                "install.wim", "install.esd", "capture.ffu",
                 "disk.vhdx.gz", "disk.qcow2.xz", "install.wim.zst",
             ):
                 with self.subTest(name=name):
@@ -501,9 +586,21 @@ Folder = -
                     with self.assertRaisesRegex(OSError, "cannot be written|not accepted"):
                         inspect_image(path)
 
+            invalid_vtsi = root / "image.vtsi"
+            invalid_vtsi.write_bytes(b"not a VTSI")
+            with self.assertRaisesRegex(ImageSourceError, "Could not inspect"):
+                inspect_image(invalid_vtsi)
+
+            compressed_vtsi = root / "disk.vtsi.gz"
+            compressed_vtsi.write_bytes(gzip.compress(b"not a VTSI"))
+            with self.assertRaisesRegex(OSError, "not accepted"):
+                inspect_image(compressed_vtsi)
+
     def test_usb_and_wic_are_explicit_raw_disk_image_aliases(self):
         self.assertTrue({".usb", ".wic"}.issubset(RAW_IMAGE_SUFFIXES))
         self.assertTrue(RAW_IMAGE_SUFFIXES.isdisjoint(NON_RAW_SUFFIXES))
+        self.assertEqual(SPARSE_SUFFIXES, frozenset({".vtsi"}))
+        self.assertTrue(SPARSE_SUFFIXES.isdisjoint(NON_RAW_SUFFIXES))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ("appliance.usb", "yocto.wic", "UPPER.USB", "UPPER.WIC"):

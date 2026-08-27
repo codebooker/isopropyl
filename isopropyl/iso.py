@@ -641,6 +641,22 @@ def build_write_plan(
         raise PlanError("Target logical sector size cannot be negative")
 
     if mode is WriteMode.DD:
+        if inspection.sparse_format:
+            if inspection.sparse_format != "VTSI":
+                raise PlanError("The sparse image format is not supported")
+            if target_size is not None and target_size != inspection.size:
+                raise PlanError(
+                    "A VTSI restore requires a target whose capacity exactly "
+                    "matches the expanded disk image"
+                )
+            if (
+                target_logical_sector_size is not None
+                and target_logical_sector_size != 512
+            ):
+                raise PlanError(
+                    "A VTSI restore requires a target that reports 512-byte "
+                    "logical sectors"
+                )
         if target_size is not None and target_size < inspection.size:
             raise PlanError("The target is smaller than the byte-for-byte image")
         warnings: tuple[str, ...] = ()
@@ -974,11 +990,22 @@ def recommend_write_method(
     ):
         raise PlanError("Target logical sector size cannot be negative")
     frozen_entries = tuple(entries)
+    is_vtsi = inspection.sparse_format == "VTSI"
     dd_plan = build_write_plan(
         inspection, frozen_entries, requested_mode=WriteMode.DD,
-        target_logical_sector_size=target_logical_sector_size,
+        target_logical_sector_size=(
+            None if is_vtsi else target_logical_sector_size
+        ),
     )
-    dd_available = target_size is None or dd_plan.minimum_target_bytes <= target_size
+    vtsi_capacity_matches = target_size is None or target_size == inspection.size
+    vtsi_sector_matches = (
+        target_logical_sector_size is None or target_logical_sector_size == 512
+    )
+    dd_available = (
+        (target_size is None or dd_plan.minimum_target_bytes <= target_size)
+        and (not is_vtsi or vtsi_capacity_matches)
+        and (not is_vtsi or vtsi_sector_matches)
+    )
     sector_mismatch = partition_sector_mismatch(
         inspection, target_logical_sector_size,
     )
@@ -997,6 +1024,14 @@ def recommend_write_method(
             modes,
             WriteMode.DD if dd_available and not requires_explicit_dd else None,
             (
+                "VTSI restore expands every described data extent and zero-filled "
+                "gap into a target with the exact original disk capacity."
+                if dd_available and is_vtsi else
+                "The selected target capacity does not exactly match the expanded "
+                "VTSI disk image."
+                if is_vtsi and not vtsi_capacity_matches else
+                "VTSI restore requires a target that reports 512-byte logical sectors."
+                if is_vtsi and not vtsi_sector_matches else
                 "The image contains malformed partition metadata. DD mode remains "
                 "available as an explicit byte-for-byte choice, but is not recommended."
                 if dd_available and malformed else

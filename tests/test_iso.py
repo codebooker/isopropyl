@@ -78,6 +78,52 @@ class PlanTests(unittest.TestCase):
         self.assertIsNone(plan.layout)
         self.assertEqual(plan.minimum_content_bytes, 1024)
 
+    def test_vtsi_requires_exact_capacity_and_512_byte_target_sectors(self):
+        image = replace(
+            inspection(iso=False),
+            size=4096,
+            sparse_format="VTSI",
+            container_size=1536,
+        )
+
+        accepted = recommend_write_method(
+            image, target_size=4096, target_logical_sector_size=512,
+        )
+        self.assertEqual(accepted.available_modes, (WriteMode.DD,))
+        self.assertEqual(accepted.recommended_mode, WriteMode.DD)
+        self.assertIn("zero-filled", accepted.reason)
+
+        for target_size, sector_size, message in (
+            (4608, 512, "exactly match"),
+            (3584, 512, "exactly match"),
+            (4096, 4096, "512-byte"),
+            (4096, 0, "512-byte"),
+        ):
+            with self.subTest(target_size=target_size, sector_size=sector_size):
+                rejected = recommend_write_method(
+                    image,
+                    target_size=target_size,
+                    target_logical_sector_size=sector_size,
+                )
+                self.assertEqual(rejected.available_modes, ())
+                self.assertIsNone(rejected.recommended_mode)
+                self.assertIn(message, rejected.reason)
+
+        with self.assertRaisesRegex(PlanError, "exactly matches"):
+            build_write_plan(
+                image,
+                requested_mode=WriteMode.DD,
+                target_size=4608,
+                target_logical_sector_size=512,
+            )
+        with self.assertRaisesRegex(PlanError, "512-byte"):
+            build_write_plan(
+                image,
+                requested_mode=WriteMode.DD,
+                target_size=4096,
+                target_logical_sector_size=4096,
+            )
+
     def test_auto_selects_extracted_fat32_mbr_for_hybrid_iso(self):
         plan = build_write_plan(
             inspection(), [ArchiveEntry("boot/grub/grub.cfg", 20)]

@@ -20,6 +20,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from .vtsi import (
+    VTSI_MAX_DISK_BYTES,
+    VTSI_SECTOR_BYTES,
+    VtsiChanged,
+    VtsiError,
+    VtsiPlan,
+    inspect_vtsi_descriptor,
+    iter_vtsi_chunks,
+    read_vtsi_at,
+    validate_vtsi_plan,
+)
+
 
 CHUNK_SIZE = 4 * 1024 * 1024
 DECODER_ERROR_LIMIT = 16 * 1024
@@ -188,13 +200,28 @@ class ImageSource:
     destructive write. The subsequent stream must have exactly that length.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        cancel_check: CancelCheck | None = None,
+        maximum_sparse_bytes: int = VTSI_MAX_DISK_BYTES,
+    ) -> None:
         self.path = Path(os.path.abspath(os.fspath(path)))
         self._descriptor: int | None = None
         self._descriptor_identity: tuple[int, int, int, int, int] | None = None
         self._descriptor_finalizer: weakref.finalize | None = None
+        self._vtsi_plan: VtsiPlan | None = None
+        self.sparse_format = ""
+        self.requires_exact_target_size = False
+        self.required_logical_sector_size = 0
         self.compression = self._detect_compression()
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         try:
             descriptor = os.open(self.path, flags)
         except OSError as error:
@@ -210,6 +237,42 @@ class ImageSource:
         self._descriptor = descriptor
         self._descriptor_identity = _bound_identity(status)
         self._descriptor_finalizer = weakref.finalize(self, os.close, descriptor)
+        if self.path.suffix.casefold() == ".vtsi":
+            cancel_failure: BaseException | None = None
+
+            def check_cancelled() -> None:
+                nonlocal cancel_failure
+                if cancel_check is None:
+                    return
+                try:
+                    cancel_check()
+                except BaseException as error:
+                    cancel_failure = error
+                    raise
+
+            try:
+                self._vtsi_plan = inspect_vtsi_descriptor(
+                    descriptor,
+                    self.path,
+                    cancel_check=check_cancelled,
+                    maximum_disk_size=maximum_sparse_bytes,
+                )
+            except VtsiChanged as error:
+                self.close()
+                if error is cancel_failure:
+                    raise
+                raise SourceChanged(str(error)) from error
+            except VtsiError as error:
+                self.close()
+                if error is cancel_failure:
+                    raise
+                raise ImageSourceError(f"Could not inspect {self.path.name}: {error}") from error
+            except BaseException:
+                self.close()
+                raise
+            self.sparse_format = "vtsi"
+            self.requires_exact_target_size = True
+            self.required_logical_sector_size = VTSI_SECTOR_BYTES
 
     @property
     def compressed(self) -> bool:
@@ -449,6 +512,42 @@ class ImageSource:
         maximum: int | None = None,
         cancel_check: CancelCheck | None = None,
     ) -> int:
+        if self._vtsi_plan is not None:
+            cancel_failure: BaseException | None = None
+
+            def check_cancelled() -> None:
+                nonlocal cancel_failure
+                if cancel_check is None:
+                    return
+                try:
+                    cancel_check()
+                except BaseException as error:
+                    cancel_failure = error
+                    raise
+
+            check_cancelled()
+            try:
+                validate_vtsi_plan(
+                    self._require_descriptor(), self._vtsi_plan,
+                    cancel_check=check_cancelled,
+                )
+            except VtsiChanged as error:
+                if error is cancel_failure:
+                    raise
+                raise SourceChanged(str(error)) from error
+            except VtsiError as error:
+                if error is cancel_failure:
+                    raise
+                raise ImageSourceError(
+                    f"Could not validate {self.path.name}: {error}"
+                ) from error
+            size = self._vtsi_plan.disk_size
+            if maximum is not None and size > maximum:
+                raise ExpandedImageTooLarge(
+                    f"The image contains {size} bytes, larger than the {maximum}-byte target"
+                )
+            check_cancelled()
+            return size
         if not self.compressed:
             size = self.identity.size
             if maximum is not None and size > maximum:
@@ -488,6 +587,39 @@ class ImageSource:
                 cancel_failure = error
                 raise
 
+        if self._vtsi_plan is not None:
+            try:
+                for block in iter_vtsi_chunks(
+                    self._require_descriptor(), self._vtsi_plan,
+                    chunk_size=CHUNK_SIZE, cancel_check=check_cancelled,
+                ):
+                    check_cancelled()
+                    self._ensure_unchanged()
+                    done += len(block)
+                    if expected_size is not None and done > expected_size:
+                        raise ImageSourceError(
+                            "The sparse image produced more data than its measured size"
+                        )
+                    yield block
+                self._ensure_unchanged()
+                if expected_size is not None and done != expected_size:
+                    raise ImageSourceError(
+                        f"The sparse image ended at {done} bytes; expected {expected_size}"
+                    )
+                return
+            except SourceChanged:
+                raise
+            except VtsiChanged as error:
+                if error is cancel_failure:
+                    raise
+                raise SourceChanged(str(error)) from error
+            except VtsiError as error:
+                if error is cancel_failure:
+                    raise
+                raise ImageSourceError(
+                    f"Could not decode {self.path.name}: {error}"
+                ) from error
+
         try:
             with self._open(cancel_check=check_cancelled) as stream:
                 while True:
@@ -520,6 +652,47 @@ class ImageSource:
             raise ImageSourceError(
                 f"The decoded image ended at {done} bytes; expected {expected_size}"
             )
+
+    def read_sparse_at(
+        self,
+        offset: int,
+        length: int,
+        *,
+        cancel_check: CancelCheck | None = None,
+    ) -> bytes:
+        """Read a bounded range from the expanded sparse-disk view."""
+
+        if self._vtsi_plan is None:
+            raise ImageSourceError("The selected image is not a supported sparse image")
+        cancel_failure: BaseException | None = None
+
+        def check_cancelled() -> None:
+            nonlocal cancel_failure
+            if cancel_check is None:
+                return
+            try:
+                cancel_check()
+            except BaseException as error:
+                cancel_failure = error
+                raise
+
+        try:
+            payload = read_vtsi_at(
+                self._require_descriptor(), self._vtsi_plan, offset, length,
+                cancel_check=check_cancelled,
+            )
+        except VtsiChanged as error:
+            if error is cancel_failure:
+                raise
+            raise SourceChanged(str(error)) from error
+        except VtsiError as error:
+            if error is cancel_failure:
+                raise
+            raise ImageSourceError(
+                f"Could not read {self.path.name}: {error}"
+            ) from error
+        self._ensure_unchanged()
+        return payload
 
     @contextmanager
     def _open(
@@ -680,8 +853,16 @@ class ImageSource:
             yield stream
 
 
-def open_image_source(path: Path) -> ImageSource:
-    return ImageSource(path)
+def open_image_source(
+    path: Path,
+    *,
+    cancel_check: CancelCheck | None = None,
+    maximum_sparse_bytes: int = VTSI_MAX_DISK_BYTES,
+) -> ImageSource:
+    return ImageSource(
+        path, cancel_check=cancel_check,
+        maximum_sparse_bytes=maximum_sparse_bytes,
+    )
 
 
 def sha256_source(

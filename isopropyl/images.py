@@ -41,7 +41,8 @@ Progress = Callable[[int, int], None]
 CHECKSUM_LENGTHS = {32: "MD5", 40: "SHA-1", 64: "SHA-256", 128: "SHA-512"}
 RAW_IMAGE_SUFFIXES = frozenset({".img", ".raw", ".usb", ".wic"})
 VIRTUAL_SUFFIXES = frozenset({".vhd", ".vhdx", ".qcow", ".qcow2"})
-NON_RAW_SUFFIXES = frozenset({".wim", ".esd", ".ffu", ".vtsi"})
+SPARSE_SUFFIXES = frozenset({".vtsi"})
+NON_RAW_SUFFIXES = frozenset({".wim", ".esd", ".ffu"})
 COMPRESSION_SUFFIXES = frozenset({
     ".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".lzma", ".zst", ".zstd",
     ".z", ".zip",
@@ -130,6 +131,7 @@ class ImageInspection:
     mbr_kind: str = ""
     mbr_boot_code: str = ""
     partition_table_inspection_complete: bool = True
+    sparse_format: str = ""
 
     @property
     def partition_table_incomplete(self) -> bool:
@@ -157,6 +159,8 @@ class ImageInspection:
 
     @property
     def layout(self) -> str:
+        if self.sparse_format:
+            return f"Sparse {self.sparse_format} disk image"
         if self.virtual_format:
             return f"Virtual {self.virtual_format} disk"
         if self.partition_table_incomplete:
@@ -529,6 +533,25 @@ def _read_partition_evidence(
 ) -> tuple[int, bytes, bytes, PartitionTableInspection]:
     """Read bounded image headers and partition metadata from one bound source."""
 
+    if source.sparse_format:
+        size = source.measure(
+            maximum=maximum_expanded_bytes,
+            cancel_check=cancel_check,
+        )
+        needed = max(17 * 2048, PARTITION_TABLE_CAPTURE_BYTES)
+        prefix_size = min(size, needed)
+        tail_size = min(size, PARTITION_TABLE_CAPTURE_BYTES)
+        prefix = source.read_sparse_at(
+            0, prefix_size, cancel_check=cancel_check,
+        )
+        tail = source.read_sparse_at(
+            size - tail_size, tail_size, cancel_check=cancel_check,
+        )
+        header = prefix[:4096]
+        descriptor = prefix[16 * 2048:17 * 2048]
+        partition_tables = inspect_partition_tables_capture(prefix, tail, size)
+        return size, header, descriptor, partition_tables
+
     if source.compressed:
         needed = max(17 * 2048, PARTITION_TABLE_CAPTURE_BYTES)
         prefix = bytearray()
@@ -623,7 +646,11 @@ def inspect_image(
         )
     if suffix in COMPRESSION_SUFFIXES:
         inner_suffix = Path(path.stem).suffix.casefold()
-        if inner_suffix in VIRTUAL_SUFFIXES or inner_suffix in NON_RAW_SUFFIXES:
+        if (
+            inner_suffix in VIRTUAL_SUFFIXES
+            or inner_suffix in NON_RAW_SUFFIXES
+            or inner_suffix in SPARSE_SUFFIXES
+        ):
             raise OSError(
                 "Compressed virtual, WIM/ESD, FFU, and VTSI containers are not "
                 "accepted until a chained decode-and-apply workflow is available"
@@ -660,7 +687,10 @@ def inspect_image(
             virtual_format=virtual.display_format,
             container_size=virtual.identity.size,
         )
-    source = open_image_source(path)
+    source = open_image_source(
+        path,
+        cancel_check=check_inspection,
+    )
     try:
         source_identity = (
             source.identity.device, source.identity.inode,
@@ -676,16 +706,26 @@ def inspect_image(
         )
         is_compressed = source.compressed
         compression = source.compression
+        sparse_format = source.sparse_format
+        container_size = source.identity.size if sparse_format else 0
     finally:
         source.close()
 
     has_mbr = partition_tables.has_mbr
     has_gpt = partition_tables.has_gpt
-    is_iso9660 = len(descriptor) >= 6 and descriptor[1:6] == b"CD001"
+    # VTSI is a sparse disk container and remains a raw-write workflow even if
+    # arbitrary expanded bytes resemble an optical volume descriptor.
+    is_iso9660 = (
+        not sparse_format
+        and len(descriptor) >= 6
+        and descriptor[1:6] == b"CD001"
+    )
     volume_label = ""
     if is_iso9660 and len(descriptor) >= 72:
         volume_label = descriptor[40:72].decode("ascii", errors="replace").strip()
-    if is_iso9660 or suffix == ".iso":
+    if sparse_format:
+        kind = "Sparse disk image (VTSI)"
+    elif is_iso9660 or suffix == ".iso":
         kind = "Optical ISO"
     elif suffix in RAW_IMAGE_SUFFIXES:
         kind = "Raw disk image"
@@ -694,7 +734,7 @@ def inspect_image(
         # structured formats above remain a fail-closed denylist.
         kind = "Raw image"
     inspection_fd = -1
-    if not is_compressed:
+    if not is_compressed and not sparse_format:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         inspection_fd = os.open(path, flags)
         bound = os.fstat(inspection_fd)
@@ -794,6 +834,8 @@ def inspect_image(
         mbr_kind=partition_tables.mbr_kind,
         mbr_boot_code=partition_tables.mbr_boot_code,
         partition_table_inspection_complete=partition_tables.complete,
+        sparse_format="VTSI" if sparse_format == "vtsi" else "",
+        container_size=container_size,
     )
     check_inspection()
     final = path.stat()

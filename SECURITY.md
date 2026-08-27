@@ -42,6 +42,23 @@ issue requesting a private contact channel without disclosing the vulnerability.
   bounded. Destructive decompression is bounded by the selected target. Legal
   middle metadata outside the capture is reported as incomplete and is never
   automatically recommended for DD.
+- VTSI v1.0 sources use the same single, no-follow descriptor and add link
+  count to their immutable identity. The parser accepts only the exact 512-byte
+  footer/table layout, zero reserved bytes and padding, valid footer and table
+  checksums, 1–128 in-range segments with contiguous catalog-order source data,
+  and non-overlapping disk extents. Official non-monotonic disk order is
+  preserved; overlap rejection is ISOpropyl's additional fail-closed policy.
+  The footer disk-signature field is treated as opaque metadata, not an integrity
+  or provenance check. Random reads and the
+  destructive stream synthesize zero gaps without allocating the declared disk;
+  source identity and cancellation are checked around every bounded read. A VTSI
+  restore is offered only when the selected drive capacity exactly equals the
+  expanded disk size and it freshly reports 512-byte logical sectors. Those
+  constraints are rechecked before and after unmounting and after the write, and
+  GUI full read-back verification is mandatory. The VTSI checksums cover only
+  its footer and segment table—not stored disk payload bytes or authorship—so
+  read-back proves restoration fidelity, not provenance. This does not yet
+  constitute physical Ventoy boot certification.
 - Checksum calculation separately opens the inspected image once with
   `O_NOFOLLOW`, requires its bound device/inode/size/mtime/ctime identity, and
   revalidates descriptor metadata around every read plus the pathname at EOF.

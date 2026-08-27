@@ -604,17 +604,79 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertEqual(self.window.write_button.text(), "Write in ISO mode")
         self.assertTrue(self.window.write_button.isEnabled())
 
-    def test_image_chooser_advertises_raw_aliases_not_structured_apply_formats(self):
+    def test_image_chooser_advertises_raw_and_vtsi_not_other_apply_formats(self):
         with patch(
             "isopropyl.app.QFileDialog.getOpenFileName", return_value=("", ""),
         ) as chooser:
             self.window.choose_image()
 
         image_filter = chooser.call_args.args[3]
-        for pattern in ("*.img", "*.raw", "*.usb", "*.wic"):
+        for pattern in ("*.img", "*.raw", "*.usb", "*.wic", "*.vtsi"):
             self.assertIn(pattern, image_filter)
-        for pattern in ("*.wim", "*.esd", "*.ffu", "*.vtsi"):
+        for pattern in ("*.wim", "*.esd", "*.ffu"):
             self.assertNotIn(pattern, image_filter)
+
+    def test_vtsi_restore_has_exact_label_mandatory_verify_and_confirmation(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            size=1024,
+            container_size=640,
+            kind="Ventoy sparse disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            sparse_format="VTSI",
+        )
+        self.window.devices = [device(1024)]
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+
+        self.assertEqual(self.window.selected_write_mode(), WriteMode.DD)
+        self.assertEqual(
+            self.window.write_method.currentText(),
+            "VTSI restore — expand sparse disk image",
+        )
+        self.assertEqual(self.window.write_button.text(), "Restore VTSI image")
+        self.assertTrue(self.window.verify.isChecked())
+        self.assertFalse(self.window.verify.isEnabled())
+        self.window.set_busy(True)
+        self.window.set_busy(False)
+        self.assertTrue(self.window.verify.isChecked())
+        self.assertFalse(self.window.verify.isEnabled())
+
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as warning,
+            patch.object(self.window, "start_write") as start_write,
+        ):
+            self.window.confirm_write()
+
+        start_write.assert_called_once()
+        self.assertTrue(start_write.call_args.args[2])
+        self.assertIn(
+            "Ventoy sparse image restore",
+            warning.call_args.args[2],
+        )
+
+    def test_vtsi_target_geometry_disables_restore(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            size=1024,
+            container_size=640,
+            kind="Ventoy sparse disk image",
+            is_iso9660=False,
+            looks_windows=False,
+            has_windows_installer=False,
+            sparse_format="VTSI",
+        )
+        for target in (device(2048), replace(device(1024), logical_sector_size=4096)):
+            with self.subTest(target=target):
+                self.window.devices = [target]
+                self.window.rebuild_write_recommendation(preserve_selection=False)
+                self.assertEqual(self.window.write_method.count(), 0)
+                self.assertFalse(self.window.write_button.isEnabled())
 
     def test_catalog_times_reach_execution_and_plan_preview_entries(self):
         modified_ns = 1_709_210_096_123_456_789

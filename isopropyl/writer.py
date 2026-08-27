@@ -390,10 +390,39 @@ class ImageWriter:
         try:
             if current.identity != identity:
                 raise WriterSafetyError("The selected image changed after it was measured")
-            if not current.compressed and current.identity.size != total:
+            if (
+                not current.compressed
+                and not current.sparse_format
+                and current.identity.size != total
+            ):
                 raise WriterSafetyError("The selected image size changed after it was measured")
         finally:
             current.close()
+
+    @staticmethod
+    def _validate_source_target_geometry(
+        source: ImageSource,
+        total: int,
+        device: Device,
+    ) -> None:
+        """Enforce format-specific geometry before any destructive boundary."""
+
+        if not source.requires_exact_target_size:
+            return
+        if device.size != total:
+            raise WriterSafetyError(
+                "This sparse image requires a target whose capacity exactly "
+                "matches the expanded disk image"
+            )
+        required_sector = source.required_logical_sector_size
+        if (
+            required_sector <= 0
+            or device.logical_sector_size != required_sector
+        ):
+            raise WriterSafetyError(
+                "This sparse image requires a target that reports "
+                f"{required_sector}-byte logical sectors"
+            )
 
     def write(
         self,
@@ -428,19 +457,25 @@ class ImageWriter:
             self._prepared_identity = source_identity
             self._prepared_size = total
             self._prepared_device = device
+            self._validate_source_target_geometry(source, total, device)
             self._check_cancelled()
 
             # Revalidate on both sides of unmounting.  This remains outside the
             # overridable unmount method so subclasses cannot bypass the guard.
-            self._revalidate(device, tools, writable=True)
+            current = self._revalidate(device, tools, writable=True)
+            self._validate_source_target_geometry(source, total, current)
             self.unmount(device)
-            self._revalidate(device, tools, writable=True)
+            current = self._revalidate(device, tools, writable=True)
+            self._validate_source_target_geometry(source, total, current)
             self._assert_source_bound(source, source_identity, total)
             self._check_cancelled()
             # Every source is streamed from its one O_NOFOLLOW-bound descriptor.
             # Passing a pathname to privileged dd would reintroduce a
             # check-to-open race after the target has already been unmounted.
             self._write_stream(source, device, tools, flock, total, progress)
+            if source.requires_exact_target_size:
+                current = self._revalidate(device, tools, writable=False)
+                self._validate_source_target_geometry(source, total, current)
         finally:
             source.close()
 

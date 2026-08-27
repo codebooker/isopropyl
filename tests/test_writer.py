@@ -388,8 +388,86 @@ class WriterTests(unittest.TestCase):
             harness.writer().write(
                 Path("image.img"), harness.device, lambda _d, _t: None,
             )
-
         source.close.assert_called_once()
+
+    def test_sparse_source_rejects_non_exact_capacity_before_unmount(self):
+        harness = WriterHarness(removable_device(size=12, logical_sector_size=512))
+        source = Mock()
+        source.identity = SimpleNamespace(
+            device=1, inode=2, size=3, modified_ns=4, changed_ns=5,
+        )
+        source.measure.return_value = 8
+        source.requires_exact_target_size = True
+        source.required_logical_sector_size = 512
+
+        with (
+            patch("isopropyl.writer.open_image_source", return_value=source),
+            self.assertRaisesRegex(WriterSafetyError, "capacity exactly matches"),
+        ):
+            harness.writer().write(
+                Path("image.vtsi"), harness.device, lambda _d, _t: None,
+            )
+
+        self.assertEqual(harness.run_calls, [])
+        self.assertEqual(harness.processes, [])
+        source.close.assert_called_once()
+
+    def test_sparse_source_rejects_non_512_target_before_unmount(self):
+        harness = WriterHarness(removable_device(size=12, logical_sector_size=4096))
+        source = Mock()
+        source.identity = SimpleNamespace(
+            device=1, inode=2, size=3, modified_ns=4, changed_ns=5,
+        )
+        source.measure.return_value = 12
+        source.requires_exact_target_size = True
+        source.required_logical_sector_size = 512
+
+        with (
+            patch("isopropyl.writer.open_image_source", return_value=source),
+            self.assertRaisesRegex(WriterSafetyError, "512-byte logical sectors"),
+        ):
+            harness.writer().write(
+                Path("image.vtsi"), harness.device, lambda _d, _t: None,
+            )
+
+        self.assertEqual(harness.run_calls, [])
+        self.assertEqual(harness.processes, [])
+        source.close.assert_called_once()
+
+    def test_sparse_target_geometry_is_rechecked_after_the_write(self):
+        selected = removable_device(size=512, logical_sector_size=512)
+        harness = WriterHarness(selected)
+        source = Mock()
+        source.identity = SimpleNamespace(
+            device=1, inode=2, size=3, modified_ns=4, changed_ns=5,
+        )
+        source.measure.return_value = 512
+        source.requires_exact_target_size = True
+        source.required_logical_sector_size = 512
+        source.sparse_format = "vtsi"
+        source.compressed = False
+        source.compression = "none"
+        source.chunks.return_value = iter((b"V" * 512,))
+        harness.process_factory = lambda argv, kwargs: FakeProcess(
+            argv,
+            stderr_data=b"512 bytes copied\n",
+            on_wait=lambda: setattr(
+                harness,
+                "current",
+                removable_device(size=512, logical_sector_size=4096),
+            ),
+            **kwargs,
+        )
+
+        with (
+            patch("isopropyl.writer.open_image_source", return_value=source),
+            self.assertRaisesRegex(WriterSafetyError, "logical sector size changed"),
+        ):
+            harness.writer().write(
+                Path("image.vtsi"), selected, lambda _d, _t: None,
+            )
+
+        self.assertEqual(len(harness.processes), 1)
 
     def test_verification_closes_source_when_target_probe_fails(self):
         source = Mock()

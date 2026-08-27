@@ -36,7 +36,8 @@ Status meanings:
 | Raw `.usb`/`.wic` aliases | **Done** | Both extensions are explicit raw-disk aliases in inspection and the image chooser, with fixtures covering case-insensitive admission; structured apply formats remain rejected. |
 | VHD/VHDX/QCOW/QCOW2 input | **Done** | Identity-bound `qemu-img` inspection/conversion; backing files, encryption, corruption metadata, and unsafe output are rejected. |
 | Compressed virtual containers | **Planned** | Explicitly rejected until decode→inspect→convert can be safely chained. |
-| FFU and VTSI input | **Planned** | Explicitly rejected rather than raw-written; requires real format/platform validation. |
+| FFU input | **Planned** | Explicitly rejected rather than raw-written; requires a reviewed Linux apply backend plus real format/platform validation. |
+| VTSI v1.0 input | **Partial** | Strictly parses the bound Ventoy sparse-image footer and segment table, synthesizes every zero gap into a deterministic full-disk stream, and uses the existing cancellation and full read-back path. Selection is limited to an exact-capacity target that freshly reports 512-byte logical sectors. Physical Ventoy boot certification remains. |
 | Direct WIM/ESD input | **Planned** | Explicitly rejected; belongs to Windows To Go/apply, never raw DD. |
 | Windows installer ISO | **Partial** | UEFI/FAT32 and UEFI:NTFS construction, WIM split, WIM/ESD edition/index selection, and answer-file injection ship; BIOS/dual construction and hardware certification remain. |
 | Save drive as raw image | **Done** | Exact-length privileged read to a new, atomically published user file with cancellation and free-space checks. |

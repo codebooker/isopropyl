@@ -78,12 +78,14 @@ launchers are also available:
 
 ## Quick start
 
-### Exact DD write
+### Raw, compressed, virtual, or VTSI write
 
 1. Choose or drop a hybrid/raw-write-compatible ISO, raw image, compressed image,
-   or supported virtual disk, and follow the write-method recommendation.
+   supported virtual disk, or VTSI sparse image, and follow the write-method
+   recommendation.
 2. Select a removable target and review its model, capacity, path, and serial.
-3. Choose **DD mode — exact byte-for-byte copy**.
+3. Choose **VTSI restore — expand sparse disk image** for `.vtsi`; otherwise,
+   choose **DD mode — exact byte-for-byte copy**.
 4. Keep verification enabled, review the final erase warning, and confirm.
 
 ### Filesystem-aware ISO write
@@ -120,6 +122,11 @@ Keyboard shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
 - Compressed `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, legacy `.Z`, and single-file
   ZIP images stream without an expanded copy. VHD, VHDX, QCOW, and QCOW2 inputs
   use an identity-checked `qemu-img` staging step.
+- **VTSI v1.0 restore** validates a Ventoy sparse-image footer and segment table,
+  then streams the complete expanded disk—including verified zero-filled gaps—to
+  an exact-capacity drive with 512-byte logical sectors. Full read-back
+  verification is mandatory; VTSI metadata checksums do not authenticate its
+  payload or author, and physical Ventoy boot certification is still needed.
 - Image selection is bound to device, inode, size, modification time, and change
   time so a replacement or mutation cannot quietly become the written image.
 
@@ -171,8 +178,9 @@ For the implementation-level capability audit and Rufus comparison, see
 | `.img`, `.raw`, `.usb`, `.wic` | DD mode | Treated as raw disk images, not structured installers. |
 | Compressed raw image | Streaming DD | ZIP must contain exactly one regular image. |
 | VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; encrypted containers and backing files are rejected. |
+| `.vtsi` v1.0 | Sparse restore | Target capacity must exactly match the expanded disk and report 512-byte logical sectors. |
 
-Unsupported formats fail closed. FFU, VTSI, Windows To Go, dual BIOS+UEFI
+Unsupported formats fail closed. FFU, Windows To Go, dual BIOS+UEFI
 construction, broader persistence profiles, localization, and release packaging
 remain on the [roadmap](ROADMAP.md).
 

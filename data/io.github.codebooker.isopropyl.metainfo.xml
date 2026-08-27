@@ -21,8 +21,9 @@
     </p>
     <p>
       It can inspect common boot layouts, calculate and compare checksums, stream
-      compressed disk images, inspect and convert virtual disk images, inspect
-      and select Windows WIM/ESD editions, customize supported Windows installers,
+      compressed disk images, restore validated VTSI sparse disk images, inspect
+      and convert virtual disk images, select Windows WIM/ESD editions, customize
+      supported Windows installers,
       add bounded ZIP overlays to eligible ISO-mode media without replacing files,
       save raw, VHD, or VHDX drive backups and optical-disc images, restore
       ordinary data storage with nine filesystem choices, and run explicitly
