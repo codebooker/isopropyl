@@ -120,7 +120,11 @@ confirmations and expanded drive visibility are never persisted.
 - **ISO mode** safely extracts eligible UEFI media, selects FAT32 or NTFS,
   handles a sole conventional oversized Windows WIM when possible, and verifies
   every destination file. NTFS media use a release-and-hash-pinned UEFI:NTFS
-  bridge after explicit download consent.
+  bridge after explicit download consent. A bundled, versioned,
+  higher-confidence compatibility policy excludes reconstruction for exact
+  Manjaro, Proxmox, and Pop!_OS member
+  layouts known to need native image handling; these rules never use host filenames,
+  volume labels, overlays, or network lookups.
 - **Additive ZIP overlays** can add ordinary files and directories from one
   bounded stored/deflated archive in ISO mode. Identity, SHA-256, CRC, sizes, and
   the final private tree are checked; collisions, traversal, links, special
@@ -257,7 +261,9 @@ optional tools disable the relevant path rather than weakening its checks.
   intended target. The root-backed disk is never eligible.
 - **ISO mode is unavailable:** open **Plan details…**. The image may lack a safe
   UEFI fallback loader, require an unavailable filesystem/helper, or contain a
-  layout ISOpropyl will not transform.
+  layout ISOpropyl will not transform. For a recognized distro layout, ISOpropyl
+  preserves DD as a separate explicit choice only when the ordinary image and
+  target safety checks allow it; a compatibility match never declares DD safe.
 - **A privilege prompt fails:** check that `pkexec`, a PolicyKit agent, udisks2,
   and the required formatter are installed in the desktop session.
 - **Secure Boot fails:** Authenticode integrity is not a firmware trust verdict.

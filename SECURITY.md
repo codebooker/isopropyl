@@ -107,6 +107,20 @@ issue requesting a private contact channel without disclosing the vulnerability.
   copies through an independently identity-bound plan. It supports either one
   FAT32 partition or an exact NTFS plus raw UEFI:NTFS helper layout on
   512-byte-logical-sector media.
+- Distro compatibility exclusions come from one bundled, strict, versioned JSON
+  catalog and perform no network access. Matching uses only the complete,
+  identity-bound original ISO member catalog: never the host filename, volume
+  label, ZIP overlay, or effective merged catalog. Current predicates require
+  exact regular-file structure for Manjaro, Proxmox, and Pop!_OS and are
+  deliberately narrower than the motivating Rufus path heuristics; Unicode
+  compatibility characters do not alias ASCII markers. Normalization ambiguity,
+  malformed policy data, or unsafe member evidence blocks ISO mode.
+  Staging relists the descriptor-bound source before extraction, requires the
+  complete catalog to match exactly, and seals that result into the validated
+  staging plan. Source and extraction bindings include device, inode, size,
+  mtime, and ctime; executor validation checks the witness and rederives the policy.
+  A match can only subtract filesystem-aware ISO mode and does not establish
+  that DD is bootable, safe for the target geometry, or recommended.
 - ZIP overlays are untrusted installer/media content, not authenticated
   software. SHA-256 binds the exact selected archive across planning and staging
   but establishes no publisher or provenance trust; its files can intentionally

@@ -1,0 +1,40 @@
+{
+  "catalog_version": 1,
+  "policies": [
+    {
+      "id": "manjaro-miso-layout",
+      "distribution": "Manjaro",
+      "reason": "This image carries Manjaro's root .miso layout marker. Recognized upstream compatibility handling excludes filesystem-aware reconstruction for this layout.",
+      "source_url": "https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/iso.c#L346-L373",
+      "source_description": "Pinned Rufus compatibility evidence, conservatively limited here to a root regular .miso file.",
+      "match": {
+        "kind": "exact_file",
+        "path": ".miso"
+      }
+    },
+    {
+      "id": "proxmox-native-layout",
+      "distribution": "Proxmox",
+      "reason": "This image contains a regular file directly inside the root Proxmox media directory. Recognized upstream compatibility handling excludes filesystem-aware reconstruction for this layout.",
+      "source_url": "https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/iso.c#L341-L344",
+      "source_description": "Pinned Rufus compatibility evidence, narrowed here to a regular direct child of the root Proxmox directory.",
+      "match": {
+        "kind": "direct_child_file",
+        "root": "proxmox"
+      }
+    },
+    {
+      "id": "pop-os-casper-layout",
+      "distribution": "Pop!_OS",
+      "reason": "This image contains Pop!_OS filesystem.squashfs media in a distribution-specific root Casper directory. Recognized upstream compatibility handling excludes filesystem-aware reconstruction for this layout.",
+      "source_url": "https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/iso.c#L334-L339",
+      "source_description": "Pinned Rufus compatibility evidence, narrowed here to the canonical Pop!_OS filesystem.squashfs member layout.",
+      "match": {
+        "kind": "direct_named_file_in_root_fragment",
+        "root_prefix": "casper",
+        "fragment": "pop-os",
+        "filename": "filesystem.squashfs"
+      }
+    }
+  ]
+}

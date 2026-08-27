@@ -73,6 +73,26 @@ def basic_entries() -> tuple[ArchiveEntry, ...]:
     )
 
 
+def fake_catalog_scanner(entries: tuple[ArchiveEntry, ...]):
+    members = [
+        iso_staging.ImageMember(
+            entry.path,
+            entry.size,
+            entry.kind.value,
+            entry.link_target or "",
+            entry.modified_ns,
+        )
+        for entry in entries
+    ]
+
+    def scan(_image, *, image_fd=None, cancel_check=None):
+        if cancel_check is not None:
+            cancel_check()
+        return list(members), True
+
+    return scan
+
+
 def windows_entries() -> tuple[ArchiveEntry, ...]:
     return basic_entries() + (
         ArchiveEntry("sources", kind=EntryKind.DIRECTORY),
@@ -306,14 +326,16 @@ class IsoStagingTests(unittest.TestCase):
         selected = entries or basic_entries()
         image = root / "source.iso"
         image.write_bytes(b"ISO placeholder")
-        return build_iso_staging_plan(
-            image,
-            root / "ready-media",
-            selected,
-            kwargs.pop("write_plan", write_plan(selected)),
-            seven_zip=SEVEN_ZIP,
-            **kwargs,
-        )
+        scanner = kwargs.pop("catalog_scanner", fake_catalog_scanner(selected))
+        with patch("isopropyl.iso_staging.scan_image_contents", scanner):
+            return build_iso_staging_plan(
+                image,
+                root / "ready-media",
+                selected,
+                kwargs.pop("write_plan", write_plan(selected)),
+                seven_zip=SEVEN_ZIP,
+                **kwargs,
+            )
 
     def test_plan_is_frozen_and_binds_source_catalog_parent_and_mode(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -334,6 +356,103 @@ class IsoStagingTests(unittest.TestCase):
             with self.assertRaisesRegex(IsoStagingSafetyError, "catalog binding"):
                 validate_iso_staging_plan(replace(plan, entries=forged_entries))
 
+    def test_distro_exclusion_is_rechecked_before_extraction(self):
+        entries = basic_entries() + (ArchiveEntry(".miso", 1),)
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "isopropyl.iso_staging.build_extraction_plan"
+        ) as extraction_builder:
+            with self.assertRaisesRegex(IsoStagingSafetyError, "Manjaro"):
+                self.make_plan(
+                    Path(directory), entries, write_plan=write_plan(entries),
+                )
+            extraction_builder.assert_not_called()
+
+    def test_omitted_distro_marker_cannot_bypass_complete_source_relisting(self):
+        supplied = basic_entries()
+        actual = supplied + (ArchiveEntry(".miso", 1),)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "complete bound source catalog",
+            ):
+                self.make_plan(
+                    Path(directory),
+                    supplied,
+                    catalog_scanner=fake_catalog_scanner(actual),
+                )
+
+    def test_source_change_or_malformed_relisting_fails_before_plan_publish(self):
+        entries = basic_entries()
+
+        def mutate_source(image, **_kwargs):
+            image.write_bytes(b"changed during catalog scan")
+            return fake_catalog_scanner(entries)(image)
+
+        for scanner, message in (
+            (mutate_source, "changed during catalog verification"),
+            (lambda *_args, **_kwargs: None, "could not be verified"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(IsoStagingSafetyError, message):
+                    self.make_plan(
+                        Path(directory), entries, catalog_scanner=scanner,
+                    )
+
+    def test_overlay_cannot_manufacture_a_base_distro_exclusion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(root, ((".miso", b"marker"),))
+            plan = self.make_plan(
+                root,
+                overlay=overlay,
+                write_plan=overlay_write_plan(basic_entries(), overlay),
+            )
+
+            self.assertNotIn(".miso", tuple(entry.path for entry in plan.entries))
+            self.assertIn(
+                ".miso", tuple(entry.path for entry in plan.effective_entries),
+            )
+            validate_iso_staging_plan(plan)
+
+    def test_forged_distro_catalog_is_rejected_before_executor_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.make_plan(root)
+            entries = plan.entries + (ArchiveEntry(".miso", 1),)
+            forged = replace(
+                plan,
+                entries=entries,
+                catalog_digest=iso_staging._catalog_digest(entries),
+                write_plan=write_plan(entries),
+                content_bytes=plan.content_bytes + 1,
+                required_free_bytes=plan.required_free_bytes + 1,
+                effective_entries=entries,
+                effective_catalog_digest=iso_staging._catalog_digest(entries),
+            )
+            extractor = FakeExtractor()
+
+            with self.assertRaisesRegex(IsoStagingSafetyError, "Manjaro"):
+                IsoStagingExecutor(extractor=extractor).execute(forged)
+
+            self.assertEqual(extractor.calls, [])
+            self.assertFalse(plan.destination.exists())
+
+    def test_plan_subclasses_are_not_accepted_at_staging_trust_boundaries(self):
+        class ForgedWritePlan(WritePlan):
+            pass
+
+        class ForgedStagingPlan(iso_staging.IsoStagingPlan):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.make_plan(root)
+            forged_write = ForgedWritePlan(**plan.write_plan.__dict__)
+            with self.assertRaisesRegex(IsoStagingSafetyError, "WritePlan"):
+                self.make_plan(root, write_plan=forged_write)
+            forged_staging = ForgedStagingPlan(**plan.__dict__)
+            with self.assertRaisesRegex(IsoStagingSafetyError, "IsoStagingPlan"):
+                validate_iso_staging_plan(forged_staging)
+
     def test_plan_rejects_nonintegral_boolean_negative_and_malformed_bindings(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = self.make_plan(Path(directory))
@@ -344,9 +463,9 @@ class IsoStagingTests(unittest.TestCase):
                 replace(plan, required_free_bytes=False),
                 replace(plan, required_free_bytes=float(plan.required_free_bytes)),
                 replace(plan, required_free_bytes=-1),
-                replace(plan, image_identity=(True, 1, 1, 1)),
-                replace(plan, image_identity=(1, 1, 0, 1)),
-                replace(plan, image_identity=(1, 1, 1.0, 1)),
+                replace(plan, image_identity=(True, 1, 1, 1, 1)),
+                replace(plan, image_identity=(1, 1, 0, 1, 1)),
+                replace(plan, image_identity=(1, 1, 1.0, 1, 1)),
                 replace(plan, destination_parent_identity=(1, 0)),
                 replace(plan, destination_parent_identity=(1, 2.0)),
                 replace(plan, destination_parent_identity=(1,)),
@@ -674,6 +793,20 @@ class IsoStagingTests(unittest.TestCase):
             plan.image.write_bytes(b"changed source")
             with self.assertRaises(IsoStagingSafetyError):
                 IsoStagingExecutor(extractor=FakeExtractor()).execute(plan)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.make_plan(root)
+            before = plan.image.stat()
+            plan.image.write_bytes(b"X" * before.st_size)
+            os.utime(
+                plan.image,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            extractor = FakeExtractor()
+            with self.assertRaisesRegex(IsoStagingSafetyError, "changed"):
+                IsoStagingExecutor(extractor=extractor).execute(plan)
+            self.assertEqual(extractor.calls, [])
 
     def test_splits_install_wim_privately_and_publishes_only_verified_swm_parts(self):
         with tempfile.TemporaryDirectory(dir=LARGE_TEMP_PARENT) as directory:

@@ -9,6 +9,10 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Iterable
 
+from isopropyl.distro_policies import (
+    DistroPolicyError,
+    match_distro_iso_exclusion,
+)
 from isopropyl.images import ImageInspection
 from isopropyl.timestamps import (
     MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
@@ -82,6 +86,10 @@ class Transformation(str, Enum):
 
 class PlanError(ValueError):
     """Raised when the requested write plan cannot produce a safe layout."""
+
+
+class _DistroIsoPolicyPlanError(PlanError):
+    """ISO-mode planning was removed by distro compatibility policy."""
 
 
 class UnsafeArchiveError(PlanError):
@@ -177,6 +185,7 @@ class WriteMethodRecommendation:
     dd_plan: WritePlan
     iso_plan: WritePlan | None
     iso_unavailable_reason: str = ""
+    distro_iso_exclusion_reason: str = ""
 
 
 _WINDOWS_DRIVE = re.compile(r"^[a-zA-Z]:")
@@ -697,6 +706,15 @@ def build_write_plan(
             content_constraints_checked=True, blockers=(),
         )
 
+    try:
+        distro_exclusion = match_distro_iso_exclusion(inspection)
+    except DistroPolicyError as error:
+        raise _DistroIsoPolicyPlanError(
+            f"ISO-mode compatibility evidence is unsafe: {error}"
+        ) from error
+    if distro_exclusion is not None:
+        raise _DistroIsoPolicyPlanError(distro_exclusion.reason)
+
     supplied_entries = tuple(entries)
     safe_entries = validate_extraction_entries(supplied_entries)
     content_bytes = sum(
@@ -811,7 +829,7 @@ def build_write_plan(
 
     warnings: list[str] = []
     blockers: list[str] = []
-    if not supplied_entries:
+    if not supplied_entries or inspection.contents_scanned is not True:
         warnings.append(
             "ISO file sizes and extraction paths have not been checked; rescan before execution."
         )
@@ -925,7 +943,9 @@ def build_write_plan(
         requirements=tuple(requirements),
         transformations=tuple(transformations), warnings=tuple(warnings),
         minimum_content_bytes=content_bytes, minimum_target_bytes=minimum_target,
-        content_constraints_checked=bool(supplied_entries),
+        content_constraints_checked=(
+            bool(supplied_entries) and inspection.contents_scanned is True
+        ),
         blockers=tuple(blockers),
     )
 
@@ -1057,6 +1077,7 @@ def recommend_write_method(
 
     iso_plan: WritePlan | None = None
     iso_error = ""
+    distro_iso_exclusion_reason = ""
     try:
         iso_plan = build_write_plan(
             inspection,
@@ -1064,6 +1085,9 @@ def recommend_write_method(
             requested_mode=WriteMode.EXTRACTED_ISO,
             firmware_target=FirmwareTarget.UEFI_ONLY,
         )
+    except _DistroIsoPolicyPlanError as error:
+        iso_error = str(error)
+        distro_iso_exclusion_reason = iso_error
     except PlanError as error:
         iso_error = str(error)
     iso_available = bool(iso_plan and iso_plan.executable)
@@ -1140,11 +1164,19 @@ def recommend_write_method(
             if inspection.partition_table_incomplete else
             "The image's MBR or GPT metadata is malformed. DD mode remains available "
             "as an explicit byte-for-byte choice, but is not recommended."
+            if inspection.partition_table_malformed else
+            "DD mode remains available only as an explicit byte-for-byte choice, "
+            "but this optical-only image has no USB-native disk layout and may not boot."
         )
     else:
         recommended = None
-        reason = iso_error or "No safe write method fits the selected target."
+        reason = (
+            "The selected target is too small for this byte-for-byte image."
+            if target_size is not None and target_size < inspection.size else
+            iso_error or "No safe write method fits the selected target."
+        )
 
     return WriteMethodRecommendation(
         tuple(available), recommended, reason, dd_plan, iso_plan, iso_error,
+        distro_iso_exclusion_reason,
     )

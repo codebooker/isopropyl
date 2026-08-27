@@ -199,6 +199,22 @@ class ExtractionTests(unittest.TestCase):
             with self.assertRaisesRegex(ExtractionSafetyError, "appeared"):
                 SafeIsoExtractor(streamer=payload_streamer({"file": b"x"})).execute(plan)
 
+    def test_same_size_source_rewrite_with_restored_mtime_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.plan(root, (ArchiveEntry("file", 1),))
+            before = plan.image.stat()
+            plan.image.write_bytes(b"X" * before.st_size)
+            os.utime(
+                plan.image,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+
+            with self.assertRaisesRegex(ExtractionSafetyError, "source changed"):
+                SafeIsoExtractor(
+                    streamer=payload_streamer({"file": b"x"}),
+                ).execute(plan)
+
     def test_cancel_before_start_writes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

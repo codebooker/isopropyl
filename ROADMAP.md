@@ -53,7 +53,10 @@ evidence.
   hardware-certify the immutable Casper workflow across 512- and 4096-byte
   logical-sector media and expand profiles only through release-specific
   fixtures and hardware results.
-- Add distro-specific DD-only rules and tested BIOS/UEFI construction profiles.
+- Expand the shipped distro-specific ISO-mode exclusion catalog only through
+  unique structural evidence and representative fixtures, and add tested
+  BIOS/UEFI construction profiles. Nobara and openSUSE remain deferred because
+  their currently documented names/layouts do not provide safe unique matches.
 
 ### Trust, formats, and advanced media
 

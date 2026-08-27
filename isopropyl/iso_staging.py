@@ -30,6 +30,10 @@ from .constructed import (
     ConstructedMediaSafetyError,
     scan_staging_tree,
 )
+from .distro_policies import (
+    DistroPolicyError,
+    match_distro_member_exclusion,
+)
 from .extraction import (
     OUTPUT_SPACE_RESERVE,
     ExtractionCancelled,
@@ -54,6 +58,7 @@ from .iso import (
     merge_additive_overlay_entries,
     validate_extraction_entries,
 )
+from .images import ImageMember, scan_image_contents
 from .timestamps import (
     STAGING_MTIME_TOLERANCE_NS,
     TimestampPreservationError,
@@ -114,13 +119,14 @@ class IsoStagingCancelled(IsoStagingError):
     """The caller cancelled staging before its atomic commit point."""
 
 
-FileIdentity = tuple[int, int, int, int]
+FileIdentity = tuple[int, int, int, int, int]
 ParentIdentity = tuple[int, int]
 Progress = Callable[["IsoStagingProgress"], None]
 Publisher = Callable[[Path, Path, int], None]
 SplitPlanBuilder = Callable[[Path, Path, str], WimSplitPlan]
 WimInspector = Callable[[Path, str, threading.Event], WimInfo]
 OverlayApplier = Callable[..., ZipOverlayResult]
+CatalogScanner = Callable[..., tuple[list[ImageMember], bool]]
 
 _DIR_FLAGS = (
     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -130,6 +136,7 @@ _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _WIM_PART = re.compile(r"install(?:(?P<number>[2-9][0-9]*))?\.swm", re.IGNORECASE)
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
+_CATALOG_WITNESS_TOKEN = object()
 
 
 def _is_install_wim_path(path: str) -> bool:
@@ -162,6 +169,7 @@ class IsoStagingPlan:
     overlay: ZipOverlayPlan | None = None
     effective_entries: tuple[ArchiveEntry, ...] = ()
     effective_catalog_digest: str = ""
+    _catalog_witness: object | None = None
 
     @property
     def needs_wim_split(self) -> bool:
@@ -194,6 +202,13 @@ class IsoStagingResult:
     autounattend_added: bool
 
 
+@dataclass(frozen=True)
+class _CatalogWitness:
+    token: object
+    image_identity: FileIdentity
+    catalog_digest: str
+
+
 def _identity(path: Path) -> FileIdentity:
     try:
         info = path.stat()
@@ -201,7 +216,10 @@ def _identity(path: Path) -> FileIdentity:
         raise IsoStagingSafetyError("The ISO source is unavailable") from error
     if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
         raise IsoStagingSafetyError("The ISO source must be a non-empty regular file")
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+    return (
+        info.st_dev, info.st_ino, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
 
 
 def _wim_identity(path: Path) -> WimFileIdentity:
@@ -240,6 +258,99 @@ def _catalog_digest(entries: Sequence[ArchiveEntry]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _verify_complete_source_catalog(
+    image: Path,
+    expected_entries: tuple[ArchiveEntry, ...],
+    scanner: CatalogScanner,
+    cancel_check: Callable[[], None] | None,
+) -> FileIdentity:
+    """Relist the bound source and prove the caller supplied its full catalog."""
+
+    try:
+        source = image.expanduser().resolve(strict=True)
+        descriptor = os.open(
+            source,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise IsoStagingSafetyError(
+            "The ISO source could not be opened for catalog verification"
+        ) from error
+    try:
+        try:
+            before = os.fstat(descriptor)
+        except OSError as error:
+            raise IsoStagingSafetyError(
+                "The ISO source could not be bound for catalog verification"
+            ) from error
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            raise IsoStagingSafetyError(
+                "The ISO source must be a non-empty regular file"
+            )
+        if cancel_check is not None:
+            cancel_check()
+        try:
+            members, complete = scanner(
+                source, image_fd=descriptor, cancel_check=cancel_check,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise IsoStagingSafetyError(
+                "The ISO source catalog could not be verified"
+            ) from error
+        try:
+            after = os.fstat(descriptor)
+        except OSError as error:
+            raise IsoStagingSafetyError(
+                "The ISO source catalog binding could not be rechecked"
+            ) from error
+        if (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        ) != (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        ):
+            raise IsoStagingSafetyError(
+                "The ISO source changed during catalog verification"
+            )
+    finally:
+        os.close(descriptor)
+    if complete is not True or type(members) is not list:
+        raise IsoStagingSafetyError(
+            "The complete ISO source catalog could not be verified"
+        )
+    kinds = {
+        "file": EntryKind.FILE,
+        "directory": EntryKind.DIRECTORY,
+        "symlink": EntryKind.SYMLINK,
+    }
+    try:
+        scanned_entries = validate_extraction_entries(tuple(
+            ArchiveEntry(
+                member.path,
+                member.size,
+                kinds[member.kind],
+                member.link_target or None,
+                member.modified_ns,
+            )
+            for member in members
+            if type(member) is ImageMember
+        ))
+    except (KeyError, UnsafeArchiveError, ValueError) as error:
+        raise IsoStagingSafetyError(
+            "The relisted ISO source catalog is unsafe"
+        ) from error
+    if len(scanned_entries) != len(members) or scanned_entries != expected_entries:
+        raise IsoStagingSafetyError(
+            "The supplied ISO catalog does not match the complete bound source catalog"
+        )
+    return (
+        before.st_dev, before.st_ino, before.st_size,
+        before.st_mtime_ns, before.st_ctime_ns,
+    )
 
 
 def _merge_effective_catalog(
@@ -292,7 +403,7 @@ def _validate_staging_scalar_bindings(plan: IsoStagingPlan) -> None:
         if type(value) is not int or value < 0:
             raise IsoStagingSafetyError(f"The staging plan {name} value is invalid")
     identities = (
-        ("image identity", plan.image_identity, 4),
+        ("image identity", plan.image_identity, 5),
         ("destination parent identity", plan.destination_parent_identity, 2),
     )
     for name, identity, length in identities:
@@ -308,7 +419,7 @@ def _validate_staging_scalar_bindings(plan: IsoStagingPlan) -> None:
 
 
 def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> str | None:
-    if not isinstance(plan, WritePlan):
+    if type(plan) is not WritePlan:
         raise IsoStagingSafetyError("A WritePlan is required")
     layout = plan.layout
     if not plan.executable:
@@ -387,6 +498,29 @@ def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> st
             "The ISO catalog has no non-empty removable-media UEFI fallback loader"
         )
     return eligible[0].path if eligible else None
+
+
+def _validate_distro_iso_policy(entries: tuple[ArchiveEntry, ...]) -> None:
+    """Recheck the identity-bound base ISO catalog before reconstruction."""
+
+    members = tuple(
+        ImageMember(
+            entry.path,
+            entry.size,
+            entry.kind.value,
+            entry.link_target or "",
+            entry.modified_ns,
+        )
+        for entry in entries
+    )
+    try:
+        exclusion = match_distro_member_exclusion(members)
+    except DistroPolicyError as error:
+        raise IsoStagingSafetyError(
+            f"ISO-mode compatibility evidence is unsafe: {error}"
+        ) from error
+    if exclusion is not None:
+        raise IsoStagingSafetyError(exclusion.reason)
 
 
 def _expected_directories(entries: Sequence[ArchiveEntry]) -> dict[tuple[str, ...], str]:
@@ -514,6 +648,7 @@ def build_iso_staging_plan(
         raise IsoStagingSafetyError(str(error)) from error
     if not safe_entries:
         raise IsoStagingSafetyError("The ISO member catalog is empty")
+    _validate_distro_iso_policy(safe_entries)
     _validate_overlay(overlay, cancel_check=cancel_check)
     effective_entries, _overlay_targets = _merge_effective_catalog(
         safe_entries, overlay,
@@ -596,6 +731,13 @@ def build_iso_staging_plan(
         raise IsoStagingUnavailable(str(error)) from error
     except (ExtractionSafetyError, ExtractionError, OSError) as error:
         raise IsoStagingSafetyError(str(error)) from error
+    source_catalog_identity = _verify_complete_source_catalog(
+        extraction.image, safe_entries, scan_image_contents, cancel_check,
+    )
+    if source_catalog_identity != extraction.image_identity:
+        raise IsoStagingSafetyError(
+            "The ISO source identity changed during catalog binding"
+        )
 
     wimlib_imagex: str | None = None
     if wim_source is not None or wim_selection is not None:
@@ -647,6 +789,11 @@ def build_iso_staging_plan(
         overlay=overlay,
         effective_entries=effective_entries,
         effective_catalog_digest=_catalog_digest(effective_entries),
+        _catalog_witness=_CatalogWitness(
+            _CATALOG_WITNESS_TOKEN,
+            extraction.image_identity,
+            _catalog_digest(safe_entries),
+        ),
     )
 
 
@@ -659,7 +806,7 @@ def validate_iso_staging_plan(
 
     if cancel_check is not None:
         cancel_check()
-    if not isinstance(plan, IsoStagingPlan):
+    if type(plan) is not IsoStagingPlan:
         raise IsoStagingSafetyError("An IsoStagingPlan is required")
     _validate_staging_scalar_bindings(plan)
     try:
@@ -668,6 +815,7 @@ def validate_iso_staging_plan(
         raise IsoStagingSafetyError(str(error)) from error
     if entries != plan.entries or _catalog_digest(entries) != plan.catalog_digest:
         raise IsoStagingSafetyError("The ISO catalog binding is invalid")
+    _validate_distro_iso_policy(entries)
     _validate_overlay(plan.overlay, cancel_check=cancel_check)
     effective_entries, _overlay_targets = _merge_effective_catalog(
         entries, plan.overlay,
@@ -793,6 +941,16 @@ def validate_iso_staging_plan(
             raise IsoStagingSafetyError(
                 "The Windows answer file does not match its bound customization exactly"
             )
+    witness = plan._catalog_witness
+    if (
+        type(witness) is not _CatalogWitness
+        or witness.token is not _CATALOG_WITNESS_TOKEN
+        or witness.image_identity != plan.image_identity
+        or witness.catalog_digest != plan.catalog_digest
+    ):
+        raise IsoStagingSafetyError(
+            "The complete ISO source catalog witness is invalid"
+        )
     try:
         rebuilt = build_extraction_plan(
             plan.image, plan.destination, entries, seven_zip=plan.seven_zip,

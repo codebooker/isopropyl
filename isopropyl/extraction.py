@@ -51,7 +51,7 @@ class ExtractionSafetyError(ExtractionError):
     pass
 
 
-FileIdentity = tuple[int, int, int, int]
+FileIdentity = tuple[int, int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,10 @@ def _identity(path: Path) -> FileIdentity:
     status = path.stat()
     if not stat.S_ISREG(status.st_mode) or status.st_size <= 0:
         raise ExtractionSafetyError("The ISO source must be a non-empty regular file")
-    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+    return (
+        status.st_dev, status.st_ino, status.st_size,
+        status.st_mtime_ns, status.st_ctime_ns,
+    )
 
 
 def _trusted_7z() -> str:

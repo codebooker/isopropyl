@@ -171,6 +171,7 @@ def fake_iso_staging_plan(
         image_identity=(
             image_status.st_dev, image_status.st_ino,
             image_status.st_size, image_status.st_mtime_ns,
+            image_status.st_ctime_ns,
         ),
         destination=destination,
         destination_parent_identity=(parent_status.st_dev, parent_status.st_ino),
@@ -605,6 +606,49 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.verify.isEnabled())
         self.assertEqual(self.window.write_button.text(), "Write in ISO mode")
         self.assertTrue(self.window.write_button.isEnabled())
+
+    def test_distro_exclusion_removes_only_iso_and_keeps_plan_explanation(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(hybrid=True),
+            members=optical_windows_inspection(hybrid=True).members
+            + (ImageMember(".miso", 1, "file"),),
+        )
+
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        self.window.update_zip_overlay_controls()
+
+        modes = tuple(
+            WriteMode(self.window.write_method.itemData(index))
+            for index in range(self.window.write_method.count())
+        )
+        self.assertEqual(modes, (WriteMode.DD,))
+        self.assertEqual(self.window.selected_write_mode(), WriteMode.DD)
+        self.assertIn("Manjaro", self.window.write_method_reason.text())
+        self.assertTrue(self.window.iso_plan_button.isEnabled())
+        self.assertFalse(self.window.zip_overlay_choose_button.isEnabled())
+        self.assertIn("Manjaro", self.window.zip_overlay_choose_button.toolTip())
+        with patch(
+            "isopropyl.app.match_distro_iso_exclusion",
+            side_effect=AssertionError("cached policy result was recomputed"),
+        ):
+            self.window.update_ready()
+            self.window.update_zip_overlay_controls()
+        with patch("isopropyl.app.QFileDialog.getOpenFileName") as chooser:
+            self.window.choose_zip_overlay()
+        chooser.assert_not_called()
+
+        with patch("isopropyl.app.QMessageBox.warning") as preview_warning:
+            self.window.preview_iso_plan()
+        self.assertIn("Manjaro", preview_warning.call_args.args[2])
+
+        with (
+            patch("isopropyl.app.image_identity", return_value=(1, 2, 3, 4)),
+            patch("isopropyl.app.QMessageBox.warning") as write_warning,
+            patch.object(self.window, "start_constructed_iso_write") as start,
+        ):
+            self.window.confirm_iso_write(self.window.devices[0])
+        start.assert_not_called()
+        self.assertIn("Manjaro", write_warning.call_args.args[2])
 
     def test_image_chooser_advertises_raw_and_vtsi_not_other_apply_formats(self):
         with patch(
@@ -2558,13 +2602,48 @@ class WindowZipOverlayTests(unittest.TestCase):
 
         args, kwargs = captured[0]
         self.assertEqual(tuple(args[2]), self.window.archive_entries())
-        self.assertIs(args[3], recommendation.iso_plan)
+        self.assertEqual(args[3], recommendation.iso_plan)
         self.assertIs(kwargs["overlay"], self.overlay)
         self.assertTrue(callable(kwargs["cancel_check"]))
         continuation.assert_called_once()
         pending = continuation.call_args.args[0]
         self.assertIs(pending.staging_plan.overlay, self.overlay)
         pending.workspace.cleanup()
+
+    def test_stale_executable_iso_plan_cannot_bypass_distro_exclusion(self):
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        stale_plan = recommendation.iso_plan
+        self.window.inspection = replace(
+            self.window.inspection,
+            members=self.window.inspection.members
+            + (ImageMember(".miso", 1, "file"),),
+        )
+
+        with (
+            patch("isopropyl.app.tempfile.TemporaryDirectory") as temporary,
+            patch("isopropyl.app.QFileDialog.getExistingDirectory") as chooser,
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), stale_plan,
+            )
+
+        temporary.assert_not_called()
+        chooser.assert_not_called()
+        self.assertIn("Manjaro", warning.call_args.args[2])
+        self.assertIsNone(self.window.write_recommendation.iso_plan)
+
+    def test_malformed_write_plan_is_rejected_before_attribute_access(self):
+        with (
+            patch("isopropyl.app.tempfile.TemporaryDirectory") as temporary,
+            patch("isopropyl.app.QFileDialog.getExistingDirectory") as chooser,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), object(),  # type: ignore[arg-type]
+            )
+        temporary.assert_not_called()
+        chooser.assert_not_called()
 
     def test_staging_completion_rejects_different_windows_snapshot(self):
         recommendation = self.window.write_recommendation
@@ -3075,7 +3154,7 @@ class WindowPersistenceTests(unittest.TestCase):
         self.assertEqual(pending.image, self.window.image)
         self.assertEqual(pending.inspection, self.window.inspection)
         self.assertEqual(pending.device, self.window.devices[0])
-        self.assertIs(pending.write_plan, recommendation.iso_plan)
+        self.assertEqual(pending.write_plan, recommendation.iso_plan)
         self.assertIs(pending.workspace, workspace)
         self.assertIsInstance(pending.staging_plan, IsoStagingPlan)
         self.assertEqual(pending.persistence_profile, self.window.persistence_profile)

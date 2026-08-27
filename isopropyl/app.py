@@ -42,6 +42,7 @@ from .constructed import (
     ConstructedMediaCancelled, ConstructedMediaExecutor, ConstructedMediaPlan,
     build_constructed_media_plan, validate_constructed_media_plan,
 )
+from .distro_policies import DistroPolicyError, match_distro_iso_exclusion
 from .devices import (
     Device, SizeUnitMode, format_size, image_is_on_device, list_devices,
     path_is_on_device,
@@ -253,6 +254,8 @@ class Window(QMainWindow):
         self.inspection_worker_count = 0
         self.close_after_inspection = False
         self.write_recommendation: WriteMethodRecommendation | None = None
+        self._distro_policy_inspection: ImageInspection | None = None
+        self._distro_policy_exclusion_reason = ""
         self.device_refresh_generation = 0
         self.device_refresh_busy = False
         self.persistence_profile: CasperCompatibilityProfile | None = None
@@ -837,6 +840,8 @@ class Window(QMainWindow):
         self.logger.info("Selected image %s", path)
         self.inspection = None
         self.inspection_identity = None
+        self._distro_policy_inspection = None
+        self._distro_policy_exclusion_reason = ""
         self.write_recommendation = None
         self.persistence_profile = None
         self.persistence_checkbox.blockSignals(True)
@@ -1020,15 +1025,43 @@ class Window(QMainWindow):
         except OSError:
             return True
 
+    def _distro_iso_exclusion_reason(self) -> str:
+        inspection = self.inspection
+        if inspection is self._distro_policy_inspection:
+            return self._distro_policy_exclusion_reason
+        reason = ""
+        if (
+            inspection is not None
+            and (inspection.is_iso9660 or inspection.kind == "Optical ISO")
+            and inspection.contents_scanned is True
+        ):
+            try:
+                matched = match_distro_iso_exclusion(inspection)
+            except DistroPolicyError as error:
+                reason = f"ISO-mode compatibility evidence is unsafe: {error}"
+            else:
+                if matched is not None:
+                    reason = matched.reason
+        self._distro_policy_inspection = inspection
+        self._distro_policy_exclusion_reason = reason
+        return reason
+
     def update_zip_overlay_controls(self) -> None:
         eligible = bool(
             self.inspection is not None
             and self.inspection.is_iso9660
             and self.inspection.contents_scanned
         )
+        iso_exclusion = self._distro_iso_exclusion_reason() if eligible else ""
         planning = self.zip_overlay_preparer is not None
         self.zip_overlay_choose_button.setEnabled(
-            eligible and not planning and not self.operation_active
+            eligible and not iso_exclusion and not planning
+            and not self.operation_active
+        )
+        self.zip_overlay_choose_button.setToolTip(
+            iso_exclusion
+            or "Add one bounded ZIP archive to ISO mode without replacing any "
+            "file already present in the image."
         )
         self.zip_overlay_clear_button.setEnabled(
             (planning or self.zip_overlay_plan is not None) and not self.operation_active
@@ -1086,6 +1119,8 @@ class Window(QMainWindow):
             and self.inspection_identity is not None
             and not self.operation_active
         ):
+            return
+        if self._distro_iso_exclusion_reason():
             return
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -1338,6 +1373,10 @@ class Window(QMainWindow):
                 f"No safe write method could be planned: {error}"
             )
             return
+        self._distro_policy_inspection = inspection
+        self._distro_policy_exclusion_reason = (
+            recommendation.distro_iso_exclusion_reason
+        )
         self.write_recommendation = recommendation
         selected = (
             previous
@@ -3254,6 +3293,8 @@ class Window(QMainWindow):
             self.logger.warning("Image inspection failed: %s", result)
             self.inspection = None
             self.inspection_identity = None
+            self._distro_policy_inspection = None
+            self._distro_policy_exclusion_reason = ""
             self.write_recommendation = None
             self.write_method.clear()
             self.write_method.setEnabled(False)
@@ -3997,9 +4038,56 @@ class Window(QMainWindow):
         device = self.selected_device()
         if (
             image is None or inspection is None or device is None
-            or self.operation_active or not write_plan.executable
+            or self.operation_active or type(write_plan) is not WritePlan
+            or not write_plan.executable
         ):
             return
+        base_entries = self.archive_entries()
+        if tuple(entries) != base_entries:
+            QMessageBox.warning(
+                self,
+                "ISO mode unavailable",
+                "The ISO catalog or write plan changed. Review the current plan "
+                "before trying again.",
+            )
+            self.rebuild_write_recommendation()
+            return
+        try:
+            effective_entries = self.effective_archive_entries()
+            recommendation = recommend_write_method(
+                inspection,
+                effective_entries,
+                target_size=device.size,
+                target_logical_sector_size=device.logical_sector_size,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "ISO mode unavailable", str(error))
+            self.rebuild_write_recommendation()
+            return
+        fresh_plan = recommendation.iso_plan
+        if (
+            fresh_plan is None
+            or not fresh_plan.executable
+            or WriteMode.EXTRACTED_ISO not in recommendation.available_modes
+        ):
+            QMessageBox.warning(
+                self,
+                "ISO mode unavailable",
+                recommendation.iso_unavailable_reason
+                or "This image no longer has an executable ISO-mode plan.",
+            )
+            self.rebuild_write_recommendation()
+            return
+        if fresh_plan != write_plan:
+            QMessageBox.warning(
+                self,
+                "ISO mode unavailable",
+                "The ISO-mode plan changed. Review the refreshed plan before "
+                "starting the write.",
+            )
+            self.rebuild_write_recommendation()
+            return
+        write_plan = fresh_plan
         if image_is_on_device(str(image), device):
             QMessageBox.critical(
                 self, "Move the ISO first",
@@ -4061,7 +4149,6 @@ class Window(QMainWindow):
                 "ISOpropyl cannot stage the ISO on the target drive that will be erased.",
             )
             return
-        base_entries = tuple(entries)
         persistence_bytes = self.selected_persistence_bytes()
         persistence_profile = (
             supported_casper_profile(inspection) if persistence_bytes else None

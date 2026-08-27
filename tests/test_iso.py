@@ -6,7 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from isopropyl.authenticode import AuthenticodeIntegrityState, AuthenticodeResult
-from isopropyl.images import ImageInspection
+from isopropyl.distro_policies import DistroPolicyCatalogError
+from isopropyl.images import ImageInspection, ImageMember
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.iso import (
     AdditiveOverlayMerge,
@@ -514,6 +515,85 @@ class WriteMethodRecommendationTests(unittest.TestCase):
             (WriteMode.DD, WriteMode.EXTRACTED_ISO),
         )
         self.assertIn("native BIOS/UEFI", result.reason)
+
+    def test_known_native_layout_excludes_only_iso_mode(self):
+        image = replace(
+            inspection(),
+            members=(ImageMember(".MISO", 1, "file"),),
+        )
+
+        result = recommend_write_method(image, self.uefi_entries())
+
+        self.assertEqual(result.available_modes, (WriteMode.DD,))
+        self.assertEqual(result.recommended_mode, WriteMode.DD)
+        self.assertIsNone(result.iso_plan)
+        self.assertIn("native BIOS/UEFI", result.reason)
+        self.assertIn("Manjaro", result.iso_unavailable_reason)
+        self.assertIn("Manjaro", result.distro_iso_exclusion_reason)
+        with self.assertRaisesRegex(PlanError, "Manjaro"):
+            build_write_plan(
+                image,
+                self.uefi_entries(),
+                requested_mode=WriteMode.EXTRACTED_ISO,
+                firmware_target=FirmwareTarget.UEFI_ONLY,
+            )
+        with self.assertRaisesRegex(PlanError, "Manjaro"):
+            build_write_plan(
+                image,
+                self.uefi_entries(),
+                firmware_target=FirmwareTarget.UEFI_ONLY,
+            )
+        self.assertEqual(
+            build_write_plan(image, requested_mode=WriteMode.DD).mode,
+            WriteMode.DD,
+        )
+
+    def test_invalid_policy_catalog_disables_only_iso_mode(self):
+        image = inspection()
+        with patch(
+            "isopropyl.distro_policies._bundled_policies",
+            side_effect=DistroPolicyCatalogError("fixture catalog failure"),
+        ):
+            result = recommend_write_method(image, self.uefi_entries())
+            self.assertEqual(result.available_modes, (WriteMode.DD,))
+            self.assertEqual(result.recommended_mode, WriteMode.DD)
+            self.assertIn("fixture catalog failure", result.iso_unavailable_reason)
+            self.assertIn(
+                "fixture catalog failure", result.distro_iso_exclusion_reason,
+            )
+            self.assertEqual(
+                build_write_plan(image, requested_mode=WriteMode.DD).mode,
+                WriteMode.DD,
+            )
+
+    def test_native_layout_policy_never_makes_optical_dd_safe_or_fit(self):
+        image = replace(
+            inspection(hybrid=False, boot_modes=("UEFI",)),
+            members=(ImageMember("proxmox/pve-base.squashfs", 1, "file"),),
+        )
+
+        fits = recommend_write_method(image, self.uefi_entries())
+        self.assertEqual(fits.available_modes, (WriteMode.DD,))
+        self.assertIsNone(fits.recommended_mode)
+        self.assertIn("optical-only", fits.reason)
+        self.assertIn("Proxmox", fits.iso_unavailable_reason)
+
+        too_small = recommend_write_method(
+            image, self.uefi_entries(), target_size=image.size - 1,
+        )
+        self.assertEqual(too_small.available_modes, ())
+        self.assertIsNone(too_small.recommended_mode)
+        self.assertIn("too small", too_small.reason)
+        self.assertIn("Proxmox", too_small.iso_unavailable_reason)
+
+    def test_additive_entries_cannot_spoof_a_base_image_policy_match(self):
+        image = inspection(hybrid=False, boot_modes=("UEFI",))
+        entries = (*self.uefi_entries(), ArchiveEntry(".miso", 1))
+
+        result = recommend_write_method(image, entries)
+
+        self.assertIn(WriteMode.EXTRACTED_ISO, result.available_modes)
+        self.assertEqual(result.iso_unavailable_reason, "")
 
     def test_blocked_iso_exposes_reason_without_silent_fallback(self):
         result = recommend_write_method(
