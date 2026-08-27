@@ -47,6 +47,145 @@ ONLINE_ACCOUNT_BYPASS_EDITIONS = frozenset({
     "professionalworkstationn",
 })
 
+# This fixed manifest is adapted effect-for-effect from Rufus's Windows User
+# Experience generator at commit 2368e49a82e854d3e702f824648cc723953dbb53.
+# Rufus's copyright and GPL-3.0-or-later notice are retained in
+# THIRD_PARTY_NOTICES.md; ISOpropyl adds its own gating, disclosure, command
+# descriptions, XML generation, and safety validation around the manifest.
+_QOL_SPECIALIZE_COMMANDS = (
+    (
+        "Disable OneDrive file synchronization",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\OneDrive" '
+        "/v DisableFileSyncNGSC /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Remove the preinstalled OneDrive setup programs",
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+        '-Command "Remove-Item -Path $env:SystemRoot\\System32\\OneDriveSetup.exe '
+        "-Force -Confirm:$false; Remove-Item -Path "
+        '$env:SystemRoot\\SysWOW64\\OneDriveSetup.exe -Force -Confirm:$false;"',
+    ),
+    (
+        "Remove provisioned Outlook packages",
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+        '-Command "Get-AppxProvisionedPackage -Online | Where-Object '
+        "{$_.PackageName -like '*Outlook*'} | Remove-AppxProvisionedPackage -Online\"",
+    ),
+    (
+        "Remove installed Outlook packages",
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+        '-Command "Get-AppxPackage -AllUsers *Outlook* | '
+        'Remove-AppxPackage -AllUsers"',
+    ),
+    (
+        "Remove provisioned Teams packages",
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+        '-Command "Get-AppxProvisionedPackage -Online | Where-Object '
+        "{$_.PackageName -like '*Teams*'} | Remove-AppxProvisionedPackage -Online\"",
+    ),
+    (
+        "Remove installed Teams packages",
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+        '-Command "Get-AppxPackage -AllUsers *Teams* | '
+        'Remove-AppxPackage -AllUsers"',
+    ),
+)
+
+_FAST_STARTUP_COMMAND = (
+    "Disable Windows Fast Startup",
+    'reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Power" '
+    "/v HiberbootEnabled /t REG_DWORD /d 0 /f",
+)
+
+_QOL_FIRST_LOGON_COMMANDS = (
+    _FAST_STARTUP_COMMAND,
+    (
+        "Hide the Windows Copilot taskbar button",
+        'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" '
+        "/v ShowCopilotButton /t REG_DWORD /d 0 /f",
+    ),
+    (
+        "Disable Windows Copilot by policy",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\WindowsCopilot" '
+        "/v TurnOffWindowsCopilot /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Use the compact taskbar search icon",
+        'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search" '
+        "/v SearchboxTaskbarMode /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Keep the compact taskbar search setting",
+        'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search" '
+        "/v SearchboxTaskbarModeCache /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Disable Windows consumer-feature suggestions",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\CloudContent" '
+        "/v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Disable Start menu suggestions",
+        'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager" '
+        "/v SystemPaneSuggestionsEnabled /t REG_DWORD /d 0 /f",
+    ),
+    (
+        "Disable Bing-backed Windows search",
+        'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search" '
+        "/v BingSearchEnabled /t REG_DWORD /d 0 /f",
+    ),
+    (
+        "Disable device metadata downloads",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\Device Metadata" '
+        "/v PreventDeviceMetadataFromNetwork /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Disable News and Interests",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Dsh" '
+        "/v AllowNewsAndInterests /t REG_DWORD /d 0 /f",
+    ),
+    (
+        "Disable Windows feeds",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\Windows Feeds" '
+        "/v EnableFeeds /t REG_DWORD /d 0 /f",
+    ),
+    (
+        "Disable automatic Teams chat installation",
+        'reg add "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Communications" '
+        "/v ConfigureChatAutoInstall /t REG_DWORD /d 0 /f",
+    ),
+    (
+        "Disable cloud-optimized taskbar content",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\CloudContent" '
+        "/v DisableCloudOptimizedContent /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Skip the Microsoft Edge first-run experience",
+        'reg add "HKLM\\Software\\Policies\\Microsoft\\Edge" '
+        "/v HideFirstRunExperience /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Show more pinned items in Start",
+        'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" '
+        "/v Start_Layout /t REG_DWORD /d 1 /f",
+    ),
+    (
+        "Enable useful Start menu folder shortcuts",
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+        "-Command \"Set-ItemProperty -Path "
+        "'Registry::HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Start' "
+        "-Name 'VisiblePlaces' -Value $([convert]::FromBase64String("
+        "'ztU0LVr6Q0WC8iLm6vd3PC+zZ+PeiVVDv85h83sYqTe8JIoUDNaJQqCAbtm7oki"
+        "CRIF1/g0IrkKL2jTtl7ZjlEqwvXRK+WhPi9ZDmAcdqLyGCHNSqlFDQp97J3ZYRlnU'"
+        ")) -Type 'Binary'\"",
+    ),
+    (
+        "Restore the classic context menu",
+        'reg add "HKCU\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+        '\\InprocServer32" /ve /t REG_SZ /d "" /f',
+    ),
+)
+
 
 @dataclass(frozen=True)
 class WindowsCustomization:
@@ -74,6 +213,8 @@ class WindowsCustomization:
     acknowledge_online_account_limitations: bool = False
     # Appended to retain the positional argument order of the public dataclass.
     disable_fast_startup: bool = False
+    quality_of_life: bool = False
+    acknowledge_quality_of_life_limitations: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -82,6 +223,7 @@ class WindowsCustomization:
             self.bypass_online_account_requirement,
             bool(self.local_username), self.reduce_data_collection,
             self.disable_automatic_bitlocker, self.disable_fast_startup,
+            self.quality_of_life,
             bool(self.input_locale),
             bool(self.system_locale), bool(self.ui_language),
             bool(self.user_locale), bool(self.timezone), self.install_image is not None,
@@ -211,6 +353,47 @@ def online_account_bypass_compatibility(
     )
 
 
+def quality_of_life_compatibility(
+    selection: WimSelection | None,
+) -> tuple[bool, str]:
+    """Gate the fixed policy/package bundle on conclusive Windows 11 metadata."""
+
+    if selection is None:
+        return False, (
+            "Inspect and select a Windows 11 edition before enabling this option"
+        )
+    try:
+        validate_wim_selection(selection)
+    except WimValidationError:
+        return False, "The selected Windows edition metadata is not valid"
+    edition = selection.edition
+    if (
+        edition.major_version != 10
+        or edition.minor_version != 0
+        or edition.build < 22000
+    ):
+        return False, "The quality-of-life bundle is limited to Windows 11"
+    if edition.architecture not in {"amd64", "arm64"}:
+        return False, "The quality-of-life bundle requires x64 or ARM64 Windows 11"
+    edition_text = unicodedata.normalize("NFKC", " ".join((
+        edition.name, edition.description, edition.edition_id,
+    ))).casefold()
+    compact_edition_text = "".join(
+        character for character in edition_text if character.isalnum()
+    )
+    if "smode" in compact_edition_text or "cloud" in compact_edition_text:
+        return False, (
+            "The quality-of-life bundle is disabled because first-logon commands "
+            "are not reliable for S-mode or cloud editions"
+        )
+    return True, (
+        "Disables OneDrive synchronization, deletes its setup binaries, removes "
+        "provisioned/installed Outlook and Teams packages, and applies fixed "
+        "Windows 11 policies at specialize/first logon. Microsoft may rename "
+        "packages or settings, and WIM metadata cannot prove S mode is absent."
+    )
+
+
 def _settings(root: ET.Element, passes: dict[str, ET.Element], name: str) -> ET.Element:
     settings = passes.get(name)
     if settings is None:
@@ -288,6 +471,16 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
         compatible, reason = online_account_bypass_compatibility(options.install_image)
         if not compatible:
             raise ValueError(reason)
+    if options.quality_of_life:
+        if not options.acknowledge_quality_of_life_limitations:
+            raise ValueError(
+                "Acknowledge that the quality-of-life bundle removes provisioned "
+                "packages, depends on first-logon commands, and may change as "
+                "Windows evolves"
+            )
+        compatible, reason = quality_of_life_compatibility(options.install_image)
+        if not compatible:
+            raise ValueError(reason)
 
     root = ET.Element(f"{{{UNATTEND_NS}}}unattend")
     passes: dict[str, ET.Element] = {}
@@ -335,11 +528,9 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
             "/v BypassNRO /t REG_DWORD /d 1 /f",
         ))
     if options.disable_fast_startup:
-        specialize_commands.append((
-            "Disable Windows Fast Startup",
-            'reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Power" '
-            "/v HiberbootEnabled /t REG_DWORD /d 0 /f",
-        ))
+        specialize_commands.append(_FAST_STARTUP_COMMAND)
+    if options.quality_of_life:
+        specialize_commands.extend(_QOL_SPECIALIZE_COMMANDS)
     if specialize_commands:
         deployment = component("specialize", "Microsoft-Windows-Deployment")
         synchronous = ET.SubElement(deployment, "RunSynchronous")
@@ -366,7 +557,7 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
 
     needs_shell = any((
         options.hide_online_account, options.bypass_online_account_requirement,
-        username, options.reduce_data_collection, timezone,
+        username, options.reduce_data_collection, options.quality_of_life, timezone,
     ))
     if needs_shell:
         shell = component("oobeSystem", "Microsoft-Windows-Shell-Setup")
@@ -391,6 +582,7 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
         if timezone:
             ET.SubElement(shell, "TimeZone").text = timezone
 
+        first_logon_commands: list[tuple[str, str]] = []
         if username:
             accounts = ET.SubElement(shell, "UserAccounts")
             local_accounts = ET.SubElement(accounts, "LocalAccounts")
@@ -407,7 +599,6 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
             ET.SubElement(account, "Group").text = "Administrators"
             ET.SubElement(account, "Name").text = username
 
-            first_logon_commands: list[tuple[str, str]] = []
             if options.require_local_password_change:
                 ps_username = username.replace("'", "''")
                 account_policy = (
@@ -426,10 +617,16 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
                     "powershell.exe -NoLogo -NoProfile -NonInteractive -Command "
                     + account_policy,
                 ))
-            if first_logon_commands:
-                commands = ET.SubElement(shell, "FirstLogonCommands")
-                for order, (description, command) in enumerate(first_logon_commands, 1):
-                    _first_logon_command(commands, order, description, command)
+        if options.quality_of_life:
+            first_logon_commands.extend(
+                _QOL_FIRST_LOGON_COMMANDS[
+                    1 if options.disable_fast_startup else 0:
+                ]
+            )
+        if first_logon_commands:
+            commands = ET.SubElement(shell, "FirstLogonCommands")
+            for order, (description, command) in enumerate(first_logon_commands, 1):
+                _first_logon_command(commands, order, description, command)
 
     if options.disable_automatic_bitlocker:
         secure_startup = component(

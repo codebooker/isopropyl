@@ -3,8 +3,9 @@
 This is the live product-parity audit for ISOpropyl. It compares the current
 Linux implementation with Rufus master commit
 [`2368e49a`](https://github.com/pbatard/rufus/tree/2368e49a82e854d3e702f824648cc723953dbb53)
-(2026-08-24, including Rufus 4.15 changes). ISOpropyl is an independent
-AGPL-3.0-or-later implementation and contains no Rufus source code.
+(2026-08-24, including Rufus 4.15 changes). ISOpropyl is a Linux-native
+AGPL-3.0-or-later implementation. Adapted data or behavior with upstream
+copyright significance is identified in [third-party notices](THIRD_PARTY_NOTICES.md).
 
 Status meanings:
 
@@ -101,7 +102,7 @@ Status meanings:
 | Internal disks offline for Windows To Go | **Planned** | Belongs to future offline SAN/BCD configuration. |
 | Windows CA 2023 / `SkuSiPolicy.p7b` | **Planned** | Security-sensitive, versioned validation required. |
 | S Mode-aware customization | **Partial** | UI warns first-logon commands do not run in S Mode; no complete alternative path. |
-| Quality-of-life/debloating options | **Research** | Fast Startup is implemented as a separate disclosed option. Package removal and other subjective, fast-changing preferences remain research items rather than a bundled policy. |
+| Quality-of-life/debloating options | **Done** | A transparent default-off Windows 11 bundle emits six fixed `specialize` commands to disable OneDrive synchronization and remove provisioned/installed OneDrive, Outlook, and Teams components, plus seventeen ordered first-logon commands for Fast Startup, Copilot, recommendations, search, device metadata, news/feeds, chat, Edge first-run, Start shortcuts, and the classic context menu. It requires a validated selected x64/ARM64 Windows 11 WIM/ESD edition, rejects obvious S-mode/cloud editions, and requires a separate limitations acknowledgment. No command contains user text, networking, disk selection, `DiskConfiguration`, `InstallTo`, or `WillWipeDisk`; the frozen staging plan regenerates and byte-compares the complete XML. Package/policy drift and physical Windows validation remain product limitations. |
 | Silent install to first disk | **Research** | Future expert-only profile with severe target-PC warnings, never default. |
 | In-place upgrade bypass wrapper | **Research** | Not USB creation; high maintenance and security burden. |
 

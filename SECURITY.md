@@ -219,6 +219,18 @@ issue requesting a private contact channel without disclosing the vulnerability.
   The separate Fast Startup option emits only the fixed machine-level
   `HiberbootEnabled=0` registry command during `specialize`; it is default-off
   and discloses that full shutdowns may make startup slower.
+  The separate Windows 11 quality-of-life bundle is also default-off. It
+  requires an explicitly selected, validated x64/ARM64 Windows 11 WIM/ESD
+  edition, rejects obvious normalized S-mode/cloud markers, and requires an
+  acknowledgment that first-logon execution and Microsoft package/policy names
+  can change. Its six `specialize` and seventeen first-logon commands are fixed
+  project data: no username, path, downloaded text, or other user input enters
+  them. They disable OneDrive synchronization, delete its setup binaries,
+  remove provisioned/installed Outlook and Teams packages, and set the disclosed
+  Windows policy/UI defaults. Selecting standalone Fast Startup as well cannot
+  duplicate `HiberbootEnabled`. Tests assert one ordered component, one ordered
+  first-logon sequence, exact regeneration from the frozen staging model, and
+  the absence of `DiskConfiguration`, `InstallTo`, and `WillWipeDisk`.
   This is an ISOpropyl construction invariant, not a claim that every unusual
   booted Windows Setup launch context has been physically certified. ISOpropyl
   never emits an automatic target-disk wipe instruction for Windows Setup.

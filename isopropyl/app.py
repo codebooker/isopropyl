@@ -22,8 +22,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSlider, QTabWidget, QVBoxLayout,
-    QWidget,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from .backup import (
@@ -129,7 +129,8 @@ from .wim import (
 )
 from .windows import (
     WindowsCustomization, generate_autounattend,
-    online_account_bypass_compatibility, windows_architecture,
+    online_account_bypass_compatibility, quality_of_life_compatibility,
+    windows_architecture,
 )
 from .zip_overlay import (
     ZipOverlayPlan, build_zip_overlay_plan,
@@ -3861,11 +3862,15 @@ class Window(QMainWindow):
             or self.windows_options.install_image_path
             or self.windows_options.bypass_online_account_requirement
             or self.windows_options.acknowledge_online_account_limitations
+            or self.windows_options.quality_of_life
+            or self.windows_options.acknowledge_quality_of_life_limitations
         ):
             self.windows_options = replace(
                 self.windows_options, install_image=None, install_image_path="",
                 bypass_online_account_requirement=False,
                 acknowledge_online_account_limitations=False,
+                quality_of_life=False,
+                acknowledge_quality_of_life_limitations=False,
             )
 
     def start_windows_wim_inspection(self) -> None:
@@ -3971,11 +3976,15 @@ class Window(QMainWindow):
                 or self.windows_options.install_image_path
                 or self.windows_options.bypass_online_account_requirement
                 or self.windows_options.acknowledge_online_account_limitations
+                or self.windows_options.quality_of_life
+                or self.windows_options.acknowledge_quality_of_life_limitations
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
                     bypass_online_account_requirement=False,
                     acknowledge_online_account_limitations=False,
+                    quality_of_life=False,
+                    acknowledge_quality_of_life_limitations=False,
                 )
             self.windows_wim_error = (
                 str(result) if isinstance(result, Exception)
@@ -3998,11 +4007,15 @@ class Window(QMainWindow):
                 or self.windows_options.install_image_path
                 or self.windows_options.bypass_online_account_requirement
                 or self.windows_options.acknowledge_online_account_limitations
+                or self.windows_options.quality_of_life
+                or self.windows_options.acknowledge_quality_of_life_limitations
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
                     bypass_online_account_requirement=False,
                     acknowledge_online_account_limitations=False,
+                    quality_of_life=False,
+                    acknowledge_quality_of_life_limitations=False,
                 )
             self.windows_wim_error = str(error)
             self.windows_button.setToolTip(
@@ -4016,11 +4029,15 @@ class Window(QMainWindow):
                 or self.windows_options.install_image_path
                 or self.windows_options.bypass_online_account_requirement
                 or self.windows_options.acknowledge_online_account_limitations
+                or self.windows_options.quality_of_life
+                or self.windows_options.acknowledge_quality_of_life_limitations
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
                     bypass_online_account_requirement=False,
                     acknowledge_online_account_limitations=False,
+                    quality_of_life=False,
+                    acknowledge_quality_of_life_limitations=False,
                 )
             self.windows_wim_error = (
                 "The WIM inspector returned metadata for a different catalog size"
@@ -4041,12 +4058,16 @@ class Window(QMainWindow):
             bool(self.windows_options.install_image_path)
             or self.windows_options.bypass_online_account_requirement
             or self.windows_options.acknowledge_online_account_limitations
+            or self.windows_options.quality_of_life
+            or self.windows_options.acknowledge_quality_of_life_limitations
         )
         if selection_is_stale or selection_is_missing:
             self.windows_options = replace(
                 self.windows_options, install_image=None, install_image_path="",
                 bypass_online_account_requirement=False,
                 acknowledge_online_account_limitations=False,
+                quality_of_life=False,
+                acknowledge_quality_of_life_limitations=False,
             )
         labels = "\n".join(edition.display_label for edition in info.editions)
         self.windows_button.setToolTip(labels)
@@ -4262,6 +4283,12 @@ class Window(QMainWindow):
             lines.append(
                 f"Windows image: {self.windows_options.install_image.display_label} · "
                 f"{self.windows_options.install_image.source_name}"
+            )
+        if self.windows_options.quality_of_life:
+            lines.append(
+                "Windows option: quality-of-life bundle disables OneDrive, "
+                "removes Outlook/Teams packages, and applies fixed first-logon "
+                "policy/UI defaults"
             )
         lines.extend(("", "Dependencies:"))
         lines.extend(
@@ -5126,6 +5153,18 @@ class Window(QMainWindow):
             "\nWindows customization: autounattend.xml will be added."
             if staging_plan.windows_customization is not None else ""
         )
+        if (
+            staging_plan.windows_customization is not None
+            and staging_plan.windows_customization.quality_of_life
+        ):
+            customization += (
+                "\nWindows 11 quality-of-life bundle: disable OneDrive "
+                "synchronization and delete its setup binaries; remove "
+                "provisioned/installed Outlook and Teams packages; apply the "
+                "disclosed Copilot, recommendations, search, news, Start, Edge, "
+                "Fast Startup, and context-menu defaults. Package or policy steps "
+                "may partially fail."
+            )
         if staging_plan.wim_selection is not None:
             customization += (
                 "\nWindows image: "
@@ -5926,9 +5965,13 @@ class Window(QMainWindow):
         tabs = QTabWidget()
         setup_tab = QWidget()
         setup_layout = QVBoxLayout(setup_tab)
+        setup_scroll = QScrollArea()
+        setup_scroll.setWidgetResizable(True)
+        setup_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        setup_scroll.setWidget(setup_tab)
         regional_tab = QWidget()
         regional_form = QFormLayout(regional_tab)
-        tabs.addTab(setup_tab, "Setup and account")
+        tabs.addTab(setup_scroll, "Setup and account")
         tabs.addTab(regional_tab, "Region and keyboard")
         layout.addWidget(tabs)
 
@@ -6081,6 +6124,17 @@ class Window(QMainWindow):
             "Writes the fixed HiberbootEnabled=0 machine setting during Windows "
             "Setup. This avoids hybrid shutdown but may make startup slower."
         )
+        quality_of_life = QCheckBox(
+            "Windows 11 quality-of-life bundle"
+        )
+        quality_of_life.setObjectName("windowsQualityOfLifeCheckBox")
+        quality_of_life_acknowledgment = QCheckBox(
+            "I understand these package removals and policies may change or "
+            "partially fail"
+        )
+        quality_of_life_acknowledgment.setObjectName(
+            "windowsQualityOfLifeAcknowledgment",
+        )
         local = QCheckBox("Create a local administrator account")
         username = QLineEdit()
         username.setPlaceholderText("Local account name")
@@ -6097,7 +6151,8 @@ class Window(QMainWindow):
 
         local.toggled.connect(set_local_controls)
         for checkbox in (
-            bypass, online, offline_account, privacy, bitlocker, fast_startup, local,
+            bypass, online, offline_account, privacy, bitlocker, fast_startup,
+            quality_of_life,
         ):
             setup_layout.addWidget(checkbox)
         offline_account_note = QLabel()
@@ -6105,6 +6160,12 @@ class Window(QMainWindow):
         offline_account_note.setObjectName("muted")
         setup_layout.addWidget(offline_account_note)
         setup_layout.addWidget(offline_account_acknowledgment)
+        quality_of_life_note = QLabel()
+        quality_of_life_note.setWordWrap(True)
+        quality_of_life_note.setObjectName("muted")
+        setup_layout.addWidget(quality_of_life_note)
+        setup_layout.addWidget(quality_of_life_acknowledgment)
+        setup_layout.addWidget(local)
         setup_layout.addWidget(username)
         setup_layout.addWidget(password_change)
         setup_layout.addWidget(password_never_expires)
@@ -6150,6 +6211,10 @@ class Window(QMainWindow):
         privacy.setChecked(current.reduce_data_collection)
         bitlocker.setChecked(current.disable_automatic_bitlocker)
         fast_startup.setChecked(current.disable_fast_startup)
+        quality_of_life.setChecked(current.quality_of_life)
+        quality_of_life_acknowledgment.setChecked(
+            current.acknowledge_quality_of_life_limitations,
+        )
         local.setChecked(bool(current.local_username))
         username.setText(current.local_username)
         password_change.setChecked(current.require_local_password_change)
@@ -6186,11 +6251,34 @@ class Window(QMainWindow):
             if not enabled:
                 offline_account_acknowledgment.setChecked(False)
 
+        def update_quality_of_life_control() -> None:
+            supported, reason = quality_of_life_compatibility(
+                selected_bypass_image(),
+            )
+            quality_of_life.setEnabled(supported)
+            quality_of_life.setToolTip(reason)
+            quality_of_life_note.setText(reason)
+            if not supported:
+                quality_of_life.setChecked(False)
+
+        def update_quality_of_life_acknowledgment() -> None:
+            enabled = quality_of_life.isEnabled() and quality_of_life.isChecked()
+            quality_of_life_acknowledgment.setEnabled(enabled)
+            if not enabled:
+                quality_of_life_acknowledgment.setChecked(False)
+
         source_combo.currentIndexChanged.connect(update_offline_account_control)
         image_combo.currentIndexChanged.connect(update_offline_account_control)
+        source_combo.currentIndexChanged.connect(update_quality_of_life_control)
+        image_combo.currentIndexChanged.connect(update_quality_of_life_control)
         offline_account.toggled.connect(update_offline_account_acknowledgment)
+        quality_of_life.toggled.connect(
+            update_quality_of_life_acknowledgment,
+        )
         update_offline_account_control()
         update_offline_account_acknowledgment()
+        update_quality_of_life_control()
+        update_quality_of_life_acknowledgment()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel
@@ -6231,6 +6319,10 @@ class Window(QMainWindow):
                 reduce_data_collection=privacy.isChecked(),
                 disable_automatic_bitlocker=bitlocker.isChecked(),
                 disable_fast_startup=fast_startup.isChecked(),
+                quality_of_life=quality_of_life.isChecked(),
+                acknowledge_quality_of_life_limitations=(
+                    quality_of_life_acknowledgment.isChecked()
+                ),
                 input_locale=input_locale.text(),
                 system_locale=system_locale.text(),
                 ui_language=ui_language.text(),

@@ -9,7 +9,7 @@ from isopropyl.wim import WimEdition, WimSelection
 from isopropyl.windows import (
     UNATTEND_NS, WCM_NS, WindowsCustomization, add_autounattend_to_staging,
     answer_file_install_index, answer_file_install_path, generate_autounattend,
-    online_account_bypass_compatibility,
+    online_account_bypass_compatibility, quality_of_life_compatibility,
     validate_input_locale, validate_install_wim_path, validate_language_tag,
     validate_timezone,
     validate_username, windows_architecture,
@@ -91,6 +91,176 @@ class WindowsCustomizationTests(unittest.TestCase):
         paths = [item.findtext("u:Path", namespaces=NS) for item in commands]
         self.assertIn("BypassNRO", paths[0] or "")
         self.assertIn("HiberbootEnabled", paths[1] or "")
+
+    def test_quality_of_life_requires_conclusive_windows_11_metadata(self):
+        for architecture in ("amd64", "arm64"):
+            for build in (22000, 22631, 26100, 26200, 30000):
+                with self.subTest(architecture=architecture, build=build):
+                    supported, reason = quality_of_life_compatibility(
+                        install_selection(architecture, build=build),
+                    )
+                    self.assertTrue(supported, reason)
+
+        invalid = (
+            None,
+            install_selection(build=19045, name="Windows 10 Pro"),
+            install_selection("x86"),
+            install_selection(
+                edition_id="ProfessionalSMode", name="Windows 11 Pro S Mode",
+            ),
+            install_selection(
+                edition_id="CloudEdition", name="Windows 11 SE Cloud",
+            ),
+        )
+        for selection in invalid:
+            with self.subTest(selection=selection):
+                supported, reason = quality_of_life_compatibility(selection)
+                self.assertFalse(supported)
+                self.assertTrue(reason)
+
+    def test_quality_of_life_requires_explicit_limit_acknowledgment(self):
+        with self.assertRaisesRegex(ValueError, "Acknowledge"):
+            generate_autounattend(WindowsCustomization(
+                install_image=install_selection(), quality_of_life=True,
+            ))
+
+    def test_quality_of_life_emits_exact_ordered_fixed_commands_without_wipe(self):
+        options = WindowsCustomization(
+            install_image=install_selection(),
+            quality_of_life=True,
+            acknowledge_quality_of_life_limitations=True,
+        )
+        self.assertTrue(options.enabled)
+        root = ET.fromstring(generate_autounattend(options, "amd64"))
+
+        specialize = root.findall(
+            ".//u:RunSynchronous/u:RunSynchronousCommand", NS,
+        )
+        expected_specialize = (
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\OneDrive" '
+            "/v DisableFileSyncNGSC /t REG_DWORD /d 1 /f",
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+            '-Command "Remove-Item -Path $env:SystemRoot\\System32\\OneDriveSetup.exe '
+            "-Force -Confirm:$false; Remove-Item -Path "
+            '$env:SystemRoot\\SysWOW64\\OneDriveSetup.exe -Force -Confirm:$false;"',
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+            '-Command "Get-AppxProvisionedPackage -Online | Where-Object '
+            "{$_.PackageName -like '*Outlook*'} | Remove-AppxProvisionedPackage -Online\"",
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+            '-Command "Get-AppxPackage -AllUsers *Outlook* | '
+            'Remove-AppxPackage -AllUsers"',
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+            '-Command "Get-AppxProvisionedPackage -Online | Where-Object '
+            "{$_.PackageName -like '*Teams*'} | Remove-AppxProvisionedPackage -Online\"",
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+            '-Command "Get-AppxPackage -AllUsers *Teams* | '
+            'Remove-AppxPackage -AllUsers"',
+        )
+        self.assertEqual(
+            tuple(item.findtext("u:Path", namespaces=NS) for item in specialize),
+            expected_specialize,
+        )
+        self.assertEqual(
+            tuple(item.findtext("u:Order", namespaces=NS) for item in specialize),
+            tuple(str(index) for index in range(1, 7)),
+        )
+
+        first_logon = root.findall(
+            ".//u:FirstLogonCommands/u:SynchronousCommand", NS,
+        )
+        expected_first_logon = (
+            'reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Power" '
+            "/v HiberbootEnabled /t REG_DWORD /d 0 /f",
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" '
+            "/v ShowCopilotButton /t REG_DWORD /d 0 /f",
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\WindowsCopilot" '
+            "/v TurnOffWindowsCopilot /t REG_DWORD /d 1 /f",
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search" '
+            "/v SearchboxTaskbarMode /t REG_DWORD /d 1 /f",
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search" '
+            "/v SearchboxTaskbarModeCache /t REG_DWORD /d 1 /f",
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\CloudContent" '
+            "/v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f",
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager" '
+            "/v SystemPaneSuggestionsEnabled /t REG_DWORD /d 0 /f",
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search" '
+            "/v BingSearchEnabled /t REG_DWORD /d 0 /f",
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\Device Metadata" '
+            "/v PreventDeviceMetadataFromNetwork /t REG_DWORD /d 1 /f",
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Dsh" '
+            "/v AllowNewsAndInterests /t REG_DWORD /d 0 /f",
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\Windows Feeds" '
+            "/v EnableFeeds /t REG_DWORD /d 0 /f",
+            'reg add "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Communications" '
+            "/v ConfigureChatAutoInstall /t REG_DWORD /d 0 /f",
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Windows\\CloudContent" '
+            "/v DisableCloudOptimizedContent /t REG_DWORD /d 1 /f",
+            'reg add "HKLM\\Software\\Policies\\Microsoft\\Edge" '
+            "/v HideFirstRunExperience /t REG_DWORD /d 1 /f",
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced" '
+            "/v Start_Layout /t REG_DWORD /d 1 /f",
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+            "-Command \"Set-ItemProperty -Path "
+            "'Registry::HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Start' "
+            "-Name 'VisiblePlaces' -Value $([convert]::FromBase64String("
+            "'ztU0LVr6Q0WC8iLm6vd3PC+zZ+PeiVVDv85h83sYqTe8JIoUDNaJQqCAbtm7oki"
+            "CRIF1/g0IrkKL2jTtl7ZjlEqwvXRK+WhPi9ZDmAcdqLyGCHNSqlFDQp97J3ZYRlnU'"
+            ")) -Type 'Binary'\"",
+            'reg add "HKCU\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+            '\\InprocServer32" /ve /t REG_SZ /d "" /f',
+        )
+        self.assertEqual(
+            tuple(
+                item.findtext("u:CommandLine", namespaces=NS)
+                for item in first_logon
+            ),
+            expected_first_logon,
+        )
+        self.assertEqual(
+            tuple(item.findtext("u:Order", namespaces=NS) for item in first_logon),
+            tuple(str(index) for index in range(1, 18)),
+        )
+        self.assertEqual(len(root.findall(".//u:FirstLogonCommands", NS)), 1)
+        self.assertIsNone(root.find(".//u:DiskConfiguration", NS))
+        self.assertIsNone(root.find(".//u:InstallTo", NS))
+        self.assertIsNone(root.find(".//u:WillWipeDisk", NS))
+
+    def test_quality_of_life_merges_commands_and_deduplicates_fast_startup(self):
+        options = WindowsCustomization(
+            install_image=install_selection(),
+            bypass_online_account_requirement=True,
+            acknowledge_online_account_limitations=True,
+            local_username="O'Brien & Co",
+            disable_fast_startup=True,
+            quality_of_life=True,
+            acknowledge_quality_of_life_limitations=True,
+        )
+        xml = generate_autounattend(options, "amd64")
+        root = ET.fromstring(xml)
+        self.assertEqual(xml.count("HiberbootEnabled"), 1)
+        self.assertEqual(
+            len(root.findall(".//u:FirstLogonCommands", NS)), 1,
+        )
+        first_logon = root.findall(
+            ".//u:FirstLogonCommands/u:SynchronousCommand", NS,
+        )
+        self.assertEqual(len(first_logon), 17)
+        self.assertIn(
+            "PasswordExpired",
+            first_logon[0].findtext("u:CommandLine", namespaces=NS) or "",
+        )
+        self.assertIn(
+            "ShowCopilotButton",
+            first_logon[1].findtext("u:CommandLine", namespaces=NS) or "",
+        )
+        self.assertEqual(
+            len([
+                item for item in root.findall(".//u:component", NS)
+                if item.attrib.get("name") == "Microsoft-Windows-Deployment"
+            ]),
+            1,
+        )
+        self.assertEqual(root.findtext(".//u:Name", namespaces=NS), "O'Brien & Co")
 
     def test_emits_one_fixed_version_gated_online_account_bypass_command(self):
         options = WindowsCustomization(

@@ -1554,6 +1554,65 @@ class WindowWriteMethodTests(unittest.TestCase):
             self.window.configure_windows()
         self.assertTrue(self.window.windows_options.disable_fast_startup)
 
+    def test_quality_of_life_defaults_off_requires_edition_and_acknowledgment(self):
+        source = ArchiveEntry("sources/install.wim", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26100, 0,
+        )
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_install_source_count = 1
+        self.window.windows_wim_member = source
+        self.window.windows_wim_editions = (edition,)
+
+        def enable_and_save(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsQualityOfLifeCheckBox",
+            )
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsQualityOfLifeAcknowledgment",
+            )
+            combo = dialog.findChild(QComboBox, "windowsEditionCombo")
+            assert checkbox is not None and acknowledgment is not None
+            assert combo is not None
+            self.assertFalse(checkbox.isEnabled())
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(acknowledgment.isEnabled())
+            combo.setCurrentIndex(combo.findData(edition.index))
+            self.assertTrue(checkbox.isEnabled())
+            self.assertIn("OneDrive", checkbox.toolTip())
+            checkbox.setChecked(True)
+            self.assertTrue(acknowledgment.isEnabled())
+            acknowledgment.setChecked(True)
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=enable_and_save):
+            self.window.configure_windows()
+        self.assertTrue(self.window.windows_options.quality_of_life)
+        self.assertTrue(
+            self.window.windows_options.acknowledge_quality_of_life_limitations,
+        )
+        self.assertEqual(self.window.windows_options.install_image.edition, edition)
+
+        def verify_reopened(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsQualityOfLifeCheckBox",
+            )
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsQualityOfLifeAcknowledgment",
+            )
+            assert checkbox is not None and acknowledgment is not None
+            self.assertTrue(checkbox.isEnabled())
+            self.assertTrue(checkbox.isChecked())
+            self.assertTrue(acknowledgment.isEnabled())
+            self.assertTrue(acknowledgment.isChecked())
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=verify_reopened):
+            self.window.configure_windows()
+
     def test_online_account_bypass_disables_unknown_later_build(self):
         source = ArchiveEntry("sources/install.wim", 16)
         edition = WimEdition(
@@ -1600,6 +1659,8 @@ class WindowWriteMethodTests(unittest.TestCase):
             install_image_path=first.path,
             bypass_online_account_requirement=True,
             acknowledge_online_account_limitations=True,
+            quality_of_life=True,
+            acknowledge_quality_of_life_limitations=True,
         )
 
         self.window.select_windows_wim_source(second)
@@ -1611,6 +1672,10 @@ class WindowWriteMethodTests(unittest.TestCase):
         )
         self.assertFalse(
             self.window.windows_options.acknowledge_online_account_limitations,
+        )
+        self.assertFalse(self.window.windows_options.quality_of_life)
+        self.assertFalse(
+            self.window.windows_options.acknowledge_quality_of_life_limitations,
         )
 
     def test_nested_wim_edition_records_its_exact_source_path(self):
@@ -1694,6 +1759,8 @@ class WindowWriteMethodTests(unittest.TestCase):
             install_image=selection, install_image_path=source.path,
             bypass_online_account_requirement=True,
             acknowledge_online_account_limitations=True,
+            quality_of_life=True,
+            acknowledge_quality_of_life_limitations=True,
         )
         info = WimInfo("/tmp/install.wim", 17, (edition,), (1, 2, 17, 4, 5, 1))
 
@@ -1709,6 +1776,10 @@ class WindowWriteMethodTests(unittest.TestCase):
         )
         self.assertFalse(
             self.window.windows_options.acknowledge_online_account_limitations,
+        )
+        self.assertFalse(self.window.windows_options.quality_of_life)
+        self.assertFalse(
+            self.window.windows_options.acknowledge_quality_of_life_limitations,
         )
 
     def test_settings_persist_binary_units_and_refresh_device_label(self):
@@ -3430,6 +3501,48 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         self.assertIn("final transformed EFI payloads", confirmation)
         self.assertNotIn("helper payloads", confirmation)
         self.assertIn("before the target writer runs", confirmation)
+        workspace.cleanup.assert_called_once_with()
+
+    def test_final_confirmation_discloses_quality_of_life_package_removal(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        source = ArchiveEntry("sources/install.esd", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26100, 0,
+        )
+        customization = WindowsCustomization(
+            install_image=WimSelection(source.path, source.size, (edition,), 1),
+            quality_of_life=True,
+            acknowledge_quality_of_life_limitations=True,
+        )
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        staging = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            plan,
+            windows_customization=customization,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging,
+        )
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        confirmation = warning.call_args.args[2]
+        self.assertIn("quality-of-life bundle", confirmation)
+        self.assertIn("disable OneDrive synchronization", confirmation)
+        self.assertIn("Outlook and Teams packages", confirmation)
+        self.assertIn("Package or policy steps may partially fail", confirmation)
         workspace.cleanup.assert_called_once_with()
 
     def test_malformed_prepared_payload_is_rejected_before_confirmation(self):

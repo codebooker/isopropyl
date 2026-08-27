@@ -184,13 +184,20 @@ confirmations and expanded drive visibility are never persisted.
 - Inspect recognized Windows WIM/ESD sources and editions. ISO mode can add a
   transparent `autounattend.xml` for setup-check bypasses, privacy/OOBE choices,
   locale and time-zone settings, BitLocker-device-encryption prevention,
-  opt-in Fast Startup suppression, and carefully gated local/offline account
-  paths.
+  opt-in Fast Startup suppression, carefully gated local/offline account paths,
+  and a default-off Windows 11 quality-of-life bundle. That bundle disables
+  OneDrive synchronization and deletes its setup binaries, removes
+  provisioned/installed Outlook and Teams packages, and applies disclosed fixed
+  policies for Copilot, recommendations, search, news, Start, Edge, and the
+  context menu. It requires a selected x64/ARM64 Windows 11 edition and a
+  separate limitations acknowledgment.
 
 Windows customization is best-effort and intentionally conservative. Existing
 answer files are never silently combined or replaced; unsupported Home, S-mode,
 future-release, architecture, or ambiguous layouts disable the stronger account
-paths. The exact gates and residual limitations are documented in the
+paths. Quality-of-life package names and Windows policies can change, and its
+first-logon steps do not make S-mode media compatible. The exact gates and
+residual limitations are documented in the
 [feature matrix](FEATURE_MATRIX.md) and [security model](SECURITY.md).
 
 ### Maintain removable media
@@ -326,10 +333,11 @@ private-reporting guidance in [SECURITY.md](SECURITY.md), not a public issue.
 ## Credits and third-party software
 
 ISOpropyl is inspired by the clarity and capability of
-[Rufus](https://github.com/pbatard/rufus), but its application code is an
-independent Linux-native implementation. Optional UEFI:NTFS and UEFI Shell files
-remain under their upstream licenses and are acquired only after explicit user
-consent. Dependency licenses and provenance are recorded in
+[Rufus](https://github.com/pbatard/rufus) and is a Linux-native implementation.
+The small fixed Windows quality-of-life command manifest is adapted from Rufus
+with attribution; optional UEFI:NTFS and UEFI Shell files remain under their
+upstream licenses and are acquired only after explicit user consent. Dependency,
+adaptation, and payload provenance are recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 The symbol, repository banner, palette, and naming guidance live in

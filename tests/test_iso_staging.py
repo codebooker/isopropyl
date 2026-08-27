@@ -985,6 +985,45 @@ class IsoStagingTests(unittest.TestCase):
                         )
                     self.assertEqual(extractor.calls, [])
 
+    def test_quality_of_life_profile_is_frozen_and_regenerated_exactly(self):
+        customization = WindowsCustomization(
+            install_image=selected_esd(),
+            quality_of_life=True,
+            acknowledge_quality_of_life_limitations=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), selected_esd_entries(),
+                windows_customization=customization,
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            validate_iso_staging_plan(plan)
+            xml = plan.autounattend_xml or ""
+            self.assertIn("DisableFileSyncNGSC", xml)
+            self.assertIn("ShowCopilotButton", xml)
+            self.assertIn("VisiblePlaces", xml)
+            self.assertNotIn("WillWipeDisk", xml)
+
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "bound customization",
+            ):
+                validate_iso_staging_plan(replace(
+                    plan,
+                    autounattend_xml=xml.replace(
+                        "DisableFileSyncNGSC", "DisableFileSyncNGSC_FORGED",
+                    ),
+                ))
+            with self.assertRaises(IsoStagingSafetyError):
+                validate_iso_staging_plan(replace(
+                    plan,
+                    windows_customization=replace(
+                        customization,
+                        quality_of_life=False,
+                        acknowledge_quality_of_life_limitations=False,
+                    ),
+                ))
+
     def test_answer_file_requires_consistent_bound_generation_inputs(self):
         customization = WindowsCustomization(hide_online_account=True)
         with tempfile.TemporaryDirectory() as directory:

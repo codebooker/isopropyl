@@ -7,6 +7,23 @@ validator are obtained only after explicit user consent. The GRUB and Syslinux
 entries are dormant preparation inputs: normal writes do not download them and
 no BIOS executor consumes them yet.
 
+## Rufus Windows experience command manifest
+
+- Upstream source: Rufus [`src/wue.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/wue.c#L266-L468)
+  at commit `2368e49a82e854d3e702f824648cc723953dbb53`
+- Copyright © 2022–2026 Pete Batard `<pete@akeo.ie>`
+- License: GPL-3.0-or-later; the upstream license text is available as
+  [`LICENSE.txt`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/LICENSE.txt)
+
+The fixed Windows 11 quality-of-life command selection, order, registry values,
+and opaque `VisiblePlaces` payload in `isopropyl/windows.py` are adapted
+effect-for-effect from that source. ISOpropyl represents the manifest in Python,
+adds descriptions and noninteractive PowerShell switches, and surrounds it with
+independent WIM/ESD gating, disclosure, XML generation, staging identity checks,
+and no-wipe validation. Under GPLv3 section 13, the combined work is distributed
+under ISOpropyl's AGPL-3.0-or-later terms. Rufus and ISOpropyl provide these
+commands without warranty.
+
 ## Ubuntu CD Image signing key
 
 ISOpropyl embeds the public `ubuntu-keyring-2012-cdimage.gpg` keyring solely to

@@ -38,9 +38,11 @@ evidence.
   after upstream payload and firmware evidence supports it.
 - Track Windows CA 2023, `SkuSiPolicy.p7b`, S Mode, and post-24H2 online-account
   behavior without silently extending the current exact-build `BypassNRO` policy.
-- Keep the implemented Fast Startup switch narrow, opt-in, and reversible;
-  evaluate other Rufus quality-of-life choices as separately disclosed settings
-  rather than one opaque debloating policy.
+- Keep the standalone Fast Startup switch and the implemented Windows 11
+  quality-of-life bundle separate, default-off, and explicitly disclosed. Track
+  package/policy drift through release fixtures without adding downloaded or
+  user-supplied commands, and physically validate the fixed bundle on supported
+  x64/ARM64 Windows 11 releases.
 
 ### Linux boot and persistence
 
