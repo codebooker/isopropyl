@@ -42,6 +42,13 @@ issue requesting a private contact channel without disclosing the vulnerability.
   bounded. Destructive decompression is bounded by the selected target. Legal
   middle metadata outside the capture is reported as incomplete and is never
   automatically recommended for DD.
+- Checksum calculation separately opens the inspected image once with
+  `O_NOFOLLOW`, requires its bound device/inode/size/mtime/ctime identity, and
+  revalidates descriptor metadata around every read plus the pathname at EOF.
+  It is cancellable before and between reads. Image reselection invalidates its
+  generation token, so stale progress or completion cannot publish a digest or
+  tear down a newer operation. MD5 and SHA-1 are included only for comparison
+  with legacy provider manifests; prefer SHA-256 or SHA-512 for trust decisions.
 - A structurally valid MBR/GPT image whose logical-sector interpretation differs
   from the discovered target is not automatically recommended for DD; neither is
   structured DD when the target omits logical-sector metadata. An expert exact

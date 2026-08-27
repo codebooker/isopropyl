@@ -58,6 +58,10 @@ class ImageInspectionTimedOut(OSError):
     pass
 
 
+class ChecksumCancelled(Exception):
+    """Checksum calculation was cancelled before publishing a result."""
+
+
 @dataclass(frozen=True)
 class ImageMember:
     path: str
@@ -761,25 +765,77 @@ def inspect_image(
     return result
 
 
-def calculate_checksums(path: Path, progress: Progress | None = None) -> dict[str, str]:
-    total = path.stat().st_size
-    digests = {
-        "MD5": hashlib.md5(usedforsecurity=False),
-        "SHA-1": hashlib.sha1(usedforsecurity=False),
-        "SHA-256": hashlib.sha256(),
-        "SHA-512": hashlib.sha512(),
-    }
-    done = 0
-    with path.open("rb", buffering=0) as stream:
-        while block := stream.read(4 * 1024 * 1024):
+def calculate_checksums(
+    path: Path,
+    progress: Progress | None = None,
+    *,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> dict[str, str]:
+    """Hash one no-follow descriptor and fail closed if its identity changes."""
+
+    def check_cancelled() -> None:
+        if cancel_check is not None:
+            cancel_check()
+
+    def identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+
+    check_cancelled()
+    # O_NONBLOCK prevents a pathname race to a FIFO from hanging before fstat
+    # can reject it. It does not change ordinary regular-file reads on Linux.
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise OSError(f"Could not securely open the selected image: {error}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("The selected image is not a regular file")
+        opened_identity = identity(opened)
+        if expected_identity is not None and opened_identity != expected_identity:
+            raise OSError("The selected image changed before checksums were calculated")
+
+        total = opened.st_size
+        digests = {
+            "MD5": hashlib.md5(usedforsecurity=False),
+            "SHA-1": hashlib.sha1(usedforsecurity=False),
+            "SHA-256": hashlib.sha256(),
+            "SHA-512": hashlib.sha512(),
+        }
+        done = 0
+        while True:
+            check_cancelled()
+            if identity(os.fstat(descriptor)) != opened_identity:
+                raise OSError("The image changed while checksums were being calculated")
+            block = os.read(descriptor, 4 * 1024 * 1024)
+            check_cancelled()
+            if identity(os.fstat(descriptor)) != opened_identity:
+                raise OSError("The image changed while checksums were being calculated")
+            if not block:
+                break
+            done += len(block)
+            if done > total:
+                raise OSError("The image changed while checksums were being calculated")
             for digest in digests.values():
                 digest.update(block)
-            done += len(block)
-            if progress:
+            if progress is not None:
                 progress(done, total)
-    if done != total:
-        raise OSError("The image changed while checksums were being calculated")
-    return {name: digest.hexdigest() for name, digest in digests.items()}
+            check_cancelled()
+
+        if done != total:
+            raise OSError("The image changed while checksums were being calculated")
+        final = os.lstat(path)
+        if not stat.S_ISREG(final.st_mode) or identity(final) != opened_identity:
+            raise OSError("The selected image changed while checksums were being calculated")
+        check_cancelled()
+        return {name: digest.hexdigest() for name, digest in digests.items()}
+    finally:
+        os.close(descriptor)
 
 
 def parse_expected_checksum(text: str) -> tuple[str, str]:

@@ -11,7 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from isopropyl.images import (
-    ImageInspectionCancelled, ImageInspectionTimedOut, ImageMember,
+    ChecksumCancelled, ImageInspectionCancelled, ImageInspectionTimedOut,
+    ImageMember,
     NON_RAW_SUFFIXES, RAW_IMAGE_SUFFIXES,
     boot_identity_fields,
     calculate_checksums, classify_boot_paths, classify_windows_installer_members,
@@ -65,6 +66,14 @@ def add_valid_mbr(data: bytearray, sector_size: int = 512) -> None:
 
 
 class ImageTests(unittest.TestCase):
+    @staticmethod
+    def file_identity(path: Path) -> tuple[int, int, int, int, int]:
+        status = path.stat()
+        return (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+
     def test_inspection_rejects_a_source_changed_after_selection(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "disk.img"
@@ -445,10 +454,142 @@ Folder = -
             payload = b"isopropyl"
             path.write_bytes(payload)
             progress = []
-            result = calculate_checksums(path, lambda done, total: progress.append((done, total)))
+            result = calculate_checksums(
+                path, lambda done, total: progress.append((done, total)),
+            )
             self.assertEqual(result["SHA-256"], hashlib.sha256(payload).hexdigest())
             self.assertEqual(result["SHA-512"], hashlib.sha512(payload).hexdigest())
             self.assertEqual(progress[-1], (len(payload), len(payload)))
+
+    def test_checksum_rejects_a_symbolic_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.img"
+            target.write_bytes(b"approved")
+            link = Path(directory) / "image.img"
+            link.symlink_to(target)
+
+            with self.assertRaisesRegex(OSError, "securely open"):
+                calculate_checksums(link)
+
+    def test_checksum_rejects_fifo_without_blocking_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.img"
+            os.mkfifo(path)
+
+            with self.assertRaisesRegex(OSError, "not a regular file"):
+                calculate_checksums(path)
+
+    def test_checksum_rejects_wrong_expected_identity_before_reading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.img"
+            path.write_bytes(b"approved")
+            expected = list(self.file_identity(path))
+            expected[2] += 1
+
+            with (
+                patch("isopropyl.images.os.read", wraps=os.read) as read,
+                self.assertRaisesRegex(OSError, "changed before checksums"),
+            ):
+                calculate_checksums(path, expected_identity=tuple(expected))
+
+            read.assert_not_called()
+
+    def test_checksum_rejects_path_replacement_without_reading_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.img"
+            original = Path(directory) / "original.img"
+            payload = b"a" * (8 * 1024 * 1024 + 17)
+            path.write_bytes(payload)
+            expected = self.file_identity(path)
+            progress: list[tuple[int, int]] = []
+
+            def replace_after_first_block(done: int, total: int) -> None:
+                progress.append((done, total))
+                if len(progress) == 1:
+                    path.rename(original)
+                    path.write_bytes(b"b" * len(payload))
+
+            with self.assertRaisesRegex(OSError, "image changed"):
+                calculate_checksums(
+                    path, replace_after_first_block, expected_identity=expected,
+                )
+
+            self.assertEqual(progress, [(4 * 1024 * 1024, len(payload))])
+            self.assertEqual(original.read_bytes(), payload)
+
+    def test_checksum_catches_same_size_rewrite_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.img"
+            payload = b"approved checksum payload"
+            path.write_bytes(payload)
+            expected = self.file_identity(path)
+            changed = False
+
+            def rewrite(_done: int, _total: int) -> None:
+                nonlocal changed
+                if changed:
+                    return
+                changed = True
+                path.write_bytes(b"x" * len(payload))
+                os.utime(path, ns=(path.stat().st_atime_ns, expected[3]))
+
+            with self.assertRaisesRegex(OSError, "image changed"):
+                calculate_checksums(path, rewrite, expected_identity=expected)
+
+    def test_checksum_cancellation_is_checked_before_and_during_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.img"
+            path.write_bytes(b"a" * (5 * 1024 * 1024))
+            expected = self.file_identity(path)
+
+            def cancelled() -> None:
+                raise ChecksumCancelled("cancelled fixture")
+
+            with self.assertRaises(ChecksumCancelled):
+                calculate_checksums(
+                    path, expected_identity=expected, cancel_check=cancelled,
+                )
+
+            cancel_now = False
+
+            def check_midstream() -> None:
+                if cancel_now:
+                    raise ChecksumCancelled("cancelled fixture")
+
+            def progress(_done: int, _total: int) -> None:
+                nonlocal cancel_now
+                cancel_now = True
+
+            with self.assertRaises(ChecksumCancelled):
+                calculate_checksums(
+                    path, progress, expected_identity=expected,
+                    cancel_check=check_midstream,
+                )
+
+    def test_checksum_closes_descriptor_when_progress_callback_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.img"
+            path.write_bytes(b"approved")
+            opened: list[int] = []
+            real_open = os.open
+
+            def record_open(*args, **kwargs) -> int:
+                descriptor = real_open(*args, **kwargs)
+                opened.append(descriptor)
+                return descriptor
+
+            def fail_progress(_done: int, _total: int) -> None:
+                raise RuntimeError("callback failed")
+
+            with (
+                patch("isopropyl.images.os.open", side_effect=record_open),
+                patch("isopropyl.images.os.close", wraps=os.close) as close,
+                self.assertRaisesRegex(RuntimeError, "callback failed"),
+            ):
+                calculate_checksums(path, fail_progress)
+
+            self.assertEqual(len(opened), 1)
+            close.assert_called_once_with(opened[0])
 
     def test_classifies_bios_uefi_architecture_and_windows_installer(self):
         modes, architectures, bootloader, windows = classify_boot_paths([

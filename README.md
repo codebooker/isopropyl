@@ -71,8 +71,9 @@ installer customization, verification, backups, formatting, and media tools.
   presence, and SBAT structure without pretending that structure equals trust.
 - Detect Windows installer media and exact GRUB/Syslinux payload identities when
   the image contains enough evidence.
-- Calculate MD5, SHA-1, SHA-256, and SHA-512 in one pass and compare a provider's
-  pasted checksum without guessing.
+- Calculate MD5, SHA-1, SHA-256, and SHA-512 in one cancellable pass over a
+  descriptor bound to the exact inspected identity, reject file replacement or
+  mutation, and compare a provider's pasted checksum without guessing.
 
 ### Customize Windows installation media
 

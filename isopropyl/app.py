@@ -58,8 +58,9 @@ from .formatting import (
     restore_allocation_unit_sizes, restore_filesystem_geometry_supported,
 )
 from .images import (
-    ImageInspection, ImageInspectionCancelled, calculate_checksums,
-    classify_windows_installer_members, compare_expected_checksum, inspect_image,
+    ChecksumCancelled, ImageInspection, ImageInspectionCancelled,
+    calculate_checksums, classify_windows_installer_members,
+    compare_expected_checksum, inspect_image,
 )
 from .iso import (
     ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget, WriteMode, WritePlan,
@@ -133,12 +134,20 @@ class WindowsMetadataToken:
     extractor: SafeIsoExtractor
 
 
+@dataclass(frozen=True)
+class ChecksumToken:
+    generation: int
+    image_identity: object
+    operation: BackgroundPreparation
+
+
 class Bridge(QObject):
     # PyQt's plain `int` maps to a signed 32-bit C++ int. Disk images routinely
     # exceed that, so keep byte counters as Python objects across threads.
     progress = pyqtSignal(object, object, str)
     finished = pyqtSignal(bool, str)
     inspection_finished = pyqtSignal(object, object, object)
+    checksum_progress = pyqtSignal(object, object, object)
     checksums_finished = pyqtSignal(object, object)
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
@@ -164,6 +173,8 @@ class Window(QMainWindow):
         self.device_refresh_busy = False
         self.persistence_profile: CasperCompatibilityProfile | None = None
         self.checksum_busy = False
+        self.checksum_generation = 0
+        self.checksum_preparer: BackgroundPreparation | None = None
         self.devices: list[Device] = []
         self.writer: ImageWriter | None = None
         self.imager: DriveImager | VirtualDriveImager | None = None
@@ -203,6 +214,7 @@ class Window(QMainWindow):
         self.bridge.progress.connect(self.on_progress)
         self.bridge.finished.connect(self.on_finished)
         self.bridge.inspection_finished.connect(self.on_inspection_finished)
+        self.bridge.checksum_progress.connect(self.on_checksum_progress)
         self.bridge.checksums_finished.connect(self.on_checksums_finished)
         self.setWindowTitle("ISOpropyl")
         self.setMinimumSize(720, 700)
@@ -439,6 +451,15 @@ class Window(QMainWindow):
         except OSError as error:
             QMessageBox.critical(self, "Image unavailable", str(error))
             return
+        checksum_was_active = self.checksum_preparer is not None
+        if self.checksum_preparer is not None:
+            self.checksum_preparer.cancel()
+        self.checksum_generation += 1
+        self.checksum_preparer = None
+        self.checksum_busy = False
+        self.checksum_button.setText("Checksums…")
+        if checksum_was_active and not self.operation_active:
+            self.set_busy(False)
         self.image = path.resolve()
         path = self.image
         self.inspection_cancel_event.set()
@@ -832,6 +853,7 @@ class Window(QMainWindow):
             self.casper_preparer,
             self.casper_stager,
             self.casper_writer,
+            self.checksum_preparer,
         ))
 
     def confirm_write(self) -> None:
@@ -1203,6 +1225,7 @@ class Window(QMainWindow):
             self.uefi_preparer,
             self.casper_preparer, self.casper_stager, self.casper_writer,
             self.windows_wim_extractor,
+            self.checksum_preparer,
         )))
         if active:
             self.status.setText("Stopping…")
@@ -2480,43 +2503,112 @@ class Window(QMainWindow):
         )
 
     def calculate_image_checksums(self) -> None:
-        if not self.image or self.checksum_busy:
+        if (
+            not self.image or self.inspection_identity is None
+            or self.checksum_busy or self.operation_active
+        ):
             return
         path = self.image
-        identity = image_identity(path)
+        try:
+            identity = image_identity(path)
+        except OSError as error:
+            QMessageBox.critical(self, "Checksum calculation failed", str(error))
+            return
+        if identity != self.inspection_identity:
+            QMessageBox.critical(
+                self, "Image changed",
+                "The selected image changed after inspection. Select it again before "
+                "calculating checksums.",
+            )
+            return
+        operation = BackgroundPreparation()
+        self.checksum_generation += 1
+        token = ChecksumToken(self.checksum_generation, identity, operation)
+        self.checksum_preparer = operation
         self.checksum_busy = True
         self.checksum_button.setText("Calculating…")
-        self.checksum_button.setEnabled(False)
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
         self.progress.setValue(0)
-        self.update_ready()
+        self.status.setText("Calculating image checksums…")
 
         def work() -> None:
+            def check_cancelled() -> None:
+                if operation.cancelled:
+                    raise ChecksumCancelled("Checksum calculation was cancelled")
+
             try:
                 result: object = calculate_checksums(
-                    path, lambda done, total: self.bridge.progress.emit(done, total, "Checksumming")
+                    path,
+                    lambda done, total: self.bridge.checksum_progress.emit(
+                        token, done, total,
+                    ),
+                    expected_identity=identity,
+                    cancel_check=check_cancelled,
                 )
             except Exception as error:
                 result = error
-            self.bridge.checksums_finished.emit(identity, result)
+            self.bridge.checksums_finished.emit(token, result)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_checksums_finished(self, identity: object, result: object) -> None:
+    def on_checksum_progress(
+        self, token: object, done: object, total: object,
+    ) -> None:
+        if (
+            not isinstance(token, ChecksumToken)
+            or token.operation is not self.checksum_preparer
+            or token.generation != self.checksum_generation
+            or token.image_identity != self.inspection_identity
+            or type(done) is not int or type(total) is not int
+            or done < 0 or total < 0 or done > total
+        ):
+            return
+        self.on_progress(done, total, "Checksumming")
+
+    def on_checksums_finished(self, token: object, result: object) -> None:
+        if (
+            not isinstance(token, ChecksumToken)
+            or token.operation is not self.checksum_preparer
+            or token.generation != self.checksum_generation
+        ):
+            return
+        current = bool(
+            self.image is not None
+            and token.image_identity == self.inspection_identity
+        )
+        if current:
+            try:
+                current = token.image_identity == image_identity(self.image)  # type: ignore[arg-type]
+            except OSError:
+                current = False
+        self.checksum_preparer = None
         self.checksum_busy = False
         self.checksum_button.setText("Checksums…")
         self.progress.setValue(0)
-        self.update_ready()
-        if not self.image:
+        self.set_busy(False)
+        if token.operation.cancelled or isinstance(result, ChecksumCancelled):
+            self.status.setText("Checksum calculation cancelled")
             return
-        try:
-            if identity != image_identity(self.image):
-                return
-        except OSError:
+        if not current or not self.image:
+            self.status.setText(
+                "Checksum result discarded because the selected image changed"
+            )
             return
         if isinstance(result, Exception):
             QMessageBox.critical(self, "Checksum calculation failed", str(result))
             return
-        checksums: dict[str, str] = result  # type: ignore[assignment]
+        if not (
+            isinstance(result, dict)
+            and set(result) == {"MD5", "SHA-1", "SHA-256", "SHA-512"}
+            and all(isinstance(value, str) for value in result.values())
+        ):
+            QMessageBox.critical(
+                self, "Checksum calculation failed",
+                "The checksum worker returned an invalid result.",
+            )
+            return
+        checksums: dict[str, str] = result
         dialog = QDialog(self)
         dialog.setWindowTitle("Image checksums")
         dialog.resize(700, 480)

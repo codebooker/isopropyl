@@ -17,7 +17,10 @@ from PyQt6.QtWidgets import (
     QLabel, QPlainTextEdit, QPushButton,
 )
 
-from isopropyl.app import PendingIsoWrite, Window, WindowsMetadataToken
+from isopropyl.app import (
+    BackgroundPreparation, ChecksumToken, PendingIsoWrite, Window,
+    WindowsMetadataToken,
+)
 from isopropyl.backup import VHD_MAX_SIZE
 from isopropyl.bootloaders import (
     BootloaderCacheDeletionResult, BootloaderCacheInventory, CacheDeletion,
@@ -28,7 +31,7 @@ from isopropyl.devices import Device, SizeUnitMode
 from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
 )
-from isopropyl.images import ImageInspection, ImageMember
+from isopropyl.images import ChecksumCancelled, ImageInspection, ImageMember
 from isopropyl.iso import ArchiveEntry, WriteMode
 from isopropyl.extraction import SafeIsoExtractor
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
@@ -602,6 +605,180 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertTrue(self.window.inspection_cancel_event.is_set())
         self.assertFalse(self.window.inspection_busy)
         self.assertEqual(self.window.image_detail.text(), "Image inspection cancelled")
+
+    def test_selecting_an_image_cancels_and_invalidates_checksum_worker(self):
+        image = Path(self.settings_home.name) / "replacement.iso"
+        image.write_bytes(b"fixture")
+        operation = BackgroundPreparation()
+        self.window.checksum_preparer = operation
+        self.window.checksum_generation = 4
+        self.window.checksum_busy = True
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                pass
+
+        with patch("isopropyl.app.threading.Thread", DeferredThread):
+            self.window.load_image(image)
+
+        self.assertTrue(operation.cancelled)
+        self.assertIsNone(self.window.checksum_preparer)
+        self.assertEqual(self.window.checksum_generation, 5)
+        self.assertFalse(self.window.checksum_busy)
+
+    def test_stale_checksum_completion_cannot_clear_a_newer_operation(self):
+        old = BackgroundPreparation()
+        current = BackgroundPreparation()
+        self.window.checksum_generation = 2
+        self.window.checksum_preparer = current
+        self.window.checksum_busy = True
+        token = ChecksumToken(1, self.window.inspection_identity, old)
+
+        with patch("isopropyl.app.QMessageBox.critical") as critical:
+            self.window.on_checksums_finished(token, RuntimeError("stale fixture"))
+
+        self.assertIs(self.window.checksum_preparer, current)
+        self.assertTrue(self.window.checksum_busy)
+        critical.assert_not_called()
+        self.window.checksum_preparer = None
+        self.window.checksum_busy = False
+
+    def test_wrong_checksum_generation_cannot_clear_current_operation(self):
+        current = BackgroundPreparation()
+        self.window.checksum_generation = 2
+        self.window.checksum_preparer = current
+        self.window.checksum_busy = True
+        token = ChecksumToken(1, self.window.inspection_identity, current)
+
+        self.window.on_checksums_finished(token, RuntimeError("stale fixture"))
+
+        self.assertIs(self.window.checksum_preparer, current)
+        self.assertTrue(self.window.checksum_busy)
+        self.window.checksum_preparer = None
+        self.window.checksum_busy = False
+
+    def test_stale_checksum_progress_cannot_replace_current_status(self):
+        old = BackgroundPreparation()
+        current = BackgroundPreparation()
+        self.window.checksum_generation = 2
+        self.window.checksum_preparer = current
+        self.window.status.setText("Current operation")
+        self.window.progress.setValue(321)
+        token = ChecksumToken(1, self.window.inspection_identity, old)
+
+        self.window.on_checksum_progress(token, 8, 16)
+
+        self.assertEqual(self.window.status.text(), "Current operation")
+        self.assertEqual(self.window.progress.value(), 321)
+        self.window.checksum_preparer = None
+
+    def test_checksum_cancellation_clears_worker_without_error_dialog(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        operation = BackgroundPreparation()
+        self.window.inspection_identity = identity
+        self.window.checksum_generation = 1
+        self.window.checksum_preparer = operation
+        self.window.checksum_busy = True
+        token = ChecksumToken(1, identity, operation)
+
+        with (
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch("isopropyl.app.QDialog.exec") as dialog,
+        ):
+            self.window.on_checksums_finished(
+                token, ChecksumCancelled("cancelled fixture"),
+            )
+
+        self.assertIsNone(self.window.checksum_preparer)
+        self.assertFalse(self.window.checksum_busy)
+        self.assertIn("cancelled", self.window.status.text().casefold())
+        critical.assert_not_called()
+        dialog.assert_not_called()
+
+    def test_late_checksum_cancellation_suppresses_success_dialog(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        operation = BackgroundPreparation()
+        operation.cancel()
+        self.window.inspection_identity = identity
+        self.window.checksum_generation = 1
+        self.window.checksum_preparer = operation
+        self.window.checksum_busy = True
+        token = ChecksumToken(1, identity, operation)
+        result = {
+            "MD5": "1" * 32,
+            "SHA-1": "2" * 40,
+            "SHA-256": "3" * 64,
+            "SHA-512": "4" * 128,
+        }
+
+        with (
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch("isopropyl.app.QDialog.exec") as dialog,
+        ):
+            self.window.on_checksums_finished(token, result)
+
+        self.assertIsNone(self.window.checksum_preparer)
+        self.assertFalse(self.window.checksum_busy)
+        self.assertIn("cancelled", self.window.status.text().casefold())
+        critical.assert_not_called()
+        dialog.assert_not_called()
+
+    def test_cancel_stops_active_checksum_worker(self):
+        operation = BackgroundPreparation()
+        self.window.checksum_preparer = operation
+        self.window.checksum_busy = True
+
+        self.window.cancel()
+
+        self.assertTrue(operation.cancelled)
+        self.assertEqual(self.window.status.text(), "Stopping…")
+        self.window.checksum_preparer = None
+        self.window.checksum_busy = False
+
+    def test_checksum_worker_is_bound_to_inspected_identity(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        self.window.inspection_identity = identity
+        result = {
+            "MD5": "1" * 32,
+            "SHA-1": "2" * 40,
+            "SHA-256": "3" * 64,
+            "SHA-512": "4" * 128,
+        }
+
+        with (
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch(
+                "isopropyl.app.calculate_checksums", return_value=result,
+            ) as calculate,
+            patch(
+                "isopropyl.app.QDialog.exec",
+                return_value=QDialog.DialogCode.Rejected,
+            ),
+        ):
+            self.window.calculate_image_checksums()
+
+        calculate.assert_called_once()
+        self.assertEqual(calculate.call_args.args[0], self.window.image)
+        self.assertTrue(callable(calculate.call_args.args[1]))
+        self.assertEqual(calculate.call_args.kwargs["expected_identity"], identity)
+        self.assertTrue(callable(calculate.call_args.kwargs["cancel_check"]))
+        self.assertIsNone(self.window.checksum_preparer)
+        self.assertFalse(self.window.checksum_busy)
 
     def test_image_tooltip_surfaces_partition_structure_and_issues(self):
         inspection = replace(

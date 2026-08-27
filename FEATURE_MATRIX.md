@@ -44,7 +44,7 @@ Status meanings:
 | Save optical disc as ISO | **Done** | Read-only sector capture with source identity, size/free-space checks, cancellation, and atomic publication. |
 | Save USB/VHD as UDF ISO | **Planned** | Separate authoring workflow not implemented. |
 | Linux persistence | **Partial** | A hardened executor transforms a recognized UEFI GRUB line only in private staging, creates an exact up-front GPT/FAT32 + ext4 `writable` layout on 512- or 4096-byte logical sectors, formats both filesystems before copying, revalidates complete source/target/partition identities around every destructive boundary, and read-back verifies data files. Guarded GUI plumbing exists for candidate remasters whose catalog exposes a recognized GRUB config path; private staging performs the final eligible-line check before any target change. Current official Ubuntu 20.04.6/22.04.5/24.04.3 desktop catalogs do not expose that path (24.04 also changed squashfs layout), so they correctly receive no persistence control. Embedded-config support, broader profiles, and physical certification remain. |
-| MD5/SHA-1/SHA-256/SHA-512 | **Done** | One-pass calculation plus strict pasted-provider comparison. |
+| MD5/SHA-1/SHA-256/SHA-512 | **Done** | One cancellable pass over a no-follow descriptor bound to the exact inspected device/inode/size/mtime/ctime identity, with mutation and pathname-replacement refusal plus strict pasted-provider comparison. |
 | Bad-block passes | **Done** | Separate destructive `badblocks` workflow with 1–4 patterns, typed confirmation, progress, and identity rechecks. |
 | Fake-capacity detection | **Done** | Separate destructive `f3probe` workflow; availability depends on the system F3 package. |
 | Full zero | **Done** | Exact full-device zero pass with cancellation and revalidation. |
@@ -119,7 +119,7 @@ Status meanings:
 | Quick format | **Done** | Restore and ISO construction use quick mkfs; full zero is separate. |
 | Persistence-size slider | **Partial** | The capacity-bounded aligned control and transaction wiring ship, but it appears only for a candidate remastered Ubuntu profile with an exposed recognized UEFI GRUB config path; final private staging validates its contents. Current official Ubuntu desktop media correctly remain ineligible pending embedded-config support. |
 | ISO mode versus DD mode | **Done** | The main screen exposes both executable choices, recommends from inspected image evidence, names compatibility limits, resets on a new image, re-plans against the selected target at dispatch, and never silently falls back. ISO mode forces verification. |
-| Image checksums | **Done** | Dedicated dialog with copy and strict compare. |
+| Image checksums | **Done** | Dedicated copy/compare dialog, 64-bit progress, cancellation, exact inspected-image identity binding, and generation-scoped workers so stale progress or completion cannot alter a newer selection or operation. |
 | Save-drive action | **Done** | Separate read-only raw/VHD/VHDX workflow with conservative free-space checks and no-overwrite publication. |
 | Progress, speed, ETA, cancellation | **Done** | 64-bit counters, stage-aware rolling rate/ETA, cross-thread cancellation. |
 | Recoverable I/O retries | **Planned** | Never retry identity changes or ambiguous device failures. |
