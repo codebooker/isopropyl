@@ -190,6 +190,20 @@ Each file has its own exact size and SHA-256 in `bootloaders-v2.json`. A matched
 bundle is accepted only when every named artifact resolves at the same exact
 version. ISOpropyl does not use Rufus's version-suffix or prefix fallback.
 
+The non-destructive implementation in `isopropyl/syslinux.py` adapts the on-disk
+ADV, extent, patch-area checksum, first-sector-pointer, and FAT VBR merge formats
+from Syslinux's GPL-2.0-or-later installer and Rufus's corresponding integration:
+[`setadv.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux/libinstaller/setadv.c),
+[`syslxmod.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux/libinstaller/syslxmod.c),
+[`fs.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux/libinstaller/fs.c),
+and [`syslinux.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux.c).
+ISOpropyl reimplements those formats in Python with stricter consumer-local
+hash/provenance pins, overlap and width checks, a descriptor-only FAT32 mapper,
+and complete regular-file read-back tests. No Syslinux binary is included in the
+Python package, no downloaded payload is executed on Linux, and no device-facing
+BIOS path is enabled yet. Under GPLv3 section 13, the combined work is distributed
+under ISOpropyl's AGPL-3.0-or-later terms.
+
 ## GRUB BIOS core-image bundles
 
 - Cataloged builds: GRUB 2.06, 2.12, and 2.14 `core.img`

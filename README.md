@@ -172,6 +172,14 @@ confirmations and expanded drive visibility are never persisted.
 - Validate MBR, extended partitions, protective/hybrid MBR, and reciprocal GPT
   metadata at supported sector sizes; malformed or incomplete evidence is shown
   instead of treated as bootable.
+- Reproduce the exact Syslinux 6.03/6.04 ADV, extent, checksum, and FAT32 VBR
+  patch formats in a non-destructive regular-file harness. The harness binds
+  pinned payload bytes to a descriptor-derived FAT chain, checks every consulted
+  entry in both FAT copies, primary/backup VBRs, FSInfo, partition offset,
+  configuration path,
+  and complete before/after file hashes. It is groundwork, not a GUI/device BIOS
+  writer: MBR bootstrap provenance, privileged writes, QEMU, and physical boot
+  certification still gate that feature.
 - Parse El Torito BIOS/UEFI entries, including the bounded embedded-FAT subset,
   and inspect EFI PE architecture, certificate framing, and SBAT. A sealed,
   resource-limited worker can report embedded
@@ -242,9 +250,9 @@ For the implementation-level capability audit and Rufus comparison, see
 | Compressed VHD/VHDX/QCOW/QCOW2 | Decode, convert, then DD | Exactly one supported wrapper; decoded containers are capped at 64 GiB and staged privately. |
 | `.vtsi` v1.0 | Sparse restore | Target capacity must exactly match the expanded disk and report 512-byte logical sectors. |
 
-Unsupported formats fail closed. FFU, Windows To Go, dual BIOS+UEFI
-construction, broader persistence profiles, localization, and release packaging
-remain on the [roadmap](ROADMAP.md).
+Unsupported formats fail closed. FFU, Windows To Go, device-facing BIOS and dual
+BIOS+UEFI construction, broader persistence profiles, localization, and release
+packaging remain on the [roadmap](ROADMAP.md).
 
 ## Safety model
 
@@ -323,7 +331,9 @@ ISOpropyl is an ambitious alpha, not yet a feature-for-feature Rufus replacement
 CI currently exercises the non-destructive suite on an Ubuntu x86-64 runner with
 Python 3.12; device-facing tests mock block devices and privileged commands and
 never write a real drive. Broad distro, desktop, Wayland/X11, firmware, Secure
-Boot, card-reader, and physical-media testing is still required.
+Boot, card-reader, and physical-media testing is still required. BIOS options
+remain intentionally hidden until the regular-file Syslinux work has a pinned
+MBR bootstrap, a bounded writer, QEMU/SeaBIOS results, and physical evidence.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
 and [ROADMAP.md](ROADMAP.md).

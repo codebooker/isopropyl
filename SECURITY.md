@@ -178,8 +178,10 @@ issue requesting a private contact channel without disclosing the vulnerability.
   matching, and no partial return; every cache directory and object is opened
   no-follow, the parent pathname is revalidated against its bound descriptor,
   and every stable singly linked regular file is rehashed and frozen as immutable
-  bytes. GRUB entries never satisfy a detected-image dependency. No production
-  BIOS executor consumes these bundles. The UEFI Shell backend independently
+  bytes. GRUB entries never satisfy a detected-image dependency. A pure,
+  non-destructive Syslinux consumer independently re-pins the two enabled
+  payload pairs; no production BIOS executor or GUI path consumes them. The
+  UEFI Shell backend independently
   rechecks the five exact hashes and sizes, PE architecture, EFI application
   subsystem, and unchanged unsigned state before it can create a new mode-0700
   private staging tree. It writes canonical fallback names through no-follow,
@@ -200,6 +202,7 @@ issue requesting a private contact channel without disclosing the vulnerability.
   skips links, multiply linked files, and anything whose identity or metadata
   changes between inspection and unlink. Corrupt catalog-known regular files
   remain removable so a failed download cannot become permanent cache debris.
+
 - The curated Linux downloader is network-inactive until the user chooses
   **Download Linux…**, a catalog entry, an exact destination filename, and final
   consent. The initial catalog pins Ubuntu 24.04.4 LTS Desktop amd64 plus the
@@ -318,6 +321,32 @@ issue requesting a private contact channel without disclosing the vulnerability.
   required before the alpha label can be removed.
 - Diagnostics omit drive identifiers, mount paths, ISO member lists, and logs by
   default. ISOpropyl contains no telemetry.
+
+## Dormant Syslinux BIOS boundary
+
+The device-facing BIOS path remains disabled. Its implemented groundwork accepts
+only exact Syslinux `6.03-2014-10-06` or `6.04-pre1` immutable bundles whose
+family, purpose, license, provenance, artifact order, size, catalog digest, and
+fresh SHA-256 all match a second consumer-local pin set. It reproduces upstream's
+two-sector ADV, 64-KiB-aware extent encoding, patch-area checksum, first-sector
+pointers, and FAT32 VBR merge. Bounds, overlap, integer-width, extent-capacity,
+directory, and copied-code-region violations fail closed.
+
+The companion mapper reads only an already-open regular-file descriptor. It
+requires 512-byte mirrored FAT32 with matching primary/backup VBRs, valid FSInfo,
+an exact `BPB_HiddSec`/volume-offset relationship, matching consulted entries
+across both FAT copies, and one
+unaliased root `LDLINUX.SYS`. It rejects loops, root/file cross-links, malformed
+LFNs, duplicate sectors, source identity drift, and any byte or SHA-256 mismatch.
+Sector numbers remain volume-relative. Synthetic fragmented images exercise a
+complete patch/read-back loop; optional offline tests also compare both real
+pinned payloads with frozen golden hashes from the upstream algorithm.
+
+This is not authorization to write a device. A provenance-bound Syslinux MBR,
+source/config/C32 transformation policy, bounded privileged executor, exact
+post-write sector verification, QEMU/SeaBIOS and OVMF gates, and physical BIOS
+testing remain mandatory before the GUI can offer BIOS construction. Until then,
+hybrid media should use verified DD mode to preserve its existing boot layout.
 
 ## Boot-time corruption-check boundary
 
