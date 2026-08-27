@@ -19,6 +19,7 @@ from isopropyl.iso import (
     UnsafeArchiveError,
     WriteMode,
     build_write_plan,
+    recommend_write_method,
     validate_extraction_entries,
 )
 
@@ -27,6 +28,7 @@ def inspection(
     *, iso: bool = True, boot_modes: tuple[str, ...] = ("BIOS", "UEFI"),
     bootloader: str = "GRUB", windows: bool = False,
     architectures: tuple[str, ...] = ("x64",),
+    hybrid: bool = True,
 ) -> ImageInspection:
     payloads = (
         ImageUefiPayload(
@@ -36,7 +38,7 @@ def inspection(
     ) if architectures else ()
     return ImageInspection(
         size=1024, kind="Optical ISO" if iso else "Raw image", volume_label="TEST",
-        has_mbr=iso, has_gpt=False, is_iso9660=iso, looks_windows=windows,
+        has_mbr=iso and hybrid, has_gpt=False, is_iso9660=iso, looks_windows=windows,
         boot_modes=boot_modes, architectures=architectures, bootloader=bootloader,
         has_windows_installer=windows, contents_scanned=True,
         uefi_payloads=payloads,
@@ -265,6 +267,66 @@ class PlanTests(unittest.TestCase):
                 inspection(boot_modes=("UEFI",)), [ArchiveEntry("file", 100)],
                 target_size=100,
             )
+
+
+class WriteMethodRecommendationTests(unittest.TestCase):
+    @staticmethod
+    def uefi_entries():
+        return (
+            ArchiveEntry("EFI", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("EFI/BOOT", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 8),
+            ArchiveEntry("casper/filesystem.squashfs", 512),
+        )
+
+    def test_raw_images_offer_only_dd(self):
+        result = recommend_write_method(inspection(iso=False))
+        self.assertEqual(result.available_modes, (WriteMode.DD,))
+        self.assertEqual(result.recommended_mode, WriteMode.DD)
+        self.assertIsNone(result.iso_plan)
+
+    def test_optical_only_uefi_iso_recommends_iso_mode(self):
+        result = recommend_write_method(
+            inspection(hybrid=False, boot_modes=("UEFI",)), self.uefi_entries(),
+        )
+        self.assertEqual(result.recommended_mode, WriteMode.EXTRACTED_ISO)
+        self.assertIn(WriteMode.EXTRACTED_ISO, result.available_modes)
+        self.assertIn("optical-only", result.reason)
+
+    def test_windows_installer_recommends_iso_even_when_hybrid(self):
+        result = recommend_write_method(
+            inspection(windows=True), self.uefi_entries(),
+        )
+        self.assertEqual(result.recommended_mode, WriteMode.EXTRACTED_ISO)
+        self.assertIn("Windows installer", result.reason)
+
+    def test_hybrid_linux_iso_recommends_dd_but_exposes_iso(self):
+        result = recommend_write_method(inspection(), self.uefi_entries())
+        self.assertEqual(result.recommended_mode, WriteMode.DD)
+        self.assertEqual(
+            result.available_modes,
+            (WriteMode.DD, WriteMode.EXTRACTED_ISO),
+        )
+        self.assertIn("native BIOS/UEFI", result.reason)
+
+    def test_blocked_iso_exposes_reason_without_silent_fallback(self):
+        result = recommend_write_method(
+            inspection(boot_modes=("UEFI",)),
+            (ArchiveEntry("README", 1),),
+        )
+        self.assertEqual(result.available_modes, (WriteMode.DD,))
+        self.assertEqual(result.recommended_mode, WriteMode.DD)
+        self.assertIn("fallback loader", result.iso_unavailable_reason)
+
+    def test_target_capacity_is_method_specific(self):
+        result = recommend_write_method(
+            inspection(hybrid=False, boot_modes=("UEFI",)),
+            self.uefi_entries(),
+            target_size=100,
+        )
+        self.assertEqual(result.available_modes, ())
+        self.assertIsNone(result.recommended_mode)
+        self.assertIn("too small", result.reason)
 
 
 class ExtractionSafetyTests(unittest.TestCase):

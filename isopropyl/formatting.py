@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -784,6 +785,55 @@ def parse_partitions(payload: str, device_path: str) -> tuple[str, ...]:
     return tuple(sorted(unique, key=lambda path: int(path.removeprefix(prefix))))
 
 
+def parse_partition_identities(
+    payload: str, device_path: str,
+) -> tuple[tuple[str, str], ...]:
+    """Bind each direct partition path to its kernel major:minor identity."""
+    if not _WHOLE_DISK.fullmatch(device_path):
+        raise FormatValidationError(f"Unsafe whole-disk path: {device_path!r}")
+    try:
+        nodes = json.loads(payload).get("blockdevices", [])
+    except (AttributeError, TypeError, json.JSONDecodeError) as error:
+        raise FormattingError("lsblk returned invalid partition identities") from error
+    if (
+        not isinstance(nodes, list)
+        or len(nodes) != 1
+        or not isinstance(nodes[0], dict)
+        or nodes[0].get("path") != device_path
+        or nodes[0].get("type") != "disk"
+    ):
+        raise FormattingError("lsblk did not return the selected whole device")
+    children = nodes[0].get("children", [])
+    if not isinstance(children, list):
+        raise FormattingError("lsblk returned invalid partition children")
+    prefix = device_path + ("p" if device_path[-1].isdigit() else "")
+    found: list[tuple[str, str]] = []
+    for child in children:
+        if not isinstance(child, dict) or child.get("type") != "part":
+            raise FormattingError("lsblk returned a non-partition child")
+        path = child.get("path")
+        parent = child.get("pkname")
+        major_minor = child.get("maj:min")
+        if isinstance(parent, str) and parent and not parent.startswith("/dev/"):
+            parent = "/dev/" + parent
+        if (
+            not isinstance(path, str)
+            or not _BLOCK_PATH.fullmatch(path)
+            or not _partition_belongs_to_device(device_path, path)
+            or parent != device_path
+            or not isinstance(major_minor, str)
+            or not re.fullmatch(r"\d+:\d+", major_minor)
+        ):
+            raise FormattingError("lsblk returned an unsafe partition identity")
+        found.append((path, major_minor))
+    paths = [path for path, _identity in found]
+    if len(paths) != len(set(paths)):
+        raise FormattingError("lsblk returned duplicate partition paths")
+    return tuple(sorted(
+        found, key=lambda item: int(item[0].removeprefix(prefix)),
+    ))
+
+
 def parse_logical_sector_size(payload: str, device_path: str) -> int:
     """Return one whole device's kernel-reported logical sector size."""
     if not _WHOLE_DISK.fullmatch(device_path):
@@ -907,6 +957,7 @@ class FormatExecutor:
         which: Callable[[str], str | None] = _trusted_which,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        lstat_func: Callable[[str], os.stat_result] = os.lstat,
         sleep: Callable[[float], None] = time.sleep,
         discovery_attempts: int = 20,
         discovery_interval: float = 0.25,
@@ -917,6 +968,7 @@ class FormatExecutor:
         self._which = which
         self._popen = popen
         self._runner = runner
+        self._lstat = lstat_func
         self._sleep = sleep
         self._discovery_attempts = max(1, discovery_attempts)
         self._discovery_interval = max(0.0, discovery_interval)
@@ -1149,6 +1201,56 @@ class MultiFormatExecutor(FormatExecutor):
             )
         validate_explicit_partition_metadata(plan, result.stdout, partitions)
 
+    def _observe_partition_nodes(
+        self,
+        plan: MultiFormatPlan,
+        tools: MultiFormatTools,
+        partitions: Sequence[str],
+    ) -> tuple[tuple[str, str], ...]:
+        self._check_cancelled()
+        result = self._runner(
+            [
+                tools.lsblk, "--json", "--paths", "--output",
+                "PATH,TYPE,PKNAME,MAJ:MIN", plan.device_path,
+            ],
+            capture_output=True, text=True, timeout=15, shell=False,
+        )
+        if result.returncode:
+            message = ((result.stdout or "") + (result.stderr or "")).strip()
+            raise FormattingError(
+                message or "Could not bind the new partition device identities"
+            )
+        observed = parse_partition_identities(result.stdout, plan.device_path)
+        if tuple(path for path, _identity in observed) != tuple(partitions):
+            raise DeviceChangedError("The partition device paths changed after discovery")
+        for path, major_minor in observed:
+            try:
+                info = self._lstat(path)
+            except OSError as error:
+                raise DeviceChangedError(
+                    f"The partition device node disappeared: {path}"
+                ) from error
+            if (
+                not stat.S_ISBLK(info.st_mode)
+                or f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}" != major_minor
+            ):
+                raise DeviceChangedError(
+                    f"The partition device node identity changed: {path}"
+                )
+        return observed
+
+    def _verify_partition_nodes(
+        self,
+        plan: MultiFormatPlan,
+        tools: MultiFormatTools,
+        partitions: Sequence[str],
+        expected: tuple[tuple[str, str], ...],
+    ) -> None:
+        if self._observe_partition_nodes(plan, tools, partitions) != expected:
+            raise DeviceChangedError(
+                "A partition device identity changed before filesystem creation"
+            )
+
     def _assert_logical_sector_size(
         self,
         plan: MultiFormatPlan,
@@ -1213,14 +1315,25 @@ class MultiFormatExecutor(FormatExecutor):
         self._assert_identity(plan, tools)  # type: ignore[arg-type]
         self._verify_explicit_geometry(plan, tools, partitions)
         self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        partition_identities = self._observe_partition_nodes(
+            plan, tools, partitions,
+        )
 
         commands = multi_format_commands(plan, tools, partitions)
         if commands:
             report("Creating filesystems")
         for command in commands:
             self._assert_identity(plan, tools)  # type: ignore[arg-type]
+            self._verify_explicit_geometry(plan, tools, partitions)
+            self._verify_partition_nodes(
+                plan, tools, partitions, partition_identities,
+            )
             self._run_process(command)
         self._run_process([tools.udevadm, "settle"])
         self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        self._verify_explicit_geometry(plan, tools, partitions)
+        self._verify_partition_nodes(
+            plan, tools, partitions, partition_identities,
+        )
         report("Complete")
         return partitions

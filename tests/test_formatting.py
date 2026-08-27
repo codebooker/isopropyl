@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import json
+import os
+import stat
 import subprocess
 import unittest
 from unittest.mock import Mock, patch
@@ -30,6 +32,7 @@ from isopropyl.formatting import (
     multi_partition_command,
     multi_partition_script,
     parse_logical_sector_size,
+    parse_partition_identities,
     parse_partitions,
     partition_command,
     partition_script,
@@ -86,6 +89,11 @@ class FakeProcess:
 
 def completed(stdout="", stderr="", code=0):
     return subprocess.CompletedProcess([], code, stdout, stderr)
+
+
+def partition_lstat(path: str):
+    number = int(path.rsplit("z", 1)[-1])
+    return Mock(st_mode=stat.S_IFBLK, st_rdev=os.makedev(65, 144 + number))
 
 
 class FormatPlanTests(unittest.TestCase):
@@ -207,10 +215,27 @@ class FormatPlanTests(unittest.TestCase):
                 {"path": "/dev/sdy1", "type": "part"},
             ]},
             {"path": "/dev/sdz", "type": "disk", "children": [
-                {"path": "/dev/sdz1", "type": "part"},
+                {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
             ]},
         ]})
         self.assertEqual(parse_partitions(payload, "/dev/sdz"), ("/dev/sdz1",))
+
+    def test_partition_identity_parser_requires_direct_kernel_children(self):
+        payload = json.dumps({"blockdevices": [{
+            "path": "/dev/sdz", "type": "disk", "children": [
+                {"path": "/dev/sdz2", "type": "part", "pkname": "sdz", "maj:min": "65:146"},
+                {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
+            ],
+        }]})
+        self.assertEqual(
+            parse_partition_identities(payload, "/dev/sdz"),
+            (("/dev/sdz1", "65:145"), ("/dev/sdz2", "65:146")),
+        )
+        with self.assertRaisesRegex(FormattingError, "unsafe partition identity"):
+            parse_partition_identities(
+                payload.replace('"pkname": "sdz"', '"pkname": "sdy"'),
+                "/dev/sdz",
+            )
 
 
 class MultiFormatPlanTests(unittest.TestCase):
@@ -542,7 +567,7 @@ class FormatExecutorTests(unittest.TestCase):
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
-                        {"path": "/dev/sdz1", "type": "part"},
+                        {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
                     ],
                 }]}))
             return completed()
@@ -679,8 +704,8 @@ class FormatExecutorTests(unittest.TestCase):
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
-                        {"path": "/dev/sdz1", "type": "part"},
-                        {"path": "/dev/sdz2", "type": "part"},
+                        {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
+                        {"path": "/dev/sdz2", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:146"},
                     ],
                 }]}))
             return completed()
@@ -719,8 +744,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
-                        {"path": "/dev/sdz2", "type": "part"},
-                        {"path": "/dev/sdz1", "type": "part"},
+                        {"path": "/dev/sdz2", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:146"},
+                        {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
                     ],
                 }]}))
             return completed()
@@ -728,7 +753,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
         self.executor = MultiFormatExecutor(
             device_lookup=lambda _path: self.device,
             which=lambda name: f"/usr/bin/{name}",
-            popen=popen, runner=runner, sleep=lambda _seconds: None,
+            popen=popen, runner=runner, lstat_func=partition_lstat,
+            sleep=lambda _seconds: None,
         )
 
     def test_complete_flow_creates_and_formats_exact_ordered_layout(self):
@@ -759,7 +785,7 @@ class MultiFormatExecutorTests(unittest.TestCase):
         executor = MultiFormatExecutor(
             device_lookup=lambda _path: self.device,
             which=lambda name: None if name == "mkfs.ntfs" else f"/usr/bin/{name}",
-            runner=runner, popen=popen,
+            runner=runner, popen=popen, lstat_func=partition_lstat,
         )
         with self.assertRaisesRegex(MissingFormatToolError, "mkfs.ntfs"):
             executor.execute_multi(self.device, self.plan)
@@ -772,6 +798,7 @@ class MultiFormatExecutorTests(unittest.TestCase):
         executor = MultiFormatExecutor(
             device_lookup=lambda _path: changed,
             which=lambda name: f"/usr/bin/{name}", runner=runner,
+            lstat_func=partition_lstat,
         )
         with self.assertRaises(DeviceChangedError):
             executor.execute_multi(self.device, self.plan)
@@ -789,9 +816,9 @@ class MultiFormatExecutorTests(unittest.TestCase):
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
-                        {"path": "/dev/sdz1", "type": "part"},
-                        {"path": "/dev/sdz2", "type": "part"},
-                        {"path": "/dev/sdz3", "type": "part"},
+                        {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
+                        {"path": "/dev/sdz2", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:146"},
+                        {"path": "/dev/sdz3", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:147"},
                     ],
                 }]}))
             return completed()
@@ -799,7 +826,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
         executor = MultiFormatExecutor(
             device_lookup=lambda _path: self.device,
             which=lambda name: f"/usr/bin/{name}",
-            runner=runner, popen=popen, sleep=lambda _seconds: None,
+            runner=runner, popen=popen, lstat_func=partition_lstat,
+            sleep=lambda _seconds: None,
         )
         with self.assertRaisesRegex(FormattingError, "more children"):
             executor.execute_multi(self.device, self.plan)
@@ -834,8 +862,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
             if "lsblk" in argv[0]:
                 return completed(json.dumps({"blockdevices": [{
                     "path": "/dev/sdz", "type": "disk", "children": [
-                        {"path": "/dev/sdz1", "type": "part"},
-                        {"path": "/dev/sdz2", "type": "part"},
+                        {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
+                        {"path": "/dev/sdz2", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:146"},
                     ],
                 }]}))
             return completed()
@@ -843,7 +871,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
         executor = MultiFormatExecutor(
             device_lookup=lambda _path: device,
             which=lambda name: f"/usr/bin/{name}",
-            runner=runner, popen=popen, sleep=lambda _seconds: None,
+            runner=runner, popen=popen, lstat_func=partition_lstat,
+            sleep=lambda _seconds: None,
         )
         self.assertEqual(
             executor.execute_multi(device, plan), ("/dev/sdz1", "/dev/sdz2"),
@@ -854,6 +883,46 @@ class MultiFormatExecutorTests(unittest.TestCase):
         ]
         self.assertEqual(len(mkfs_commands), 1)
         self.assertEqual(mkfs_commands[0][-1], "/dev/sdz2")
+
+    def test_partition_node_replacement_stops_before_mkfs(self):
+        processes = []
+        lstat_calls = 0
+
+        def popen(argv, **kwargs):
+            process = FakeProcess(argv, **kwargs)
+            processes.append(process)
+            return process
+
+        def runner(argv, **_kwargs):
+            if "lsblk" in argv[0]:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": "/dev/sdz", "type": "disk", "children": [
+                        {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
+                        {"path": "/dev/sdz2", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:146"},
+                    ],
+                }]}))
+            return completed()
+
+        def changing_lstat(path):
+            nonlocal lstat_calls
+            lstat_calls += 1
+            info = partition_lstat(path)
+            if lstat_calls == 3:
+                info.st_rdev = os.makedev(65, 200)
+            return info
+
+        executor = MultiFormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: f"/usr/bin/{name}",
+            runner=runner, popen=popen, lstat_func=changing_lstat,
+            sleep=lambda _seconds: None,
+        )
+        with self.assertRaisesRegex(DeviceChangedError, "identity changed"):
+            executor.execute_multi(self.device, self.plan)
+        self.assertFalse(any(
+            any("mkfs." in argument for argument in process.argv)
+            for process in processes
+        ))
 
     def test_explicit_layout_is_verified_before_filesystem_creation(self):
         plan = create_uefi_ntfs_format_plan(self.device, "gpt")
@@ -897,8 +966,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
                 if "lsblk" in argv[0]:
                     return completed(json.dumps({"blockdevices": [{
                         "path": "/dev/sdz", "type": "disk", "children": [
-                            {"path": "/dev/sdz1", "type": "part"},
-                            {"path": "/dev/sdz2", "type": "part"},
+                            {"path": "/dev/sdz1", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:145"},
+                            {"path": "/dev/sdz2", "type": "part", "pkname": "/dev/sdz", "maj:min": "65:146"},
                         ],
                     }]}))
                 if argv[:3] == [
@@ -910,7 +979,8 @@ class MultiFormatExecutorTests(unittest.TestCase):
             executor = MultiFormatExecutor(
                 device_lookup=lambda _path: self.device,
                 which=lambda name: f"/usr/bin/{name}",
-                runner=runner, popen=popen, sleep=lambda _seconds: None,
+                runner=runner, popen=popen, lstat_func=partition_lstat,
+                sleep=lambda _seconds: None,
             )
             return executor.execute_multi(self.device, plan)
 
@@ -942,6 +1012,7 @@ class MultiFormatExecutorTests(unittest.TestCase):
         executor = MultiFormatExecutor(
             device_lookup=lambda _path: self.device,
             which=lambda name: f"/usr/bin/{name}", runner=runner, popen=popen,
+            lstat_func=partition_lstat,
         )
         with self.assertRaisesRegex(DeviceChangedError, "4096-byte"):
             executor.execute_multi(self.device, plan)

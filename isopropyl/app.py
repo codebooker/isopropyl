@@ -44,7 +44,7 @@ from .images import (
 )
 from .iso import (
     ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget, WriteMode, WritePlan,
-    build_write_plan,
+    WriteMethodRecommendation, build_write_plan, recommend_write_method,
 )
 from .iso_staging import (
     IsoStagingCancelled, IsoStagingExecutor, IsoStagingPlan,
@@ -116,6 +116,8 @@ class Window(QMainWindow):
         super().__init__()
         self.image: Path | None = None
         self.inspection: ImageInspection | None = None
+        self.inspection_identity: object | None = None
+        self.write_recommendation: WriteMethodRecommendation | None = None
         self.checksum_busy = False
         self.devices: list[Device] = []
         self.writer: ImageWriter | None = None
@@ -193,6 +195,23 @@ class Window(QMainWindow):
         self.image_detail = QLabel("DD mode · Image type and boot layout will appear here")
         self.image_detail.setObjectName("muted")
         self.source_card.layout().addWidget(self.image_detail)
+        method_row = QHBoxLayout()
+        method_label = QLabel("Write method")
+        method_label.setObjectName("muted")
+        self.write_method = QComboBox()
+        self.write_method.setEnabled(False)
+        self.write_method.currentIndexChanged.connect(
+            self.on_write_method_changed
+        )
+        method_row.addWidget(method_label)
+        method_row.addWidget(self.write_method, 1)
+        self.source_card.layout().addLayout(method_row)
+        self.write_method_reason = QLabel(
+            "ISOpropyl will recommend a method after inspecting the image."
+        )
+        self.write_method_reason.setObjectName("muted")
+        self.write_method_reason.setWordWrap(True)
+        self.source_card.layout().addWidget(self.write_method_reason)
         self.checksum_button = QPushButton("Checksums…")
         self.checksum_button.setEnabled(False)
         self.checksum_button.clicked.connect(self.calculate_image_checksums)
@@ -200,7 +219,7 @@ class Window(QMainWindow):
         self.windows_button.setEnabled(False)
         self.windows_button.clicked.connect(self.configure_windows)
         image_tools.addStretch()
-        self.iso_plan_button = QPushButton("ISO mode…")
+        self.iso_plan_button = QPushButton("Plan details…")
         self.iso_plan_button.setToolTip(
             "Preview or write an ISO through a filesystem-aware UEFI/FAT32 workflow."
         )
@@ -215,7 +234,7 @@ class Window(QMainWindow):
         self.target_card = self.card("2", "Destination", "Only removable USB and SD media are shown")
         target_row = QHBoxLayout()
         self.device_combo = QComboBox()
-        self.device_combo.currentIndexChanged.connect(self.update_ready)
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh_devices)
         target_row.addWidget(self.device_combo, 1)
@@ -307,6 +326,8 @@ class Window(QMainWindow):
         path = self.image
         self.logger.info("Selected image %s", path)
         self.inspection = None
+        self.inspection_identity = None
+        self.write_recommendation = None
         self.windows_options = WindowsCustomization()
         self.windows_wim_member = None
         self.windows_wim_editions = ()
@@ -315,11 +336,18 @@ class Window(QMainWindow):
         self.windows_button.setToolTip("")
         self.windows_button.setEnabled(False)
         self.iso_plan_button.setEnabled(False)
+        self.write_method.blockSignals(True)
+        self.write_method.clear()
+        self.write_method.blockSignals(False)
+        self.write_method.setEnabled(False)
+        self.write_method_reason.setText(
+            "ISOpropyl will recommend a method after inspecting the image."
+        )
         self.image_label.setText(f"{path.name}  ·  {format_size(path.stat().st_size)}")
         self.image_label.setToolTip(str(path))
         self.image_detail.setText("DD mode · Inspecting image layout…")
         self.checksum_button.setEnabled(False)
-        self.update_ready()
+        self.on_device_changed()
 
         def work() -> None:
             try:
@@ -359,18 +387,132 @@ class Window(QMainWindow):
             self.devices = []
             self.device_combo.addItem("Could not inspect drives")
             self.status.setText(str(error))
-        self.update_ready()
+        self.on_device_changed()
 
     def selected_device(self) -> Device | None:
         index = self.device_combo.currentIndex()
         return self.devices[index] if 0 <= index < len(self.devices) else None
 
+    def archive_entries(self) -> tuple[ArchiveEntry, ...]:
+        if self.inspection is None:
+            return ()
+        kinds = {
+            "file": EntryKind.FILE,
+            "directory": EntryKind.DIRECTORY,
+            "symlink": EntryKind.SYMLINK,
+            "hardlink": EntryKind.HARDLINK,
+        }
+        return tuple(
+            ArchiveEntry(
+                member.path,
+                member.size,
+                kinds.get(member.kind, EntryKind.FILE),
+                member.link_target or None,
+            )
+            for member in self.inspection.members
+        )
+
+    def selected_write_mode(self) -> WriteMode | None:
+        value = self.write_method.currentData()
+        try:
+            return WriteMode(value) if value is not None else None
+        except ValueError:
+            return None
+
+    def rebuild_write_recommendation(self, *, preserve_selection: bool = True) -> None:
+        inspection = self.inspection
+        if inspection is None:
+            self.write_recommendation = None
+            self.write_method.setEnabled(False)
+            return
+        previous = self.selected_write_mode() if preserve_selection else None
+        device = self.selected_device()
+        try:
+            recommendation = recommend_write_method(
+                inspection,
+                self.archive_entries(),
+                target_size=device.size if device is not None else None,
+            )
+        except ValueError as error:
+            self.write_recommendation = None
+            self.write_method.blockSignals(True)
+            self.write_method.clear()
+            self.write_method.blockSignals(False)
+            self.write_method.setEnabled(False)
+            self.write_method_reason.setText(
+                f"No safe write method could be planned: {error}"
+            )
+            return
+        self.write_recommendation = recommendation
+        selected = (
+            previous
+            if previous in recommendation.available_modes else
+            recommendation.recommended_mode
+        )
+        labels = {
+            WriteMode.DD: "DD mode — exact byte-for-byte copy",
+            WriteMode.EXTRACTED_ISO: "ISO mode — filesystem-aware, UEFI-only",
+        }
+        self.write_method.blockSignals(True)
+        self.write_method.clear()
+        for mode in recommendation.available_modes:
+            self.write_method.addItem(labels[mode], mode.value)
+        if selected is not None:
+            index = self.write_method.findData(selected.value)
+            self.write_method.setCurrentIndex(index)
+        self.write_method.blockSignals(False)
+        self.write_method.setEnabled(bool(recommendation.available_modes))
+        prefix = (
+            "Recommended: ISO mode. "
+            if recommendation.recommended_mode is WriteMode.EXTRACTED_ISO else
+            "Recommended: DD mode. "
+            if recommendation.recommended_mode is WriteMode.DD else
+            "No write method is currently available. "
+        )
+        detail = prefix + recommendation.reason
+        if (
+            inspection.is_iso9660
+            and WriteMode.EXTRACTED_ISO not in recommendation.available_modes
+            and recommendation.iso_unavailable_reason
+        ):
+            detail += " ISO mode unavailable: " + recommendation.iso_unavailable_reason
+        self.write_method_reason.setText(detail)
+        self.on_write_method_changed()
+
+    def on_device_changed(self) -> None:
+        self.rebuild_write_recommendation()
+        self.update_ready()
+
+    def on_write_method_changed(self) -> None:
+        mode = self.selected_write_mode()
+        if self.inspection is not None:
+            label = "ISO mode" if mode is WriteMode.EXTRACTED_ISO else "DD mode"
+            self.image_detail.setText(f"{label} · {self.inspection.summary}")
+        iso_mode = mode is WriteMode.EXTRACTED_ISO
+        self.verify.setChecked(True if iso_mode else self.verify.isChecked())
+        self.verify.setEnabled(not self.operation_active and not iso_mode)
+        self.write_button.setText(
+            "Write in ISO mode" if iso_mode else "Write in DD mode"
+        )
+        self.update_ready()
+
     def update_ready(self) -> None:
         device = self.selected_device()
-        image_size = self.inspection.size if self.inspection else (
-            self.image.stat().st_size if self.image else 0
+        mode = self.selected_write_mode()
+        recommendation = self.write_recommendation
+        plan = None
+        if recommendation is not None:
+            plan = (
+                recommendation.iso_plan
+                if mode is WriteMode.EXTRACTED_ISO else
+                recommendation.dd_plan
+                if mode is WriteMode.DD else None
+            )
+        enough_space = bool(
+            self.image and device and plan
+            and mode in recommendation.available_modes  # type: ignore[union-attr]
+            and plan.minimum_target_bytes <= device.size
         )
-        enough_space = bool(self.image and device and image_size <= device.size)
         self.write_button.setEnabled(
             enough_space and not self.operation_active and self.inspection is not None and not self.checksum_busy
         )
@@ -383,8 +525,10 @@ class Window(QMainWindow):
             )
         else:
             self.device_detail.setText("Connect a removable drive, then refresh")
-        if self.image and device and not enough_space:
-            self.status.setText("The selected image is larger than this drive")
+        if self.image and device and plan is not None and not enough_space:
+            self.status.setText(
+                "The selected target is too small for this write method"
+            )
         elif not self.operation_active:
             self.status.setText("Ready when you are")
 
@@ -406,10 +550,20 @@ class Window(QMainWindow):
         device = self.selected_device()
         if not self.image or not device or not self.inspection:
             return
+        mode = self.selected_write_mode()
+        if mode is WriteMode.EXTRACTED_ISO:
+            self.confirm_iso_write(device)
+            return
+        if mode is not WriteMode.DD:
+            QMessageBox.warning(
+                self, "No write method selected",
+                "Choose an available write method before continuing.",
+            )
+            return
         compatibility_warning = None
         if self.inspection.has_windows_installer:
             compatibility_warning = (
-                "This button uses DD mode. Most Windows ISOs need the filesystem-aware "
+                "Most Windows ISOs need the filesystem-aware "
                 "workflow, so a byte-for-byte copy may not boot from USB.\n\n"
                 "Use ISO mode for supported UEFI Windows media unless you know this "
                 "image supports raw USB writing."
@@ -452,7 +606,8 @@ class Window(QMainWindow):
         answer = QMessageBox.warning(
             self, "Erase removable drive?",
             f"Everything on {device.label} will be permanently erased.\n\n"
-            f"Image: {self.image.name}\nLayout: {self.inspection.layout}\n"
+            f"Image: {self.image.name}\nMethod: DD mode · exact byte-for-byte copy\n"
+            f"Layout: {self.inspection.layout}\n"
             f"Target: {device.path}\nSerial: {device.serial or device.wwn or 'not reported'}\n\n"
             "Check the target carefully before continuing.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
@@ -461,6 +616,51 @@ class Window(QMainWindow):
         if answer == QMessageBox.StandardButton.Yes:
             self.logger.info("Confirmed write: image=%s target=%s identity=%s", self.image, device.path, device.identity)
             self.start_write(self.image, device, self.verify.isChecked())
+
+    def confirm_iso_write(self, device: Device) -> None:
+        image = self.image
+        inspection = self.inspection
+        if image is None or inspection is None:
+            return
+        try:
+            current_identity = image_identity(image)
+        except OSError as error:
+            QMessageBox.critical(self, "Image unavailable", str(error))
+            return
+        if current_identity != self.inspection_identity:
+            QMessageBox.warning(
+                self,
+                "Image changed",
+                "The image changed after inspection. Select it again before writing.",
+            )
+            return
+        entries = self.archive_entries()
+        try:
+            recommendation = recommend_write_method(
+                inspection, entries, target_size=device.size,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "ISO mode unavailable", str(error))
+            return
+        plan = recommendation.iso_plan
+        if (
+            plan is None
+            or not plan.executable
+            or WriteMode.EXTRACTED_ISO not in recommendation.available_modes
+        ):
+            QMessageBox.warning(
+                self,
+                "ISO mode unavailable",
+                recommendation.iso_unavailable_reason
+                or "This image no longer has an executable ISO-mode plan.",
+            )
+            self.rebuild_write_recommendation()
+            return
+        self.logger.info(
+            "Dispatching fresh ISO-mode plan: image=%s target=%s identity=%s",
+            image, device.path, device.identity,
+        )
+        self.start_constructed_iso_write(list(entries), plan)
 
     def start_write(self, image: Path, device: Device, should_verify: bool) -> None:
         try:
@@ -584,7 +784,9 @@ class Window(QMainWindow):
             self.progress_estimator.reset()
         self.source_card.setEnabled(not busy)
         self.target_card.setEnabled(not busy)
-        self.verify.setEnabled(not busy)
+        self.verify.setEnabled(
+            not busy and self.selected_write_mode() is not WriteMode.EXTRACTED_ISO
+        )
         self.show_external.setEnabled(not busy)
         self.tools_button.setEnabled(not busy and self.selected_device() is not None)
         self.optical_button.setEnabled(not busy)
@@ -1231,9 +1433,15 @@ class Window(QMainWindow):
         if isinstance(result, Exception):
             self.logger.warning("Image inspection failed: %s", result)
             self.inspection = None
+            self.inspection_identity = None
+            self.write_recommendation = None
+            self.write_method.clear()
+            self.write_method.setEnabled(False)
+            self.write_method_reason.setText("Image inspection did not complete.")
             self.image_detail.setText(f"Could not inspect image: {result}")
         else:
             self.inspection = result  # type: ignore[assignment]
+            self.inspection_identity = identity
             self.logger.info("Image inspection: %s", self.inspection.summary)
             if self.inspection.compression != "none":
                 self.image_label.setText(
@@ -1315,6 +1523,7 @@ class Window(QMainWindow):
             self.windows_button.setEnabled(self.inspection.has_windows_installer)
             self.iso_plan_button.setEnabled(self.inspection.is_iso9660)
             self.checksum_button.setEnabled(True)
+            self.rebuild_write_recommendation(preserve_selection=False)
         self.update_ready()
 
     def start_windows_wim_inspection(self) -> None:

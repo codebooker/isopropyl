@@ -9,6 +9,7 @@ import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
+import isopropyl.iso_staging as iso_staging
 from isopropyl.extraction import (
     ExtractionCancelled,
     ExtractionProgress,
@@ -428,6 +429,38 @@ class IsoStagingTests(unittest.TestCase):
                     write_plan=write_plan(collision),
                     windows_customization=customization,
                 )
+
+    def test_refuses_known_oem_answer_file_case_insensitively(self):
+        customization = WindowsCustomization(hide_online_account=True)
+        collision = basic_entries() + (
+            ArchiveEntry("SoUrCeS/$OeM$/$$/PaNtHeR/UnAtTeNd.XmL", 4),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, r"\$OeM\$.*UnAtTeNd\.XmL",
+            ):
+                self.make_plan(
+                    Path(directory), collision,
+                    write_plan=write_plan(collision),
+                    windows_customization=customization,
+                )
+
+    def test_forged_plan_cannot_combine_generated_and_oem_answer_files(self):
+        customization = WindowsCustomization(hide_online_account=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.make_plan(root, windows_customization=customization)
+            forged_entries = plan.entries + (
+                ArchiveEntry("sources/$OEM$/$$/Panther/unattend.xml", 4),
+            )
+            forged = replace(
+                plan,
+                entries=forged_entries,
+                catalog_digest=iso_staging._catalog_digest(forged_entries),
+                write_plan=write_plan(forged_entries),
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "conflicts"):
+                validate_iso_staging_plan(forged)
 
     def test_selected_esd_index_is_bound_reinspected_and_published(self):
         with tempfile.TemporaryDirectory() as directory:

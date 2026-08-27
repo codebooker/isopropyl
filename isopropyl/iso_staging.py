@@ -346,6 +346,23 @@ def _fixed_wim_resolver(path: str) -> Callable[[str], str | None]:
     return lambda name: path if name == "wimlib-imagex" else None
 
 
+_WINDOWS_ANSWER_FILE_PATHS = frozenset({
+    "autounattend.xml",
+    "sources/$oem$/$$/panther/unattend.xml",
+})
+
+
+def _existing_windows_answer_file(
+    entries: Sequence[ArchiveEntry],
+) -> str | None:
+    """Return a known Windows Setup answer-file path, case-insensitively."""
+    for entry in entries:
+        path = PurePosixPath(entry.path).as_posix()
+        if path.casefold() in _WINDOWS_ANSWER_FILE_PATHS:
+            return path
+    return None
+
+
 def build_iso_staging_plan(
     image: Path,
     destination: Path,
@@ -375,13 +392,11 @@ def build_iso_staging_plan(
 
     answer_file: str | None = None
     if windows_customization is not None and windows_customization.enabled:
-        if any(
-            len(PurePosixPath(entry.path).parts) == 1
-            and entry.path.casefold() == "autounattend.xml"
-            for entry in safe_entries
-        ):
+        existing_answer_file = _existing_windows_answer_file(safe_entries)
+        if existing_answer_file is not None:
             raise IsoStagingSafetyError(
-                "The ISO already contains autounattend.xml; it will not be overwritten"
+                f"The ISO already contains the Windows answer file "
+                f"{existing_answer_file}; it will not be combined with or overwritten"
             )
         try:
             answer_file = generate_autounattend(
@@ -487,12 +502,12 @@ def validate_iso_staging_plan(plan: IsoStagingPlan) -> None:
             raise IsoStagingSafetyError(
                 "The answer file image index does not match the staging plan"
             )
-        if any(
-            len(PurePosixPath(entry.path).parts) == 1
-            and entry.path.casefold() == "autounattend.xml"
-            for entry in entries
-        ):
-            raise IsoStagingSafetyError("The answer file would replace ISO content")
+        existing_answer_file = _existing_windows_answer_file(entries)
+        if existing_answer_file is not None:
+            raise IsoStagingSafetyError(
+                f"The generated answer file conflicts with existing ISO content at "
+                f"{existing_answer_file}"
+            )
     elif plan.wim_selection is not None:
         raise IsoStagingSafetyError(
             "A selected Windows image requires a bound answer file"

@@ -13,17 +13,19 @@ evidence.
    SSDs.
 2. Test unplug, cancellation, authentication refusal, short writes, full disks,
    mount conflicts, and cleanup failures without weakening identity checks.
-3. Confirm the GPT partition type and removable-media fallback loaders across a
+3. Add a privileged exclusive whole-target ownership primitive that remains held
+   across the complete destructive transaction, without an unsafe bypass.
+4. Confirm the GPT partition type and removable-media fallback loaders across a
    documented firmware matrix.
-4. Ship reproducible native packages and at least one portable format with signed
+5. Ship reproducible native packages and at least one portable format with signed
    release artifacts and installation documentation.
 
 ## Next capability milestones
 
 ### Windows installer workflow
 
-- Make ISO/DD selection first-class rather than placing ISO mode in a secondary
-  plan dialog.
+- Continue refining the implemented first-class ISO/DD selector as new executable
+  firmware profiles become available; never silently change the user's choice.
 - Add BIOS and dual BIOS+UEFI construction with exact, provenance-bound boot code.
 - Expand the implemented UEFI:NTFS path beyond 512-byte logical sectors only
   after upstream payload and firmware evidence supports it.
@@ -56,6 +58,8 @@ evidence.
 
 ## Product quality
 
+- Move bounded `lsblk` device discovery to a background worker with generation
+  tokens so stale refreshes can never replace newer target state.
 - Localization, system/high-contrast appearance, keyboard and screen-reader QA.
 - Conflicting-process diagnostics and narrowly bounded I/O retries.
 - Cluster size, filesystem, partition-layout, and volume-label controls where the

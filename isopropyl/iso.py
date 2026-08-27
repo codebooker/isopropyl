@@ -147,6 +147,16 @@ class WritePlan:
         return self.content_constraints_checked and not self.blockers
 
 
+@dataclass(frozen=True)
+class WriteMethodRecommendation:
+    available_modes: tuple[WriteMode, ...]
+    recommended_mode: WriteMode | None
+    reason: str
+    dd_plan: WritePlan
+    iso_plan: WritePlan | None
+    iso_unavailable_reason: str = ""
+
+
 _WINDOWS_DRIVE = re.compile(r"^[a-zA-Z]:")
 _WINDOWS_DEVICE = re.compile(
     r"^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$", re.IGNORECASE,
@@ -583,4 +593,98 @@ def build_write_plan(
         minimum_content_bytes=content_bytes, minimum_target_bytes=minimum_target,
         content_constraints_checked=bool(supplied_entries),
         blockers=tuple(blockers),
+    )
+
+
+def recommend_write_method(
+    inspection: ImageInspection,
+    entries: Iterable[ArchiveEntry] = (),
+    *,
+    target_size: int | None = None,
+) -> WriteMethodRecommendation:
+    """Recommend a visible write method without silently changing the user's choice."""
+    if target_size is not None and (
+        isinstance(target_size, bool) or not isinstance(target_size, int)
+        or target_size < 0
+    ):
+        raise PlanError("Target size cannot be negative")
+    frozen_entries = tuple(entries)
+    dd_plan = build_write_plan(
+        inspection, frozen_entries, requested_mode=WriteMode.DD,
+    )
+    dd_available = target_size is None or dd_plan.minimum_target_bytes <= target_size
+    is_iso = inspection.is_iso9660 or inspection.kind == "Optical ISO"
+    if not is_iso:
+        modes = (WriteMode.DD,) if dd_available else ()
+        return WriteMethodRecommendation(
+            modes,
+            WriteMode.DD if dd_available else None,
+            (
+                "DD mode is required for raw and virtual disk images because it "
+                "preserves their existing partition layout."
+                if dd_available else
+                "The selected target is too small for this byte-for-byte image."
+            ),
+            dd_plan,
+            None,
+            "ISO mode requires an ISO filesystem image.",
+        )
+
+    iso_plan: WritePlan | None = None
+    iso_error = ""
+    try:
+        iso_plan = build_write_plan(
+            inspection,
+            frozen_entries,
+            requested_mode=WriteMode.EXTRACTED_ISO,
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+    except PlanError as error:
+        iso_error = str(error)
+    iso_available = bool(iso_plan and iso_plan.executable)
+    if iso_available and target_size is not None:
+        assert iso_plan is not None
+        if iso_plan.minimum_target_bytes > target_size:
+            iso_available = False
+            iso_error = (
+                "The selected target is too small for the extracted ISO layout."
+            )
+    if iso_plan is not None and not iso_plan.executable and not iso_error:
+        iso_error = iso_plan.blockers[0] if iso_plan.blockers else (
+            "The ISO does not have an executable filesystem-aware plan."
+        )
+
+    available: list[WriteMode] = []
+    if dd_available:
+        available.append(WriteMode.DD)
+    if iso_available:
+        available.append(WriteMode.EXTRACTED_ISO)
+
+    if iso_available and inspection.has_windows_installer:
+        recommended = WriteMode.EXTRACTED_ISO
+        reason = (
+            "ISO mode is recommended for this Windows installer so its files, "
+            "large-WIM handling, and selected customization can be applied."
+        )
+    elif iso_available and not inspection.raw_compatible:
+        recommended = WriteMode.EXTRACTED_ISO
+        reason = (
+            "ISO mode is recommended because this optical-only image has no "
+            "USB-native MBR or GPT layout to preserve with DD."
+        )
+    elif dd_available:
+        recommended = WriteMode.DD
+        reason = (
+            "DD mode is recommended for this hybrid ISO because it preserves the "
+            "image's native BIOS/UEFI disk layout exactly."
+        )
+    elif iso_available:
+        recommended = WriteMode.EXTRACTED_ISO
+        reason = "Only the filesystem-aware ISO layout fits the selected target."
+    else:
+        recommended = None
+        reason = iso_error or "No safe write method fits the selected target."
+
+    return WriteMethodRecommendation(
+        tuple(available), recommended, reason, dd_plan, iso_plan, iso_error,
     )

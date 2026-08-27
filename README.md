@@ -29,6 +29,8 @@ installer customization, verification, backups, formatting, and media tools.
 
 ### Write more than raw images
 
+- A first-class **ISO vs DD selector** recommends the safest compatible method
+  from the inspected image, explains why, and never silently changes your choice.
 - **DD mode** for hybrid ISOs and raw disk images, with cancellation and
   byte-for-byte read-back verification.
 - **ISO mode** for supported UEFI media: safely extract the ISO, choose FAT32
@@ -65,8 +67,9 @@ Windows answer file with options for:
 - privacy/OOBE choices and automatic BitLocker-device-encryption prevention;
 - input locale, system/UI language, user locale, keyboard layout, and time zone.
 
-The XML is inspectable and exportable. Existing `autounattend.xml` content is
-never silently replaced.
+The XML is inspectable and exportable. Existing root or OEM/Panther Windows
+answer files are detected case-insensitively and never silently combined or
+replaced.
 
 Local-account creation deliberately embeds no secret: the administrator starts
 with a blank password, and one sequential first-logon command requests an

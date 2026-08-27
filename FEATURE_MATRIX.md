@@ -77,24 +77,24 @@ Status meanings:
 | Image/staging stored on target | **Done** | Refused before destructive work, then rechecked in constructed execution. |
 | Conflicting-process diagnostics | **Planned** | Current errors report unmount failure but do not identify the owning process. |
 | Distro-specific DD-only rules | **Planned** | Needs a versioned compatibility catalog and fixtures. |
-| Automatic GRUB/Syslinux downloads | **Partial** | HTTPS host allowlist, exact size/SHA-256, cache, and pre-use verification infrastructure exists. The first production entry is the UEFI:NTFS helper; exact GRUB/Syslinux dependency selection and catalog entries still need executable callers. |
+| Automatic GRUB/Syslinux downloads | **Planned** | Verified-download infrastructure exists, but there is no user-facing GRUB/Syslinux caller or release catalog yet. UEFI:NTFS uses the same underlying safety model but is a separate payload family. |
 
 ## Windows-specific construction and customization
 
 | Rufus Windows feature | Status | ISOpropyl evidence and remaining work |
 |---|---:|---|
-| Detect WIM edition/build/architecture/index | **Done** | Strict bounded `wimlib-imagex info --xml` inspection is integrated into the GUI; the staging executor re-inspects and identity-binds the catalog, architecture, and selected index before answer-file generation. |
+| Detect WIM edition/build/architecture/index | **Partial** | Strict bounded `wimlib-imagex info --xml` inspection is integrated and identity-bound, but the GUI still requires exactly one `install.wim`/`install.esd`; Rufus can select among multiple source images. |
 | Split `install.wim` over FAT32 limit | **Done** | Integrated private `wimlib-imagex split`, validates complete numbered parts, atomically commits staging. |
 | UEFI-only install media | **Partial** | Executable GPT/FAT32 and GPT/NTFS+UEFI:NTFS paths with per-file verification; physical firmware and Secure Boot testing remain. |
 | BIOS-only and dual BIOS+UEFI | **Planned** | Exact Windows/GRUB/Syslinux boot code and layouts required. |
-| UEFI:NTFS / dual partition | **Done** | Exact 512-byte-sector GPT/MBR geometry, NTFS data partition, pinned 1 MiB upstream FAT12 helper image, x64/x86/ARM64 payload validation, conditional CA2011 warning, raw and file read-back verification, identity rechecks, and cancellation. ARM32 requires an unsigned opt-in; broken upstream RISC-V64 and incomplete LoongArch64 pairs fail closed. Physical certification remains. |
+| UEFI:NTFS / dual partition | **Partial** | Exact 512-byte-sector GPT/MBR geometry, NTFS data partition, pinned 1 MiB upstream FAT12 helper image, x64/x86/ARM64 payload validation, conditional CA2011 warning, raw and file read-back verification, identity rechecks, and cancellation. ARM32 requires an unsigned opt-in. The pinned image contains an unsigned RISC-V64 pair that still needs an explicit Secure-Boot-off path; LoongArch64 remains incomplete. Physical certification remains. |
 | Windows 11 RAM/TPM/Secure Boot bypass | **Done** | Transparent opt-in answer-file registry commands; applied only through ISO mode. |
 | Hide online Microsoft-account screen | **Partial** | OOBE settings ship; current Windows versions may require more version-aware mechanisms. |
 | Local administrator | **Partial** | Validated username and no collected secret; the account starts blank and a single sequential first-logon command mandates replacement and applies the chosen expiration policy. The GUI warns that this is best-effort and unsupported in S mode. |
 | Locale, language, keyboard, time zone | **Done** | Explicit validated Linux-side fields, not host-Windows settings replication. |
 | Privacy-question/Express settings | **Done** | Opt-in OOBE privacy settings. |
 | Prevent automatic BitLocker encryption | **Done** | Transparent opt-in unattend/registry behavior. |
-| Existing answer file protection | **Done** | Existing root `autounattend.xml` is never overwritten. |
+| Existing answer file protection | **Done** | Root `autounattend.xml` and `sources/$OEM$/$$/Panther/unattend.xml` are detected case-insensitively; customization refuses to combine with or replace either. |
 | Windows To Go | **Planned** | WIM apply, ESP/MSR/NTFS layout, offline BCD, SAN policy, and driver/hardware caveats. |
 | Internal disks offline for Windows To Go | **Planned** | Belongs to future offline SAN/BCD configuration. |
 | Windows CA 2023 / `SkuSiPolicy.p7b` | **Planned** | Security-sensitive, versioned validation required. |
@@ -108,6 +108,7 @@ Status meanings:
 | Rufus UI/workflow | Status | ISOpropyl evidence and remaining work |
 |---|---:|---|
 | Device model, capacity, path, serial/WWN | **Done** | Deterministic size/model/path sorting and explicit identity display. |
+| Bounded background device refresh | **Planned** | Device enumeration is currently synchronous and `lsblk` has no explicit timeout/output bound; move it off the Qt UI thread with stale-result suppression. |
 | Ignore selected USB devices | **Done** | Persistent stable-ID denylist and reset controls. |
 | Show USB hard drives/SSDs | **Done** | Visible explicit opt-in; root/internal disks remain excluded. |
 | Partition scheme selector | **Partial** | MBR/GPT available for restore; current ISO profile fixes GPT. |
@@ -117,7 +118,7 @@ Status meanings:
 | Volume label | **Done** | Filesystem-specific validation in restore; ISO mode uses `ISOPROPYL`. |
 | Quick format | **Done** | Restore and ISO construction use quick mkfs; full zero is separate. |
 | Persistence-size slider | **Planned** | Show only for recognized executable distro profiles. |
-| ISO mode versus DD mode | **Partial** | Both paths are reachable and clearly named; ISO mode is still a secondary dialog rather than a first-class selector/prompt. |
+| ISO mode versus DD mode | **Done** | The main screen exposes both executable choices, recommends from inspected image evidence, names compatibility limits, resets on a new image, re-plans against the selected target at dispatch, and never silently falls back. ISO mode forces verification. |
 | Image checksums | **Done** | Dedicated dialog with copy and strict compare. |
 | Save-drive action | **Done** | Separate read-only source workflow. |
 | Progress, speed, ETA, cancellation | **Done** | 64-bit counters, stage-aware rolling rate/ETA, cross-thread cancellation. |
@@ -167,6 +168,8 @@ Status meanings:
 |---|---:|---|
 | Hide system/internal disks | **Done** | Root backing device excluded; whole-device safety model enforced. |
 | Revalidate device identity | **Done** | Path, size, model, serial/WWN, transport, and major:minor around destructive boundaries. |
+| Bind partition-node identity | **Done** | Multi-partition workflows bind every direct child path to kernel parent and major:minor identity, verify the block node with `lstat`, and repeat exact geometry and identity checks before each filesystem creation. |
+| Exclusive target ownership | **Planned** | Identity rechecks and unmounting ship, but ISOpropyl does not yet hold a privileged whole-device lock/exclusive descriptor across the complete destructive transaction. No unsafe bypass will be exposed. |
 | Fixed privileged argv/no shell | **Done** | Absolute trusted tools and bounded child processes. |
 | Verified boot components | **Partial** | A release-bundled catalog pins the UEFI:NTFS source commit, exact size, and SHA-256; explicit consent, identity-safe cache binding, in-memory privileged transfer, and full read-back are integrated. GRUB/Syslinux catalogs and signed ISOpropyl release metadata remain. |
 | No unsigned remote scripts | **Policy** | ISOpropyl will never execute a downloaded installer/downloader script. |
@@ -181,17 +184,18 @@ Status meanings:
 
 ## Priority order
 
-1. Hardware-certify current UEFI/FAT32 and UEFI:NTFS modes and failure cleanup.
-2. Make ISO/DD selection first-class and guide users from detected image traits.
-3. Implement BIOS and dual-firmware construction with exact payload handling.
-4. Integrate the narrow Casper persistence backend into initial layout and GUI.
-5. Add Windows To Go through wimlib and offline boot configuration.
-6. Add cryptographic Secure Boot trust and authenticated revocation data.
-7. Complete FFU/VTSI/direct WIM/ESD and image-output formats.
-8. Add signed opt-in downloaders, FreeDOS, and UEFI Shell workflows.
-9. Expand GRUB/Syslinux version resolution with audited payload catalogs.
+1. Add privileged exclusive target ownership across every destructive transaction.
+2. Hardware-certify current UEFI/FAT32 and UEFI:NTFS modes and failure cleanup.
+3. Move bounded device enumeration off the Qt thread and suppress stale refreshes.
+4. Implement BIOS and dual-firmware construction with exact payload handling.
+5. Integrate the narrow Casper persistence backend into initial layout and GUI.
+6. Add Windows To Go through wimlib and offline boot configuration.
+7. Add cryptographic Secure Boot trust and authenticated revocation data.
+8. Complete FFU/VTSI/direct WIM/ESD and image-output formats.
+9. Add signed opt-in downloaders, FreeDOS, UEFI Shell, and audited GRUB/Syslinux
+   payload catalogs.
 10. Finish localization, conflict diagnostics, signed reproducible packaging, and
-    first-class ISO/DD/format controls.
+    safe expert format controls.
 
 ## Primary Rufus sources reviewed
 
