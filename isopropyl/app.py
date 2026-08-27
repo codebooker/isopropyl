@@ -73,7 +73,8 @@ from .images import (
 from .iso import (
     AdditiveOverlayMerge, ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget,
     WriteMode, WritePlan, WriteMethodRecommendation, build_write_plan,
-    merge_additive_overlay_entries, partition_sector_mismatch,
+    merge_additive_embedded_entries, merge_additive_overlay_entries,
+    partition_sector_mismatch,
     partition_sector_unverified, recommend_write_method,
 )
 from .iso_staging import (
@@ -1208,13 +1209,35 @@ class Window(QMainWindow):
         )
 
     def effective_archive_entries(self) -> tuple[ArchiveEntry, ...]:
-        base_entries = self.archive_entries()
+        base_entries = self.constructed_base_entries()
         if self.zip_overlay_plan is None:
             return base_entries
         merged = self.zip_overlay_merge
         if merged is None or merged.base_entries != base_entries:
             raise ValueError("The ZIP overlay no longer matches the inspected ISO catalog")
         return merged.merged_entries
+
+    def embedded_archive_entries(self) -> tuple[ArchiveEntry, ...]:
+        if self.inspection is None or self.inspection.embedded_uefi_fat is None:
+            return ()
+        return tuple(
+            ArchiveEntry(
+                entry.path,
+                entry.size,
+                EntryKind.DIRECTORY if entry.is_directory else EntryKind.FILE,
+            )
+            for entry in self.inspection.embedded_uefi_fat.entries
+        )
+
+    def constructed_base_entries(self) -> tuple[ArchiveEntry, ...]:
+        base_entries = self.archive_entries()
+        embedded_entries = self.embedded_archive_entries()
+        if not embedded_entries:
+            return base_entries
+        return merge_additive_embedded_entries(
+            base_entries,
+            embedded_entries,
+        ).merged_entries
 
     @staticmethod
     def runtime_validation_architectures(
@@ -1426,6 +1449,11 @@ class Window(QMainWindow):
                 )
                 return
 
+        try:
+            constructed_base = self.constructed_base_entries()
+        except ValueError as error:
+            QMessageBox.warning(self, "ZIP overlay unavailable", str(error))
+            return
         if self.zip_overlay_preparer is not None:
             self.zip_overlay_preparer.cancel()
         self.zip_overlay_generation += 1
@@ -1435,7 +1463,7 @@ class Window(QMainWindow):
             self.inspection_generation,
             self.inspection_identity,
             archive,
-            self.archive_entries(),
+            constructed_base,
             operation,
         )
         self.zip_overlay_plan = None
@@ -1484,7 +1512,7 @@ class Window(QMainWindow):
                 and token.inspection_generation == self.inspection_generation
                 and token.image_identity == self.inspection_identity
                 and token.image_identity == image_identity(self.image)
-                and token.base_entries == self.archive_entries()
+                and token.base_entries == self.constructed_base_entries()
             )
         except OSError:
             current = False
@@ -3767,6 +3795,19 @@ class Window(QMainWindow):
                     f"El Torito catalog: LBA {self.inspection.eltorito.catalog_lba}; "
                     f"{platforms}"
                 )
+            if self.inspection.embedded_uefi_fat is not None:
+                embedded = self.inspection.embedded_uefi_fat
+                detail_lines.append(
+                    f"Embedded UEFI {embedded.fat_type.value} image: "
+                    f"{len(embedded.entries)} entries · "
+                    f"{self.display_size(embedded.content_bytes)}; added only "
+                    "through collision-free private ISO staging"
+                )
+            if self.inspection.embedded_uefi_issues:
+                detail_lines.append(
+                    "Embedded UEFI image issue: "
+                    + "; ".join(self.inspection.embedded_uefi_issues)
+                )
             if self.inspection.eltorito_issues:
                 detail_lines.append(
                     "El Torito catalog issue: "
@@ -4262,6 +4303,16 @@ class Window(QMainWindow):
             f"File content: {self.display_size(plan.minimum_content_bytes)}",
             f"Conservative target minimum: {self.display_size(plan.minimum_target_bytes)}",
         ]
+        if self.inspection.embedded_uefi_fat is not None:
+            embedded = self.inspection.embedded_uefi_fat
+            lines.extend((
+                "",
+                f"Embedded UEFI image: {embedded.fat_type.value} · "
+                f"{len(embedded.entries)} entries · "
+                f"{self.display_size(embedded.content_bytes)}",
+                "Merge policy: missing files are added from the bound El Torito "
+                "image; every file or alias collision blocks ISO mode.",
+            ))
         if self.zip_overlay_plan is not None:
             merge = self.zip_overlay_merge
             added = merge.overlay_entries if merge is not None else ()
@@ -4604,6 +4655,7 @@ class Window(QMainWindow):
                     request.base_entries,
                     request.write_plan,
                     overlay=request.overlay,
+                    embedded_fat=request.inspection.embedded_uefi_fat,
                     cancel_check=check_cancelled,
                     windows_customization=request.windows_customization,
                     windows_architecture=request.windows_architecture,
@@ -5184,6 +5236,14 @@ class Window(QMainWindow):
                 f"{self.display_size(staging_plan.content_bytes)} of ISO/overlay file data."
                 "\nOverlay policy: additive only; no existing ISO file is replaced."
             )
+        if staging_plan.embedded_fat is not None:
+            customization += (
+                f"\nEmbedded UEFI image: expand a bound "
+                f"{staging_plan.embedded_fat.fat_type.value} tree with "
+                f"{len(staging_plan.embedded_entries)} entries and "
+                f"{self.display_size(staging_plan.embedded_content_bytes)} of "
+                "file data. Existing ISO files are never replaced."
+            )
         if persistence_enabled:
             assert pending.persistence_profile is not None
             mode_description = (
@@ -5437,6 +5497,14 @@ class Window(QMainWindow):
                         update.bytes_done, update.total_bytes, update.stage,
                     ),
                 )
+                if (
+                    staged.image_identity != staging_plan.image_identity
+                    or staged.catalog_digest
+                    != staging_plan.effective_catalog_digest
+                ):
+                    raise RuntimeError(
+                        "The ISO staging result does not match its source/catalog plan"
+                    )
                 if persistence_enabled:
                     assert pending.persistence_profile is not None
                     assert self.casper_stager is not None

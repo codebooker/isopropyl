@@ -51,6 +51,7 @@ MACHINE_ARCHITECTURES = {
     0x01C2: "Thumb",
     0x01C4: "ARMv7",
     0x0200: "IA-64",
+    0x0EBC: "EBC",
     0x5032: "RISC-V32",
     0x5064: "RISC-V64",
     0x5128: "RISC-V128",
@@ -59,6 +60,33 @@ MACHINE_ARCHITECTURES = {
     0x8664: "x64",
     0xAA64: "ARM64",
 }
+
+_FALLBACK_PE_ARCHITECTURES = {
+    "bootia32.efi": ("x86", frozenset({"x86"})),
+    "bootx64.efi": ("x64", frozenset({"x64"})),
+    # UEFI removable-media naming uses one BOOTARM filename for all 32-bit ARM
+    # PE machine variants that the parser recognizes.
+    "bootarm.efi": ("ARM", frozenset({"ARM", "Thumb", "ARMv7"})),
+    "bootaa64.efi": ("ARM64", frozenset({"ARM64"})),
+    "bootia64.efi": ("IA-64", frozenset({"IA-64"})),
+    "bootriscv64.efi": ("RISC-V64", frozenset({"RISC-V64"})),
+    "bootloongarch64.efi": ("LoongArch64", frozenset({"LoongArch64"})),
+    "bootebc.efi": ("EBC", frozenset({"EBC"})),
+}
+
+
+def fallback_loader_architecture(filename: str) -> str | None:
+    """Return the canonical firmware architecture for a fallback filename."""
+
+    value = _FALLBACK_PE_ARCHITECTURES.get(filename.casefold())
+    return value[0] if value is not None else None
+
+
+def fallback_loader_matches_architecture(filename: str, architecture: str) -> bool:
+    """Whether parsed PE code is valid for the removable-media filename."""
+
+    value = _FALLBACK_PE_ARCHITECTURES.get(filename.casefold())
+    return value is not None and architecture in value[1]
 
 EFI_SUBSYSTEMS = {
     10: "EFI application",
@@ -169,6 +197,12 @@ class ImageUefiPayload:
     warnings: tuple[str, ...]
     authenticode: AuthenticodeResult | None = None
     dbx: DbxAssessment | None = None
+    source_kind: str = "iso-member"
+    destination_path: str = ""
+
+    @property
+    def target_path(self) -> str:
+        return self.destination_path or self.path
 
 
 @dataclass(frozen=True)

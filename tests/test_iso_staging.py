@@ -17,6 +17,11 @@ from isopropyl.extraction import (
     ExtractionProgress,
     ExtractionResult,
 )
+from isopropyl.eltorito import inspect_eltorito_file
+from isopropyl.fat_image import (
+    FatType,
+    inspect_uefi_eltorito_fat,
+)
 from isopropyl.iso import (
     FAT32_MAX_FILE_SIZE,
     ArchiveEntry,
@@ -29,6 +34,7 @@ from isopropyl.iso import (
     Transformation,
     WriteMode,
     WritePlan,
+    merge_additive_embedded_entries,
     merge_additive_overlay_entries,
 )
 from isopropyl.iso_staging import (
@@ -57,6 +63,7 @@ from isopropyl.zip_overlay import (
     apply_zip_overlay,
     build_zip_overlay_plan,
 )
+from tests.test_fat_image import make_fat, write_container
 
 
 SEVEN_ZIP = "/usr/bin/7z"
@@ -355,6 +362,53 @@ class IsoStagingTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(IsoStagingSafetyError, "catalog binding"):
                 validate_iso_staging_plan(replace(plan, entries=forged_entries))
+
+    def test_embedded_fat_tree_is_bound_materialized_and_counted(self):
+        base_entries = (ArchiveEntry("README.txt", 5),)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "embedded.iso"
+            write_container(image, make_fat(FatType.FAT12))
+            catalog = inspect_eltorito_file(image)
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded = inspect_uefi_eltorito_fat(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            assert embedded is not None
+            embedded_entries = tuple(
+                ArchiveEntry(
+                    entry.path,
+                    entry.size,
+                    EntryKind.DIRECTORY if entry.is_directory else EntryKind.FILE,
+                )
+                for entry in embedded.entries
+            )
+            effective = merge_additive_embedded_entries(
+                base_entries,
+                embedded_entries,
+            ).merged_entries
+            with patch(
+                "isopropyl.iso_staging.scan_image_contents",
+                fake_catalog_scanner(base_entries),
+            ):
+                plan = build_iso_staging_plan(
+                    image,
+                    root / "ready-media",
+                    base_entries,
+                    write_plan(effective),
+                    seven_zip=SEVEN_ZIP,
+                    embedded_fat=embedded,
+                )
+                validate_iso_staging_plan(plan)
+            self.assertEqual(plan.embedded_content_bytes, 3)
+            self.assertEqual(plan.content_bytes, 8)
+            result = IsoStagingExecutor(extractor=FakeExtractor()).execute(plan)
+            self.assertEqual(
+                (result.destination / "EFI/BOOT/BOOTX64.EFI").read_bytes(),
+                b"MZ!",
+            )
+            self.assertEqual(result.bytes_staged, 8)
 
     def test_distro_exclusion_is_rechecked_before_extraction(self):
         entries = basic_entries() + (ArchiveEntry(".miso", 1),)
@@ -1104,6 +1158,10 @@ class IsoStagingTests(unittest.TestCase):
                 catalog_digest=iso_staging._catalog_digest(forged_entries),
                 effective_entries=forged_entries,
                 effective_catalog_digest=iso_staging._catalog_digest(
+                    forged_entries,
+                ),
+                base_with_embedded_entries=forged_entries,
+                base_with_embedded_catalog_digest=iso_staging._catalog_digest(
                     forged_entries,
                 ),
                 write_plan=write_plan(forged_entries),

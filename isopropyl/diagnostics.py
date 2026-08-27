@@ -83,6 +83,18 @@ def _image_record(inspection: ImageInspection | None) -> dict[str, Any] | None:
     }
     record.pop("uefi_analysis_issues", None)
     record["uefi_analysis_issue_count"] = len(inspection.uefi_analysis_issues)
+    record.pop("embedded_uefi_fat", None)
+    record.pop("embedded_uefi_issues", None)
+    record["embedded_uefi_issue_count"] = len(inspection.embedded_uefi_issues)
+    if inspection.embedded_uefi_fat is not None:
+        embedded = inspection.embedded_uefi_fat
+        record["embedded_uefi_fat"] = {
+            "fat_type": embedded.fat_type.value,
+            "entry_count": len(embedded.entries),
+            "file_count": sum(not entry.is_directory for entry in embedded.entries),
+            "content_bytes": embedded.content_bytes,
+            "mbr_wrapped": embedded.partition_start_lba is not None,
+        }
     if inspection.eltorito is not None:
         record["eltorito"] = {
             "source_size": inspection.eltorito.source_size,
@@ -90,6 +102,7 @@ def _image_record(inspection: ImageInspection | None) -> dict[str, Any] | None:
             "catalog_offset": inspection.eltorito.catalog_offset,
             "catalog_size": inspection.eltorito.catalog_size,
             "descriptors_scanned": inspection.eltorito.descriptors_scanned,
+            "logical_volume_size": inspection.eltorito.logical_volume_size,
             "validation_platform": inspection.eltorito.validation.platform.value,
             "entry_count": len(inspection.eltorito.entries),
             "bootable_platforms": [

@@ -17,6 +17,7 @@ from isopropyl.images import ImageInspection
 from isopropyl.timestamps import (
     MAX_PORTABLE_ARCHIVE_MTIME_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
 )
+from isopropyl.uefi import fallback_loader_matches_architecture
 
 
 # FAT stores a file's size in an unsigned 32-bit field.  The largest valid
@@ -25,14 +26,6 @@ FAT32_MAX_FILE_SIZE = (4 * 1024**3) - 1
 WIM_SPLIT_PART_SIZE = 3800 * 1024**2
 ISO_OVERLAY_EFFECTIVE_MEMBER_MAX_COUNT = 65_536
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
-_FALLBACK_ARCHITECTURES = {
-    "bootia32.efi": "x86",
-    "bootx64.efi": "x64",
-    "bootarm.efi": "ARM",
-    "bootaa64.efi": "ARM64",
-    "bootriscv64.efi": "RISC-V64",
-    "bootloongarch64.efi": "LoongArch64",
-}
 
 
 class WriteMode(str, Enum):
@@ -461,32 +454,27 @@ def _entry_with_path(entry: ArchiveEntry, parts: tuple[str, ...]) -> ArchiveEntr
     )
 
 
-def merge_additive_overlay_entries(
+def _merge_additive_entries(
     base_entries: Iterable[ArchiveEntry],
-    overlay_entries: Iterable[ArchiveEntry],
+    added_entries: Iterable[ArchiveEntry],
+    *,
+    namespace: str,
+    reject_reserved: bool,
 ) -> AdditiveOverlayMerge:
-    """Merge an untrusted overlay into an extracted-image namespace.
-
-    This is a pure planning operation. Directories may merge with directories;
-    every other case-insensitive/NFC full-path collision is rejected. Files and
-    links may not become ancestors on either side. Reserved boot and canonical
-    Windows installation payload paths are controlled exclusively by the base.
-    """
-
     base = validate_portable_fat_entries(base_entries)
-    overlay = validate_portable_fat_entries(overlay_entries)
+    overlay = validate_portable_fat_entries(added_entries)
     base_by_key = {
         _case_key(PurePosixPath(entry.path).parts): entry for entry in base
     }
     base_directories = _directory_spellings(base, namespace="base")
     # This rejects ambiguous overlay aliases before base spelling is adopted.
-    _directory_spellings(overlay, namespace="overlay")
+    _directory_spellings(overlay, namespace=namespace)
 
     additions: list[ArchiveEntry] = []
     targets: list[ArchiveEntry] = []
     for entry in overlay:
         parts = PurePosixPath(entry.path).parts
-        if _reserved_overlay_path(parts):
+        if reject_reserved and _reserved_overlay_path(parts):
             raise UnsafeArchiveError(
                 f"Overlay path is reserved for boot or installer payloads: {entry.path!r}"
             )
@@ -508,7 +496,8 @@ def merge_additive_overlay_entries(
                 targets.append(target)
                 continue
             raise UnsafeArchiveError(
-                f"Overlay path collides with the base image: {entry.path!r}"
+                f"{namespace.capitalize()} path collides with the base image: "
+                f"{entry.path!r}"
             )
 
         # A non-directory at an implied base-directory key would become an
@@ -519,7 +508,8 @@ def merge_additive_overlay_entries(
                 targets.append(target)
                 continue
             raise UnsafeArchiveError(
-                f"Overlay file would be an ancestor of base content: {entry.path!r}"
+                f"{namespace.capitalize()} file would be an ancestor of base "
+                f"content: {entry.path!r}"
             )
 
         for length in range(1, len(parts)):
@@ -536,12 +526,45 @@ def merge_additive_overlay_entries(
     # the final namespace; callers never need to trust the merge implementation.
     if len(base) + len(additions) > ISO_OVERLAY_EFFECTIVE_MEMBER_MAX_COUNT:
         raise UnsafeArchiveError(
-            "The combined ISO and ZIP overlay catalog contains too many members"
+            f"The combined ISO and {namespace} catalog contains too many members"
         )
     merged = validate_portable_fat_entries((*base, *additions))
     normalized_additions = validate_portable_fat_entries(additions)
     normalized_targets = validate_portable_fat_entries(targets)
     return AdditiveOverlayMerge(base, normalized_additions, merged, normalized_targets)
+
+
+def merge_additive_overlay_entries(
+    base_entries: Iterable[ArchiveEntry],
+    overlay_entries: Iterable[ArchiveEntry],
+) -> AdditiveOverlayMerge:
+    """Merge an untrusted ZIP overlay without replacing reserved base paths."""
+
+    return _merge_additive_entries(
+        base_entries,
+        overlay_entries,
+        namespace="ZIP overlay",
+        reject_reserved=True,
+    )
+
+
+def merge_additive_embedded_entries(
+    base_entries: Iterable[ArchiveEntry],
+    embedded_entries: Iterable[ArchiveEntry],
+) -> AdditiveOverlayMerge:
+    """Merge a parsed embedded boot tree without replacing any base file.
+
+    Unlike a user overlay, an embedded tree is allowed to supply the reserved
+    removable-media fallback loader that makes construction possible. It still
+    cannot overwrite, alias, or become an ancestor of any ordinary ISO member.
+    """
+
+    return _merge_additive_entries(
+        base_entries,
+        embedded_entries,
+        namespace="embedded boot image",
+        reject_reserved=False,
+    )
 
 
 def select_write_mode(inspection: ImageInspection, requested: WriteMode | None = None) -> WriteMode:
@@ -859,16 +882,17 @@ def build_write_plan(
             and entry.size > 0
         }
         validated_payloads = {
-            payload.path.casefold(): payload.architecture
+            payload.target_path.casefold(): payload.architecture
             for payload in inspection.uefi_payloads
             if payload.is_uefi_image
         }
         invalid_fallbacks = sorted(fallback_paths - validated_payloads.keys())
         mismatched_fallbacks = sorted(
             path for path in fallback_paths & validated_payloads.keys()
-            if _FALLBACK_ARCHITECTURES.get(
-                PurePosixPath(path).name.casefold()
-            ) != validated_payloads[path]
+            if not fallback_loader_matches_architecture(
+                PurePosixPath(path).name,
+                validated_payloads[path],
+            )
         )
         if not fallback_paths:
             blockers.append(

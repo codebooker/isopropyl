@@ -31,6 +31,9 @@ from isopropyl.eltorito import (
     BootEntry, BootPlatform, ElToritoError, ElToritoInspection,
     ElToritoNotFound, EmulationType, ValidationEntry,
 )
+from isopropyl.fat_image import FatType
+from tests.test_fat_image import make_fat, write_container
+from tests.test_uefi import make_pe
 
 
 class FakeCatalogProcess:
@@ -1101,6 +1104,31 @@ Folder = -
                 "EFI El Torito boot image" in issue
                 for issue in result.uefi_analysis_issues
             ))
+
+    def test_embedded_fat_fallback_is_pe_inspected_and_adds_architecture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "embedded.iso"
+            write_container(
+                path,
+                make_fat(FatType.FAT12, payload=make_pe()),
+            )
+            with patch(
+                "isopropyl.images.scan_image_contents",
+                return_value=([ImageMember("README.txt", 5, "file")], True),
+            ):
+                result = inspect_image(path)
+            self.assertEqual(result.boot_modes, ("UEFI",))
+            self.assertEqual(result.architectures, ("x64",))
+            self.assertIsNotNone(result.embedded_uefi_fat)
+            self.assertEqual(result.embedded_uefi_issues, ())
+            self.assertTrue(result.uefi_analysis_complete)
+            self.assertEqual(result.uefi_candidate_count, 1)
+            self.assertEqual(result.uefi_selected_count, 1)
+            self.assertEqual(len(result.uefi_payloads), 1)
+            payload = result.uefi_payloads[0]
+            self.assertEqual(payload.source_kind, "eltorito-fat")
+            self.assertEqual(payload.target_path, "EFI/BOOT/BOOTX64.EFI")
+            self.assertTrue(payload.is_uefi_image)
 
     def test_el_torito_parse_failure_is_reported_without_losing_iso_inspection(self):
         with tempfile.TemporaryDirectory() as directory:

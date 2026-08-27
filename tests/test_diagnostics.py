@@ -15,6 +15,9 @@ from isopropyl.eltorito import (
     BootEntry, BootPlatform, ElToritoInspection, EmulationType, ValidationEntry,
 )
 from isopropyl.images import ImageInspection, ImageMember
+from isopropyl.fat_image import (
+    EmbeddedFatImage, FatImageEntry, FatSourceIdentity, FatType,
+)
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 
 
@@ -95,6 +98,56 @@ class DiagnosticTests(unittest.TestCase):
         summary = report["selected_image_inspection"]["eltorito"]
         self.assertEqual(summary["entry_count"], 1)
         self.assertEqual(summary["bootable_platforms"], [BootPlatform.EFI.value])
+
+    def test_embedded_fat_diagnostics_export_counts_not_paths_or_hashes(self):
+        boot = BootEntry(
+            1, True, BootPlatform.EFI, "SECRET-SECTION", True,
+            EmulationType.NO_EMULATION, 0, 0, 1, 24, 49_152,
+            512, 49_664, 0, b"",
+        )
+        embedded = EmbeddedFatImage(
+            FatSourceIdentity(1, 2, 100_000, 3, 4),
+            boot,
+            49_152,
+            100_000,
+            49_152,
+            4_096,
+            None,
+            None,
+            FatType.FAT12,
+            512,
+            1,
+            (FatImageEntry(
+                "EFI/SECRET-CUSTOMER/BOOTX64.EFI",
+                8,
+                False,
+                2,
+                (2,),
+                "b" * 64,
+            ),),
+            "c" * 64,
+        )
+        report = build_diagnostics(
+            [],
+            replace(
+                inspection(),
+                embedded_uefi_fat=embedded,
+                embedded_uefi_issues=("SECRET-ISSUE",),
+            ),
+            tool_probe=lambda: {},
+        )
+        rendered = json.dumps(report)
+        self.assertNotIn("SECRET", rendered)
+        self.assertNotIn("b" * 64, rendered)
+        self.assertNotIn("c" * 64, rendered)
+        summary = report["selected_image_inspection"]["embedded_uefi_fat"]
+        self.assertEqual(summary["entry_count"], 1)
+        self.assertEqual(summary["file_count"], 1)
+        self.assertEqual(summary["content_bytes"], 8)
+        self.assertEqual(
+            report["selected_image_inspection"]["embedded_uefi_issue_count"],
+            1,
+        )
 
     def test_explicit_opt_in_includes_identifiers_and_log(self):
         report = build_diagnostics(

@@ -53,11 +53,11 @@ evidence.
   exposing the dormant payload bundles or removing any BIOS blocker. GRUB BIOS
   follows only after its prefix, module set, filesystem, and boot-region layout
   can be reproduced and verified without executing downloaded code.
-- Add bounded support for the embedded UEFI GRUB configuration used by current
-  official Ubuntu media, rather than assuming a synthetic extracted path. Then
-  hardware-certify the immutable Casper workflow across 512- and 4096-byte
-  logical-sector media and expand profiles only through release-specific
-  fixtures and hardware results.
+- Integrate the implemented bounded El Torito FAT tree with persistence-profile
+  discovery and safe mutation of the embedded UEFI GRUB configuration used by
+  current official Ubuntu media. Then hardware-certify the immutable Casper
+  workflow across 512- and 4096-byte logical-sector media and expand profiles
+  only through release-specific fixtures and hardware results.
 - Expand the shipped distro-specific ISO-mode exclusion catalog only through
   unique structural evidence and representative fixtures, and add tested
   BIOS/UEFI construction profiles. Nobara and openSUSE remain deferred because
@@ -68,9 +68,9 @@ evidence.
 - Extend the implemented integrity-only Authenticode check and pinned offline
   Microsoft DBX image-hash advisor with independently authenticated live
   firmware policy, certificate revocation, signing-time validation, SBAT, SVN,
-  and El Torito EFI-image coverage. Keep runtime media validation distinct from
-  static analysis and never promote a snapshot miss or an embedded-only result
-  into boot trust.
+  and coverage for El Torito layouts outside the strict FAT subset. Keep runtime
+  media validation distinct from static analysis and never promote a snapshot
+  miss or an embedded-only result into boot trust.
 - Firmware-test the implemented default-off `uefi-md5sum` v1.2 transformation,
   including every fallback architecture, manifest failure/cancellation behavior,
   Secure Boot acceptance or rejection, and post-write corruption. Expand beyond

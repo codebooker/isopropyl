@@ -13,8 +13,9 @@ from isopropyl.dbx import DbxState
 from isopropyl.uefi import (
     CertificateTable, ImageUefiPayload, PeFormatError, PolicyState, SbatMetadata,
     SbatRequirement, SbatState, SignatureTableState, UefiInspection,
-    evaluate_sbat_policy, inspect_iso_uefi_payloads, inspect_pe_bytes, inspect_pe_file,
-    uefi_member_paths,
+    evaluate_sbat_policy, fallback_loader_architecture,
+    fallback_loader_matches_architecture, inspect_iso_uefi_payloads,
+    inspect_pe_bytes, inspect_pe_file, uefi_member_paths,
 )
 from tests.test_dbx import canonical_pe
 
@@ -268,6 +269,26 @@ class UefiInspectionTests(unittest.TestCase):
         self.assertEqual(result.architecture, "x86")
         self.assertEqual(result.pe_kind, "PE32")
         self.assertEqual(result.subsystem_name, "EFI boot-service driver")
+
+    def test_bootarm_accepts_all_recognized_32_bit_arm_pe_variants(self):
+        self.assertEqual(fallback_loader_architecture("BOOTARM.EFI"), "ARM")
+        for machine, architecture in (
+            (0x01C0, "ARM"),
+            (0x01C2, "Thumb"),
+            (0x01C4, "ARMv7"),
+        ):
+            with self.subTest(machine=hex(machine)):
+                parsed = inspect_pe_bytes(make_pe(machine=machine, pe32=True))
+                self.assertEqual(parsed.architecture, architecture)
+                self.assertTrue(
+                    fallback_loader_matches_architecture(
+                        "bootarm.efi",
+                        parsed.architecture,
+                    )
+                )
+        self.assertFalse(
+            fallback_loader_matches_architecture("bootarm.efi", "ARM64")
+        )
 
     def test_certificate_table_is_only_structurally_present_unverified(self):
         certificate = struct.pack("<IHH", 16, 0x0200, 0x0002) + b"12345678"

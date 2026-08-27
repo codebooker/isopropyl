@@ -76,10 +76,14 @@ def make_iso(
         duplicate = descriptor(17, 0)
         duplicate[7:39] = b"EL TORITO SPECIFICATION".ljust(32, b" ")
         struct.pack_into("<I", duplicate, 71, catalog_lba)
-        descriptor(18, 1)
+        primary = descriptor(18, 1)
+        struct.pack_into("<I", primary, 80, sectors)
+        struct.pack_into(">I", primary, 84, sectors)
         descriptor(19, 255)
     else:
-        descriptor(17, 1)
+        primary = descriptor(17, 1)
+        struct.pack_into("<I", primary, 80, sectors)
+        struct.pack_into(">I", primary, 84, sectors)
         descriptor(18, 255)
 
     last_descriptor = 19 if second_boot_record else 18
@@ -138,6 +142,20 @@ class ElToritoTests(unittest.TestCase):
         self.assertFalse(entry.bootable)
         self.assertIsNone(entry.image_offset)
         self.assertEqual(result.bootable_platforms, ())
+
+    def test_zero_sector_count_is_limited_to_efi_no_emulation(self):
+        result = inspect_eltorito_bytes(make_iso(
+            validation=validation_entry(platform=0xEF),
+            default=boot_entry(count=0, image_lba=24),
+        ))
+        entry = result.entries[0]
+        self.assertEqual(entry.platform, BootPlatform.EFI)
+        self.assertEqual(entry.load_size, 0)
+        self.assertEqual(entry.load_extent, (24 * BLOCK, 24 * BLOCK))
+        with self.assertRaisesRegex(ElToritoError, "zero sector count"):
+            inspect_eltorito_bytes(make_iso(
+                default=boot_entry(count=0, image_lba=24),
+            ))
 
     def test_reports_emulation_and_explicit_load_segment(self):
         result = inspect_eltorito_bytes(make_iso(default=boot_entry(
@@ -225,7 +243,12 @@ class ElToritoTests(unittest.TestCase):
             result = inspect_eltorito_file(path)
             after = path.stat()
             self.assertIsNotNone(result.source_identity)
-            self.assertEqual((before.st_size, before.st_mtime_ns), (after.st_size, after.st_mtime_ns))
+            self.assertEqual(
+                (before.st_size, before.st_mtime_ns, before.st_ctime_ns),
+                (after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+            )
+            assert result.source_identity is not None
+            self.assertEqual(result.source_identity.changed_ns, before.st_ctime_ns)
 
             real_fstat = os.fstat
             calls = 0

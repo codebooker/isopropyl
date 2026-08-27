@@ -159,6 +159,21 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(plan.executable)
         self.assertNotIn("matching-grub-i386-pc", {item.key for item in plan.requirements})
 
+    def test_embedded_payload_validates_its_constructed_destination_path(self):
+        image = inspection(boot_modes=("UEFI",))
+        embedded = replace(
+            image.uefi_payloads[0],
+            path="El Torito #2: EFI/BOOT/BOOTX64.EFI",
+            source_kind="eltorito-fat",
+            destination_path="EFI/BOOT/BOOTX64.EFI",
+        )
+        plan = build_write_plan(
+            replace(image, uefi_payloads=(embedded,)),
+            [ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 10)],
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertTrue(plan.executable)
+
     def test_uefi_execution_requires_a_recognized_fallback_loader(self):
         plan = build_write_plan(
             inspection(boot_modes=("UEFI",), architectures=()),
@@ -407,6 +422,27 @@ class PlanTests(unittest.TestCase):
         )
         self.assertFalse(plan.executable)
         self.assertTrue(any("does not match" in item for item in plan.blockers))
+
+    def test_bootarm_fallback_accepts_thumb_and_armv7_pe_machine_labels(self):
+        for architecture in ("ARM", "Thumb", "ARMv7"):
+            image = inspection(boot_modes=("UEFI",), architectures=("ARM",))
+            image = ImageInspection(**{
+                **image.__dict__,
+                "uefi_payloads": (
+                    ImageUefiPayload(
+                        "EFI/BOOT/BOOTARM.EFI", architecture,
+                        "EFI application", True, SignatureTableState.ABSENT,
+                        SbatState.ABSENT, (),
+                    ),
+                ),
+            })
+            with self.subTest(architecture=architecture):
+                plan = build_write_plan(
+                    image,
+                    [ArchiveEntry("EFI/BOOT/BOOTARM.EFI", 10)],
+                    firmware_target=FirmwareTarget.UEFI_ONLY,
+                )
+                self.assertTrue(plan.executable, plan.blockers)
 
     def test_explicit_fat32_rejects_unsplittable_large_file(self):
         with self.assertRaisesRegex(PlanError, "cannot hold"):

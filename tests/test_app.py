@@ -43,9 +43,11 @@ from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
 )
 from isopropyl.images import ChecksumCancelled, ImageInspection, ImageMember
+from isopropyl.eltorito import inspect_eltorito_file
+from isopropyl.fat_image import FatType, inspect_uefi_eltorito_fat
 from isopropyl.iso import (
-    ArchiveEntry, BootStrategy, EntryKind, FileSystem, WriteMode, build_write_plan,
-    merge_additive_overlay_entries,
+    ArchiveEntry, BootStrategy, EntryKind, FileSystem, FirmwareTarget, WriteMode,
+    build_write_plan, merge_additive_overlay_entries,
 )
 from isopropyl.iso_staging import IsoStagingPlan
 from isopropyl.linux_downloads import DownloadedLinuxImage, available_linux_images
@@ -61,6 +63,7 @@ from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
 from isopropyl.wim import WimEdition, WimInfo, WimSelection
 from isopropyl.windows import WindowsCustomization
 from isopropyl.zip_overlay import ZipOverlayPlan, build_zip_overlay_plan
+from tests.test_fat_image import make_fat, write_container
 
 
 def device(size: int = 8 * 1024**3) -> Device:
@@ -214,6 +217,15 @@ def fake_runtime_validation() -> PreparedRuntimeValidation:
         (),
         RUNTIME_VALIDATION_LICENSE,
         RUNTIME_VALIDATION_PROVENANCE_URL,
+    )
+
+
+def fake_staged_iso(plan: IsoStagingPlan, destination: Path):
+    return SimpleNamespace(
+        destination=destination,
+        bytes_staged=plan.content_bytes,
+        image_identity=plan.image_identity,
+        catalog_digest=plan.effective_catalog_digest,
     )
 
 
@@ -624,6 +636,47 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.verify.isEnabled())
         self.assertEqual(self.window.write_button.text(), "Write in ISO mode")
         self.assertTrue(self.window.write_button.isEnabled())
+
+    def test_embedded_fat_members_join_constructed_catalog_but_not_iso_catalog(self):
+        write_container(self.window.image, make_fat(FatType.FAT12))
+        catalog = inspect_eltorito_file(self.window.image)
+        descriptor = os.open(self.window.image, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            embedded = inspect_uefi_eltorito_fat(descriptor, catalog)
+        finally:
+            os.close(descriptor)
+        assert embedded is not None
+        original = self.window.inspection
+        assert original is not None
+        payload = replace(
+            original.uefi_payloads[0],
+            path="El Torito #1: EFI/BOOT/BOOTX64.EFI",
+            source_kind="eltorito-fat",
+            destination_path="EFI/BOOT/BOOTX64.EFI",
+        )
+        self.window.inspection = replace(
+            original,
+            members=(ImageMember("README.txt", 5, "file"),),
+            has_windows_installer=False,
+            embedded_uefi_fat=embedded,
+            embedded_uefi_issues=(),
+            uefi_payloads=(payload,),
+        )
+        self.assertEqual(
+            tuple(entry.path for entry in self.window.archive_entries()),
+            ("README.txt",),
+        )
+        constructed = self.window.constructed_base_entries()
+        self.assertEqual(
+            tuple(entry.path for entry in constructed),
+            ("README.txt", "EFI", "EFI/BOOT", "EFI/BOOT/BOOTX64.EFI"),
+        )
+        plan = build_write_plan(
+            self.window.inspection,
+            constructed,
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertTrue(plan.executable)
 
     def test_dbx_match_warning_is_precise_and_defaults_to_cancel(self):
         match = DbxAssessment(
@@ -3596,7 +3649,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         stager = Mock()
         stager.execute.side_effect = lambda *_args: (
             order.append("stage")
-            or SimpleNamespace(destination=root, bytes_staged=1024)
+            or fake_staged_iso(staging_plan, root)
         )
         writer = Mock()
         writer.execute.side_effect = lambda *_args: (
@@ -3690,9 +3743,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
             runtime_validation=fake_runtime_validation(),
         )
         stager = Mock()
-        stager.execute.return_value = SimpleNamespace(
-            destination=root, bytes_staged=1024,
-        )
+        stager.execute.return_value = fake_staged_iso(staging_plan, root)
         writer = Mock()
         final_match = StagedDbxPayload(
             "EFI/BOOT/BOOTX64.EFI",
@@ -3765,7 +3816,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         stager = Mock()
         stager.execute.side_effect = lambda *_args: (
             order.append("stage")
-            or SimpleNamespace(destination=root, bytes_staged=1024)
+            or fake_staged_iso(pending.staging_plan, root)
         )
         writer = Mock()
         writer.execute.side_effect = lambda *_args: (
@@ -3825,9 +3876,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
     def test_incomplete_uefi_ntfs_helper_assessment_defaults_to_cancel(self):
         pending, workspace, root = self.uefi_ntfs_pending_write()
         stager = Mock()
-        stager.execute.return_value = SimpleNamespace(
-            destination=root, bytes_staged=1024,
-        )
+        stager.execute.return_value = fake_staged_iso(pending.staging_plan, root)
         writer = Mock()
         target_plan = SimpleNamespace(content=object())
         helper_unknown = StagedDbxPayload(
@@ -3887,9 +3936,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
     def test_cancellation_during_uefi_ntfs_helper_assessment_stops_writer(self):
         pending, workspace, root = self.uefi_ntfs_pending_write()
         stager = Mock()
-        stager.execute.return_value = SimpleNamespace(
-            destination=root, bytes_staged=1024,
-        )
+        stager.execute.return_value = fake_staged_iso(pending.staging_plan, root)
         writer = Mock()
         target_plan = SimpleNamespace(content=object())
         assess_staged = Mock()
@@ -3945,9 +3992,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
             runtime_validation=fake_runtime_validation(),
         )
         stager = Mock()
-        stager.execute.return_value = SimpleNamespace(
-            destination=root, bytes_staged=1024,
-        )
+        stager.execute.return_value = fake_staged_iso(staging_plan, root)
         finished = Mock()
         self.window.bridge.finished.disconnect()
         self.window.bridge.finished.connect(finished)

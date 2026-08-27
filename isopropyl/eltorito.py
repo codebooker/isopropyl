@@ -71,6 +71,7 @@ class IsoIdentity:
     inode: int
     size: int
     modified_ns: int
+    changed_ns: int
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,7 @@ class ElToritoInspection:
     validation: ValidationEntry
     entries: tuple[BootEntry, ...]
     source_identity: IsoIdentity | None = None
+    logical_volume_size: int = 0
 
     @property
     def bootable_platforms(self) -> tuple[BootPlatform, ...]:
@@ -164,8 +166,9 @@ def _emulation(value: int, label: str) -> EmulationType:
 
 def _scan_volume_descriptors(
     read_at: ReadAt, size: int,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     boot_catalogs: list[int] = []
+    logical_volume_blocks: list[int] = []
     terminator_lba: int | None = None
     descriptors_scanned = 0
     for index in range(MAX_VOLUME_DESCRIPTORS):
@@ -183,6 +186,14 @@ def _scan_volume_descriptors(
             if system_identifier == b"EL TORITO SPECIFICATION":
                 catalog_lba = struct.unpack_from("<I", descriptor, 71)[0]
                 boot_catalogs.append(catalog_lba)
+        elif descriptor_type == 1:
+            little = struct.unpack_from("<I", descriptor, 80)[0]
+            big = struct.unpack_from(">I", descriptor, 84)[0]
+            if little == 0 or little != big:
+                raise ElToritoError(
+                    f"invalid ISO logical-volume size at LBA {lba}"
+                )
+            logical_volume_blocks.append(little)
         elif descriptor_type == 255:
             terminator_lba = lba
             break
@@ -196,10 +207,15 @@ def _scan_volume_descriptors(
         raise ElToritoNotFound("The ISO does not contain an El Torito boot record")
     if len(boot_catalogs) != 1:
         raise ElToritoError("Multiple El Torito boot records are ambiguous")
+    if len(logical_volume_blocks) != 1:
+        raise ElToritoError("The ISO must contain one unambiguous primary volume descriptor")
+    logical_volume_size = logical_volume_blocks[0] * LOGICAL_BLOCK_SIZE
+    if logical_volume_size > size:
+        raise ElToritoError("The ISO logical volume extends beyond the selected file")
     catalog_lba = boot_catalogs[0]
     if catalog_lba <= terminator_lba:
         raise ElToritoError("El Torito boot catalog overlaps the ISO volume descriptors")
-    return catalog_lba, terminator_lba, descriptors_scanned
+    return catalog_lba, terminator_lba, descriptors_scanned, logical_volume_size
 
 
 def _parse_validation(raw: bytes) -> ValidationEntry:
@@ -244,14 +260,25 @@ def _parse_boot_entry(
         raise ElToritoError("default boot-catalog entry reserved bytes are nonzero")
     sector_count = struct.unpack_from("<H", raw, 6)[0]
     image_lba = struct.unpack_from("<I", raw, 8)[0]
-    if bootable and (sector_count == 0 or image_lba == 0):
+    if bootable and image_lba == 0:
         raise ElToritoError(f"{label} has no boot-image extent")
+    if (
+        bootable
+        and sector_count == 0
+        and not (
+            platform is BootPlatform.EFI
+            and emulation is EmulationType.NO_EMULATION
+        )
+    ):
+        raise ElToritoError(
+            f"{label} has a zero sector count outside an EFI no-emulation entry"
+        )
     if not bootable and bool(sector_count) != bool(image_lba):
         raise ElToritoError(f"{label} has an incomplete boot-image extent")
     load_size = sector_count * 512
     image_offset: int | None = None
     extent_end: int | None = None
-    if sector_count and image_lba:
+    if image_lba:
         image_offset = image_lba * LOGICAL_BLOCK_SIZE
         if image_offset > source_size or load_size > source_size - image_offset:
             raise ElToritoError(f"{label} boot-image load extent lies outside the ISO file")
@@ -264,7 +291,12 @@ def _parse_boot_entry(
 
 
 def _inspect(read_at: ReadAt, source_size: int) -> ElToritoInspection:
-    catalog_lba, terminator_lba, descriptors_scanned = _scan_volume_descriptors(
+    (
+        catalog_lba,
+        terminator_lba,
+        descriptors_scanned,
+        logical_volume_size,
+    ) = _scan_volume_descriptors(
         read_at, source_size
     )
     catalog_offset = catalog_lba * LOGICAL_BLOCK_SIZE
@@ -340,6 +372,7 @@ def _inspect(read_at: ReadAt, source_size: int) -> ElToritoInspection:
     return ElToritoInspection(
         source_size, catalog_lba, catalog_offset, catalog_size,
         descriptors_scanned, validation, tuple(entries),
+        logical_volume_size=logical_volume_size,
     )
 
 
@@ -351,7 +384,13 @@ def inspect_eltorito_bytes(blob: bytes) -> ElToritoInspection:
 
 
 def _identity(status: os.stat_result) -> IsoIdentity:
-    return IsoIdentity(status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
+    return IsoIdentity(
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
 
 
 def inspect_eltorito_file(

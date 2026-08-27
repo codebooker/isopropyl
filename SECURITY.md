@@ -107,6 +107,20 @@ issue requesting a private contact channel without disclosing the vulnerability.
   copies through an independently identity-bound plan. It supports either one
   FAT32 partition or an exact NTFS plus raw UEFI:NTFS helper layout on
   512-byte-logical-sector media.
+- A supported embedded El Torito EFI image is parsed directly from the same
+  no-follow, five-field identity-bound ISO descriptor. The accepted subset is
+  one bootable EFI/no-emulation image containing either direct FAT12/16/32 or an
+  active first FAT partition in an otherwise empty MBR wrapper. The parser
+  bounds filesystem/FAT/directory sizes, entries, depth, paths, and clusters;
+  requires FAT copies to match when multiple are present; validates BPB geometry,
+  VFAT chains, portable aliases, cluster chains, cross-links, and ISO/catalog
+  overlap; and hashes every file. Sector counts 0/1 are expanded only from
+  validated filesystem geometry.
+  Planning, execution, and final-tree validation independently recheck source
+  identity, the El Torito/FAT manifest, file hashes, and the no-overwrite merge.
+  Unsupported, ambiguous, multiple-image, non-FAT, hard-disk-emulation, or
+  colliding layouts do not silently contribute files and leave relevant UEFI or
+  DBX evidence incomplete.
 - Distro compatibility exclusions come from one bundled, strict, versioned JSON
   catalog and perform no network access. Matching uses only the complete,
   identity-bound original ISO member catalog: never the host filename, volume
@@ -296,8 +310,9 @@ issue requesting a private contact channel without disclosing the vulnerability.
   driver; those actual PE bytes join the same final DBX decision. Nonselected
   architecture and exFAT payloads cannot complete the selected NTFS boot chain
   and are not assessed. RISC-V64 remains explicitly unknown because Microsoft's
-  snapshot has no applicable architecture set. Embedded El Torito EFI boot
-  images remain outside the final pass.
+  snapshot has no applicable architecture set. EFI executables reconstructed
+  from a supported embedded El Torito FAT tree join both the source and final
+  staged-tree passes; unsupported or ambiguous embedded layouts remain unknown.
 - Automated device-facing tests use mocks and regular files. Hardware-backed
   write, boot, Secure Boot, cancellation, and failure-recovery testing is still
   required before the alpha label can be removed.

@@ -44,6 +44,17 @@ from .extraction import (
     SafeIsoExtractor,
     build_extraction_plan,
 )
+from .eltorito import (
+    ElToritoError,
+    ElToritoNotFound,
+    inspect_eltorito_file,
+)
+from .fat_image import (
+    EmbeddedFatImage,
+    FatImageError,
+    materialize_embedded_fat,
+    validate_uefi_eltorito_fat,
+)
 from .iso import (
     FAT32_MAX_FILE_SIZE,
     ArchiveEntry,
@@ -55,6 +66,7 @@ from .iso import (
     UnsafeArchiveError,
     WriteMode,
     WritePlan,
+    merge_additive_embedded_entries,
     merge_additive_overlay_entries,
     validate_extraction_entries,
 )
@@ -170,6 +182,12 @@ class IsoStagingPlan:
     effective_entries: tuple[ArchiveEntry, ...] = ()
     effective_catalog_digest: str = ""
     _catalog_witness: object | None = None
+    embedded_fat: EmbeddedFatImage | None = None
+    embedded_entries: tuple[ArchiveEntry, ...] = ()
+    embedded_targets: tuple[str, ...] = ()
+    base_with_embedded_entries: tuple[ArchiveEntry, ...] = ()
+    base_with_embedded_catalog_digest: str = ""
+    embedded_content_bytes: int = 0
 
     @property
     def needs_wim_split(self) -> bool:
@@ -374,6 +392,121 @@ def _merge_effective_catalog(
             "The ZIP overlay is not bound to the effective catalog"
         )
     return merged.merged_entries, merged.overlay_targets
+
+
+def _embedded_archive_entries(
+    embedded: EmbeddedFatImage | None,
+) -> tuple[ArchiveEntry, ...]:
+    if embedded is None:
+        return ()
+    return tuple(
+        ArchiveEntry(
+            entry.path,
+            entry.size,
+            EntryKind.DIRECTORY if entry.is_directory else EntryKind.FILE,
+        )
+        for entry in embedded.entries
+    )
+
+
+def _merge_embedded_catalog(
+    entries: Sequence[ArchiveEntry],
+    embedded: EmbeddedFatImage | None,
+) -> tuple[
+    tuple[ArchiveEntry, ...],
+    tuple[ArchiveEntry, ...],
+    tuple[str, ...],
+    int,
+]:
+    embedded_entries = _embedded_archive_entries(embedded)
+    if not embedded_entries:
+        return tuple(entries), (), (), 0
+    try:
+        merged = merge_additive_embedded_entries(entries, embedded_entries)
+    except (UnsafeArchiveError, ValueError) as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    if len(merged.overlay_targets) != len(embedded_entries):
+        raise IsoStagingSafetyError(
+            "The embedded boot-image tree is not bound to its staging targets"
+        )
+    content_bytes = sum(
+        entry.size for entry in merged.overlay_entries
+        if entry.kind is EntryKind.FILE
+    )
+    return (
+        merged.merged_entries,
+        embedded_entries,
+        tuple(entry.path for entry in merged.overlay_targets),
+        content_bytes,
+    )
+
+
+def _validate_embedded_source(
+    image: Path,
+    image_identity: FileIdentity,
+    embedded: EmbeddedFatImage | None,
+    cancel_check: Callable[[], None] | None,
+) -> None:
+    if embedded is None:
+        return
+    if not isinstance(embedded, EmbeddedFatImage):
+        raise IsoStagingSafetyError("The embedded boot-image plan is invalid")
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(image, flags)
+    except OSError as error:
+        raise IsoStagingSafetyError(
+            "The ISO could not be opened for embedded boot-image validation"
+        ) from error
+    try:
+        status = os.fstat(descriptor)
+        observed = (
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+        )
+        if not stat.S_ISREG(status.st_mode) or observed != image_identity:
+            raise IsoStagingSafetyError(
+                "The ISO identity changed before embedded boot-image validation"
+            )
+        expected_source = embedded.source_identity
+        if observed != (
+            expected_source.device,
+            expected_source.inode,
+            expected_source.size,
+            expected_source.modified_ns,
+            expected_source.changed_ns,
+        ):
+            raise IsoStagingSafetyError(
+                "The embedded boot-image plan belongs to another ISO identity"
+            )
+        catalog = inspect_eltorito_file(image, image_fd=descriptor)
+        validate_uefi_eltorito_fat(
+            descriptor,
+            catalog,
+            embedded,
+            cancel_check=cancel_check,
+        )
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) != observed:
+            raise IsoStagingSafetyError(
+                "The ISO changed during embedded boot-image validation"
+            )
+    except (ElToritoNotFound, ElToritoError, FatImageError, OSError) as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    finally:
+        os.close(descriptor)
 
 
 def _validate_overlay(
@@ -633,6 +766,7 @@ def build_iso_staging_plan(
     *,
     seven_zip: str | None = None,
     overlay: ZipOverlayPlan | None = None,
+    embedded_fat: EmbeddedFatImage | None = None,
     cancel_check: Callable[[], None] | None = None,
     windows_customization: WindowsCustomization | None = None,
     windows_architecture: str = "amd64",
@@ -649,9 +783,15 @@ def build_iso_staging_plan(
     if not safe_entries:
         raise IsoStagingSafetyError("The ISO member catalog is empty")
     _validate_distro_iso_policy(safe_entries)
+    (
+        base_with_embedded_entries,
+        embedded_entries,
+        embedded_targets,
+        embedded_content_bytes,
+    ) = _merge_embedded_catalog(safe_entries, embedded_fat)
     _validate_overlay(overlay, cancel_check=cancel_check)
     effective_entries, _overlay_targets = _merge_effective_catalog(
-        safe_entries, overlay,
+        base_with_embedded_entries, overlay,
     )
     wim_source = _validate_write_plan(write_plan, effective_entries)
     _validate_catalog_shape(effective_entries, wim_source)
@@ -738,6 +878,12 @@ def build_iso_staging_plan(
         raise IsoStagingSafetyError(
             "The ISO source identity changed during catalog binding"
         )
+    _validate_embedded_source(
+        extraction.image,
+        extraction.image_identity,
+        embedded_fat,
+        cancel_check,
+    )
 
     wimlib_imagex: str | None = None
     if wim_source is not None or wim_selection is not None:
@@ -756,9 +902,12 @@ def build_iso_staging_plan(
         entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
     )
     overlay_bytes = overlay.content_bytes if overlay is not None else 0
-    if content_bytes != extraction.content_bytes + overlay_bytes:
+    if (
+        content_bytes
+        != extraction.content_bytes + embedded_content_bytes + overlay_bytes
+    ):
         raise IsoStagingSafetyError(
-            "The ZIP overlay expanded-size accounting is inconsistent"
+            "The embedded/overlay expanded-size accounting is inconsistent"
         )
     required_free = content_bytes + split_extra + OUTPUT_SPACE_RESERVE
     try:
@@ -794,6 +943,14 @@ def build_iso_staging_plan(
             extraction.image_identity,
             _catalog_digest(safe_entries),
         ),
+        embedded_fat=embedded_fat,
+        embedded_entries=embedded_entries,
+        embedded_targets=embedded_targets,
+        base_with_embedded_entries=base_with_embedded_entries,
+        base_with_embedded_catalog_digest=_catalog_digest(
+            base_with_embedded_entries,
+        ),
+        embedded_content_bytes=embedded_content_bytes,
     )
 
 
@@ -816,9 +973,32 @@ def validate_iso_staging_plan(
     if entries != plan.entries or _catalog_digest(entries) != plan.catalog_digest:
         raise IsoStagingSafetyError("The ISO catalog binding is invalid")
     _validate_distro_iso_policy(entries)
+    _validate_embedded_source(
+        plan.image,
+        plan.image_identity,
+        plan.embedded_fat,
+        cancel_check,
+    )
+    (
+        base_with_embedded_entries,
+        embedded_entries,
+        embedded_targets,
+        embedded_content_bytes,
+    ) = _merge_embedded_catalog(entries, plan.embedded_fat)
+    if (
+        embedded_entries != plan.embedded_entries
+        or embedded_targets != plan.embedded_targets
+        or embedded_content_bytes != plan.embedded_content_bytes
+        or base_with_embedded_entries != plan.base_with_embedded_entries
+        or _catalog_digest(base_with_embedded_entries)
+        != plan.base_with_embedded_catalog_digest
+    ):
+        raise IsoStagingSafetyError(
+            "The embedded boot-image catalog binding is invalid"
+        )
     _validate_overlay(plan.overlay, cancel_check=cancel_check)
     effective_entries, _overlay_targets = _merge_effective_catalog(
-        entries, plan.overlay,
+        base_with_embedded_entries, plan.overlay,
     )
     if (
         effective_entries != plan.effective_entries
@@ -965,7 +1145,9 @@ def validate_iso_staging_plan(
     ):
         raise IsoStagingSafetyError("The ISO, destination, or content binding changed")
     overlay_bytes = plan.overlay.content_bytes if plan.overlay is not None else 0
-    expected_content = rebuilt.content_bytes + overlay_bytes
+    expected_content = (
+        rebuilt.content_bytes + embedded_content_bytes + overlay_bytes
+    )
     catalog_content = sum(
         entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
     )
@@ -1466,17 +1648,86 @@ class IsoStagingExecutor:
                 tree, plan.entries, self._check_cancelled,
             )
 
+            if plan.embedded_fat is not None:
+                self._check_cancelled()
+                progress(IsoStagingProgress(
+                    "Expanding embedded UEFI boot image",
+                    "",
+                    sum(
+                        entry.size for entry in plan.entries
+                        if entry.kind is EntryKind.FILE
+                    ),
+                    plan.content_bytes,
+                ))
+                descriptor = -1
+                try:
+                    descriptor = os.open(
+                        plan.image,
+                        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    status = os.fstat(descriptor)
+                    observed = (
+                        status.st_dev,
+                        status.st_ino,
+                        status.st_size,
+                        status.st_mtime_ns,
+                        status.st_ctime_ns,
+                    )
+                    if not stat.S_ISREG(status.st_mode) or observed != plan.image_identity:
+                        raise IsoStagingSafetyError(
+                            "The ISO changed before embedded boot-image staging"
+                        )
+                    catalog = inspect_eltorito_file(
+                        plan.image,
+                        image_fd=descriptor,
+                    )
+                    base_bytes = sum(
+                        entry.size for entry in plan.entries
+                        if entry.kind is EntryKind.FILE
+                    )
+                    written = materialize_embedded_fat(
+                        descriptor,
+                        catalog,
+                        plan.embedded_fat,
+                        tree,
+                        plan.embedded_targets,
+                        cancel_check=self._check_cancelled,
+                        progress=lambda relative, done, _total: progress(
+                            IsoStagingProgress(
+                                "Expanding embedded UEFI boot image",
+                                relative,
+                                base_bytes + done,
+                                plan.content_bytes,
+                            )
+                        ),
+                    )
+                    if written != plan.embedded_content_bytes:
+                        raise IsoStagingSafetyError(
+                            "The embedded boot-image byte count changed"
+                        )
+                except (ElToritoError, FatImageError, OSError) as error:
+                    raise IsoStagingSafetyError(str(error)) from error
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                self._check_cancelled()
+                _verify_extracted_catalog(
+                    tree,
+                    plan.base_with_embedded_entries,
+                )
+
             if plan.overlay is not None:
                 self._check_cancelled()
                 effective_entries, overlay_targets = _merge_effective_catalog(
-                    plan.entries, plan.overlay,
+                    plan.base_with_embedded_entries, plan.overlay,
                 )
                 if effective_entries != plan.effective_entries:
                     raise IsoStagingSafetyError(
                         "The effective staging catalog changed before ZIP extraction"
                     )
                 base_bytes = sum(
-                    entry.size for entry in plan.entries
+                    entry.size for entry in plan.base_with_embedded_entries
                     if entry.kind is EntryKind.FILE
                 )
                 progress(IsoStagingProgress(

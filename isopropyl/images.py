@@ -16,7 +16,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .sources import ExpandedImageTooLarge, ImageSource, open_image_source
 from .timestamps import (
@@ -32,7 +32,22 @@ from .eltorito import (
     BootPlatform, ElToritoError, ElToritoInspection, ElToritoNotFound,
     inspect_eltorito_file,
 )
-from .uefi import ImageUefiPayload, inspect_iso_uefi_payloads
+from .fat_image import (
+    EmbeddedFatImage,
+    FatImageError,
+    inspect_uefi_eltorito_fat,
+    read_embedded_fat_file,
+)
+from .uefi import (
+    MAX_PE_SIZE,
+    MAX_UEFI_MEMBERS,
+    ImageUefiAnalysis,
+    ImageUefiPayload,
+    fallback_loader_architecture,
+    fallback_loader_matches_architecture,
+    inspect_iso_uefi_payloads,
+    inspect_pe_bytes,
+)
 from .virtual import CompressedVirtualDiskPreparer, inspect_virtual_disk
 from .windows_paths import validate_install_image_member_path
 
@@ -136,6 +151,8 @@ class ImageInspection:
     uefi_analysis_complete: bool = True
     uefi_candidate_count: int = 0
     uefi_selected_count: int = 0
+    embedded_uefi_fat: EmbeddedFatImage | None = None
+    embedded_uefi_issues: tuple[str, ...] = ()
 
     @property
     def partition_table_incomplete(self) -> bool:
@@ -279,6 +296,8 @@ def classify_boot_paths(
         "efi/boot/bootarm.efi": "ARM",
         "efi/boot/bootriscv64.efi": "RISC-V64",
         "efi/boot/bootloongarch64.efi": "LoongArch64",
+        "efi/boot/bootia64.efi": "IA-64",
+        "efi/boot/bootebc.efi": "EBC",
     }
     architectures = tuple(
         label for filename, label in architecture_files.items() if filename in normalized
@@ -338,6 +357,93 @@ def boot_identity_fields(
     return (
         identity.version or "", identity.build or "", identity.dependency_key or "",
         identity.ambiguous, analysis.issues,
+    )
+
+
+def _inspect_embedded_uefi_payloads(
+    image_fd: int,
+    plan: EmbeddedFatImage,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+    timeout: float = 30.0,
+) -> ImageUefiAnalysis:
+    """Inspect a globally bounded EFI selection from one parsed FAT image."""
+
+    candidates = []
+    for entry in plan.entries:
+        if entry.is_directory or not entry.path.casefold().endswith(".efi"):
+            continue
+        lowered = tuple(part.casefold() for part in Path(entry.path).parts)
+        name = lowered[-1]
+        if (
+            len(lowered) == 3
+            and lowered[:2] == ("efi", "boot")
+            and name.startswith("boot")
+        ):
+            priority = 0
+        elif name in {"bootmgfw.efi", "cdboot.efi", "cdboot_noprompt.efi"}:
+            priority = 1
+        else:
+            priority = 2
+        candidates.append((priority, entry.path.casefold(), entry))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    selected = candidates[:MAX_UEFI_MEMBERS]
+    complete = len(selected) == len(candidates)
+    issues: list[str] = []
+    payloads: list[ImageUefiPayload] = []
+    started = time.monotonic()
+    for _priority, _key, entry in selected:
+        if cancel_check is not None:
+            cancel_check()
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            issues.append("embedded UEFI payload inspection reached its time limit")
+            complete = False
+            break
+        try:
+            blob = read_embedded_fat_file(
+                image_fd,
+                plan,
+                entry.path,
+                maximum_bytes=MAX_PE_SIZE,
+                cancel_check=cancel_check,
+            )
+            parsed = inspect_pe_bytes(
+                blob,
+                authenticode_timeout=min(remaining, 10.0),
+                authenticode_cancel_check=cancel_check,
+            )
+        except (FatImageError, OSError, TimeoutError, ValueError) as error:
+            if cancel_check is not None:
+                cancel_check()
+            issues.append(f"{entry.path}: {error}")
+            complete = False
+            continue
+        payloads.append(ImageUefiPayload(
+            f"El Torito #{plan.boot_entry.catalog_index}: {entry.path}",
+            parsed.architecture,
+            parsed.subsystem_name,
+            parsed.is_uefi_image,
+            parsed.certificate_table.state,
+            parsed.sbat.state,
+            parsed.warnings,
+            parsed.authenticode,
+            parsed.dbx,
+            "eltorito-fat",
+            entry.path,
+        ))
+    if len(payloads) != len(selected):
+        complete = False
+    if len(candidates) > len(selected):
+        issues.append(
+            f"selected {len(selected)} of {len(candidates)} embedded EFI candidates"
+        )
+    return ImageUefiAnalysis(
+        tuple(payloads),
+        tuple(issues),
+        len(candidates),
+        len(selected),
+        complete,
     )
 
 
@@ -835,6 +941,21 @@ def inspect_image(
                 mode for mode in ("BIOS", "UEFI", "PowerPC", "Mac")
                 if mode in detected
             )
+        embedded_uefi_fat: EmbeddedFatImage | None = None
+        embedded_uefi_issues: tuple[str, ...] = ()
+        if (
+            inspection_fd >= 0
+            and eltorito is not None
+            and BootPlatform.EFI in eltorito.bootable_platforms
+        ):
+            try:
+                embedded_uefi_fat = inspect_uefi_eltorito_fat(
+                    inspection_fd,
+                    eltorito,
+                    cancel_check=check_inspection,
+                )
+            except FatImageError as error:
+                embedded_uefi_issues = (str(error),)
         version = build = dependency = ""
         identity_ambiguous = False
         identity_issues: tuple[str, ...] = ()
@@ -865,13 +986,62 @@ def inspect_image(
                 uefi_issues += (
                     "a complete ISO file catalog was unavailable for DBX analysis",
                 )
-            if (
+            if embedded_uefi_fat is not None:
+                embedded_analysis = _inspect_embedded_uefi_payloads(
+                    inspection_fd,
+                    embedded_uefi_fat,
+                    cancel_check=check_inspection,
+                )
+                uefi_payloads += embedded_analysis.payloads
+                uefi_issues += tuple(
+                    f"embedded El Torito FAT: {issue}"
+                    for issue in embedded_analysis.issues
+                )
+                embedded_uefi_issues += embedded_analysis.issues
+                uefi_complete = uefi_complete and embedded_analysis.complete
+                uefi_candidate_count += embedded_analysis.candidate_count
+                uefi_selected_count += embedded_analysis.selected_count
+
+                embedded_payloads = {
+                    payload.target_path.casefold(): payload
+                    for payload in embedded_analysis.payloads
+                }
+                detected_architectures = list(architectures)
+                for loader in embedded_uefi_fat.fallback_loaders:
+                    name = PurePosixPath(loader.path).name.casefold()
+                    expected = fallback_loader_architecture(name)
+                    payload = embedded_payloads.get(loader.path.casefold())
+                    if (
+                        expected is None
+                        or payload is None
+                        or not payload.is_uefi_image
+                        or not fallback_loader_matches_architecture(
+                            name,
+                            payload.architecture,
+                        )
+                    ):
+                        uefi_complete = False
+                        issue = (
+                            f"embedded fallback loader {loader.path!r} did not "
+                            "validate as matching UEFI PE code"
+                        )
+                        uefi_issues += (issue,)
+                        embedded_uefi_issues += (issue,)
+                        continue
+                    if expected not in detected_architectures:
+                        detected_architectures.append(expected)
+                architectures = tuple(detected_architectures)
+            elif (
                 eltorito is not None
                 and BootPlatform.EFI in eltorito.bootable_platforms
             ):
                 uefi_complete = False
                 uefi_issues += (
-                    "the EFI El Torito boot image was not inspected for DBX analysis",
+                    "the EFI El Torito boot image could not be parsed for DBX analysis",
+                )
+                uefi_issues += tuple(
+                    f"embedded El Torito FAT: {issue}"
+                    for issue in embedded_uefi_issues
                 )
             if eltorito_issues:
                 uefi_complete = False
@@ -919,6 +1089,8 @@ def inspect_image(
         partition_table_inspection_complete=partition_tables.complete,
         sparse_format="VTSI" if sparse_format == "vtsi" else "",
         container_size=container_size,
+        embedded_uefi_fat=embedded_uefi_fat,
+        embedded_uefi_issues=embedded_uefi_issues,
     )
     check_inspection()
     final = path.stat()

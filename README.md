@@ -126,6 +126,16 @@ confirmations and expanded drive visibility are never persisted.
   Manjaro, Proxmox, and Pop!_OS member
   layouts known to need native image handling; these rules never use host filenames,
   volume labels, overlays, or network lookups.
+- **Embedded El Torito UEFI images** are supported for a deliberately bounded
+  subset used by real installer media: direct FAT12/16/32 filesystems and an
+  active first FAT partition in an otherwise empty MBR wrapper. ISOpropyl
+  requires FAT copies to match when two are present, and validates directory
+  chains, VFAT names, aliases, bounds, cross-links, and source identity; hashes
+  every file; and merges the complete tree into private ISO staging without
+  replacing an extracted ISO member.
+  Eligible fallback EFI executables then receive the same PE, Authenticode,
+  architecture, and offline DBX analysis as ordinary ISO members. Ambiguous,
+  non-FAT, hard-disk-emulation, multi-image, or colliding layouts fail closed.
 - **Boot-time corruption checking** is an explicit, default-off option for the
   first native UEFI/FAT32 profile. ISOpropyl obtains the exact hash-pinned
   `uefi-md5sum` v1.2 wrapper set, preserves every recognized fallback loader,
@@ -162,8 +172,9 @@ confirmations and expanded drive visibility are never persisted.
 - Validate MBR, extended partitions, protective/hybrid MBR, and reciprocal GPT
   metadata at supported sector sizes; malformed or incomplete evidence is shown
   instead of treated as bootable.
-- Parse El Torito BIOS/UEFI entries and inspect EFI PE architecture, certificate
-  framing, and SBAT. A sealed, resource-limited worker can report embedded
+- Parse El Torito BIOS/UEFI entries, including the bounded embedded-FAT subset,
+  and inspect EFI PE architecture, certificate framing, and SBAT. A sealed,
+  resource-limited worker can report embedded
   Authenticode **integrity only**; it does not establish publisher, Microsoft,
   firmware, timestamp, or Secure Boot trust. Separately, an offline advisor
   compares eligible signed **and unsigned** EFI images against all 673
