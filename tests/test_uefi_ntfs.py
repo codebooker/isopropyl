@@ -15,24 +15,29 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
+import isopropyl.uefi_ntfs as uefi_ntfs
 from isopropyl.bootloaders import BootloaderCatalog, BootloaderResource
 from isopropyl.constructed import (
     ConstructedMediaError,
     ConstructedMediaResult,
 )
+from isopropyl.dbx import DbxAssessment, DbxState
 from isopropyl.devices import Device
 from isopropyl.formatting import FormattingError, PartitionTable
 from isopropyl.uefi_ntfs import (
     ArchitecturePayload,
     BoundArtifact,
+    EmbeddedPayloadManifest,
     PayloadTrust,
     UefiNtfsCancelled,
     UefiNtfsError,
     UefiNtfsExecutor,
     UefiNtfsSafetyError,
     UefiNtfsUnavailable,
+    assess_uefi_ntfs_dbx,
     bind_uefi_ntfs_artifact,
     build_uefi_ntfs_media_plan,
+    extract_uefi_ntfs_boot_payloads,
     prepare_uefi_ntfs_artifact,
     probe_uefi_ntfs_logical_sector_size,
     validate_uefi_ntfs_media_plan,
@@ -114,6 +119,27 @@ def build_plan(root: Path, architectures=("x64",), **kwargs):
         source_on_device=kwargs.pop("source_on_device", lambda _path, _device: False),
         **kwargs,
     )
+
+
+def fixture_embedded_manifest(plan) -> tuple[EmbeddedPayloadManifest, ...]:
+    paths = tuple(
+        (path, payload.architecture)
+        for payload in plan.payloads
+        for path in (payload.bridge_path, payload.driver_path)
+    )
+    data = plan.artifact.data
+    base, remainder = divmod(len(data), len(paths))
+    offset = 0
+    records = []
+    for index, (path, architecture) in enumerate(paths):
+        size = base + (1 if index < remainder else 0)
+        blob = data[offset:offset + size]
+        records.append(EmbeddedPayloadManifest(
+            path, architecture, offset, size, hashlib.sha256(blob).hexdigest(),
+        ))
+        offset += size
+    assert offset == len(data)
+    return tuple(records)
 
 
 def partition_metadata(plan, *, wrong_size=False) -> str:
@@ -359,6 +385,13 @@ class PlanTests(unittest.TestCase):
             cases = (
                 replace(plan, data_capacity=1),
                 replace(plan, artifact=replace(plan.artifact, data=b"bad")),
+                replace(
+                    plan,
+                    artifact=replace(
+                        plan.artifact,
+                        data=bytearray(plan.artifact.data),  # type: ignore[arg-type]
+                    ),
+                ),
                 replace(plan, payloads=()),
                 replace(
                     plan,
@@ -372,6 +405,138 @@ class PlanTests(unittest.TestCase):
                 with self.subTest(forged=forged):
                     with self.assertRaises(UefiNtfsSafetyError):
                         validate_uefi_ntfs_media_plan(forged)
+
+
+class EmbeddedPayloadTests(unittest.TestCase):
+    def test_release_manifest_covers_each_canonical_boot_chain_exactly(self):
+        manifest = uefi_ntfs._UEFI_NTFS_EMBEDDED_MANIFEST
+        expected = {
+            (path, payload.architecture)
+            for payload in uefi_ntfs._ARCHITECTURES.values()
+            for path in (payload.bridge_path, payload.driver_path)
+        }
+        self.assertEqual(
+            {(item.path, item.architecture) for item in manifest}, expected,
+        )
+        folded = [item.path.casefold() for item in manifest]
+        self.assertEqual(len(folded), len(set(folded)))
+        ranges = sorted((item.offset, item.offset + item.size) for item in manifest)
+        self.assertTrue(all(
+            0 <= start < end <= uefi_ntfs.UEFI_NTFS_SIZE
+            for start, end in ranges
+        ))
+        self.assertTrue(all(
+            first_end <= second_start
+            for (_first_start, first_end), (second_start, _second_end)
+            in zip(ranges, ranges[1:])
+        ))
+
+    def test_extracts_only_selected_bridge_and_ntfs_driver_in_plan_order(self):
+        with tempfile.TemporaryDirectory() as directory, fixture_constants():
+            plan = build_plan(staging_tree(Path(directory)))
+            manifest = fixture_embedded_manifest(plan)
+            with patch(
+                "isopropyl.uefi_ntfs._UEFI_NTFS_EMBEDDED_MANIFEST", manifest,
+            ):
+                selected = extract_uefi_ntfs_boot_payloads(plan)
+        self.assertEqual(
+            tuple(item.path for item in selected),
+            (plan.payloads[0].bridge_path, plan.payloads[0].driver_path),
+        )
+        self.assertEqual(tuple(item.architecture for item in selected), ("x64", "x64"))
+        self.assertEqual(b"".join(item.data for item in selected), ARTIFACT_DATA)
+        self.assertFalse(any("exfat" in item.path.casefold() for item in selected))
+
+    def test_manifest_mismatch_overlap_and_missing_record_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory, fixture_constants():
+            plan = build_plan(staging_tree(Path(directory)))
+            good = fixture_embedded_manifest(plan)
+            cases = (
+                (replace(good[0], sha256="0" * 64), good[1]),
+                (good[0], replace(good[1], offset=good[0].offset + 1)),
+                (replace(good[0], architecture="ARM64"), good[1]),
+                (good[0],),
+            )
+            for manifest in cases:
+                with self.subTest(manifest=manifest), patch(
+                    "isopropyl.uefi_ntfs._UEFI_NTFS_EMBEDDED_MANIFEST", manifest,
+                ):
+                    with self.assertRaises(UefiNtfsSafetyError):
+                        extract_uefi_ntfs_boot_payloads(plan)
+
+    def test_assessment_uses_bound_helper_bytes_and_helper_qualified_paths(self):
+        match = DbxAssessment(
+            DbxState.MATCHED_OPTIONAL, "x64", "a" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory, fixture_constants():
+            plan = build_plan(staging_tree(Path(directory)))
+            manifest = fixture_embedded_manifest(plan)
+            with (
+                patch(
+                    "isopropyl.uefi_ntfs._UEFI_NTFS_EMBEDDED_MANIFEST", manifest,
+                ),
+                patch("isopropyl.uefi_ntfs.assess_dbx", return_value=match) as assess,
+            ):
+                result = assess_uefi_ntfs_dbx(plan)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.candidate_count, 2)
+        self.assertEqual(result.matches, result.payloads)
+        self.assertTrue(all(
+            item.path.startswith("uefi-ntfs.img:/EFI/")
+            for item in result.payloads
+        ))
+        self.assertEqual(
+            [call.args[0] for call in assess.call_args_list],
+            [
+                plan.artifact.data[item.offset:item.offset + item.size]
+                for item in manifest
+            ],
+        )
+
+    def test_risc_v_assessment_remains_explicitly_incomplete(self):
+        unknown = DbxAssessment(
+            DbxState.UNKNOWN,
+            error="PE machine 0x5064 has no Microsoft DBX hash set",
+        )
+        with tempfile.TemporaryDirectory() as directory, fixture_constants():
+            plan = build_plan(
+                staging_tree(Path(directory), ("RISC-V64",)),
+                architectures=("RISC-V64",),
+                allow_unsigned_payloads=True,
+            )
+            manifest = fixture_embedded_manifest(plan)
+            with (
+                patch(
+                    "isopropyl.uefi_ntfs._UEFI_NTFS_EMBEDDED_MANIFEST", manifest,
+                ),
+                patch("isopropyl.uefi_ntfs.assess_dbx", return_value=unknown),
+            ):
+                result = assess_uefi_ntfs_dbx(plan)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.selected_count, 2)
+        self.assertEqual(len(result.issues), 2)
+        self.assertTrue(all(
+            item.dbx.state is DbxState.UNKNOWN for item in result.payloads
+        ))
+
+    def test_cancellation_propagates_while_binding_embedded_payloads(self):
+        marker = RuntimeError("cancel embedded helper assessment")
+        checks = 0
+
+        def cancel() -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise marker
+
+        with tempfile.TemporaryDirectory() as directory, fixture_constants():
+            plan = build_plan(staging_tree(Path(directory)))
+            manifest = fixture_embedded_manifest(plan)
+            with patch(
+                "isopropyl.uefi_ntfs._UEFI_NTFS_EMBEDDED_MANIFEST", manifest,
+            ), self.assertRaises(RuntimeError) as raised:
+                extract_uefi_ntfs_boot_payloads(plan, cancel_check=cancel)
+        self.assertIs(raised.exception, marker)
 
 
 class FakeLayoutExecutor:

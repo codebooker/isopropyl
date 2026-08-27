@@ -44,7 +44,7 @@ from isopropyl.formatting import (
 )
 from isopropyl.images import ChecksumCancelled, ImageInspection, ImageMember
 from isopropyl.iso import (
-    ArchiveEntry, EntryKind, WriteMode, build_write_plan,
+    ArchiveEntry, BootStrategy, EntryKind, FileSystem, WriteMode, build_write_plan,
     merge_additive_overlay_entries,
 )
 from isopropyl.iso_staging import IsoStagingPlan
@@ -3008,7 +3008,9 @@ class WindowZipOverlayTests(unittest.TestCase):
         self.assertIn(self.overlay.archive_sha256, confirmation)
         self.assertIn("additive only", confirmation)
         self.assertIn("base ISO only", confirmation)
-        self.assertIn("final transformed EFI payload set", confirmation)
+        self.assertIn("final transformed EFI payloads", confirmation)
+        self.assertNotIn("helper payloads", confirmation)
+        self.assertIn("before the target writer runs", confirmation)
         workspace.cleanup.assert_called_once_with()
 
     def test_iso_confirmation_rechecks_source_after_yes(self):
@@ -3173,6 +3175,7 @@ class WindowRuntimeValidationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.iso_stager = None
         self.window.constructed_writer = None
+        self.window.uefi_ntfs_writer = None
         self.window.iso_workspace = None
         self.window.close()
         self.window.deleteLater()
@@ -3424,7 +3427,9 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         self.assertIn("chainload the original", confirmation)
         self.assertIn("Secure Boot", confirmation)
         self.assertIn("base ISO only", confirmation)
-        self.assertIn("final transformed EFI payload set", confirmation)
+        self.assertIn("final transformed EFI payloads", confirmation)
+        self.assertNotIn("helper payloads", confirmation)
+        self.assertIn("before the target writer runs", confirmation)
         workspace.cleanup.assert_called_once_with()
 
     def test_malformed_prepared_payload_is_rejected_before_confirmation(self):
@@ -3616,6 +3621,201 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         workspace.cleanup.assert_called_once_with()
         self.assertFalse(finished.call_args.args[0])
         self.assertIn("Secure Boot review", finished.call_args.args[1])
+
+    def uefi_ntfs_pending_write(self):
+        original = self.window.write_recommendation.iso_plan
+        assert original is not None and original.layout is not None
+        plan = replace(
+            original,
+            layout=replace(
+                original.layout,
+                main_filesystem=FileSystem.NTFS,
+                partition_count=2,
+                boot_strategy=BootStrategy.UEFI_NTFS,
+            ),
+        )
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        root = Path(self.settings_home.name) / "ready-media"
+        staging_plan = fake_iso_staging_plan(
+            self.window.image, root, self.window.archive_entries(), plan,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging_plan,
+        )
+        return pending, workspace, root
+
+    def test_uefi_ntfs_helper_assessment_precedes_and_can_authorize_writer(self):
+        pending, _workspace, root = self.uefi_ntfs_pending_write()
+        order = []
+        stager = Mock()
+        stager.execute.side_effect = lambda *_args: (
+            order.append("stage")
+            or SimpleNamespace(destination=root, bytes_staged=1024)
+        )
+        writer = Mock()
+        writer.execute.side_effect = lambda *_args: (
+            order.append("write")
+            or SimpleNamespace(powered_off=True, unmounted=True, cleanup_diagnostic="")
+        )
+        target_plan = SimpleNamespace(content=object())
+        helper_match = StagedDbxPayload(
+            "uefi-ntfs.img:/EFI/Boot/bootx64.efi",
+            DbxAssessment(DbxState.MATCHED_OPTIONAL, "x64", "1" * 64),
+        )
+        finished = Mock()
+        self.window.bridge.finished.disconnect()
+        self.window.bridge.finished.connect(finished)
+
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as warning,
+            patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
+            patch("isopropyl.app.UefiNtfsExecutor", return_value=writer),
+            patch(
+                "isopropyl.app.build_uefi_ntfs_media_plan",
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("plan") or target_plan
+                ),
+            ),
+            patch(
+                "isopropyl.app.assess_uefi_ntfs_dbx",
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("helper")
+                    or StagedDbxAnalysis((helper_match,), 1, 1, True)
+                ),
+            ) as assess_helper,
+            patch(
+                "isopropyl.app.assess_staged_dbx",
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("staged") or StagedDbxAnalysis((), 0, 0, True)
+                ),
+            ) as assess_staged,
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.confirm_and_start_iso_write(pending, Mock(), 512)
+
+        self.assertEqual(order, ["stage", "plan", "helper", "staged", "write"])
+        self.assertIs(assess_helper.call_args.args[0], target_plan)
+        self.assertIs(assess_staged.call_args.args[0], target_plan.content)
+        self.assertEqual(warning.call_count, 2)
+        self.assertEqual(
+            warning.call_args_list[-1].args[1], "Secure Boot revocation match",
+        )
+        writer.execute.assert_called_once()
+        self.assertTrue(finished.call_args.args[0])
+
+    def test_incomplete_uefi_ntfs_helper_assessment_defaults_to_cancel(self):
+        pending, workspace, root = self.uefi_ntfs_pending_write()
+        stager = Mock()
+        stager.execute.return_value = SimpleNamespace(
+            destination=root, bytes_staged=1024,
+        )
+        writer = Mock()
+        target_plan = SimpleNamespace(content=object())
+        helper_unknown = StagedDbxPayload(
+            "uefi-ntfs.img:/EFI/Boot/bootriscv64.efi",
+            DbxAssessment(
+                DbxState.UNKNOWN,
+                error="Microsoft DBX hash inventory does not cover RISC-V64",
+            ),
+        )
+        assess_staged = Mock(
+            return_value=StagedDbxAnalysis((), 0, 0, True),
+        )
+        finished = Mock()
+        self.window.bridge.finished.disconnect()
+        self.window.bridge.finished.connect(finished)
+
+        def answer(_parent, title, *_args, **_kwargs):
+            if title == "Erase drive and write in ISO mode?":
+                return QMessageBox.StandardButton.Yes
+            self.assertEqual(title, "Incomplete final Secure Boot assessment")
+            return QMessageBox.StandardButton.Cancel
+
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.QMessageBox.warning", side_effect=answer) as warning,
+            patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
+            patch("isopropyl.app.UefiNtfsExecutor", return_value=writer),
+            patch(
+                "isopropyl.app.build_uefi_ntfs_media_plan",
+                return_value=target_plan,
+            ),
+            patch(
+                "isopropyl.app.assess_uefi_ntfs_dbx",
+                return_value=StagedDbxAnalysis(
+                    (helper_unknown,), 1, 1, False,
+                    ("RISC-V64 is not covered by the DBX hash inventory",),
+                ),
+            ),
+            patch("isopropyl.app.assess_staged_dbx", assess_staged),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.confirm_and_start_iso_write(pending, Mock(), 512)
+
+        assess_staged.assert_called_once()
+        self.assertIs(assess_staged.call_args.args[0], target_plan.content)
+        self.assertTrue(callable(assess_staged.call_args.kwargs["cancel_check"]))
+        writer.execute.assert_not_called()
+        workspace.cleanup.assert_called_once_with()
+        self.assertEqual(warning.call_count, 2)
+        self.assertEqual(
+            warning.call_args_list[-1].args[4],
+            QMessageBox.StandardButton.Cancel,
+        )
+        self.assertFalse(finished.call_args.args[0])
+        self.assertIn("Secure Boot review", finished.call_args.args[1])
+
+    def test_cancellation_during_uefi_ntfs_helper_assessment_stops_writer(self):
+        pending, workspace, root = self.uefi_ntfs_pending_write()
+        stager = Mock()
+        stager.execute.return_value = SimpleNamespace(
+            destination=root, bytes_staged=1024,
+        )
+        writer = Mock()
+        target_plan = SimpleNamespace(content=object())
+        assess_staged = Mock()
+        finished = Mock()
+        self.window.bridge.finished.disconnect()
+        self.window.bridge.finished.connect(finished)
+
+        def cancel_helper(_plan, *, cancel_check):
+            self.window.cancel()
+            cancel_check()
+
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as warning,
+            patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
+            patch("isopropyl.app.UefiNtfsExecutor", return_value=writer),
+            patch(
+                "isopropyl.app.build_uefi_ntfs_media_plan",
+                return_value=target_plan,
+            ),
+            patch(
+                "isopropyl.app.assess_uefi_ntfs_dbx",
+                side_effect=cancel_helper,
+            ) as assess_helper,
+            patch("isopropyl.app.assess_staged_dbx", assess_staged),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.confirm_and_start_iso_write(pending, Mock(), 512)
+
+        assess_helper.assert_called_once()
+        assess_staged.assert_not_called()
+        writer.execute.assert_not_called()
+        workspace.cleanup.assert_called_once_with()
+        self.assertEqual(warning.call_count, 1)
+        self.assertFalse(finished.call_args.args[0])
+        self.assertIn("cancelled", finished.call_args.args[1].casefold())
 
     def test_cancellation_during_transform_never_builds_target_plan(self):
         plan = self.window.write_recommendation.iso_plan

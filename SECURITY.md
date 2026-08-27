@@ -278,10 +278,14 @@ issue requesting a private contact channel without disclosing the vulnerability.
   a second default-Cancel warning before any writer or formatter is invoked.
   Incomplete final coverage—whether from selection limits or unknown
   assessments—also requires a separate default-Cancel decision. The writer
-  independently rejects subsequent staged-tree identity drift. El
-  Torito EFI boot images and the embedded files inside the UEFI:NTFS helper image
-  are not included in that final pass; the destructive confirmation therefore
-  retains its base-image qualification whenever the helper changes the EFI set.
+  independently rejects subsequent staged-tree identity drift. For UEFI:NTFS,
+  the exact whole-image hash is additionally bound to fixed, independently
+  SHA-256-checked byte ranges for each selected architecture's bridge and NTFS
+  driver; those actual PE bytes join the same final DBX decision. Nonselected
+  architecture and exFAT payloads cannot complete the selected NTFS boot chain
+  and are not assessed. RISC-V64 remains explicitly unknown because Microsoft's
+  snapshot has no applicable architecture set. Embedded El Torito EFI boot
+  images remain outside the final pass.
 - Automated device-facing tests use mocks and regular files. Hardware-backed
   write, boot, Secure Boot, cancellation, and failure-recovery testing is still
   required before the alpha label can be removed.

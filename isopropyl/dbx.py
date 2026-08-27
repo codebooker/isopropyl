@@ -138,6 +138,12 @@ class StagedDbxPayload:
     path: str
     dbx: DbxAssessment
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or not self.path:
+            raise ValueError("staged DBX payload paths must be non-empty text")
+        if not isinstance(self.dbx, DbxAssessment):
+            raise ValueError("staged DBX payloads require a DBX assessment")
+
 
 @dataclass(frozen=True)
 class StagedDbxAnalysis:
@@ -147,9 +153,62 @@ class StagedDbxAnalysis:
     complete: bool
     issues: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.payloads, tuple)
+            or any(not isinstance(item, StagedDbxPayload) for item in self.payloads)
+            or type(self.candidate_count) is not int
+            or type(self.selected_count) is not int
+            or self.candidate_count < 0
+            or self.selected_count < 0
+            or self.selected_count > self.candidate_count
+            or len(self.payloads) != self.selected_count
+            or type(self.complete) is not bool
+            or not isinstance(self.issues, tuple)
+            or any(
+                not isinstance(issue, str)
+                or not issue
+                or any(character in "\r\n" for character in issue)
+                for issue in self.issues
+            )
+        ):
+            raise ValueError("invalid staged DBX analysis")
+        has_unknown = any(
+            payload.dbx.state is DbxState.UNKNOWN for payload in self.payloads
+        )
+        if self.complete and (
+            self.selected_count != self.candidate_count
+            or has_unknown
+            or self.issues
+        ):
+            raise ValueError("a complete staged DBX analysis must be conclusive")
+        if not self.complete and not self.issues:
+            raise ValueError("an incomplete staged DBX analysis requires a diagnostic")
+
     @property
     def matches(self) -> tuple[StagedDbxPayload, ...]:
         return tuple(payload for payload in self.payloads if payload.dbx.matched)
+
+
+def merge_staged_dbx_analyses(
+    *analyses: StagedDbxAnalysis,
+) -> StagedDbxAnalysis:
+    """Combine independently bound inventories without losing incompleteness."""
+    if not analyses or any(
+        not isinstance(analysis, StagedDbxAnalysis) for analysis in analyses
+    ):
+        raise ValueError("one or more staged DBX analyses are required")
+    return StagedDbxAnalysis(
+        tuple(
+            payload
+            for analysis in analyses
+            for payload in analysis.payloads
+        ),
+        sum(analysis.candidate_count for analysis in analyses),
+        sum(analysis.selected_count for analysis in analyses),
+        all(analysis.complete for analysis in analyses),
+        tuple(issue for analysis in analyses for issue in analysis.issues),
+    )
 
 
 def _duplicate_rejecting_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

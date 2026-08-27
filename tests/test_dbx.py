@@ -11,7 +11,8 @@ from unittest.mock import patch
 from isopropyl.dbx import (
     CATALOG_RESOURCE, DbxAssessment, DbxCatalog, DbxError, DbxState, assess_dbx,
     assess_staged_dbx, load_dbx_catalog, parse_dbx_catalog,
-    pe_authenticode_sha256,
+    merge_staged_dbx_analyses, pe_authenticode_sha256, StagedDbxAnalysis,
+    StagedDbxPayload,
 )
 from tests.test_constructed import build_plan
 
@@ -359,6 +360,49 @@ class DbxTests(unittest.TestCase):
             self.assertEqual(result.selected_count, 64)
             self.assertFalse(result.complete)
             self.assertTrue(any("selected 64 of 65" in issue for issue in result.issues))
+
+    def test_staged_analysis_merge_preserves_order_counts_and_incompleteness(self):
+        first = StagedDbxPayload(
+            "EFI/BOOT/BOOTX64.EFI",
+            DbxAssessment(DbxState.MATCHED_UNFLAGGED, "x64", "a" * 64),
+        )
+        second = StagedDbxPayload(
+            "uefi-ntfs.img:/EFI/Boot/bootriscv64.efi",
+            DbxAssessment(DbxState.UNKNOWN, error="unsupported machine"),
+        )
+        merged = merge_staged_dbx_analyses(
+            StagedDbxAnalysis((first,), 1, 1, True),
+            StagedDbxAnalysis(
+                (second,), 2, 1, False,
+                ("unsupported machine", "selected 1 of 2"),
+            ),
+        )
+        self.assertEqual(merged.payloads, (first, second))
+        self.assertEqual(merged.matches, (first,))
+        self.assertEqual(merged.candidate_count, 3)
+        self.assertEqual(merged.selected_count, 2)
+        self.assertFalse(merged.complete)
+        self.assertEqual(
+            merged.issues, ("unsupported machine", "selected 1 of 2"),
+        )
+
+    def test_staged_analysis_models_and_merge_reject_inconsistent_values(self):
+        with self.assertRaises(ValueError):
+            merge_staged_dbx_analyses()
+        with self.assertRaises(ValueError):
+            merge_staged_dbx_analyses(object())  # type: ignore[arg-type]
+        cases = (
+            lambda: StagedDbxAnalysis((), -1, 0, False, ("bad",)),
+            lambda: StagedDbxAnalysis((), 0, 1, False, ("bad",)),
+            lambda: StagedDbxAnalysis((), 1, 0, True),
+            lambda: StagedDbxAnalysis((), 1, 0, False),
+            lambda: StagedDbxPayload("", DbxAssessment(
+                DbxState.UNKNOWN, error="bad",
+            )),
+        )
+        for build in cases:
+            with self.subTest(build=build), self.assertRaises(ValueError):
+                build()
 
 
 if __name__ == "__main__":

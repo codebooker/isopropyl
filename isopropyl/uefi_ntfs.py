@@ -44,6 +44,9 @@ from .constructed import (
     validate_constructed_media_plan,
 )
 from .devices import Device, parse_lsblk, path_is_on_device
+from .dbx import (
+    DbxCatalog, DbxState, StagedDbxAnalysis, StagedDbxPayload, assess_dbx,
+)
 from .formatting import (
     Filesystem,
     FormatCancelled,
@@ -125,6 +128,48 @@ class BoundArtifact:
     data: bytes
     source_device: int
     source_inode: int
+
+
+@dataclass(frozen=True)
+class EmbeddedPayloadManifest:
+    path: str
+    architecture: str
+    offset: int
+    size: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.path, str)
+            or not self.path
+            or not isinstance(self.architecture, str)
+            or not self.architecture
+            or type(self.offset) is not int
+            or self.offset < 0
+            or type(self.size) is not int
+            or self.size <= 0
+            or not isinstance(self.sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None
+        ):
+            raise ValueError("invalid embedded UEFI:NTFS payload manifest")
+
+
+@dataclass(frozen=True)
+class BoundEmbeddedPayload:
+    path: str
+    architecture: str
+    data: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.path, str)
+            or not self.path
+            or not isinstance(self.architecture, str)
+            or not self.architecture
+            or not isinstance(self.data, bytes)
+            or not self.data
+        ):
+            raise ValueError("invalid bound embedded UEFI:NTFS payload")
 
 
 @dataclass(frozen=True)
@@ -212,6 +257,54 @@ _ARCHITECTURES: dict[str, ArchitecturePayload] = {
         "The RISC-V64 bridge and driver are not Secure Boot signed.",
     ),
 }
+
+
+# Exact boot-reachable byte ranges in the SHA-256-pinned Rufus 2368e49a
+# UEFI:NTFS image.  The image also contains exFAT drivers and other firmware
+# architectures; a media plan can only chainload the canonical bridge and NTFS
+# driver corresponding to its selected fallback architecture(s).
+_UEFI_NTFS_EMBEDDED_MANIFEST = (
+    EmbeddedPayloadManifest(
+        "EFI/Boot/bootaa64.efi", "ARM64", 25_088, 42_512,
+        "2a991a37ddfccd8152b043c3cc507bf578708ffb9f8f4c84c72a919d6c4457e3",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Boot/bootarm.efi", "ARM", 68_096, 18_656,
+        "990acb5c432dcbc91f6b77f62a7578a20874f4ac636b64d0952c6c29ad1b92d9",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Boot/bootia32.efi", "x86", 88_576, 30_288,
+        "32f7c8cb505ce7b32f560a9c51fe6abe14361823a46cb1541039cb52164769c1",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Boot/bootriscv64.efi", "RISC-V64", 119_296, 28_416,
+        "f314d864e5d9e54a7b1e4d981d6cd9b6ef70a9ff55f7f0913c0b25e55fc13846",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Boot/bootx64.efi", "x64", 147_968, 31_888,
+        "5e22e6209ea557fce49cdbab7d06be4fc99e65d45c4fba01da928e763776bb94",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Rufus/ntfs_aa64.efi", "ARM64", 401_920, 169_488,
+        "887a7c62414fc1584e199fe43e12d134829a56f8d3a91db67cdddd5b98864b85",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Rufus/ntfs_arm.efi", "ARM", 571_904, 40_544,
+        "822cd007caa4bbacd692797e3cba9ec1f9e28b7be3eb30c61ffac4725bb5cc1e",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Rufus/ntfs_ia32.efi", "x86", 612_864, 163_152,
+        "a5c02c3774c71620f4d6582495ee2d1c4df4f3cd6bd9986209f4b1f5a90933cf",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Rufus/ntfs_riscv64.efi", "RISC-V64", 776_704, 58_560,
+        "54befd00ed303abf1ebe38904097336a052e2e82333e319d6ef0fdc3b8f24afc",
+    ),
+    EmbeddedPayloadManifest(
+        "EFI/Rufus/ntfs_x64.efi", "x64", 836_096, 173_584,
+        "d77e7f1c317a42467d3f7ade7b3e0a20996b9bf541492fbc15d6245d8d46dcac",
+    ),
+)
 
 
 def _bounded(value: object, fallback: str) -> str:
@@ -432,6 +525,7 @@ def build_uefi_ntfs_media_plan(
         or artifact.version != UEFI_NTFS_VERSION
         or artifact.name != UEFI_NTFS_NAME
         or artifact.sha256 != UEFI_NTFS_SHA256
+        or not isinstance(artifact.data, bytes)
         or len(artifact.data) != UEFI_NTFS_SIZE
         or not hmac.compare_digest(hashlib.sha256(artifact.data).hexdigest(), artifact.sha256)
     ):
@@ -503,6 +597,7 @@ def validate_uefi_ntfs_media_plan(plan: UefiNtfsMediaPlan) -> None:
         or plan.artifact.version != UEFI_NTFS_VERSION
         or plan.artifact.name != UEFI_NTFS_NAME
         or plan.artifact.sha256 != UEFI_NTFS_SHA256
+        or not isinstance(plan.artifact.data, bytes)
         or len(plan.artifact.data) != UEFI_NTFS_SIZE
         or not hmac.compare_digest(
             hashlib.sha256(plan.artifact.data).hexdigest(), UEFI_NTFS_SHA256,
@@ -552,6 +647,107 @@ def validate_uefi_ntfs_media_plan(plan: UefiNtfsMediaPlan) -> None:
         raise UefiNtfsSafetyError("The plan contains an untrusted tool path") from error
     if resolved_flock != plan.tools.flock:
         raise UefiNtfsSafetyError("The plan contains inconsistent tool paths")
+
+
+def extract_uefi_ntfs_boot_payloads(
+    plan: UefiNtfsMediaPlan,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> tuple[BoundEmbeddedPayload, ...]:
+    """Bind selected boot-chain PE files inside the exact helper artifact."""
+    validate_uefi_ntfs_media_plan(plan)
+    if cancel_check is not None:
+        cancel_check()
+    manifest = _UEFI_NTFS_EMBEDDED_MANIFEST
+    if (
+        not isinstance(manifest, tuple)
+        or any(not isinstance(item, EmbeddedPayloadManifest) for item in manifest)
+    ):
+        raise UefiNtfsSafetyError("The embedded UEFI:NTFS manifest is invalid")
+    by_path: dict[str, EmbeddedPayloadManifest] = {}
+    occupied: list[tuple[int, int]] = []
+    for item in manifest:
+        folded = item.path.casefold()
+        end = item.offset + item.size
+        if (
+            folded in by_path
+            or end <= item.offset
+            or end > UEFI_NTFS_SIZE
+            or any(item.offset < other_end and other_start < end
+                   for other_start, other_end in occupied)
+        ):
+            raise UefiNtfsSafetyError(
+                "The embedded UEFI:NTFS manifest has duplicate, overlapping, "
+                "or out-of-bounds records"
+            )
+        by_path[folded] = item
+        occupied.append((item.offset, end))
+
+    selected: list[BoundEmbeddedPayload] = []
+    selected_paths: set[str] = set()
+    for payload in plan.payloads:
+        for path in (payload.bridge_path, payload.driver_path):
+            if cancel_check is not None:
+                cancel_check()
+            folded = path.casefold()
+            item = by_path.get(folded)
+            if (
+                item is None
+                or item.path != path
+                or item.architecture != payload.architecture
+                or folded in selected_paths
+            ):
+                raise UefiNtfsSafetyError(
+                    "The selected UEFI:NTFS boot chain is not represented "
+                    "canonically in the embedded manifest"
+                )
+            data = plan.artifact.data[item.offset:item.offset + item.size]
+            digest = hashlib.sha256(data).hexdigest()
+            if len(data) != item.size or not hmac.compare_digest(digest, item.sha256):
+                raise UefiNtfsSafetyError(
+                    f"Embedded UEFI:NTFS payload {item.path!r} failed SHA-256 binding"
+                )
+            selected_paths.add(folded)
+            selected.append(BoundEmbeddedPayload(
+                item.path, item.architecture, data,
+            ))
+    if len(selected) != 2 * len(plan.payloads):
+        raise UefiNtfsSafetyError(
+            "The selected UEFI:NTFS boot-chain inventory is incomplete"
+        )
+    if cancel_check is not None:
+        cancel_check()
+    return tuple(selected)
+
+
+def assess_uefi_ntfs_dbx(
+    plan: UefiNtfsMediaPlan,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+    catalog: DbxCatalog | None = None,
+) -> StagedDbxAnalysis:
+    """Assess selected bridge/NTFS-driver bytes from the pinned helper image."""
+    embedded = extract_uefi_ntfs_boot_payloads(
+        plan, cancel_check=cancel_check,
+    )
+    payloads: list[StagedDbxPayload] = []
+    issues: list[str] = []
+    for item in embedded:
+        if cancel_check is not None:
+            cancel_check()
+        assessment = assess_dbx(
+            item.data, cancel_check=cancel_check, catalog=catalog,
+        )
+        display_path = f"uefi-ntfs.img:/{item.path}"
+        payloads.append(StagedDbxPayload(display_path, assessment))
+        if assessment.state is DbxState.UNKNOWN:
+            message = " ".join(assessment.error.split())[:512]
+            issues.append(f"{display_path}: {message}")
+    if cancel_check is not None:
+        cancel_check()
+    return StagedDbxAnalysis(
+        tuple(payloads), len(embedded), len(embedded), not issues, tuple(issues),
+    )
 
 
 class UefiNtfsExecutor:

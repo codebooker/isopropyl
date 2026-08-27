@@ -147,6 +147,12 @@ The image contains several independently licensed Free Software components:
   These are present in the upstream image for other filesystem/architecture
   combinations but are not selected by ISOpropyl's normal NTFS GUI path.
 
+Before a target write, ISOpropyl binds the selected architecture's bridge and
+NTFS driver to fixed offset, length, and SHA-256 records inside this exact
+whole-image digest, then applies the same offline Microsoft DBX image-hash
+advice used for staged EFI files. This is not a certificate-chain, live
+firmware-policy, or Secure Boot acceptance verdict.
+
 Copyright remains with the respective upstream authors and contributors. The
 components are provided without warranty under their licenses. Corresponding
 source and license texts are available from the linked repositories. ISOpropyl

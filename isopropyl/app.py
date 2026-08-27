@@ -33,7 +33,7 @@ from .backup import (
 from .authenticode import AuthenticodeIntegrityState
 from .dbx import (
     DbxState, SOURCE_RELEASE, SOURCE_RELEASE_DATE, StagedDbxAnalysis,
-    StagedDbxPayload, assess_staged_dbx,
+    StagedDbxPayload, assess_staged_dbx, merge_staged_dbx_analyses,
 )
 from .bootloaders import (
     CatalogError, bundle_for_dependency, delete_cached_artifacts, inventory_cache,
@@ -116,7 +116,7 @@ from .virtual import (
 from .uefi import SignatureTableState
 from .uefi_ntfs import (
     UEFI_NTFS_SIZE, BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
-    build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
+    assess_uefi_ntfs_dbx, build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
     probe_uefi_ntfs_logical_sector_size,
 )
 from .uefi_shell import (
@@ -5202,9 +5202,15 @@ class Window(QMainWindow):
                 )
         dbx_advice = self.dbx_review_text(inspection)
         if final_efi_set_unassessed:
+            pending_sets = []
+            if staging_plan.overlay is not None or runtime_validation_enabled:
+                pending_sets.append("final transformed EFI payloads")
+            if strategy is BootStrategy.UEFI_NTFS:
+                pending_sets.append("selected UEFI:NTFS helper payloads")
             dbx_advice = (
                 "base ISO only: " + dbx_advice
-                + "; the final transformed EFI payload set has not been assessed"
+                + f"; {' and '.join(pending_sets)} "
+                "will be reassessed before the target writer runs"
             )
         customization += "\nSecure Boot DBX advice: " + dbx_advice + "."
 
@@ -5329,17 +5335,23 @@ class Window(QMainWindow):
             )
         )
 
-        def check_final_staged_dbx(plan: ConstructedMediaPlan) -> StagedDbxAnalysis:
-            def cancel_check() -> None:
-                if runtime_validation_cancel_event.is_set():
-                    raise RuntimeValidationCancelled(
-                        "ISO-mode writing was cancelled before the target was changed"
-                    )
+        def final_dbx_cancel_check() -> None:
+            if runtime_validation_cancel_event.is_set():
+                raise RuntimeValidationCancelled(
+                    "ISO-mode writing was cancelled before the target was changed"
+                )
 
+        def check_final_staged_dbx(
+            plan: ConstructedMediaPlan,
+            *additional: StagedDbxAnalysis,
+        ) -> StagedDbxAnalysis:
             self.bridge.progress.emit(
                 0, 0, "Checking final staged Secure Boot payloads",
             )
-            analysis = assess_staged_dbx(plan, cancel_check=cancel_check)
+            staged = assess_staged_dbx(
+                plan, cancel_check=final_dbx_cancel_check,
+            )
+            analysis = merge_staged_dbx_analyses(staged, *additional)
             newly_matched = tuple(
                 payload for payload in analysis.matches
                 if payload.dbx.authenticode_sha256 not in base_dbx_matches
@@ -5366,8 +5378,8 @@ class Window(QMainWindow):
                         # Mark the request stale before unwinding so a queued
                         # GUI delivery cannot open a warning after cancellation.
                         request.decision.set()
-                    cancel_check()
-                cancel_check()
+                    final_dbx_cancel_check()
+                final_dbx_cancel_check()
                 if not request.accepted:
                     raise RuntimeValidationCancelled(
                         "ISO-mode writing was cancelled after final staged "
@@ -5444,7 +5456,13 @@ class Window(QMainWindow):
                         allow_unsigned_payloads=pending.allow_unsigned_payloads,
                         logical_sector_size=logical_sector_size,
                     )
-                    check_final_staged_dbx(target_plan.content)
+                    self.bridge.progress.emit(
+                        0, 0, "Checking embedded UEFI:NTFS Secure Boot payloads",
+                    )
+                    helper_dbx = assess_uefi_ntfs_dbx(
+                        target_plan, cancel_check=final_dbx_cancel_check,
+                    )
+                    check_final_staged_dbx(target_plan.content, helper_dbx)
                     result = self.uefi_ntfs_writer.execute(
                         target_plan,
                         lambda update: self.bridge.progress.emit(

@@ -47,9 +47,10 @@ verification when the default verification option remains enabled.
 ISOpropyl currently has no release tarball, Flatpak, AppImage, or distribution
 package. Install Python 3, `python3-venv`, `python3-pip`, and the required host
 tools from your distribution first. Debian/Ubuntu package names commonly include
-`p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `ntfs-3g`, and
-`wimtools`; names vary across distributions. See [Requirements](#requirements)
-for which tool unlocks each capability.
+`p7zip-full`, `udisks2`, `util-linux`, `fdisk`, `dosfstools`, `ntfs-3g`,
+`wimtools`, and `pkexec`; the desktop session also needs a working PolicyKit
+authentication agent. Names vary across distributions. See
+[Requirements](#requirements) for which tool unlocks each capability.
 
 For alpha testing, run ISOpropyl from a source checkout in an isolated Python
 environment:
@@ -171,8 +172,10 @@ confirmations and expanded drive visibility are never persisted.
   flag and entries marked optional are distinguished without inventing additional
   policy semantics. Exact matches receive a default-Cancel warning in DD and ISO
   mode; ISO mode also rechecks the final descriptor-bound staged tree after
-  overlays, persistence changes, and generated boot wrappers, before any target
-  writer runs. Newly introduced matches require a second default-Cancel decision.
+  overlays, persistence changes, and generated boot wrappers, plus the selected
+  boot-reachable bridge and NTFS driver inside its pinned UEFI:NTFS helper,
+  before any target writer runs. Newly introduced matches require a second
+  default-Cancel decision.
   Incomplete or ambiguous final analysis also requires explicit default-Cancel
   consent, and “not listed” is explicitly not presented as safe, trusted,
   compatible, or bootable.
@@ -316,7 +319,7 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite contains more than 700 tests. See [CONTRIBUTING.md](CONTRIBUTING.md)
+The suite contains more than 1,000 tests. See [CONTRIBUTING.md](CONTRIBUTING.md)
 before changing any destructive path. Security vulnerabilities should follow the
 private-reporting guidance in [SECURITY.md](SECURITY.md), not a public issue.
 
