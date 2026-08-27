@@ -18,7 +18,11 @@ from isopropyl.syslinux import (
     merge_fat32_boot_sector,
     patch_ldlinux,
 )
-from isopropyl.syslinux_fat import map_root_ldlinux, prepare_syslinux_patch_from_map
+from isopropyl.syslinux_fat import (
+    map_root_ldlinux,
+    prepare_syslinux_patch_from_map,
+    prepare_syslinux_regular_file_plan,
+)
 
 
 TOTAL_SECTORS = 70_000
@@ -113,6 +117,19 @@ def patch_payloads() -> tuple[bytes, bytes]:
     boot[90:510] = bytes((index * 17) & 0xFF for index in range(420))
     boot[510:512] = b"\x55\xaa"
     return bytes(image), bytes(boot)
+
+
+def disk_mbr(*, partition_start: int = 2_048) -> bytes:
+    sector = bytearray(512)
+    sector[440:444] = b"\x12\x34\x56\x78"
+    entry = bytearray(16)
+    entry[0] = 0x80
+    entry[4] = 0x0C
+    struct.pack_into("<I", entry, 8, partition_start)
+    struct.pack_into("<I", entry, 12, TOTAL_SECTORS)
+    sector[446:462] = entry
+    sector[510:512] = b"\x55\xaa"
+    return bytes(sector)
 
 
 class Fat32MapTests(unittest.TestCase):
@@ -217,6 +234,46 @@ class Fat32MapTests(unittest.TestCase):
                     )
         self.assertEqual(result.sector_map, mapping.sectors)
         self.assertNotEqual(result.ldlinux_file, unpatched)
+
+    def test_complete_regular_disk_plan_binds_mbr_partition_and_live_fat_map(self):
+        base, boot_code = patch_payloads()
+        unpatched = base + make_empty_adv()
+        pins = {
+            "ldlinux.bss": (len(boot_code), hashlib.sha256(boot_code).hexdigest()),
+            "ldlinux.sys": (len(base), hashlib.sha256(base).hexdigest()),
+        }
+        bundle = BoundBootBundle(
+            "syslinux", "fixture", "matched-bios-payloads",
+            (
+                BoundBootArtifact("ldlinux.bss", boot_code, pins["ldlinux.bss"][1]),
+                BoundBootArtifact("ldlinux.sys", base, pins["ldlinux.sys"][1]),
+            ),
+            "GPL-2.0-or-later", "https://example.invalid/source",
+        )
+        with tempfile.TemporaryFile() as image:
+            make_image(
+                image.fileno(), file_bytes=unpatched,
+                volume_offset_sectors=2_048,
+            )
+            formatted_mbr = disk_mbr()
+            os.pwrite(image.fileno(), formatted_mbr, 0)
+            mapping = map_root_ldlinux(
+                image.fileno(), volume_offset=2_048 * 512,
+                volume_size=TOTAL_SECTORS * 512, expected_file=unpatched,
+            )
+            with patch(
+                "isopropyl.syslinux.PINNED_SYSLINUX_PAYLOADS", {"fixture": pins},
+            ), patch(
+                "isopropyl.syslinux.PINNED_SYSLINUX_PROVENANCE",
+                {"fixture": "https://example.invalid/source"},
+            ):
+                plan = prepare_syslinux_regular_file_plan(
+                    bundle, image.fileno(), mapping, directory="/isolinux",
+                )
+        self.assertEqual(plan.mapping, mapping)
+        self.assertEqual(plan.mbr.mbr[440:], formatted_mbr[440:])
+        self.assertEqual(plan.mbr.partition_sector_count, TOTAL_SECTORS)
+        self.assertEqual(plan.syslinux.sector_map, mapping.sectors)
 
     def test_rejects_disagreeing_fat_copies(self):
         with tempfile.TemporaryFile() as image:

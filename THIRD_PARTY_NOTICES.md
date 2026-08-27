@@ -189,6 +189,9 @@ does not modify the downloaded image.
 Each file has its own exact size and SHA-256 in `bootloaders-v2.json`. A matched
 bundle is accepted only when every named artifact resolves at the same exact
 version. ISOpropyl does not use Rufus's version-suffix or prefix fallback.
+The pure staging policy in `isopropyl/syslinux_staging.py` independently
+re-pins each exact `ldlinux.c32` size, SHA-256, license, and provenance before
+it may appear in a plan; it never executes the module on the Linux host.
 
 The non-destructive implementation in `isopropyl/syslinux.py` adapts the on-disk
 ADV, extent, patch-area checksum, first-sector-pointer, and FAT VBR merge formats
@@ -197,12 +200,28 @@ from Syslinux's GPL-2.0-or-later installer and Rufus's corresponding integration
 [`syslxmod.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux/libinstaller/syslxmod.c),
 [`fs.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux/libinstaller/fs.c),
 and [`syslinux.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux.c).
+It also embeds the 440-byte Syslinux 6.02 `mbr.bin` bootstrap identified by
+Rufus's ms-sys integration at pinned
+[`mbr_syslinux.h`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/ms-sys/inc/mbr_syslinux.h),
+SHA-256 `4746f74bc9b9d3d579c41988a4a29bb7ac932ad1c70470ea779ea161eb799b64`.
+An independent rebuild from official Syslinux 6.02 commit `67aaaeeb` using the
+immutable [`mbr.S`](https://git.kernel.org/pub/scm/boot/syslinux/syslinux.git/plain/mbr/mbr.S?id=67aaaeeb22832a0b82e5043877d26d1a9602bf2a)
+and [`adjust.h`](https://git.kernel.org/pub/scm/boot/syslinux/syslinux.git/plain/mbr/adjust.h?id=67aaaeeb22832a0b82e5043877d26d1a9602bf2a)
+sources produced the same bytes; the official `syslinux-6.02.tar.xz` release
+archive has SHA-256
+`afa31b7cbf72e1c0c1752a0636ba724ce01c0e374366e46e61db6862b4685478`.
+The corresponding `mbr/mbr.S` and `mbr/adjust.h` source files carry their own
+MIT permission grant; its exact copyright and permission notice is reproduced
+in [`licenses/SYSLINUX-MBR-MIT.txt`](licenses/SYSLINUX-MBR-MIT.txt).
+ISOpropyl replaces only the bootstrap region and preserves the existing MBR
+metadata tail.
 ISOpropyl reimplements those formats in Python with stricter consumer-local
 hash/provenance pins, overlap and width checks, a descriptor-only FAT32 mapper,
-and complete regular-file read-back tests. No Syslinux binary is included in the
-Python package, no downloaded payload is executed on Linux, and no device-facing
-BIOS path is enabled yet. Under GPLv3 section 13, the combined work is distributed
-under ISOpropyl's AGPL-3.0-or-later terms.
+and complete regular-file read-back tests. No version-specific `ldlinux` payload
+is included in the Python package; the small MIT-licensed MBR bootstrap is. No
+downloaded payload is executed on Linux, and no device-facing BIOS path is
+enabled yet. Under GPLv3 section 13, the combined work is distributed under
+ISOpropyl's AGPL-3.0-or-later terms.
 
 ## GRUB BIOS core-image bundles
 

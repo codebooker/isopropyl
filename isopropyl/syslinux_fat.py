@@ -22,10 +22,12 @@ from .bootloaders import BoundBootBundle
 from .syslinux import (
     SECTOR_SIZE,
     SyslinuxPatchError,
+    SyslinuxMbrResult,
     SyslinuxPatchResult,
     bind_syslinux_bundle,
     make_empty_adv,
     prepare_syslinux_patch,
+    prepare_syslinux_mbr,
 )
 
 
@@ -58,6 +60,15 @@ class Fat32FileMap:
     sectors: tuple[int, ...]
     boot_sector: bytes
     backup_boot_sector: int
+
+
+@dataclass(frozen=True)
+class SyslinuxRegularFilePlan:
+    """A complete, still non-destructive MBR/FAT32 patch byte plan."""
+
+    mapping: Fat32FileMap
+    mbr: SyslinuxMbrResult
+    syslinux: SyslinuxPatchResult
 
 
 @dataclass(frozen=True)
@@ -501,3 +512,43 @@ def prepare_syslinux_patch_from_map(
         volume_offset=fresh_mapping.volume_offset,
         directory=directory,
     )
+
+
+def prepare_syslinux_regular_file_plan(
+    bundle: BoundBootBundle,
+    descriptor: int,
+    mapping: Fat32FileMap,
+    *,
+    directory: str = "",
+) -> SyslinuxRegularFilePlan:
+    """Bind live MBR, VBR, FAT chain, and payload bytes without writing."""
+
+    syslinux = prepare_syslinux_patch_from_map(
+        bundle,
+        descriptor,
+        mapping,
+        directory=directory,
+    )
+    try:
+        before_status = os.fstat(descriptor)
+    except OSError as error:
+        raise SyslinuxPatchError(f"could not inspect the regular-file image: {error}") from error
+    if _identity(before_status) != mapping.source_identity:
+        raise SyslinuxPatchError("the regular-file image changed before its MBR was inspected")
+    formatted_mbr = _Reader(descriptor, mapping.source_identity).exact(
+        0, SECTOR_SIZE, "formatted MBR",
+    )
+    try:
+        after_status = os.fstat(descriptor)
+    except OSError as error:
+        raise SyslinuxPatchError(f"could not revalidate the regular-file image: {error}") from error
+    if _identity(after_status) != mapping.source_identity:
+        raise SyslinuxPatchError("the regular-file image changed while its MBR was inspected")
+    partition_start = mapping.volume_offset // SECTOR_SIZE
+    partition_sectors = mapping.volume_size // SECTOR_SIZE
+    mbr = prepare_syslinux_mbr(
+        formatted_mbr,
+        partition_start_sector=partition_start,
+        partition_sector_count=partition_sectors,
+    )
+    return SyslinuxRegularFilePlan(mapping, mbr, syslinux)

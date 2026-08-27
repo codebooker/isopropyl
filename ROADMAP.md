@@ -51,11 +51,13 @@ evidence.
   keep exact-match-only immutable preparation.
 - Complete the narrowly scoped Syslinux MBR/FAT installer. The exact ADV,
   extent, checksum, FAT32 VBR merge, descriptor-only FAT mapping, partition
-  offset binding, and regular-file before/after read-back harness are implemented.
-  Remaining gates are a provenance-bound MBR bootstrap, unambiguous config/C32
-  staging, bounded privileged writes, exact sector-diff validation,
-  QEMU/SeaBIOS plus OVMF, and physical certification. Do not expose payloads or
-  remove a BIOS blocker before those gates pass. GRUB BIOS follows only after
+  offset binding, regular-file before/after read-back harness, and exact
+  provenance-bound 440-byte MBR bootstrap merge are implemented. A pure,
+  exact-version config/C32 staging policy is also implemented, including
+  collision rejection and independently pinned `ldlinux.c32`. Remaining gates
+  are private-tree integration, bounded privileged writes, exact sector-diff
+  validation, QEMU/SeaBIOS plus OVMF, and physical certification. Do not expose
+  payloads or remove a BIOS blocker before those gates pass. GRUB BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced
   and verified without executing downloaded code.
 - Integrate the implemented bounded El Torito FAT tree with persistence-profile

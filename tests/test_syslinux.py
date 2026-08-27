@@ -17,12 +17,15 @@ from isopropyl.syslinux import (
     LDLINUX_MAGIC,
     PINNED_SYSLINUX_PAYLOADS,
     PINNED_SYSLINUX_PROVENANCE,
+    SYSLINUX_MBR_602,
+    SYSLINUX_MBR_602_SHA256,
     SectorExtent,
     SyslinuxPatchError,
     bind_syslinux_bundle,
     make_empty_adv,
     merge_fat32_boot_sector,
     patch_ldlinux,
+    prepare_syslinux_mbr,
     prepare_syslinux_patch,
 )
 
@@ -73,6 +76,24 @@ def vbr(**changes) -> bytes:
     return bytes(sector)
 
 
+def mbr(**changes) -> bytes:
+    sector = bytearray(512)
+    sector[440:444] = changes.get("disk_signature", b"\x12\x34\x56\x78")
+    sector[444:446] = changes.get("reserved", b"\0\0")
+    entry = bytearray(16)
+    entry[0] = changes.get("bootable", 0x80)
+    entry[1:4] = b"\x00\x02\x00"
+    entry[4] = changes.get("partition_type", 0x0C)
+    entry[5:8] = b"\xfe\xff\xff"
+    struct.pack_into("<I", entry, 8, changes.get("start", 2_048))
+    struct.pack_into("<I", entry, 12, changes.get("count", 100_000))
+    sector[446:462] = entry
+    sector[510:512] = changes.get("signature", b"\x55\xaa")
+    if changes.get("extra_partition", False):
+        sector[462:478] = entry
+    return bytes(sector)
+
+
 class AdvTests(unittest.TestCase):
     def test_empty_adv_has_two_identical_valid_copies(self):
         adv = make_empty_adv()
@@ -83,6 +104,66 @@ class AdvTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", adv, 508)[0], ADV_MAGIC3)
         values = struct.unpack("<126I", adv[4:508])
         self.assertEqual(sum(values) & 0xFFFFFFFF, ADV_MAGIC2)
+
+
+class MbrTests(unittest.TestCase):
+    def test_pinned_bootstrap_has_expected_length_and_digest(self):
+        self.assertEqual(len(SYSLINUX_MBR_602), 440)
+        self.assertEqual(
+            hashlib.sha256(SYSLINUX_MBR_602).hexdigest(),
+            SYSLINUX_MBR_602_SHA256,
+        )
+
+    def test_merges_only_bootstrap_and_preserves_all_mbr_metadata(self):
+        original = mbr()
+        result = prepare_syslinux_mbr(
+            original,
+            partition_start_sector=2_048,
+            partition_sector_count=100_000,
+        )
+        self.assertEqual(result.mbr[:440], SYSLINUX_MBR_602)
+        self.assertEqual(result.mbr[440:], original[440:])
+        self.assertEqual(result.partition_start_sector, 2_048)
+        self.assertEqual(result.partition_sector_count, 100_000)
+
+    def test_rejects_unpinned_bootstrap_and_nonexact_mbr_profiles(self):
+        changed = bytearray(SYSLINUX_MBR_602)
+        changed[0] ^= 1
+        cases = (
+            (mbr(), {"bootstrap": bytes(changed)}),
+            (mbr(bootable=0), {}),
+            (mbr(partition_type=0x0B), {}),
+            (mbr(start=4_096), {}),
+            (mbr(count=99_999), {}),
+            (mbr(extra_partition=True), {}),
+            (mbr(reserved=b"\x01\0"), {}),
+            (mbr(signature=b"\0\0"), {}),
+        )
+        for formatted, extra in cases:
+            with self.subTest(extra=extra), self.assertRaises(SyslinuxPatchError):
+                prepare_syslinux_mbr(
+                    formatted,
+                    partition_start_sector=2_048,
+                    partition_sector_count=100_000,
+                    **extra,
+                )
+
+    def test_rejects_unaddressable_or_empty_partition_plans(self):
+        for start, count in (
+            (0, 100_000),
+            (2_048, 0),
+            (2_048, -1),
+            (2_048, 0xFFFFFFFF),
+            (True, 100_000),
+        ):
+            with self.subTest(start=start, count=count), self.assertRaises(
+                SyslinuxPatchError,
+            ):
+                prepare_syslinux_mbr(
+                    mbr(start=int(start), count=max(0, min(int(count), 0xFFFFFFFF))),
+                    partition_start_sector=start,
+                    partition_sector_count=count,
+                )
 
 
 class PatchTests(unittest.TestCase):

@@ -342,11 +342,39 @@ Sector numbers remain volume-relative. Synthetic fragmented images exercise a
 complete patch/read-back loop; optional offline tests also compare both real
 pinned payloads with frozen golden hashes from the upstream algorithm.
 
-This is not authorization to write a device. A provenance-bound Syslinux MBR,
-source/config/C32 transformation policy, bounded privileged executor, exact
-post-write sector verification, QEMU/SeaBIOS and OVMF gates, and physical BIOS
-testing remain mandatory before the GUI can offer BIOS construction. Until then,
-hybrid media should use verified DD mode to preserve its existing boot layout.
+The same descriptor supplies the formatted MBR to a pure merge boundary. It
+accepts only the exact hash-pinned 440-byte Syslinux 6.02 bootstrap used by the
+pinned Rufus source, a conventional 2,048-sector start, and one active FAT32-LBA
+partition whose size exactly matches the mapped volume. Additional partitions,
+reserved-byte changes, malformed signatures, unaddressable geometry, and source
+identity drift fail closed. Only bytes 0–439 are replaced; the disk signature,
+reserved bytes, complete partition table, and MBR signature remain byte-for-byte
+unchanged.
+
+A separate pure staging policy accepts only complete, issue-free analysis for
+the exact two supported Isolinux builds. It requires one or more nonempty
+cataloged `isolinux.bin` payloads from one exact build, with either one
+authoritative root `syslinux.cfg` and one payload or exactly one nonempty
+sibling `isolinux.cfg`, `syslinux.cfg`, or `extlinux.conf` association. It never
+uses shortest-path, tie-breaking, or distribution-name heuristics. Root
+`ldlinux.sys`, ambiguous configs, links, special entries, case aliases, unsafe
+paths, and every foreign or misplaced C32 module fail closed. The policy either
+reuses byte-for-byte matching `ldlinux.c32` evidence or plans exclusive creation
+from an independently size/hash/provenance-pinned bundle; it never overwrites a
+source file. Generated redirects and every input-derived field are digest-bound
+and rebuilt during plan validation. The caller must supply immutable bytes for
+every identity source and the selected config: each loader is size-bound and
+re-identified, while the config is size/hash-bound, ASCII/control-checked, and
+rejected if it can load direct or transitive modules through `UI`, `COM32`,
+`CONFIG`, `INCLUDE`, `MENU INCLUDE`, or a `.c32` reference. Supporting those
+directives later requires parsing and pinning their full dependency closure.
+This policy still performs no filesystem mutation.
+
+This is not authorization to write a device. Descriptor-safe private-tree
+integration, a bounded privileged executor, exact post-write sector
+verification, QEMU/SeaBIOS and OVMF gates, and physical BIOS testing remain
+mandatory before the GUI can offer BIOS construction. Until then, hybrid media
+should use verified DD mode to preserve its existing boot layout.
 
 ## Boot-time corruption-check boundary
 

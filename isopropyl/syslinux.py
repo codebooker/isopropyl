@@ -36,6 +36,36 @@ _UINT16_MAX = (1 << 16) - 1
 MAX_LDLINUX_SYS_BYTES = 16 * 1024 * 1024
 _DIRECTORY_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]*\Z")
 
+# Syslinux 6.02 ``mbr.bin`` as embedded by Rufus. The 440-byte bootstrap is
+# independent of the matched 6.03/6.04 ldlinux payload and never includes disk
+# signature, reserved, partition-table, or MBR-signature bytes.
+SYSLINUX_MBR_602 = bytes.fromhex(
+    "33c0fa8ed88ed0bc007c89e606578ec0fbfcbf0006b90001f3a5ea1f0600005252b441bbaa5531c930f6f9cd"
+    "13721381fb55aa750dd1e9730966c7068d06b442eb155ab408cd1383e13f510fb6c640f7e152506631c06699"
+    "e86600e835014d697373696e67206f7065726174696e672073797374656d2e0d0a66606631d2bb007c665266"
+    "5006536a016a1089e666f736f47bc0e40688e188c592f636f87b88c608e141b801028a16fa7bcd138d641066"
+    "61c3e8c4ffbebe7dbfbe07b92000f3a5c3666089e5bbbe07b9040031c05351f6078074034089de83c310e2f3"
+    "48745b7939595b8a47043c0f7406247f3c057522668b4708668b56146601d06621d275036689c2e8acff7203"
+    "e8b6ff668b461ce8a0ff83c310e2cc6661c3e876004d756c7469706c65206163746976652070617274697469"
+    "6f6e732e0d0a668b44086603461c66894408e830ff722766813e007c5846534275096683c004e81cff721381"
+    "3efe7d55aa0f85f2febcfa7b5a5f07faffe4e81e004f7065726174696e672073797374656d206c6f61642065"
+    "72726f722e0d0a5eacb40e8a3e6204b307cd103c0a75f1cd18f4ebfd00000000000000000000000000000000"
+)
+SYSLINUX_MBR_602_SHA256 = "4746f74bc9b9d3d579c41988a4a29bb7ac932ad1c70470ea779ea161eb799b64"
+SYSLINUX_MBR_602_LICENSE = "MIT"
+SYSLINUX_MBR_602_SOURCE = (
+    "https://git.kernel.org/pub/scm/boot/syslinux/syslinux.git/plain/"
+    "mbr/mbr.S?id=67aaaeeb22832a0b82e5043877d26d1a9602bf2a"
+)
+SYSLINUX_MBR_602_RUFUS_SOURCE = (
+    "https://github.com/pbatard/rufus/blob/"
+    "2368e49a82e854d3e702f824648cc723953dbb53/src/ms-sys/inc/mbr_syslinux.h"
+)
+SYSLINUX_MBR_602_UPSTREAM_COMMIT = "67aaaeeb22832a0b82e5043877d26d1a9602bf2a"
+SYSLINUX_MBR_602_RELEASE_SHA256 = (
+    "afa31b7cbf72e1c0c1752a0636ba724ce01c0e374366e46e61db6862b4685478"
+)
+
 
 # Independently re-pin every byte accepted by this safety-critical consumer.
 # The generic catalog remains the acquisition source, but cannot silently
@@ -110,6 +140,76 @@ class SyslinuxPatchResult:
     @property
     def boot_sector_sha256(self) -> str:
         return hashlib.sha256(self.boot_sector).hexdigest()
+
+
+@dataclass(frozen=True)
+class SyslinuxMbrResult:
+    mbr: bytes
+    partition_start_sector: int
+    partition_sector_count: int
+    bootstrap_sha256: str
+
+    @property
+    def mbr_sha256(self) -> str:
+        return hashlib.sha256(self.mbr).hexdigest()
+
+
+def prepare_syslinux_mbr(
+    formatted_mbr: bytes,
+    *,
+    partition_start_sector: int,
+    partition_sector_count: int,
+    bootstrap: bytes = SYSLINUX_MBR_602,
+) -> SyslinuxMbrResult:
+    """Merge exact Syslinux code without changing bytes 440..511.
+
+    This pure helper accepts only the planned one-active-partition MBR/FAT32-LBA
+    profile. It does not open or write a disk.
+    """
+
+    if type(formatted_mbr) is not bytes or len(formatted_mbr) != SECTOR_SIZE:
+        raise SyslinuxPatchError("the formatted MBR must be exactly 512 bytes")
+    if type(bootstrap) is not bytes or len(bootstrap) != 440:
+        raise SyslinuxPatchError("the Syslinux MBR bootstrap must be exactly 440 bytes")
+    if (
+        hashlib.sha256(bootstrap).hexdigest() != SYSLINUX_MBR_602_SHA256
+        or bootstrap != SYSLINUX_MBR_602
+    ):
+        raise SyslinuxPatchError("the Syslinux MBR bootstrap does not match its pin")
+    if (
+        type(partition_start_sector) is not int
+        or partition_start_sector != 2_048
+        or type(partition_sector_count) is not int
+        or partition_sector_count <= 0
+        or partition_sector_count > _UINT32_MAX
+        or partition_start_sector + partition_sector_count > _UINT32_MAX + 1
+    ):
+        raise SyslinuxPatchError("the planned Syslinux MBR partition geometry is invalid")
+    if formatted_mbr[510:512] != b"\x55\xaa":
+        raise SyslinuxPatchError("the formatted MBR signature is missing")
+    if formatted_mbr[444:446] != b"\0\0":
+        raise SyslinuxPatchError("the formatted MBR reserved bytes are nonzero")
+
+    first = formatted_mbr[446:462]
+    if (
+        first[0] != 0x80
+        or first[4] != 0x0C
+        or struct.unpack_from("<I", first, 8)[0] != partition_start_sector
+        or struct.unpack_from("<I", first, 12)[0] != partition_sector_count
+    ):
+        raise SyslinuxPatchError("the formatted MBR does not match the active FAT32 plan")
+    if formatted_mbr[462:510] != b"\0" * 48:
+        raise SyslinuxPatchError("the formatted MBR contains additional partitions")
+
+    merged = bootstrap + formatted_mbr[440:]
+    if merged[440:] != formatted_mbr[440:] or merged[510:512] != b"\x55\xaa":
+        raise SyslinuxPatchError("the MBR metadata changed while merging boot code")
+    return SyslinuxMbrResult(
+        merged,
+        partition_start_sector,
+        partition_sector_count,
+        SYSLINUX_MBR_602_SHA256,
+    )
 
 
 def bind_syslinux_bundle(bundle: BoundBootBundle) -> SyslinuxPayloads:

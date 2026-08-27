@@ -176,10 +176,17 @@ confirmations and expanded drive visibility are never persisted.
   patch formats in a non-destructive regular-file harness. The harness binds
   pinned payload bytes to a descriptor-derived FAT chain, checks every consulted
   entry in both FAT copies, primary/backup VBRs, FSInfo, partition offset,
-  configuration path,
-  and complete before/after file hashes. It is groundwork, not a GUI/device BIOS
-  writer: MBR bootstrap provenance, privileged writes, QEMU, and physical boot
-  certification still gate that feature.
+  configuration path, and complete before/after file hashes. It also pins the
+  exact 440-byte Syslinux 6.02 MBR bootstrap used by Rufus, reads the formatted
+  MBR from the same live descriptor, validates one active FAT32-LBA partition,
+  and preserves the disk signature, partition table, and boot signature. It is
+  paired with a pure, exact-version staging policy that re-identifies the
+  size-bound `isolinux.bin` source bytes, hashes the selected ASCII config,
+  rejects recursive/module-loading directives and foreign C32 modules,
+  preserves an authoritative root config or generates a canonical redirect,
+  and binds the matching hash-pinned `ldlinux.c32`. It is groundwork, not a
+  GUI/device BIOS writer: private-tree integration, privileged writes, QEMU,
+  and physical boot certification still gate that feature.
 - Parse El Torito BIOS/UEFI entries, including the bounded embedded-FAT subset,
   and inspect EFI PE architecture, certificate framing, and SBAT. A sealed,
   resource-limited worker can report embedded
@@ -332,8 +339,9 @@ CI currently exercises the non-destructive suite on an Ubuntu x86-64 runner with
 Python 3.12; device-facing tests mock block devices and privileged commands and
 never write a real drive. Broad distro, desktop, Wayland/X11, firmware, Secure
 Boot, card-reader, and physical-media testing is still required. BIOS options
-remain intentionally hidden until the regular-file Syslinux work has a pinned
-MBR bootstrap, a bounded writer, QEMU/SeaBIOS results, and physical evidence.
+remain intentionally hidden until the regular-file Syslinux work has bounded
+private-tree integration and device writes, QEMU/SeaBIOS results, and physical
+evidence.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
 and [ROADMAP.md](ROADMAP.md).
