@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .backup import DriveImager
+from .bootloaders import delete_cached_artifacts, inventory_cache
 from .casper_media import (
     CasperMediaCancelled, CasperMediaExecutor, CasperStagingExecutor,
     build_casper_media_plan, build_casper_staging_plan,
@@ -359,7 +360,7 @@ class Window(QMainWindow):
     def choose_image(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self, "Choose a disk image", str(Path.home()),
-            "Disk images (*.iso *.img *.vhd *.vhdx *.qcow *.qcow2 *.gz *.gzip *.bz2 *.bzip2 *.xz *.lzma *.zst *.zstd *.Z *.z *.zip);;All files (*)",
+            "Disk images (*.iso *.img *.raw *.usb *.wic *.vhd *.vhdx *.qcow *.qcow2 *.gz *.gzip *.bz2 *.bzip2 *.xz *.lzma *.zst *.zstd *.Z *.z *.zip);;All files (*)",
         )
         if filename:
             self.load_image(Path(filename))
@@ -1289,6 +1290,8 @@ class Window(QMainWindow):
         filesystem.addItem("FAT32 — widest device compatibility", FormatFilesystem.FAT32)
         filesystem.addItem("exFAT — large files and cross-platform use", FormatFilesystem.EXFAT)
         filesystem.addItem("NTFS — Windows-focused", FormatFilesystem.NTFS)
+        filesystem.addItem("ext2 — legacy Linux compatibility", FormatFilesystem.EXT2)
+        filesystem.addItem("ext3 — journaled legacy Linux", FormatFilesystem.EXT3)
         filesystem.addItem("ext4 — Linux-focused", FormatFilesystem.EXT4)
         layout.addWidget(filesystem)
         layout.addWidget(QLabel("Partition table"))
@@ -2725,6 +2728,10 @@ class Window(QMainWindow):
         clear_ignored = QPushButton("Clear ignored-drive list")
         clear_ignored.setEnabled(bool(ignored))
         layout.addWidget(clear_ignored)
+        layout.addWidget(QLabel("Downloaded boot helpers"))
+        manage_cache = QPushButton("Manage downloaded boot helpers…")
+        manage_cache.clicked.connect(lambda: self.show_bootloader_cache(dialog))
+        layout.addWidget(manage_cache)
         reset_all = QPushButton("Reset all ISOpropyl settings")
         layout.addWidget(reset_all)
         clear_requested = False
@@ -2786,6 +2793,121 @@ class Window(QMainWindow):
 
         buttons.accepted.connect(save)
         buttons.rejected.connect(dialog.reject)
+        dialog.exec()
+
+    def show_bootloader_cache(self, parent: QWidget | None = None) -> None:
+        dialog = QDialog(parent or self)
+        dialog.setWindowTitle("Downloaded boot helpers")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel()
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        details = QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setMaximumHeight(190)
+        layout.addWidget(details)
+        note = QLabel(
+            "Only exact paths named by ISOpropyl's bundled, hash-pinned catalog are "
+            "shown or removed. Unknown files, links, and unsafe entries are left untouched."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        delete_button = buttons.addButton(
+            "Delete safe cached helpers…", QDialogButtonBox.ButtonRole.DestructiveRole,
+        )
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        current = None
+
+        def refresh() -> bool:
+            nonlocal current
+            try:
+                current = inventory_cache()
+            except Exception as error:
+                summary.setText("The boot-helper cache could not be inspected.")
+                details.setPlainText(str(error))
+                delete_button.setEnabled(False)
+                return False
+            count = len(current.artifacts)
+            if count:
+                noun = "helper" if count == 1 else "helpers"
+                summary.setText(
+                    f"{count} cataloged {noun} · {format_size(current.total_size)} cached · "
+                    f"{format_size(current.deletable_size)} safe to delete"
+                )
+                lines = []
+                for artifact in current.artifacts:
+                    status = "Verified" if artifact.hash_valid else "Invalid or incomplete"
+                    if not artifact.deletion_safe:
+                        status = "Unsafe entry — will not be deleted"
+                    if artifact.issue:
+                        status = f"{status}: {artifact.issue}"
+                    lines.append(
+                        f"{artifact.family} {artifact.version} · {artifact.name} · "
+                        f"{format_size(artifact.size)} · {status}"
+                    )
+                if current.issues:
+                    lines.extend(f"Cache notice: {issue}" for issue in current.issues)
+                details.setPlainText("\n".join(lines))
+            else:
+                summary.setText("No cataloged boot helpers are cached.")
+                details.setPlainText(
+                    "A verified helper may be downloaded later only after explicit consent."
+                )
+            delete_button.setEnabled(any(
+                artifact.deletion_safe for artifact in current.artifacts
+            ))
+            return True
+
+        def delete_cache() -> None:
+            if current is None:
+                return
+            keys = tuple(
+                (artifact.family, artifact.version, artifact.name)
+                for artifact in current.artifacts if artifact.deletion_safe
+            )
+            if not keys:
+                return
+            answer = QMessageBox.question(
+                dialog,
+                "Delete downloaded boot helpers?",
+                f"Delete {len(keys)} cataloged cached helper(s) representing "
+                f"{format_size(current.deletable_size)} of logical file data?\n\n"
+                "ISOpropyl will ask before downloading a required helper again. "
+                "Unknown or unsafe cache entries will not be touched.",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                result = delete_cached_artifacts(keys)
+            except Exception as error:
+                QMessageBox.critical(dialog, "Cache deletion failed", str(error))
+                return
+            skipped = len(result.skipped)
+            message = (
+                f"Deleted {len(result.deleted)} helper(s), representing "
+                f"{format_size(result.bytes_deleted)} of logical file data."
+            )
+            if skipped or result.issues:
+                reasons = [item.reason for item in result.skipped]
+                reasons.extend(result.issues)
+                QMessageBox.warning(
+                    dialog,
+                    "Boot-helper cache partially cleared",
+                    message + "\n\n" + "\n".join(reasons),
+                )
+            else:
+                QMessageBox.information(dialog, "Boot-helper cache cleared", message)
+            refresh()
+
+        delete_button.clicked.connect(delete_cache)
+        refresh()
         dialog.exec()
 
     def configure_windows(self) -> None:

@@ -49,6 +49,8 @@ class Filesystem(str, Enum):
     FAT32 = "fat32"
     EXFAT = "exfat"
     NTFS = "ntfs"
+    EXT2 = "ext2"
+    EXT3 = "ext3"
     EXT4 = "ext4"
 
 
@@ -156,6 +158,8 @@ _MKFS_NAMES: Mapping[Filesystem, str] = {
     Filesystem.FAT32: "mkfs.vfat",
     Filesystem.EXFAT: "mkfs.exfat",
     Filesystem.NTFS: "mkfs.ntfs",
+    Filesystem.EXT2: "mkfs.ext2",
+    Filesystem.EXT3: "mkfs.ext3",
     Filesystem.EXT4: "mkfs.ext4",
 }
 
@@ -163,6 +167,8 @@ _MBR_TYPES: Mapping[Filesystem, str] = {
     Filesystem.FAT32: "c",
     Filesystem.EXFAT: "7",
     Filesystem.NTFS: "7",
+    Filesystem.EXT2: "83",
+    Filesystem.EXT3: "83",
     Filesystem.EXT4: "83",
 }
 
@@ -170,6 +176,8 @@ _GPT_TYPES: Mapping[Filesystem, str] = {
     Filesystem.FAT32: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     Filesystem.EXFAT: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     Filesystem.NTFS: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+    Filesystem.EXT2: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+    Filesystem.EXT3: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
     Filesystem.EXT4: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
 }
 
@@ -273,9 +281,13 @@ def validate_label(filesystem: Filesystem | str, label: str) -> str:
             raise FormatValidationError("The NTFS label contains an unsupported character")
     else:
         if len(label.encode("utf-8")) > 16:
-            raise FormatValidationError("ext4 labels can be at most 16 UTF-8 bytes")
+            raise FormatValidationError(
+                f"{fs.value} labels can be at most 16 UTF-8 bytes"
+            )
         if "/" in label:
-            raise FormatValidationError("The ext4 label cannot contain a slash")
+            raise FormatValidationError(
+                f"The {fs.value} label cannot contain a slash"
+            )
     return label
 
 

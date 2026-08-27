@@ -23,6 +23,7 @@ from .virtual import inspect_virtual_disk
 Progress = Callable[[int, int], None]
 
 CHECKSUM_LENGTHS = {32: "MD5", 40: "SHA-1", 64: "SHA-256", 128: "SHA-512"}
+RAW_IMAGE_SUFFIXES = frozenset({".img", ".raw", ".usb", ".wic"})
 VIRTUAL_SUFFIXES = frozenset({".vhd", ".vhdx", ".qcow", ".qcow2"})
 NON_RAW_SUFFIXES = frozenset({".wim", ".esd", ".ffu", ".vtsi"})
 COMPRESSION_SUFFIXES = frozenset({
@@ -270,7 +271,14 @@ def inspect_image(path: Path) -> ImageInspection:
     volume_label = ""
     if is_iso9660 and len(descriptor) >= 72:
         volume_label = descriptor[40:72].decode("ascii", errors="replace").strip()
-    kind = "Optical ISO" if is_iso9660 or path.suffix.casefold() == ".iso" else "Raw image"
+    if is_iso9660 or suffix == ".iso":
+        kind = "Optical ISO"
+    elif suffix in RAW_IMAGE_SUFFIXES:
+        kind = "Raw disk image"
+    else:
+        # Keep accepting explicitly chosen unknown regular files as raw bytes;
+        # structured formats above remain a fail-closed denylist.
+        kind = "Raw image"
     members, contents_scanned = scan_image_contents(path) if not source.compressed else ([], False)
     modes, architectures, bootloader, windows_installer = classify_boot_paths(
         [member.path for member in members]

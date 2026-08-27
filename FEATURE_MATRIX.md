@@ -23,17 +23,17 @@ Status meanings:
 | Raw `.img`/DD writing | **Done** | Identity-bound whole-device writing, cancellation, progress, optional byte read-back verification, and power-off. |
 | Bootable hybrid ISO writing | **Done** | DD mode preserves the supplied disk layout; non-hybrid optical ISOs receive a warning. |
 | Rufus-style ISO extraction mode | **Partial** | Reachable UEFI-only GPT/FAT32 and GPT/NTFS+UEFI:NTFS paths safely stage, format, copy, and SHA-256 read-back verify every file; the raw helper receives a separate full read-back check. BIOS, dual firmware, links, and embedded El Torito images remain. |
-| Restore USB as ordinary storage | **Done** | MBR/GPT plus FAT32, exFAT, NTFS, or ext4 with label validation and identity rechecks. |
+| Restore USB as ordinary storage | **Done** | MBR/GPT plus FAT32, exFAT, NTFS, ext2, ext3, or ext4 with label validation and identity rechecks. |
 | FAT/FAT32 formatting | **Partial** | FAT32 ships; FAT12/FAT16 and expert cluster-size controls do not. |
 | NTFS and exFAT formatting | **Done** | Available in the separate restore workflow through trusted system mkfs tools. |
-| ext2/ext3/ext4 formatting | **Partial** | ext4 ships; ext2/ext3 are not exposed. |
+| ext2/ext3/ext4 formatting | **Done** | All three are exposed in the separate restore workflow through their exact trusted `mkfs.ext*` tools, with MBR/GPT Linux partition types and 16-byte label validation. |
 | UDF formatting | **Planned** | Useful for UDF image/export workflows; not present. |
 | ReFS formatting | **Inapplicable** | No mature supported native Linux creation stack. |
 | Super-floppy layout | **Research** | Whole-device filesystem compatibility needs an explicit hardware matrix. |
 | Removable USB/SD/card readers | **Partial** | USB/MMC removable devices are recognized; broad reader/SDXC certification is not claimed. |
 | USB HDD/SSD targets | **Done** | Hidden by default, explicitly revealable, second warning; internal and root disks remain forbidden. |
 | Compressed images | **Done** | Streaming gzip, bzip2, xz/lzma, zstd, legacy `.Z`, and single-file ZIP/ZIP64. Expansion is bounded. |
-| Raw `.usb`/`.wic` aliases | **Partial** | “All files” can accept raw bytes, but extension-specific fixtures/admission rules are absent. |
+| Raw `.usb`/`.wic` aliases | **Done** | Both extensions are explicit raw-disk aliases in inspection and the image chooser, with fixtures covering case-insensitive admission; structured apply formats remain rejected. |
 | VHD/VHDX/QCOW/QCOW2 input | **Done** | Identity-bound `qemu-img` inspection/conversion; backing files, encryption, corruption metadata, and unsafe output are rejected. |
 | Compressed virtual containers | **Planned** | Explicitly rejected until decode→inspect→convert can be safely chained. |
 | FFU and VTSI input | **Planned** | Explicitly rejected rather than raw-written; requires real format/platform validation. |
@@ -113,7 +113,7 @@ Status meanings:
 | Show USB hard drives/SSDs | **Done** | Visible explicit opt-in; root/internal disks remain excluded. |
 | Partition scheme selector | **Partial** | MBR/GPT available for restore; current ISO profile fixes GPT. |
 | Target firmware selector | **Partial** | Planner models automatic/BIOS/UEFI/both; GUI executes explicit UEFI-only. |
-| Filesystem selector | **Partial** | Restore offers FAT32/exFAT/NTFS/ext4; ISO mode automatically selects FAT32 or NTFS+UEFI:NTFS from image constraints rather than exposing an unsafe arbitrary choice. |
+| Filesystem selector | **Partial** | Restore offers FAT32/exFAT/NTFS/ext2/ext3/ext4; ISO mode automatically selects FAT32 or NTFS+UEFI:NTFS from image constraints rather than exposing an unsafe arbitrary choice. |
 | Cluster-size selector | **Planned** | Must be constrained by filesystem and boot profile. |
 | Volume label | **Done** | Filesystem-specific validation in restore; ISO mode uses `ISOPROPYL`. |
 | Quick format | **Done** | Restore and ISO construction use quick mkfs; full zero is separate. |
@@ -145,7 +145,7 @@ Status meanings:
 | Blank Syslinux/GRUB/Grub4DOS/ReactOS/UEFI:NTFS media | **Planned** | After verified payload catalog and construction profiles. |
 | Rufus MBR / “press any key” toggles | **Planned** | Belongs to Windows BIOS construction. |
 | Cycle/reset selected USB port | **Research** | Only if UDisks/sysfs semantics are safe and portable. |
-| Delete downloaded boot files | **Planned** | The verified UEFI:NTFS cache has no management UI yet. |
+| Delete downloaded boot files | **Done** | Settings inventories only exact catalog-known cache paths and deletes explicitly confirmed, filesystem-safe regular files through no-follow directory descriptors. Unknown, linked, or changed entries remain untouched; corrupt or incomplete copies can be safely cleared. |
 | Dual BIOS+UEFI Windows mode | **Planned** | Normal future profile, not a hidden cheat key. |
 | List internal/non-removable disks | **Policy** | Internal disks remain rejected; eSATA/Thunderbolt may need narrowly tested rules. |
 | List loop/NBD/virtual targets | **Policy** | Kept out of the physical target picker. |

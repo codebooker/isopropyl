@@ -86,7 +86,7 @@ ISOpropyl warns before enabling this option, and S-mode media should not use it.
 
 - Save a complete removable drive as an atomic raw image backup.
 - Capture readable optical media to ISO without modifying the disc.
-- Restore a drive as FAT32, exFAT, NTFS, or ext4 using MBR or GPT.
+- Restore a drive as FAT32, exFAT, NTFS, ext2, ext3, or ext4 using MBR or GPT.
 - Run destructive bad-block passes and F3 fake-capacity probes as separate,
   heavily warned workflows.
 - Zero the full device or only its boundary metadata regions.
@@ -120,7 +120,7 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and security invariants.
 |---|---|---|
 | Hybrid `.iso` | DD mode | Preserves the image's existing disk layout. |
 | UEFI `.iso` | ISO mode | GPT/FAT32 when every file fits; GPT/NTFS plus a pinned UEFI:NTFS bridge for x64, x86, ARM64, and explicitly consented unsigned ARM32/RISC-V64 large-file media. |
-| `.img` and raw disk images | DD mode | Exact image bytes are written. |
+| `.img`, `.raw`, `.usb`, `.wic`, and raw disk images | DD mode | Exact image bytes are written. `.usb` and Yocto-style `.wic` files are treated as raw disk images, not structured installers. |
 | Compressed raw images | Streaming DD | Formats listed above; ZIP must contain exactly one regular image. |
 | VHD/VHDX/QCOW/QCOW2 | Convert, then DD | Requires `qemu-img`; backing files and encrypted containers are rejected. |
 
@@ -146,7 +146,7 @@ Optional tools unlock additional workflows:
 | Capability | Tool |
 |---|---|
 | VHD/VHDX/QCOW/QCOW2 | `qemu-img` |
-| NTFS ISO mode and NTFS/exFAT/ext4 restore | `mkfs.ntfs`, `mkfs.exfat`, `mkfs.ext4` |
+| NTFS ISO mode and NTFS/exFAT/ext2/ext3/ext4 restore | `mkfs.ntfs`, `mkfs.exfat`, `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` |
 | Experimental matched Ubuntu persistence profile | `mkfs.ext4` |
 | Surface and fake-capacity tests | `badblocks`, `f3probe` |
 | Additional ISO inspection | `xorriso` |
@@ -188,7 +188,11 @@ Debian/Ubuntu-family systems, the relevant package names commonly include
 The first UEFI:NTFS use asks permission to download a 1 MiB helper from its
 release-pinned Rufus source URL. ISOpropyl verifies the exact byte count and
 SHA-256 before it can reach a destructive operation, caches it locally, and
-revalidates the cache on every use.
+revalidates the cache on every use. **Settings → Manage downloaded boot
+helpers…** inventories catalog-known cache entries and can remove filesystem-safe
+regular files—including corrupt or incomplete copies. Unknown paths, links,
+hard-linked files, and entries that change during inspection are deliberately
+left untouched.
 
 > [!IMPORTANT]
 > Run ISOpropyl as your normal desktop user. It requests narrowly scoped

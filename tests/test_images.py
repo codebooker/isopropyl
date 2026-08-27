@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from isopropyl.images import (
-    boot_identity_fields, calculate_checksums, classify_boot_paths, compare_expected_checksum,
+    NON_RAW_SUFFIXES, RAW_IMAGE_SUFFIXES, boot_identity_fields,
+    calculate_checksums, classify_boot_paths, compare_expected_checksum,
     inspect_image, parse_7z_listing, parse_expected_checksum,
 )
 from isopropyl.boot_identity import analyze_bootloader_members
@@ -110,6 +111,24 @@ Symbolic Link = boot/grub
                     path.write_bytes(b"not a raw disk")
                     with self.assertRaisesRegex(OSError, "cannot be written|not accepted"):
                         inspect_image(path)
+
+    def test_usb_and_wic_are_explicit_raw_disk_image_aliases(self):
+        self.assertTrue({".usb", ".wic"}.issubset(RAW_IMAGE_SUFFIXES))
+        self.assertTrue(RAW_IMAGE_SUFFIXES.isdisjoint(NON_RAW_SUFFIXES))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("appliance.usb", "yocto.wic", "UPPER.USB", "UPPER.WIC"):
+                with self.subTest(name=name):
+                    path = root / name
+                    payload = bytearray(4096)
+                    payload[510:512] = b"\x55\xaa"
+                    path.write_bytes(payload)
+                    with patch("isopropyl.images.scan_image_contents", return_value=([], False)):
+                        result = inspect_image(path)
+                    self.assertEqual(result.kind, "Raw disk image")
+                    self.assertEqual(result.size, len(payload))
+                    self.assertTrue(result.has_mbr)
+                    self.assertTrue(result.raw_compatible)
 
     def test_all_checksums_are_calculated_in_one_pass(self):
         with tempfile.TemporaryDirectory() as directory:

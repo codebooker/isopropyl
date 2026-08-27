@@ -39,7 +39,6 @@ evidence.
 - Populate GRUB/Syslinux catalog entries only with license-reviewed,
   upstream-provenanced payloads, signed release metadata, exact sizes and hashes;
   preserve the same consent and pre-use checks already used by UEFI:NTFS.
-- Add cache inspection/deletion UI for verified boot artifacts.
 - Add bounded support for the embedded UEFI GRUB configuration used by current
   official Ubuntu media, rather than assuming a synthetic extracted path. Then
   hardware-certify the immutable Casper workflow across 512- and 4096-byte
@@ -66,8 +65,8 @@ evidence.
   discovery to any future host probes that could delay the UI.
 - Localization, system/high-contrast appearance, keyboard and screen-reader QA.
 - Conflicting-process diagnostics and narrowly bounded I/O retries.
-- Cluster size, filesystem, partition-layout, and volume-label controls where the
-  selected boot profile can support them safely.
+- Cluster size, additional filesystem, partition-layout, and volume-label controls
+  where the selected boot profile can support them safely.
 - Flatpak/AppImage feasibility work, native distro packages, portable settings,
   release signatures, SBOMs, and reproducibility attestations.
 

@@ -10,11 +10,18 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QMessageBox, QPlainTextEdit, QPushButton,
+)
 
 from isopropyl.app import PendingIsoWrite, Window
+from isopropyl.bootloaders import (
+    BootloaderCacheDeletionResult, BootloaderCacheInventory, CacheDeletion,
+    CachedBootloaderArtifact,
+)
 from isopropyl.casper_media import supported_casper_profile
 from isopropyl.devices import Device
+from isopropyl.formatting import Filesystem as FormatFilesystem
 from isopropyl.images import ImageInspection, ImageMember
 from isopropyl.iso import WriteMode
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
@@ -103,6 +110,118 @@ class ImmediateThread:
         self.target()
 
 
+class RestoreFilesystemDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        with patch("isopropyl.app.list_devices", return_value=[]):
+            self.window = Window()
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+
+    def tearDown(self) -> None:
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+
+    def test_restore_selector_exposes_ext2_ext3_and_ext4(self):
+        observed = []
+
+        def inspect_dialog(dialog) -> int:
+            combo = next(
+                candidate for candidate in dialog.findChildren(QComboBox)
+                if any(
+                    candidate.itemData(index) is FormatFilesystem.EXT2
+                    for index in range(candidate.count())
+                )
+            )
+            observed.extend(combo.itemData(index) for index in range(combo.count()))
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect_dialog):
+            self.window.format_drive()
+        self.assertEqual(
+            observed,
+            [
+                FormatFilesystem.FAT32, FormatFilesystem.EXFAT,
+                FormatFilesystem.NTFS, FormatFilesystem.EXT2,
+                FormatFilesystem.EXT3, FormatFilesystem.EXT4,
+            ],
+        )
+
+
+class BootloaderCacheDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        with patch("isopropyl.app.list_devices", return_value=[]):
+            self.window = Window()
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+
+    def tearDown(self) -> None:
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+
+    def test_cache_dialog_deletes_only_inventory_entries_marked_safe(self):
+        safe = CachedBootloaderArtifact(
+            "uefi-ntfs", "2.8", "uefi-ntfs.img", 1024, True, True,
+        )
+        unsafe = CachedBootloaderArtifact(
+            "grub", "2.12", "core.img", 2048, False, False,
+            "The path is a symbolic link",
+        )
+        populated = BootloaderCacheInventory((safe, unsafe), 3072, 1024)
+        empty = BootloaderCacheInventory((), 0, 0)
+        deletion = BootloaderCacheDeletionResult(
+            (CacheDeletion("uefi-ntfs", "2.8", "uefi-ntfs.img", 1024),),
+            (), 1024,
+        )
+        observed: dict[str, str] = {}
+
+        def exercise(dialog) -> int:
+            observed["details"] = "\n".join(
+                widget.toPlainText()
+                for widget in dialog.findChildren(QPlainTextEdit)
+            )
+            delete_buttons = [
+                button for button in dialog.findChildren(QPushButton)
+                if button.text() == "Delete safe cached helpers…"
+            ]
+            self.assertEqual(len(delete_buttons), 1)
+            self.assertTrue(delete_buttons[0].isEnabled())
+            delete_buttons[0].click()
+            return 0
+
+        with (
+            patch(
+                "isopropyl.app.inventory_cache", side_effect=(populated, empty),
+            ),
+            patch("isopropyl.app.delete_cached_artifacts", return_value=deletion) as delete,
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.QMessageBox.information") as information,
+            patch("isopropyl.app.QDialog.exec", new=exercise),
+        ):
+            self.window.show_bootloader_cache()
+
+        self.assertIn("uefi-ntfs 2.8", observed["details"])
+        self.assertIn("Verified", observed["details"])
+        self.assertIn("Unsafe entry", observed["details"])
+        delete.assert_called_once_with((("uefi-ntfs", "2.8", "uefi-ntfs.img"),))
+        information.assert_called_once()
+
+
 class WindowWriteMethodTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -143,6 +262,18 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.verify.isEnabled())
         self.assertEqual(self.window.write_button.text(), "Write in ISO mode")
         self.assertTrue(self.window.write_button.isEnabled())
+
+    def test_image_chooser_advertises_raw_aliases_not_structured_apply_formats(self):
+        with patch(
+            "isopropyl.app.QFileDialog.getOpenFileName", return_value=("", ""),
+        ) as chooser:
+            self.window.choose_image()
+
+        image_filter = chooser.call_args.args[3]
+        for pattern in ("*.img", "*.raw", "*.usb", "*.wic"):
+            self.assertIn(pattern, image_filter)
+        for pattern in ("*.wim", "*.esd", "*.ffu", "*.vtsi"):
+            self.assertNotIn(pattern, image_filter)
 
     def test_explicit_dd_selection_remains_visible_and_changes_dispatch_label(self):
         self.window.rebuild_write_recommendation(preserve_selection=False)

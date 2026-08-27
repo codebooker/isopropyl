@@ -125,10 +125,14 @@ class FormatPlanTests(unittest.TestCase):
         self.assertEqual(validate_label("fat32", "ELEVENCHARS"), "ELEVENCHARS")
         self.assertEqual(validate_label("exfat", "portable"), "portable")
         self.assertEqual(validate_label("ntfs", "Windows media"), "Windows media")
+        self.assertEqual(validate_label("ext2", "Linux media"), "Linux media")
+        self.assertEqual(validate_label("ext3", "Linux media"), "Linux media")
         self.assertEqual(validate_label("ext4", "Linux media"), "Linux media")
         for filesystem, label in (
             ("fat32", "twelve-chars"), ("fat32", "BAD:LABEL"),
             ("exfat", "x" * 16), ("ntfs", "x" * 33),
+            ("ext2", "0123456789abcdefg"), ("ext2", "bad/label"),
+            ("ext3", "0123456789abcdefg"), ("ext3", "bad/label"),
             ("ext4", "0123456789abcdefg"), ("ext4", "bad/label"),
         ):
             with self.subTest(filesystem=filesystem, label=label):
@@ -137,13 +141,20 @@ class FormatPlanTests(unittest.TestCase):
 
     def test_partition_scripts_have_explicit_table_alignment_and_type(self):
         fat_mbr = create_format_plan(test_device(), "fat32", "mbr")
-        ext_gpt = create_format_plan(test_device(), "ext4", "gpt")
         self.assertEqual(
             partition_script(fat_mbr),
             b"label: dos\nunit: sectors\n\nstart=2048, type=c\n",
         )
-        self.assertIn(b"label: gpt", partition_script(ext_gpt))
-        self.assertIn(b"0FC63DAF-8483-4772-8E79-3D69D8477DE4", partition_script(ext_gpt))
+        for filesystem in ("ext2", "ext3", "ext4"):
+            with self.subTest(filesystem=filesystem):
+                ext_mbr = create_format_plan(test_device(), filesystem, "mbr")
+                ext_gpt = create_format_plan(test_device(), filesystem, "gpt")
+                self.assertIn(b"type=83", partition_script(ext_mbr))
+                self.assertIn(b"label: gpt", partition_script(ext_gpt))
+                self.assertIn(
+                    b"0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+                    partition_script(ext_gpt),
+                )
 
     def test_commands_are_argv_and_labels_remain_single_arguments(self):
         plan = create_format_plan(test_device(), "fat32", "mbr", "MY USB")
@@ -171,17 +182,38 @@ class FormatPlanTests(unittest.TestCase):
                 plan = create_format_plan(device, "ext4", "gpt")
                 self.assertEqual(format_command(plan, TOOLS, partition_path)[-1], partition_path)
 
-    def test_mkfs_flags_for_exfat_ntfs_and_ext4(self):
-        for filesystem, expected in (
-            ("exfat", ["-L", "USB"]),
-            ("ntfs", ["-f", "-L", "USB"]),
-            ("ext4", ["-F", "-L", "USB"]),
+    def test_mkfs_flags_and_trusted_tools_for_each_non_fat_filesystem(self):
+        for filesystem, tool, expected in (
+            ("exfat", "/usr/sbin/mkfs.exfat", ["-L", "USB"]),
+            ("ntfs", "/usr/sbin/mkfs.ntfs", ["-f", "-L", "USB"]),
+            ("ext2", "/usr/sbin/mkfs.ext2", ["-F", "-L", "USB"]),
+            ("ext3", "/usr/sbin/mkfs.ext3", ["-F", "-L", "USB"]),
+            ("ext4", "/usr/sbin/mkfs.ext4", ["-F", "-L", "USB"]),
         ):
-            tools = FormatTools(*TOOLS.__dict__.values())
+            tools = FormatTools(
+                TOOLS.pkexec, TOOLS.udisksctl, TOOLS.sfdisk, TOOLS.partprobe,
+                TOOLS.udevadm, TOOLS.lsblk, tool,
+            )
             plan = create_format_plan(test_device(), filesystem, "gpt", "USB")
             command = format_command(plan, tools, "/dev/sdz1")
+            self.assertEqual(command[1], tool)
             for argument in expected:
                 self.assertIn(argument, command)
+
+    def test_ext2_and_ext3_resolve_their_exact_mkfs_tools(self):
+        for filesystem in ("ext2", "ext3"):
+            with self.subTest(filesystem=filesystem):
+                requested = []
+
+                def finder(name):
+                    requested.append(name)
+                    return f"/usr/bin/{name}"
+
+                plan = create_format_plan(test_device(), filesystem, "mbr", "LINUX")
+                tools = resolve_tools(plan, finder)
+                self.assertEqual(tools.mkfs, f"/usr/bin/mkfs.{filesystem}")
+                self.assertIn(f"mkfs.{filesystem}", requested)
+                self.assertNotIn("mkfs.ext4", requested)
 
     def test_missing_tools_are_reported_together(self):
         plan = create_format_plan(test_device(), "exfat", "gpt")
@@ -601,6 +633,27 @@ class FormatExecutorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(stages[-1], "Complete")
+
+    def test_ext2_and_ext3_mkfs_are_whole_device_locked(self):
+        for filesystem in ("ext2", "ext3"):
+            with self.subTest(filesystem=filesystem):
+                before = len(self.processes)
+                plan = create_format_plan(
+                    self.device, filesystem, "gpt", "LINUX",
+                )
+                self.executor.execute(self.device, plan)
+                spawned = self.processes[before:]
+                mkfs = next(
+                    process.argv for process in spawned
+                    if any(
+                        argument.endswith(f"/mkfs.{filesystem}")
+                        for argument in process.argv
+                    )
+                )
+                self.assertEqual(mkfs[1], "/usr/bin/flock")
+                self.assertEqual(mkfs[7], self.device.path)
+                self.assertEqual(mkfs[8], f"/usr/bin/mkfs.{filesystem}")
+                self.assertEqual(mkfs[-1], "/dev/sdz1")
 
     def test_preflight_missing_tool_never_unmounts_or_spawns(self):
         executor = FormatExecutor(

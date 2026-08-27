@@ -41,7 +41,11 @@ issue requesting a private contact channel without disclosing the vulnerability.
   origins and redirects, checks exact length and SHA-256, publishes the cache
   atomically, and verifies it again before every use. The privileged writer
   receives already-bound bytes through standard input and never opens a
-  user-controlled cache pathname.
+  user-controlled cache pathname. Cache management considers only exact
+  catalog-known paths opened through no-follow directory descriptors; deletion
+  skips links, multiply linked files, and anything whose identity or metadata
+  changes between inspection and unlink. Corrupt catalog-known regular files
+  remain removable so a failed download cannot become permanent cache debris.
 - Windows customization can be injected only through the UEFI ISO staging path;
   an existing answer file is never overwritten. A selected WIM/ESD index is
   re-inspected and bound to its source catalog, size, architecture, and edition
