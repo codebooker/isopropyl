@@ -409,14 +409,49 @@ after the first write the bounded verification completes without a cancellation
 point. A write, sync, read-back, identity, map, or whole-image failure returns no
 result and poisons the unpublished anonymous image, which must be closed and
 discarded. The transaction deliberately attempts no unverifiable rollback.
+If cancellation arrives after that internal transaction returns but while the
+owner is independently reparsing or rehashing, the owner poisons and closes the
+still-unpublished image instead of enabling streaming.
 
-This is not authorization to write a device. A production-owned FAT32 image
-builder must still prove that formatting/copying is complete and all mounts,
-loop associations, and cached filesystem writers are detached before handing
-over its anonymous descriptor. A privileged executor, exact device read-back,
-QEMU/SeaBIOS and OVMF gates, and physical BIOS testing remain mandatory before
-the GUI can offer BIOS construction. Until then, hybrid media should use
-verified DD mode to preserve its existing boot layout.
+The transaction is now preceded by a production-owned, pathless image builder.
+It accepts one canonical, descriptor-scanned staging tree whose directory and
+single-link regular-file identities, timestamps, sizes, and SHA-256 digests are
+frozen in a witnessed plan. The scratch workspace must be a stable user-owned
+directory outside that tree. Construction requires Linux `O_TMPFILE | O_EXCL`,
+mode `0600`, zero links, `O_RDWR`, a nonblocking exclusive lock, and successful
+full-size preallocation. It writes a deterministic single-partition MBR/FAT32
+image directly through bounded positional I/O. No formatter, mount, loop
+association, pathname publication, or subprocess exists to outlive the build.
+The MBR disk signature and FAT volume ID are separately domain-derived from the
+canonical output-relevant plan, must be distinct and neither zero nor all ones,
+and are independently read back. They are public 32-bit identifiers, not
+secrets or global-uniqueness guarantees; byte-identical clones intentionally
+share them.
+
+Before returning, the builder rescans every source, exactly reads back its own
+metadata, and invokes a separate read-only FAT parser. That parser requires the
+canonical partition and FAT32 geometry, identical FAT copies and boot backups,
+exact FSInfo allocation accounting, one matching root volume label, valid dot
+entries, unique aliases and VFAT names, reachable non-cross-linked allocation,
+and the expected hash of every file. The complete disk is then hashed between
+stable identity snapshots. Only the opaque owner object retains the descriptor.
+It exposes no fileno and cannot stream while unpatched.
+
+After Syslinux mutation, the owner independently fsyncs, reparses, and hashes
+the complete live disk again, binding the parser identity, transaction identity,
+and expected whole-image digest. A synchronous mutation even in unused MBR gap
+space therefore discards the image. Streaming becomes available only in the
+patched-attested state and uses a close-on-exec duplicate acquired under a
+lifecycle lock, so closing the owner cannot cause descriptor-number reuse to
+splice another process file into an active stream. Patch, poison, and close are
+serialized; failures never publish a scratch path or attempt rollback.
+
+This is still not authorization to write a device. The staged Syslinux decision,
+builder, patch transaction, and target must first be joined by one witnessed
+production ISO plan. A privileged executor with transaction-wide target
+ownership, exact device read-back, QEMU/SeaBIOS and OVMF gates, and physical BIOS
+testing remain mandatory before the GUI can offer BIOS construction. Until then,
+hybrid media should use verified DD mode to preserve its existing boot layout.
 
 ## Boot-time corruption-check boundary
 

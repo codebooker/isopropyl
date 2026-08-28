@@ -53,6 +53,7 @@ FAT32_MAX_FILE_BYTES = (4 * 1024 * 1024 * 1024) - 1
 MINIMUM_CAPACITY_RESERVE_BYTES = 64 * 1024 * 1024
 PARTITION_RESERVE_BYTES = 2 * 1024 * 1024
 MAX_TREE_ENTRIES = 1_000_000
+MAX_TREE_DEPTH = 128
 MAX_ERROR_CHARACTERS = 2048
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _TRUSTED_TOOL_DIRECTORIES = tuple(_TRUSTED_TOOL_PATH.split(":"))
@@ -230,7 +231,13 @@ def _validate_component(component: str, rendered_path: str) -> None:
         raise ConstructedMediaSafetyError(
             f"Reserved FAT32 device name in staged path: {rendered_path!r}"
         )
-    if len(component.encode("utf-16-le")) // 2 > 255:
+    try:
+        utf16_units = len(component.encode("utf-16-le")) // 2
+    except UnicodeEncodeError as error:
+        raise ConstructedMediaSafetyError(
+            f"Staged path is not valid Unicode: {rendered_path!r}"
+        ) from error
+    if utf16_units > 255:
         raise ConstructedMediaSafetyError(
             f"Staged path component exceeds the FAT32 name limit: {rendered_path!r}"
         )
@@ -280,6 +287,8 @@ def _scan_directory_fd(
     occupied: dict[tuple[str, ...], str],
     max_file_bytes: int | None,
 ) -> None:
+    if len(parts) >= MAX_TREE_DEPTH:
+        raise ConstructedMediaSafetyError("The staged tree exceeds the directory-depth limit")
     try:
         names = sorted(os.listdir(directory_fd), key=lambda item: item.casefold())
     except OSError as error:

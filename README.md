@@ -201,9 +201,17 @@ confirmations and expanded drive visibility are never persisted.
   sector slack, writes loader → backup VBR → primary VBR → MBR, fsyncs and reads
   back every phase, remaps the final loader, and requires the exact expected
   whole-image hash. It never opens a path or accepts a named file; any failure
-  poisons an unpublished image that must be discarded. A production-owned FAT32
-  image builder with proven unmount/loop-detach lifecycle, privileged device
-  streaming, QEMU, and physical boot certification still gate BIOS support.
+  poisons an unpublished image that must be discarded. A production-owned,
+  mount-free builder now creates that image directly in an unlinked Linux
+  `O_TMPFILE`: it preallocates the exact MBR/FAT32 size, binds and hashes every
+  staged source, writes both FATs and all directories/files in-process, and has
+  an independent parser verify the complete tree, allocation accounting, volume
+  metadata, distinct output-derived MBR/FAT identifiers, and whole-image hash.
+  The opaque image cannot stream until the
+  Syslinux transaction succeeds and a second full live-descriptor attestation
+  passes. No loop device, mount, formatter, path publication, or subprocess is
+  involved. Production ISO-plan integration, privileged target streaming and
+  read-back, QEMU, and physical boot certification still gate BIOS support.
 - Parse El Torito BIOS/UEFI entries, including the bounded embedded-FAT subset,
   and inspect EFI PE architecture, certificate framing, and SBAT. A sealed,
   resource-limited worker can report embedded
@@ -356,10 +364,11 @@ CI currently exercises the non-destructive suite on an Ubuntu x86-64 runner with
 Python 3.12; device-facing tests mock block devices and privileged commands and
 never write a real drive. Broad distro, desktop, Wayland/X11, firmware, Secure
 Boot, card-reader, and physical-media testing is still required. BIOS options
-remain intentionally hidden. The unpatched root tree, mapper, pure patch plans,
-and anonymous regular-file transaction are joined and byte-verified; the
-remaining gates are a production-owned FAT32 image builder with proven
-unmount/loop-detach lifecycle, device streaming, QEMU/SeaBIOS results, and
+remain intentionally hidden. The unpatched root tree, deterministic mount-free
+FAT32 builder, independent parser, live mapper, pure patch plans, and anonymous
+regular-file transaction are joined and byte-verified in the backend. The
+remaining gates are binding that pipeline into the witnessed production ISO
+plan, privileged device streaming and read-back, QEMU/SeaBIOS/OVMF results, and
 physical evidence.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)

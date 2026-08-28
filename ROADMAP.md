@@ -64,10 +64,15 @@ evidence.
   exact root with the live FAT mapper and pure patch plans on an owner-only
   anonymous image. It witnesses every write, preserves partial-sector slack,
   activates MBR last, verifies every durability barrier/read-back, and proves an
-  exact whole-image posthash. Remaining gates are a production-owned FAT32 image
-  builder with proven unmount/loop-detach lifecycle, bounded device streaming,
-  QEMU/SeaBIOS plus OVMF, and physical certification. Do not expose
-  payloads or remove a BIOS blocker before those gates pass. GRUB BIOS follows only after
+  exact whole-image posthash. A production-owned, deterministic MBR/FAT32
+  builder now precedes it on an anonymous `O_TMPFILE`; source/tree hashing,
+  complete preallocation, independent allocation/tree parsing, full-image
+  posthashing, fail-closed poisoning, and descriptor-safe streaming require no
+  formatter, mount, loop device, named scratch file, or subprocess. Remaining
+  gates are witnessed production ISO-plan integration, bounded privileged
+  device streaming/read-back, QEMU/SeaBIOS plus OVMF, and physical
+  certification. Do not expose payloads or remove a BIOS blocker before those
+  gates pass. GRUB BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced
   and verified without executing downloaded code.
 - Integrate the implemented bounded El Torito FAT tree with persistence-profile

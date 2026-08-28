@@ -31,6 +31,7 @@ from .eltorito import (
 )
 
 MAX_FILESYSTEM_BYTES = 512 * 1024**2
+MAX_REGULAR_FAT32_BYTES = 128 * 1024**3
 MAX_FAT_BYTES = 32 * 1024**2
 MAX_DIRECTORY_BYTES = 8 * 1024**2
 MAX_ENTRIES = 16_384
@@ -115,6 +116,30 @@ class EmbeddedFatImage:
         )
 
 
+@dataclass(frozen=True)
+class RegularFat32Image:
+    """One completely parsed MBR-wrapped FAT32 regular-file image."""
+
+    source_identity: FatSourceIdentity
+    image_size: int
+    filesystem_offset: int
+    filesystem_size: int
+    partition_start_lba: int
+    partition_sectors: int
+    disk_signature: int
+    volume_id: int
+    bytes_per_sector: int
+    sectors_per_cluster: int
+    allocated_clusters: int
+    free_clusters: int
+    entries: tuple[FatImageEntry, ...]
+    manifest_sha256: str
+
+    @property
+    def content_bytes(self) -> int:
+        return sum(entry.size for entry in self.entries if not entry.is_directory)
+
+
 CancelCheck = Callable[[], None]
 MaterializeProgress = Callable[[str, int, int], None]
 
@@ -184,11 +209,20 @@ class _FatVolume:
         *,
         upper_bound: int,
         cancel_check: CancelCheck | None,
+        maximum_content_bytes: int = MAX_FILESYSTEM_BYTES,
+        strict_directories: bool = False,
     ) -> None:
         self.reader = reader
         self.layout = layout
         self.upper_bound = upper_bound
         self.cancel_check = cancel_check
+        if type(maximum_content_bytes) is not int or maximum_content_bytes <= 0:
+            raise FatImageError("The FAT content limit is invalid")
+        self.maximum_content_bytes = maximum_content_bytes
+        if type(strict_directories) is not bool:
+            raise FatImageError("The FAT directory-validation mode is invalid")
+        self.strict_directories = strict_directories
+        self.volume_labels: list[bytes] = []
         self._claimed_clusters: dict[int, str] = {}
         self._entries: list[FatImageEntry] = []
         self._path_keys: dict[tuple[str, ...], str] = {}
@@ -424,6 +458,8 @@ class _FatVolume:
         raw_directory: bytes,
         parent: tuple[str, ...],
         depth: int,
+        self_cluster: int,
+        parent_cluster: int,
     ) -> None:
         if depth > MAX_DEPTH:
             raise FatImageError("The embedded FAT directory depth exceeds the limit")
@@ -432,6 +468,10 @@ class _FatVolume:
         lfn_expected = 0
         lfn_checksum: int | None = None
         local_aliases: dict[str, str] = {}
+        local_short_names: dict[bytes, str] = {}
+        saw_dot = False
+        saw_dotdot = False
+        saw_terminator = False
         for offset in range(0, len(raw_directory), 32):
             self._check_cancelled()
             raw = raw_directory[offset:offset + 32]
@@ -440,6 +480,9 @@ class _FatVolume:
             if raw[0] == 0x00:
                 if lfn_chunks:
                     raise FatImageError("An embedded FAT directory ends with an orphan long name")
+                if self.strict_directories and any(raw_directory[offset:]):
+                    raise FatImageError("A FAT directory has nonzero data after its terminator")
+                saw_terminator = True
                 break
             if raw[0] == 0xE5:
                 lfn_chunks.clear()
@@ -477,9 +520,30 @@ class _FatVolume:
             short_name = bytes(raw[:11])
             short = self._decode_short(raw)
             if short in {".", ".."}:
-                if lfn_chunks or not attributes & 0x10:
+                high_cluster = struct.unpack_from("<H", raw, 20)[0]
+                low_cluster = struct.unpack_from("<H", raw, 26)[0]
+                cluster = (high_cluster << 16) | low_cluster
+                expected_cluster = self_cluster if short == "." else parent_cluster
+                expected_offset = 0 if short == "." else 32
+                if (
+                    lfn_chunks
+                    or attributes != 0x10
+                    or raw[:11] != (b".          " if short == "." else b"..         ")
+                    or struct.unpack_from("<I", raw, 28)[0] != 0
+                    or (
+                        self.strict_directories
+                        and (
+                            not parent
+                            or offset != expected_offset
+                            or cluster != expected_cluster
+                        )
+                    )
+                ):
                     raise FatImageError("A FAT dot entry is malformed")
+                saw_dot = saw_dot or short == "."
+                saw_dotdot = saw_dotdot or short == ".."
                 continue
+            had_lfn = bool(lfn_chunks)
             if lfn_chunks:
                 if lfn_expected != 0 or self._lfn_checksum(short_name) != lfn_checksum:
                     raise FatImageError("A FAT long name does not match its short entry")
@@ -489,9 +553,30 @@ class _FatVolume:
             lfn_chunks.clear()
             lfn_count = lfn_expected = 0
             lfn_checksum = None
+            short_key = short_name.upper()
+            previous_short = local_short_names.get(short_key)
+            if previous_short is not None:
+                raise FatImageError(
+                    f"Embedded FAT short names alias each other: "
+                    f"{previous_short!r} and {visible!r}"
+                )
+            local_short_names[short_key] = visible
             if attributes & 0x08:
                 if attributes & 0x10:
                     raise FatImageError("A FAT volume label is also marked as a directory")
+                if (
+                    self.strict_directories
+                    and (
+                        parent
+                        or had_lfn
+                        or attributes != 0x08
+                        or raw[12] != 0
+                        or raw[20:22] != b"\0\0"
+                        or raw[26:32] != b"\0" * 6
+                    )
+                ):
+                    raise FatImageError("The FAT volume-label entry is malformed")
+                self.volume_labels.append(short_name)
                 continue
             visible = self._safe_component(visible)
             short_alias = self._safe_component(short)
@@ -526,6 +611,8 @@ class _FatVolume:
                     self._chain_bytes(clusters, f"directory {rendered!r}"),
                     parts,
                     depth + 1,
+                    first_cluster,
+                    0 if not parent else self_cluster,
                 )
             else:
                 if size == 0:
@@ -553,6 +640,10 @@ class _FatVolume:
                 )
         if lfn_chunks:
             raise FatImageError("An embedded FAT directory ends with an orphan long name")
+        if self.strict_directories and not saw_terminator:
+            raise FatImageError("A FAT directory has no canonical end marker")
+        if self.strict_directories and parent and not (saw_dot and saw_dotdot):
+            raise FatImageError("A FAT subdirectory is missing its dot entries")
 
     def parse(self) -> tuple[FatImageEntry, ...]:
         if self.layout.fat_type is FatType.FAT32:
@@ -564,7 +655,7 @@ class _FatVolume:
                 self.layout.root_directory_bytes,
                 "embedded FAT root directory",
             )
-        self._parse_directory(raw, (), 0)
+        self._parse_directory(raw, (), 0, self.layout.root_cluster, 0)
         ordered = tuple(
             sorted(
                 self._entries,
@@ -575,7 +666,7 @@ class _FatVolume:
             )
         )
         total = sum(entry.size for entry in ordered if not entry.is_directory)
-        if total > MAX_FILESYSTEM_BYTES:
+        if total > self.maximum_content_bytes:
             raise FatImageError("The embedded FAT file content exceeds the limit")
         return ordered
 
@@ -584,7 +675,11 @@ def _parse_layout(
     reader: _Reader,
     filesystem_offset: int,
     upper_bound: int,
+    *,
+    maximum_filesystem_bytes: int = MAX_FILESYSTEM_BYTES,
 ) -> _VolumeLayout:
+    if type(maximum_filesystem_bytes) is not int or maximum_filesystem_bytes <= 0:
+        raise FatImageError("The FAT filesystem-size limit is invalid")
     boot = reader.exact(filesystem_offset, 512, "embedded FAT boot sector")
     if (
         boot[0] not in {0xE9, 0xEB}
@@ -624,7 +719,7 @@ def _parse_layout(
     filesystem_size = total_sectors * bytes_per_sector
     if (
         filesystem_size < bytes_per_sector
-        or filesystem_size > MAX_FILESYSTEM_BYTES
+        or filesystem_size > maximum_filesystem_bytes
         or filesystem_offset > upper_bound
         or filesystem_size > upper_bound - filesystem_offset
     ):
@@ -874,6 +969,158 @@ def inspect_uefi_eltorito_fat(
         raise FatImageError(f"Could not recheck the selected ISO: {error}") from error
     if after != before:
         raise FatImageError("The selected ISO changed while its embedded FAT image was parsed")
+    return result
+
+
+def inspect_regular_fat32_image(
+    descriptor: int,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> RegularFat32Image:
+    """Parse every entry in the bounded private FAT32 image profile.
+
+    This descriptor-only inspector is independent of the writer. It accepts
+    one exact MBR/FAT32 layout, hashes every file, and never mounts the image.
+    """
+
+    if type(descriptor) is not int or descriptor < 0:
+        raise FatImageError("A valid regular-file image descriptor is required")
+    try:
+        before_status = os.fstat(descriptor)
+    except OSError as error:
+        raise FatImageError(f"Could not inspect the FAT32 image: {error}") from error
+    if (
+        not stat.S_ISREG(before_status.st_mode)
+        or before_status.st_size <= 0
+        or before_status.st_size > MAX_REGULAR_FAT32_BYTES
+    ):
+        raise FatImageError("The FAT32 image is not a supported bounded regular file")
+    before = _identity(before_status)
+    reader = _Reader(descriptor, before.size)
+    if cancel_check is not None:
+        cancel_check()
+    mbr = reader.exact(0, 512, "regular-file MBR sector")
+    partition = _mbr_partition(reader, 0, before.size)
+    if partition is None:
+        raise FatImageError("The regular-file image has no active FAT partition")
+    start_lba, sectors = partition
+    if start_lba != 2_048 or mbr[450] != 0x0C:
+        raise FatImageError("The regular-file image is outside the private MBR profile")
+    filesystem_offset = start_lba * 512
+    filesystem_size = sectors * 512
+    if filesystem_offset + filesystem_size != before.size:
+        raise FatImageError("The FAT32 partition does not end at the image boundary")
+    layout = _parse_layout(
+        reader,
+        filesystem_offset,
+        before.size,
+        maximum_filesystem_bytes=MAX_REGULAR_FAT32_BYTES,
+    )
+    boot = reader.exact(filesystem_offset, 512, "regular-file FAT32 boot sector")
+    fsinfo_sector = struct.unpack_from("<H", boot, 48)[0]
+    backup_sector = struct.unpack_from("<H", boot, 50)[0]
+    if (
+        layout.fat_type is not FatType.FAT32
+        or layout.filesystem_size != filesystem_size
+        or layout.bytes_per_sector != 512
+        or layout.reserved_sectors != 32
+        or layout.fat_count != 2
+        or struct.unpack_from("<I", boot, 28)[0] != start_lba
+        or fsinfo_sector != 1
+        or backup_sector != 6
+        or boot[66] != 0x29
+        or boot[82:90] != b"FAT32   "
+    ):
+        raise FatImageError("The regular-file FAT32 geometry is outside the private profile")
+    disk_signature = struct.unpack_from("<I", mbr, 440)[0]
+    volume_id = struct.unpack_from("<I", boot, 67)[0]
+    if (
+        disk_signature in {0, 0xFFFFFFFF}
+        or volume_id in {0, 0xFFFFFFFF}
+        or volume_id == disk_signature
+    ):
+        raise FatImageError("The regular-file FAT32 media identifiers are invalid")
+    backup = reader.exact(
+        filesystem_offset + backup_sector * 512,
+        512,
+        "regular-file backup FAT32 boot sector",
+    )
+    if backup != boot:
+        raise FatImageError("The primary and backup FAT32 boot sectors disagree")
+    fsinfo = reader.exact(
+        filesystem_offset + fsinfo_sector * 512,
+        512,
+        "regular-file FAT32 FSInfo sector",
+    )
+    backup_fsinfo = reader.exact(
+        filesystem_offset + (backup_sector + fsinfo_sector) * 512,
+        512,
+        "regular-file backup FAT32 FSInfo sector",
+    )
+    if (
+        fsinfo != backup_fsinfo
+        or struct.unpack_from("<I", fsinfo, 0)[0] != 0x41615252
+        or struct.unpack_from("<I", fsinfo, 484)[0] != 0x61417272
+        or struct.unpack_from("<I", fsinfo, 508)[0] != 0xAA550000
+        or any(fsinfo[4:484])
+        or any(fsinfo[496:508])
+    ):
+        raise FatImageError("The FAT32 FSInfo copies or signatures are invalid")
+    volume = _FatVolume(
+        reader,
+        layout,
+        upper_bound=before.size,
+        cancel_check=cancel_check,
+        maximum_content_bytes=MAX_REGULAR_FAT32_BYTES,
+        strict_directories=True,
+    )
+    entries = volume.parse()
+    if volume.volume_labels != [boot[71:82]]:
+        raise FatImageError("The FAT32 root volume label disagrees with its BPB")
+    first_free = 0xFFFFFFFF
+    for cluster in range(2, layout.cluster_count + 2):
+        if cluster & 0xFFF == 0 and cancel_check is not None:
+            cancel_check()
+        value = volume._fat_value(cluster)
+        claimed = cluster in volume._claimed_clusters
+        if value != 0 and not claimed:
+            raise FatImageError("The FAT32 image contains an unreachable allocated cluster")
+        if value == 0 and first_free == 0xFFFFFFFF:
+            first_free = cluster
+    for cluster in range(layout.cluster_count + 2, len(volume.fat) // 4):
+        if cluster & 0xFFF == 0 and cancel_check is not None:
+            cancel_check()
+        if struct.unpack_from("<I", volume.fat, cluster * 4)[0] != 0:
+            raise FatImageError("The FAT32 table has nonzero entries beyond its data area")
+    allocated_clusters = len(volume._claimed_clusters)
+    free_clusters = layout.cluster_count - allocated_clusters
+    if (
+        struct.unpack_from("<I", fsinfo, 488)[0] != free_clusters
+        or struct.unpack_from("<I", fsinfo, 492)[0] != first_free
+    ):
+        raise FatImageError("The FAT32 FSInfo allocation accounting is incorrect")
+    result = RegularFat32Image(
+        before,
+        before.size,
+        filesystem_offset,
+        filesystem_size,
+        start_lba,
+        sectors,
+        disk_signature,
+        volume_id,
+        layout.bytes_per_sector,
+        layout.sectors_per_cluster,
+        allocated_clusters,
+        free_clusters,
+        entries,
+        _manifest_digest(entries),
+    )
+    try:
+        after = _identity(os.fstat(descriptor))
+    except OSError as error:
+        raise FatImageError(f"Could not recheck the FAT32 image: {error}") from error
+    if after != before:
+        raise FatImageError("The FAT32 image changed while its tree was parsed")
     return result
 
 

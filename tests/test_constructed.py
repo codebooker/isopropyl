@@ -222,6 +222,39 @@ class PlanTests(unittest.TestCase):
                     with self.assertRaises(ConstructedMediaSafetyError):
                         build_plan(staging)
 
+    def test_scanner_bounds_depth_and_normalizes_surrogate_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = Path(directory) / "deep"
+            staging.mkdir()
+            current = staging
+            for _index in range(128):
+                current = current / "d"
+                current.mkdir()
+            with self.assertRaisesRegex(
+                ConstructedMediaSafetyError,
+                "depth limit",
+            ):
+                scan_staging_tree(staging)
+
+        with tempfile.TemporaryDirectory() as directory:
+            staging = Path(directory)
+            root_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                descriptor = os.open(
+                    b"invalid-\xff",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                os.close(descriptor)
+            finally:
+                os.close(root_fd)
+            with self.assertRaisesRegex(
+                ConstructedMediaSafetyError,
+                "valid Unicode",
+            ):
+                scan_staging_tree(staging)
+
     def test_rejects_non_enum_table_target_source_overlap_and_capacity(self):
         with tempfile.TemporaryDirectory() as directory:
             staging = make_staging(Path(directory))
