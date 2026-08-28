@@ -71,6 +71,16 @@ class SyslinuxIsoFat32Cancelled(SyslinuxIsoFat32Error):
 
 
 @dataclass(frozen=True)
+class _CompositePlanReceipt:
+    token: object
+    plan: object
+    iso_plan: object
+    staging_result: object
+    private_plan: object
+    snapshot: tuple[object, ...]
+
+
+@dataclass(frozen=True)
 class SyslinuxIsoFat32Plan:
     """One exact published tree and its anonymous FAT32 construction plan."""
 
@@ -86,7 +96,12 @@ class SyslinuxIsoFat32Plan:
     root_ldlinux_size: int
     root_ldlinux_sha256: str
     plan_sha256: str
-    _witness: object = field(default=None, repr=False, compare=False)
+    _receipt: _CompositePlanReceipt | None = field(
+        init=False,
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -120,7 +135,7 @@ def _check_cancelled(cancel_check: CancelCheck | None) -> None:
         cancel_check()
 
 
-def _require_native_fat32_layout(iso_plan: IsoStagingPlan) -> None:
+def _require_compatible_source_layout(iso_plan: IsoStagingPlan) -> None:
     layout = iso_plan.write_plan.layout
     if (
         layout is None
@@ -131,7 +146,8 @@ def _require_native_fat32_layout(iso_plan: IsoStagingPlan) -> None:
         or iso_plan.write_plan.transformations
     ):
         raise SyslinuxIsoFat32Error(
-            "The initial composite profile requires a native single-partition FAT32 plan",
+            "The initial composite profile requires a native single-partition "
+            "FAT32 source plan",
         )
 
 
@@ -218,6 +234,20 @@ def _private_files(plan: PrivateFat32Plan) -> dict[str, PrivateFat32File]:
     return {item.source.path: item for item in plan.files}
 
 
+def _plan_snapshot(plan: SyslinuxIsoFat32Plan) -> tuple[object, ...]:
+    return (
+        plan.source_manifest_sha256,
+        plan.c32_bundle_sha256,
+        plan.payload_bundle_sha256,
+        plan.version,
+        plan.dependency_key,
+        plan.config_directory,
+        plan.root_ldlinux_size,
+        plan.root_ldlinux_sha256,
+        plan.plan_sha256,
+    )
+
+
 def _require_private_file(
     files: dict[str, PrivateFat32File],
     staged: SyslinuxStageFile,
@@ -244,9 +274,22 @@ def _validate_relationships(
     *,
     cancel_check: CancelCheck | None = None,
 ) -> StagingTreeManifest:
-    if type(plan) is not SyslinuxIsoFat32Plan or plan._witness is not _PLAN_WITNESS:
+    if type(plan) is not SyslinuxIsoFat32Plan:
         raise SyslinuxIsoFat32Error(
             "An authentic Syslinux ISO FAT32 plan is required",
+        )
+    receipt = plan._receipt
+    if (
+        type(receipt) is not _CompositePlanReceipt
+        or receipt.token is not _PLAN_WITNESS
+        or receipt.plan is not plan
+        or receipt.iso_plan is not plan.iso_plan
+        or receipt.staging_result is not plan.staging_result
+        or receipt.private_plan is not plan.private_plan
+        or receipt.snapshot != _plan_snapshot(plan)
+    ):
+        raise SyslinuxIsoFat32Error(
+            "The Syslinux ISO FAT32 plan receipt is missing or no longer authoritative",
         )
     for name, digest in (
         ("source manifest", plan.source_manifest_sha256),
@@ -265,7 +308,7 @@ def _validate_relationships(
         )
     except IsoStagingSafetyError as error:
         raise SyslinuxIsoFat32Error(str(error)) from error
-    _require_native_fat32_layout(plan.iso_plan)
+    _require_compatible_source_layout(plan.iso_plan)
     staging = plan.iso_plan.syslinux_staging
     c32_bundle = plan.iso_plan.syslinux_c32_bundle
     payload_bundle = plan.iso_plan.syslinux_payload_bundle
@@ -378,7 +421,7 @@ def build_syslinux_iso_fat32_plan(
         )
     except IsoStagingSafetyError as error:
         raise SyslinuxIsoFat32Error(str(error)) from error
-    _require_native_fat32_layout(iso_plan)
+    _require_compatible_source_layout(iso_plan)
     staging = iso_plan.syslinux_staging
     c32_bundle = iso_plan.syslinux_c32_bundle
     payload_bundle = iso_plan.syslinux_payload_bundle
@@ -413,7 +456,6 @@ def build_syslinux_iso_fat32_plan(
         len(staging.root_ldlinux_sys.data),
         staging.root_ldlinux_sys.sha256,
         "",
-        _PLAN_WITNESS,
     )
     plan = SyslinuxIsoFat32Plan(
         iso_plan,
@@ -428,7 +470,18 @@ def build_syslinux_iso_fat32_plan(
         candidate.root_ldlinux_size,
         candidate.root_ldlinux_sha256,
         _plan_digest(candidate),
-        _PLAN_WITNESS,
+    )
+    object.__setattr__(
+        plan,
+        "_receipt",
+        _CompositePlanReceipt(
+            _PLAN_WITNESS,
+            plan,
+            iso_plan,
+            staging_result,
+            private_plan,
+            _plan_snapshot(plan),
+        ),
     )
     _validate_relationships(plan, cancel_check=cancel_check)
     return plan

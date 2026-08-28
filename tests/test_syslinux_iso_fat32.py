@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -301,17 +301,17 @@ class SyslinuxIsoFat32Tests(unittest.TestCase):
         class ForgedPlan(SyslinuxIsoFat32Plan):
             pass
 
-        subclass = ForgedPlan(**plan.__dict__)
-        manual = SyslinuxIsoFat32Plan(
-            **{
-                name: value
-                for name, value in plan.__dict__.items()
-                if name != "_witness"
-            },
-        )
+        values = {
+            item.name: getattr(plan, item.name)
+            for item in fields(plan)
+            if item.init
+        }
+        subclass = ForgedPlan(**values)
+        manual = SyslinuxIsoFat32Plan(**values)
         forged = (
             subclass,
             manual,
+            replace(plan),
             replace(plan, plan_sha256="0" * 64),
             replace(plan, iso_plan=replace(iso_plan)),
             replace(plan, staging_result=replace(staging_result)),
