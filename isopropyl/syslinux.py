@@ -6,7 +6,8 @@ from __future__ import annotations
 
 This module deliberately stops before filesystem or block-device mutation.  It
 accepts an exact, already-bound Syslinux bundle plus an explicit sector map and
-returns the bytes a future regular-file installer must verify before writing.
+returns the bytes the descriptor-only regular-file transaction verifies before
+writing.
 The patch and ADV formats follow Syslinux's GPL-2.0-or-later installer at the
 exact versions cataloged by ISOpropyl.
 """

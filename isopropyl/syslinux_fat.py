@@ -69,6 +69,7 @@ class SyslinuxRegularFilePlan:
     mapping: Fat32FileMap
     mbr: SyslinuxMbrResult
     syslinux: SyslinuxPatchResult
+    config_directory: str
 
 
 @dataclass(frozen=True)
@@ -487,8 +488,62 @@ def prepare_syslinux_patch_from_map(
     remains read-only and non-destructive.
     """
 
-    if not isinstance(mapping, Fat32FileMap):
+    _validate_file_map(mapping)
+    _fresh_mapping, result = _prepare_syslinux_patch_from_map(
+        bundle,
+        descriptor,
+        mapping,
+        directory=directory,
+    )
+    return result
+
+
+def _validate_file_map(mapping: Fat32FileMap) -> None:
+    if type(mapping) is not Fat32FileMap:
         raise SyslinuxPatchError("a descriptor-derived FAT32 file map is required")
+    identity = mapping.source_identity
+    integer_fields = (
+        mapping.volume_offset,
+        mapping.volume_size,
+        mapping.file_size,
+        mapping.first_cluster,
+        mapping.backup_boot_sector,
+    )
+    if (
+        type(identity) is not Fat32SourceIdentity
+        or any(
+            type(value) is not int or value < 0
+            for value in (
+                identity.device,
+                identity.inode,
+                identity.size,
+                identity.modified_ns,
+                identity.changed_ns,
+            )
+        )
+        or any(type(value) is not int or value < 0 for value in integer_fields)
+        or type(mapping.file_sha256) is not str
+        or _SHA256.fullmatch(mapping.file_sha256) is None
+        or type(mapping.clusters) is not tuple
+        or type(mapping.sectors) is not tuple
+        or not mapping.clusters
+        or not mapping.sectors
+        or any(type(value) is not int or value <= 0 for value in mapping.clusters)
+        or any(type(value) is not int or value <= 0 for value in mapping.sectors)
+        or type(mapping.boot_sector) is not bytes
+        or len(mapping.boot_sector) != SECTOR_SIZE
+    ):
+        raise SyslinuxPatchError("the descriptor-derived FAT32 file map is malformed")
+
+
+def _prepare_syslinux_patch_from_map(
+    bundle: BoundBootBundle,
+    descriptor: int,
+    mapping: Fat32FileMap,
+    *,
+    directory: str,
+) -> tuple[Fat32FileMap, SyslinuxPatchResult]:
+    _validate_file_map(mapping)
     payloads = bind_syslinux_bundle(bundle)
     unpatched_file = payloads.ldlinux_sys + make_empty_adv()
     if (
@@ -505,12 +560,15 @@ def prepare_syslinux_patch_from_map(
     )
     if fresh_mapping != mapping:
         raise SyslinuxPatchError("the descriptor-derived FAT32 map changed since inspection")
-    return prepare_syslinux_patch(
-        bundle,
-        fresh_mapping.boot_sector,
-        fresh_mapping.sectors,
-        volume_offset=fresh_mapping.volume_offset,
-        directory=directory,
+    return (
+        fresh_mapping,
+        prepare_syslinux_patch(
+            bundle,
+            fresh_mapping.boot_sector,
+            fresh_mapping.sectors,
+            volume_offset=fresh_mapping.volume_offset,
+            directory=directory,
+        ),
     )
 
 
@@ -523,7 +581,7 @@ def prepare_syslinux_regular_file_plan(
 ) -> SyslinuxRegularFilePlan:
     """Bind live MBR, VBR, FAT chain, and payload bytes without writing."""
 
-    syslinux = prepare_syslinux_patch_from_map(
+    fresh_mapping, syslinux = _prepare_syslinux_patch_from_map(
         bundle,
         descriptor,
         mapping,
@@ -533,22 +591,22 @@ def prepare_syslinux_regular_file_plan(
         before_status = os.fstat(descriptor)
     except OSError as error:
         raise SyslinuxPatchError(f"could not inspect the regular-file image: {error}") from error
-    if _identity(before_status) != mapping.source_identity:
+    if _identity(before_status) != fresh_mapping.source_identity:
         raise SyslinuxPatchError("the regular-file image changed before its MBR was inspected")
-    formatted_mbr = _Reader(descriptor, mapping.source_identity).exact(
+    formatted_mbr = _Reader(descriptor, fresh_mapping.source_identity).exact(
         0, SECTOR_SIZE, "formatted MBR",
     )
     try:
         after_status = os.fstat(descriptor)
     except OSError as error:
         raise SyslinuxPatchError(f"could not revalidate the regular-file image: {error}") from error
-    if _identity(after_status) != mapping.source_identity:
+    if _identity(after_status) != fresh_mapping.source_identity:
         raise SyslinuxPatchError("the regular-file image changed while its MBR was inspected")
-    partition_start = mapping.volume_offset // SECTOR_SIZE
-    partition_sectors = mapping.volume_size // SECTOR_SIZE
+    partition_start = fresh_mapping.volume_offset // SECTOR_SIZE
+    partition_sectors = fresh_mapping.volume_size // SECTOR_SIZE
     mbr = prepare_syslinux_mbr(
         formatted_mbr,
         partition_start_sector=partition_start,
         partition_sector_count=partition_sectors,
     )
-    return SyslinuxRegularFilePlan(mapping, mbr, syslinux)
+    return SyslinuxRegularFilePlan(fresh_mapping, mbr, syslinux, directory)

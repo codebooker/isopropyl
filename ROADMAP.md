@@ -60,10 +60,13 @@ evidence.
   source and extracted-tree bytes, creates missing files exclusively, reads
   them back, and binds its Syslinux-adjusted planned catalog/accounting before
   the existing final-tree validation. It currently accepts Syslinux evidence
-  only from the base ISO. Remaining gates are integration with the existing FAT
-  mapper and pure location/VBR patch plans in one verified regular-file target
-  transaction, privileged writes, exact sector-diff validation, QEMU/SeaBIOS
-  plus OVMF, and physical certification. Do not expose
+  only from the base ISO. A descriptor-only transaction now integrates that
+  exact root with the live FAT mapper and pure patch plans on an owner-only
+  anonymous image. It witnesses every write, preserves partial-sector slack,
+  activates MBR last, verifies every durability barrier/read-back, and proves an
+  exact whole-image posthash. Remaining gates are a production-owned FAT32 image
+  builder with proven unmount/loop-detach lifecycle, bounded device streaming,
+  QEMU/SeaBIOS plus OVMF, and physical certification. Do not expose
   payloads or remove a BIOS blocker before those gates pass. GRUB BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced
   and verified without executing downloaded code.

@@ -388,9 +388,32 @@ and reused C32 byte to originate in the base ISO; overlay/embedded-origin
 evidence fails closed. It never downloads a bundle, replaces media content, or
 authorizes a device write; the normal GUI caller supplies neither Syslinux bundle.
 
-This is not authorization to write a device. Integration with the existing
-bounded FAT mapper and pure location/boot-sector patch plans in one verified
-regular-file target transaction, a privileged executor, exact post-write verification,
+The next boundary is now executable only on an already-open, owner-only `0600`
+anonymous regular file with zero directory links, `O_RDWR` access, no `O_APPEND`,
+and a nonblocking exclusive lock. It opens no path and rejects named files,
+special files, multiply referenced paths, and block devices. Planning flushes
+the fully built image, rebuilds the live FAT map and complete MBR/VBR/file patch
+plan from the same descriptor, freezes exact preimage/postimage write records,
+and streams the entire file once to bind both the source SHA-256 and the only
+permitted final SHA-256. Validation repeats that work immediately before the
+first mutation.
+
+The transaction writes only file-length loader fragments, so final-sector and
+remaining-cluster slack are not overwritten. It writes and fsyncs the loader
+first, the backup VBR second, the primary VBR third, and the complete MBR sector
+last as the activation gate. Each phase is read back exactly. Final validation
+remaps the patched loader, requires the same cluster/sector chain, rereads every
+postimage, preserves the MBR metadata tail, and hashes the entire image against
+the witnessed expected result. Cancellation is accepted only before mutation;
+after the first write the bounded verification completes without a cancellation
+point. A write, sync, read-back, identity, map, or whole-image failure returns no
+result and poisons the unpublished anonymous image, which must be closed and
+discarded. The transaction deliberately attempts no unverifiable rollback.
+
+This is not authorization to write a device. A production-owned FAT32 image
+builder must still prove that formatting/copying is complete and all mounts,
+loop associations, and cached filesystem writers are detached before handing
+over its anonymous descriptor. A privileged executor, exact device read-back,
 QEMU/SeaBIOS and OVMF gates, and physical BIOS testing remain mandatory before
 the GUI can offer BIOS construction. Until then, hybrid media should use
 verified DD mode to preserve its existing boot layout.

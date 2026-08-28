@@ -194,10 +194,16 @@ confirmations and expanded drive visibility are never persisted.
   pass runs just before publication, while the existing final-tree validator
   still covers later WIM and answer-file transformations. Syslinux evidence must
   come from the base ISO; overlay/embedded-origin evidence fails closed. The GUI
-  supplies neither bundle and normal writes never download them. Integration
-  with the existing descriptor-only FAT mapper and pure patch plans, followed by
-  privileged device writes, QEMU, and physical boot certification, still gates
-  BIOS support.
+  supplies neither bundle and normal writes never download them. A separate
+  descriptor-only transaction now proves the next boundary on an anonymous,
+  unpublished `0600` regular-file disk image: it rebuilds the live map and plan,
+  freezes every preimage/postimage, hashes the complete image, preserves partial
+  sector slack, writes loader → backup VBR → primary VBR → MBR, fsyncs and reads
+  back every phase, remaps the final loader, and requires the exact expected
+  whole-image hash. It never opens a path or accepts a named file; any failure
+  poisons an unpublished image that must be discarded. A production-owned FAT32
+  image builder with proven unmount/loop-detach lifecycle, privileged device
+  streaming, QEMU, and physical boot certification still gate BIOS support.
 - Parse El Torito BIOS/UEFI entries, including the bounded embedded-FAT subset,
   and inspect EFI PE architecture, certificate framing, and SBAT. A sealed,
   resource-limited worker can report embedded
@@ -350,10 +356,11 @@ CI currently exercises the non-destructive suite on an Ubuntu x86-64 runner with
 Python 3.12; device-facing tests mock block devices and privileged commands and
 never write a real drive. Broad distro, desktop, Wayland/X11, firmware, Secure
 Boot, card-reader, and physical-media testing is still required. BIOS options
-remain intentionally hidden until the backend-only unpatched root `ldlinux.sys`
-tree is joined to the existing bounded FAT mapper and pure boot-code patch plans
-inside a verified regular-file target transaction, then to device transactions,
-QEMU/SeaBIOS results, and physical evidence.
+remain intentionally hidden. The unpatched root tree, mapper, pure patch plans,
+and anonymous regular-file transaction are joined and byte-verified; the
+remaining gates are a production-owned FAT32 image builder with proven
+unmount/loop-detach lifecycle, device streaming, QEMU/SeaBIOS results, and
+physical evidence.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
 and [ROADMAP.md](ROADMAP.md).

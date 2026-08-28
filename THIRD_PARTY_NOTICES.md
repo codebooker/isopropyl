@@ -199,10 +199,11 @@ private-tree consumer requires both same-version bundle roles and materializes o
 validates the C32 module and unpatched root file as data only after source and
 extracted-tree validation; neither component executes a downloaded payload on
 the Linux host.
-The root file is not a boot claim: no FAT location patch, VBR/MBR write, or
-device-facing BIOS transaction is enabled.
+The private-tree root alone is not a boot claim. The separate anonymous
+regular-file transaction performs the FAT location patch and VBR/MBR writes,
+but no named image, block device, GUI, or device-facing BIOS path is enabled.
 
-The non-destructive implementation in `isopropyl/syslinux.py` adapts the on-disk
+The backend implementation in `isopropyl/syslinux.py` adapts the on-disk
 ADV, extent, patch-area checksum, first-sector-pointer, and FAT VBR merge formats
 from Syslinux's GPL-2.0-or-later installer and Rufus's corresponding integration:
 [`setadv.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/syslinux/libinstaller/setadv.c),
@@ -226,7 +227,8 @@ ISOpropyl replaces only the bootstrap region and preserves the existing MBR
 metadata tail.
 ISOpropyl reimplements those formats in Python with stricter consumer-local
 hash/provenance pins, overlap and width checks, a descriptor-only FAT32 mapper,
-and complete regular-file read-back tests. No version-specific `ldlinux` payload
+and an anonymous regular-file transaction with ordered durability barriers,
+complete read-back, and whole-image pre/post hashes. No version-specific `ldlinux` payload
 is included in the Python package or wheel; the small MIT-licensed MBR bootstrap
 is. The full GPL-2.0 text and source-release archives are available from the
 [official Syslinux distribution](https://www.kernel.org/pub/linux/utils/boot/syslinux/),
