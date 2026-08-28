@@ -1,0 +1,60 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ISOpropyl
+Source: https://github.com/codebooker/isopropyl
+
+Files: *
+Copyright: 2026 ISOpropyl contributors
+License: AGPL-3+
+ On Debian systems, the complete text of the GNU Affero General Public License
+ version 3 can be found in /usr/share/common-licenses/AGPL-3.
+
+Files: isopropyl/windows.py
+Copyright: 2022-2026 Pete Batard <pete@akeo.ie>
+           2026 ISOpropyl contributors
+License: GPL-3+ and AGPL-3+
+ The Windows quality-of-life command selection includes material adapted from
+ Rufus. That material remains GPL-3.0-or-later; ISOpropyl's original material
+ is AGPL-3.0-or-later, and the combined work is distributed under the terms
+ permitted by GPLv3 and AGPLv3 section 13.
+ .
+ On Debian systems, the complete texts are available in
+ /usr/share/common-licenses/GPL-3 and /usr/share/common-licenses/AGPL-3.
+
+Files: isopropyl/syslinux.py
+Copyright: 2007-2009 H. Peter Anvin
+           2009 Intel Corporation
+           Syslinux Project contributors
+           2011-2026 Pete Batard and Rufus contributors
+           2026 ISOpropyl contributors
+License: GPL-2+ and GPL-3+ and MIT and AGPL-3+
+ The on-disk Syslinux installer formats are adapted from GPL-2.0-or-later
+ Syslinux code and GPL-3.0-or-later Rufus integration. The embedded 440-byte
+ Syslinux 6.02 MBR bootstrap is MIT licensed, and ISOpropyl's original material
+ is AGPL-3.0-or-later. The combined work is distributed under the compatible
+ GPLv3/AGPLv3 section 13 terms while each covered component retains its license.
+ .
+ On Debian systems, the complete GPL and AGPL texts are available in
+ /usr/share/common-licenses/GPL-2, /usr/share/common-licenses/GPL-3, and
+ /usr/share/common-licenses/AGPL-3. The complete MIT notice is installed as
+ /usr/share/doc/isopropyl/licenses/SYSLINUX-MBR-MIT.txt.
+
+Files: isopropyl/data/microsoft-dbx-authenticode-v1.json
+       licenses/MICROSOFT-SECUREBOOT-OBJECTS-BSD-2-CLAUSE-PATENT.txt
+Copyright: Microsoft Corporation
+License: BSD-2-Clause-Patent
+ See /usr/share/doc/isopropyl/licenses/MICROSOFT-SECUREBOOT-OBJECTS-BSD-2-CLAUSE-PATENT.txt.
+
+Files: licenses/SYSLINUX-MBR-MIT.txt
+Copyright: 2007-2009 H. Peter Anvin
+           2009 Intel Corporation
+License: MIT
+ See /usr/share/doc/isopropyl/licenses/SYSLINUX-MBR-MIT.txt.
+
+Files: licenses/CERTVALIDATOR-MIT.txt
+Copyright: 2015-2018 Will Bond <will@wbond.net>
+License: MIT
+ See /usr/share/doc/isopropyl/licenses/CERTVALIDATOR-MIT.txt.
+
+Comment:
+ Additional exact artifact provenance and licensing notes are installed as
+ /usr/share/doc/isopropyl/THIRD_PARTY_NOTICES.md.

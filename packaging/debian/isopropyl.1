@@ -1,0 +1,42 @@
+.TH ISOPROPYL 1 "August 2026" "ISOpropyl 0.1.0" "User Commands"
+.SH NAME
+isopropyl \- safety-focused bootable USB and SD media writer
+.SH SYNOPSIS
+.B isopropyl
+.RI [ --portable ]
+.RI [ image ]
+.SH DESCRIPTION
+.B ISOpropyl
+is a graphical Linux application for inspecting disk images and writing them
+to removable USB and SD media. It supports authenticated raw/DD writes,
+filesystem-aware ISO construction, verification, guarded drive tools, and
+selected Linux and Windows image downloads.
+.PP
+Run ISOpropyl as a regular desktop user. Narrow destructive operations are
+delegated to a fixed PolicyKit helper. The application refuses to run as root.
+.SH OPTIONS
+.TP
+.B --portable
+Store non-destructive preferences in
+.I isopropyl.ini
+beside the launcher. Destructive confirmations are never persisted.
+.TP
+.I image
+Open one disk image when the application starts.
+.SH SAFETY
+Writing an image destroys data on the selected target. Verify the displayed
+device path, model, capacity, and serial number. Keep post-write verification
+enabled and use expendable media while this release is marked alpha.
+.SH FILES
+.TP
+.I /usr/libexec/isopropyl-device-helper
+Fixed root-owned PolicyKit helper launcher.
+.TP
+.I /usr/share/polkit-1/actions/io.github.codebooker.isopropyl.*.policy
+Narrow privileged action definitions.
+.SH SEE ALSO
+.BR isopropyl-cli (1),
+the installed README, and
+.UR https://github.com/codebooker/isopropyl
+the ISOpropyl project page
+.UE .

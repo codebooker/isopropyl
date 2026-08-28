@@ -35,3 +35,11 @@ jobs:
       - run: python -c "import glob,zipfile; z=zipfile.ZipFile(glob.glob('/tmp/isopropyl-wheel/*.whl')[0]); n=z.namelist(); assert 'isopropyl/data/io.github.codebooker.isopropyl.svg' in n; assert 'isopropyl/data/distro-write-policies-v1.json' in n; assert 'isopropyl/data/windows-images-v2.json' in n; assert 'isopropyl/data/windows-images-v1.json' not in n; assert any(x.endswith('/THIRD_PARTY_NOTICES.md') for x in n); assert any(x.endswith('/CERTVALIDATOR-MIT.txt') for x in n); e=next(x for x in n if x.endswith('.dist-info/entry_points.txt')); assert 'isopropyl-cli = isopropyl.cli:main' in z.read(e).decode()"
       - run: python -c "import pathlib,setuptools.build_meta as b; p=pathlib.Path('/tmp/isopropyl-sdist'); p.mkdir(); b.build_sdist(str(p))"
       - run: python -c "import glob,tarfile; t=tarfile.open(glob.glob('/tmp/isopropyl-sdist/*.tar.gz')[0]); n=t.getnames(); assert any(x.endswith('/tests/windows-profile-observations-v1.json') for x in n); assert not any(x.endswith('/isopropyl/data/windows-images-v1.json') for x in n)"
+      - run: /usr/bin/python3 -I packaging/debian/build_deb.py --output-dir /tmp/isopropyl-deb
+      - run: dpkg-deb --info /tmp/isopropyl-deb/isopropyl_0.1.0-1_amd64.deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: isopropyl-debian-amd64
+          path: /tmp/isopropyl-deb/isopropyl_0.1.0-1_amd64.deb
+          if-no-files-found: error
+          retention-days: 14

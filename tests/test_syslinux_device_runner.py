@@ -30,6 +30,8 @@ from isopropyl.syslinux_device_runner import (
     HELPER_SCRIPT_PATH,
     PKEXEC_PATH,
     POLICY_ACTION,
+    POLICY_DESCRIPTION,
+    POLICY_MESSAGE,
     POLICY_PATH,
     HelperInstallation,
     SyslinuxDeviceHelperUnavailable,
@@ -590,7 +592,9 @@ class InstallationTests(unittest.TestCase):
         script.write_bytes(b"script")
         policy.write_text(
             f'''<?xml version="1.0"?>
-<policyconfig><action id="{POLICY_ACTION}"><defaults>
+<policyconfig><action id="{POLICY_ACTION}">
+<description>{POLICY_DESCRIPTION}</description>
+<message>{POLICY_MESSAGE}</message><defaults>
 <allow_any>no</allow_any><allow_inactive>no</allow_inactive>
 <allow_active>{policy_active}</allow_active></defaults>
 <annotate key="org.freedesktop.policykit.exec.path">{launcher}</annotate>
@@ -771,6 +775,51 @@ class InstallationTests(unittest.TestCase):
                     patch.object(runner_module.os.path, "realpath", side_effect=lambda value: value),
                     patch.object(runner_module, "_trusted_parents"),
                     self.assertRaisesRegex(SyslinuxDeviceHelperUnavailable, "ambiguous"),
+                ):
+                    resolve_syslinux_helper_installation()
+
+    def test_policy_prompt_attributes_and_extra_children_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pkexec, launcher, script, policy = self._staged(root)
+            valid = policy.read_text(encoding="utf-8")
+            actual_lstat = os.lstat
+
+            def root_status(path):
+                status = actual_lstat(path)
+                mode = status.st_mode & ~0o022
+                if os.fspath(path) == os.fspath(pkexec):
+                    mode |= stat.S_ISUID | 0o500
+                elif os.fspath(path) == os.fspath(launcher):
+                    mode |= 0o500
+                else:
+                    mode |= 0o400
+                return SimpleNamespace(st_mode=mode, st_uid=0)
+
+            mutations = (
+                (POLICY_DESCRIPTION, "Write anything"),
+                (POLICY_MESSAGE, "Authenticate"),
+                (f'<action id="{POLICY_ACTION}">', f'<action id="{POLICY_ACTION}" extra="1">'),
+                ("<defaults>", '<defaults extra="1">'),
+                ("<allow_any>no</allow_any>", '<allow_any extra="1">no</allow_any>'),
+                (
+                    '<annotate key="org.freedesktop.policykit.exec.argv1">',
+                    '<annotate key="org.freedesktop.policykit.exec.argv1" extra="1">',
+                ),
+                ("</action>", "<unexpected/>\n</action>"),
+            )
+            for old, new in mutations:
+                policy.write_text(valid.replace(old, new, 1), encoding="utf-8")
+                with (
+                    self.subTest(mutation=new[:32]),
+                    patch.object(runner_module, "PKEXEC_PATH", os.fspath(pkexec)),
+                    patch.object(runner_module, "HELPER_PATH", os.fspath(launcher)),
+                    patch.object(runner_module, "HELPER_SCRIPT_PATH", os.fspath(script)),
+                    patch.object(runner_module, "POLICY_PATH", os.fspath(policy)),
+                    patch.object(runner_module.os, "lstat", side_effect=root_status),
+                    patch.object(runner_module.os.path, "realpath", side_effect=lambda value: value),
+                    patch.object(runner_module, "_trusted_parents"),
+                    self.assertRaises(SyslinuxDeviceHelperUnavailable),
                 ):
                     resolve_syslinux_helper_installation()
 

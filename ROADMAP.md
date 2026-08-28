@@ -164,9 +164,12 @@ evidence.
   sizes, then consider exposing profile-safe sizing in ISO construction.
 - Additional filesystem, partition-layout, and volume-label controls where the
   selected boot profile can support them safely.
-- Flatpak/AppImage feasibility work, native distro packages, release signatures,
-  SBOMs, and reproducibility attestations. Portable settings already support
-  adjacent launchers and AppImage's `.config` convention.
+- Promote the implemented reproducible Debian/Ubuntu `amd64`/`arm64` alpha
+  package through installed VM certification, lintian/piuparts/autopkgtest,
+  independent reproduction attestations, and signed releases. Add official
+  distro packaging, Flatpak/AppImage feasibility work, and SBOMs. Portable
+  settings already support adjacent launchers and AppImage's `.config`
+  convention.
 
 The exhaustive capability-by-capability status is maintained in
 [FEATURE_MATRIX.md](FEATURE_MATRIX.md).

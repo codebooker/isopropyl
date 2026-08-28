@@ -13,6 +13,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from isopropyl.cli import (
     CancellationController,
@@ -815,6 +816,27 @@ class CliTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('[project.gui-scripts]\nisopropyl = "isopropyl.app:main"', pyproject)
         self.assertIn('[project.scripts]\nisopropyl-cli = "isopropyl.cli:main"', pyproject)
+
+    def test_root_is_rejected_before_argument_or_dependency_processing(self):
+        dependencies = CliDependencies(
+            inspect=Mock(side_effect=AssertionError("inspection reached")),
+            discover=Mock(side_effect=AssertionError("discovery reached")),
+            workflow_factory=Mock(side_effect=AssertionError("workflow reached")),
+        )
+        error = io.StringIO()
+        with patch("isopropyl.cli.os.geteuid", return_value=0):
+            code = run(
+                ["list"],
+                stdout=io.StringIO(),
+                stderr=error,
+                dependencies=dependencies,
+                install_signal_handlers=False,
+            )
+        self.assertEqual(code, ExitCode.PREFLIGHT_FAILED)
+        self.assertIn("regular desktop user, not root", error.getvalue())
+        dependencies.inspect.assert_not_called()
+        dependencies.discover.assert_not_called()
+        dependencies.workflow_factory.assert_not_called()
 
 
 if __name__ == "__main__":

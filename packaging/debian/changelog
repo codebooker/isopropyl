@@ -1,0 +1,7 @@
+isopropyl (0.1.0-1) unstable; urgency=medium
+
+  * Initial safety-first alpha package for Debian and Ubuntu.
+  * Install the GUI, headless raw writer, desktop integration, and fixed
+    PolicyKit device helper as one auditable system package.
+
+ -- ISOpropyl contributors <codebooker@users.noreply.github.com>  Thu, 27 Aug 2026 00:00:00 +0000

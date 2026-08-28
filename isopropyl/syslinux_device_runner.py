@@ -67,6 +67,11 @@ HELPER_PATH = "/usr/libexec/isopropyl-device-helper"
 HELPER_SCRIPT_PATH = "/usr/libexec/isopropyl/syslinux_device_helper.py"
 POLICY_PATH = "/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy"
 POLICY_ACTION = "io.github.codebooker.isopropyl.write-syslinux-image"
+POLICY_DESCRIPTION = "Write a caller-supplied Syslinux image to removable media"
+POLICY_MESSAGE = (
+    "Authentication is required to overwrite the selected removable drive "
+    "with caller-supplied image data"
+)
 MAX_DIAGNOSTIC_BYTES = 8 * 1024
 HELPER_STALL_TIMEOUT_SECONDS = 300.0
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -177,25 +182,53 @@ def _validate_policy() -> None:
     except (OSError, ET.ParseError) as error:
         raise SyslinuxDeviceHelperUnavailable("The PolicyKit action is malformed") from error
     actions = root.findall("action") if root.tag == "policyconfig" else []
-    if len(actions) != 1 or actions[0].get("id") != POLICY_ACTION:
+    if len(actions) != 1 or actions[0].attrib != {"id": POLICY_ACTION}:
         raise SyslinuxDeviceHelperUnavailable("The PolicyKit action identity is invalid")
     action = actions[0]
+    descriptions = action.findall("description")
+    messages = action.findall("message")
     defaults_nodes = action.findall("defaults")
     annotations_nodes = action.findall("annotate")
-    if len(defaults_nodes) != 1 or len(annotations_nodes) != 2:
+    if (
+        len(list(action)) != 5
+        or len(descriptions) != 1
+        or len(messages) != 1
+        or len(defaults_nodes) != 1
+        or len(annotations_nodes) != 2
+    ):
         raise SyslinuxDeviceHelperUnavailable(
             "The PolicyKit action has ambiguous authorization structure",
         )
-    default_children = list(defaults_nodes[0])
+    description = descriptions[0]
+    message = messages[0]
     if (
-        len(default_children) != 3
-        or len({child.tag for child in default_children}) != 3
+        description.attrib
+        or list(description)
+        or (description.text or "").strip() != POLICY_DESCRIPTION
+        or message.attrib
+        or list(message)
+        or (message.text or "").strip() != POLICY_MESSAGE
+    ):
+        raise SyslinuxDeviceHelperUnavailable(
+            "The PolicyKit authorization prompt is invalid",
+        )
+    defaults = defaults_nodes[0]
+    default_children = list(defaults)
+    if (
+        defaults.attrib
+        or len(default_children) != 3
+        or {child.tag for child in default_children}
+        != {"allow_any", "allow_inactive", "allow_active"}
+        or any(child.attrib or list(child) for child in default_children)
     ):
         raise SyslinuxDeviceHelperUnavailable(
             "The PolicyKit action has ambiguous authorization defaults",
         )
     values = {child.tag: (child.text or "").strip() for child in default_children}
-    if len({item.get("key") for item in annotations_nodes}) != 2:
+    if (
+        any(set(item.attrib) != {"key"} or list(item) for item in annotations_nodes)
+        or len({item.get("key") for item in annotations_nodes}) != 2
+    ):
         raise SyslinuxDeviceHelperUnavailable(
             "The PolicyKit action has ambiguous executable annotations",
         )

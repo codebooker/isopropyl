@@ -10,7 +10,7 @@
 **Create Linux and Windows installation media with clear choices, guarded writes,
 and end-to-end verification.**
 
-[Install](#install-from-source) · [Quick start](#quick-start) · [Features](#highlights) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
+[Install](#install-a-debianubuntu-alpha-package) · [Quick start](#quick-start) · [Features](#highlights) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
 
 <sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; VERIFIED WRITING &amp; FAST ZERO</sub>
 
@@ -29,10 +29,10 @@ It is inspired by Rufus, but it is a Linux-native project—not a port and not y
 a feature-for-feature replacement.
 
 > [!CAUTION]
-> **ISOpropyl is destructive alpha software.** There is no packaged release yet,
-> and physical-media coverage is still limited. Keep backups, leave verification
-> enabled, and check the target model, capacity, path, and serial before approving
-> a write.
+> **ISOpropyl is destructive alpha software.** Native test packages are not yet
+> signed releases, and physical-media coverage is still limited. Keep backups,
+> leave verification enabled, and check the target model, capacity, path, and
+> serial before approving a write.
 
 ## Highlights
 
@@ -52,11 +52,40 @@ a feature-for-feature replacement.
 For the exhaustive, evidence-based Rufus comparison, see the
 [feature matrix](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md).
 
+## Install a Debian/Ubuntu alpha package
+
+The repository contains an offline, reproducible `.deb` builder for 64-bit x86
+(`amd64`) and ARM (`arm64`). Its dependencies have been checked against **Debian
+13 and Ubuntu 24.04/26.04 LTS**. It packages the GUI, terminal writer, manual
+pages, desktop integration, and exact PolicyKit helper together, so no separate
+privileged install step is needed.
+
+```bash
+git clone https://github.com/codebooker/isopropyl.git
+cd isopropyl
+/usr/bin/python3 -I packaging/debian/build_deb.py --output-dir dist
+sudo apt install ./dist/isopropyl_0.1.0-1_amd64.deb
+```
+
+On ARM64, the generated filename ends in `_arm64.deb`. The builder uses only
+the checked-out source tree and the system's trusted `dpkg` tools; it performs
+no network access, refuses unsupported architectures, and will not overwrite an
+existing package. CI currently builds and exposes the `amd64` artifact on
+successful test runs under **Actions → Artifacts**; build ARM64 locally on an
+`arm64` host. Installed VM certification remains pending for both architectures.
+
+> [!NOTE]
+> Debian and Ubuntu do not currently package every exact dependency in
+> ISOpropyl's pinned Authenticode analysis backend. The native `.deb` therefore
+> reports that analysis as unavailable instead of relaxing pins or substituting
+> a different trust implementation. Image hashing, DBX advice, Secure Boot
+> structure inspection, and write verification remain available.
+
 ## Install from source
 
-ISOpropyl currently has no release tarball, Flatpak, AppImage, or distribution
-package. For alpha testing, install the host tools listed under
-[Requirements](#requirements), then use an isolated Python environment:
+For a development environment or a distribution without the native test
+package, install the host tools listed under [Requirements](#requirements), then
+use an isolated Python environment:
 
 ```bash
 git clone https://github.com/codebooker/isopropyl.git

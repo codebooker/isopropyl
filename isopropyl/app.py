@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import os
 import sys
 import threading
 import logging
@@ -7549,6 +7550,12 @@ THEMES = {"dark": STYLE, "light": LIGHT_STYLE}
 
 
 def main() -> int:
+    if os.geteuid() == 0:
+        print(
+            "ISOpropyl must be run as a regular desktop user, not root.",
+            file=sys.stderr,
+        )
+        return 1
     setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("ISOpropyl")

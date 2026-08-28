@@ -1,0 +1,53 @@
+.TH ISOPROPYL-CLI 1 "August 2026" "ISOpropyl 0.1.0" "User Commands"
+.SH NAME
+isopropyl-cli \- authenticated terminal raw-image writer
+.SH SYNOPSIS
+.B isopropyl-cli list
+.RB [ --include-usb-hard-drives ]
+.br
+.B isopropyl-cli write
+.I image
+.B --target
+.I /dev/DEVICE
+.RB [ --include-usb-hard-drives ]
+.RB [ --no-final-verification ]
+.SH DESCRIPTION
+.B isopropyl-cli
+uses the same identity-bound raw/DD workflow and fixed PolicyKit helper as the
+ISOpropyl graphical application. It accepts one exact whole-device path, never
+an index or glob, and requires interactive typed confirmation before mutation.
+Internal disks remain ineligible.
+.PP
+Run the command as a regular desktop user. It refuses to run as root.
+.SH COMMANDS
+.TP
+.B list
+List raw-writable removable USB and SD targets with 512-byte logical sectors.
+.TP
+.B write
+Inspect and write one raw, compressed, sparse, or supported virtual image to
+one exact target returned by the
+.B list
+command.
+.SH OPTIONS
+.TP
+.B --target /dev/DEVICE
+Select one canonical whole-device path. Required by
+.BR write .
+.TP
+.B --include-usb-hard-drives
+Reveal or permit hot-pluggable fixed USB HDDs and SSDs for this invocation.
+This requires an additional typed warning when writing.
+.TP
+.B --no-final-verification
+Skip the final full-device hash. Mandatory pre-activation read-back still runs,
+and a second typed warning is required.
+.SH EXIT STATUS
+0 indicates success, 2 invalid usage, 3 cancellation, 4 preflight failure,
+5 write failure, and 6 refused confirmation. Signal cancellation may return
+128 plus the signal number.
+.SH SAFETY
+Writing an image destroys data on the target. Prefer full verification and use
+expendable media while this release is marked alpha.
+.SH SEE ALSO
+.BR isopropyl (1)

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+import io
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from isopropyl.app import (
     UefiShellPreparationToken, Window, WindowsMetadataToken,
     WindowsDownloadToken, ZipOverlayPlanningToken,
 )
+import isopropyl.app as app_module
 from isopropyl.authenticode import AuthenticodeIntegrityState, AuthenticodeResult
 from isopropyl.backup import VHD_MAX_SIZE
 from isopropyl.bootloaders import (
@@ -486,6 +488,21 @@ def fake_staged_iso(plan: IsoStagingPlan, destination: Path):
         image_identity=plan.image_identity,
         catalog_digest=plan.staged_catalog_digest,
     )
+
+
+class ApplicationEntryPointTests(unittest.TestCase):
+    def test_root_is_rejected_before_logging_or_qt_startup(self):
+        error = io.StringIO()
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "setup_logging") as setup_logging,
+            patch.object(app_module, "QApplication") as application,
+            patch.object(app_module.sys, "stderr", error),
+        ):
+            self.assertEqual(app_module.main(), 1)
+        self.assertIn("regular desktop user, not root", error.getvalue())
+        setup_logging.assert_not_called()
+        application.assert_not_called()
 
 
 class RestoreFilesystemDialogTests(unittest.TestCase):

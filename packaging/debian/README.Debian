@@ -1,0 +1,26 @@
+ISOpropyl for Debian and Ubuntu
+===============================
+
+This is an upstream-built alpha package for amd64 and arm64. Its dependency set
+has been checked against Debian 13 and Ubuntu 24.04/26.04 LTS. It is not yet an
+official Debian or Ubuntu archive package, and installed VM certification is
+still pending on both architectures.
+
+The package installs ISOpropyl's unprivileged GUI and CLI together with the
+fixed root-owned PolicyKit helper and all three exact action policies. Never run
+the GUI or CLI with sudo; both entry points reject root execution. No
+package-owned file is setuid, and there are no maintainer scripts that download
+software, start services, or access block devices.
+
+The official distro archives do not currently contain every exact version in
+ISOpropyl's pinned Authenticode analysis backend. That analysis therefore
+reports unavailable in this package instead of using relaxed pins or a
+substitute trust implementation. The normal inspection, hashing, DBX advice,
+download authentication, media construction, and write-verification paths do
+not depend on that backend.
+
+This package does not remove the alpha release gates documented in SECURITY.md:
+installed PolicyKit/SCM_RIGHTS race testing, power-loss and hot-swap testing,
+QEMU boot testing, and representative physical-media certification remain
+required before production use. Test only with expendable media and keep full
+verification enabled.

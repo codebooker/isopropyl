@@ -648,6 +648,12 @@ def run(
 ) -> int:
     """Run one CLI invocation and return a stable process exit status."""
 
+    if os.geteuid() == 0:
+        print(
+            "ISOpropyl must be run as a regular desktop user, not root.",
+            file=stderr,
+        )
+        return int(ExitCode.PREFLIGHT_FAILED)
     if type(dependencies) is not CliDependencies:
         print("Internal CLI dependency configuration is invalid.", file=stderr)
         return int(ExitCode.PREFLIGHT_FAILED)
