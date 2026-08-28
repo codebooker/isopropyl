@@ -184,15 +184,28 @@ issue requesting a private contact channel without disclosing the vulnerability.
   external tool. None of this authorizes physical media: privileged topology,
   mount, GPT/NTFS, PREPARED → COMMIT, cancellation-recovery, and physical-boot
   gates remain unimplemented.
-- The Windows BCD oracle module is a non-authorizing evidence contract, not a
-  hive parser, editor, or trust decision. It accepts only canonical, bounded
+- The Windows BCD oracle module is a non-authorizing evidence contract, not an
+  editor or trust decision. It accepts only canonical, bounded
   JSON; models BCD values with their actual registry kinds; derives references,
   boot paths, devices, inheritance, and recovery-disabled byte `00` from typed
   elements; binds a disposable fresh-store GPT layout and hash-verified Microsoft
   tool transcripts; and requires a four-run one-GUID-at-a-time differential
-  cohort. Its tests are synthetic and cannot remove the native BCD authoring,
-  read-back, QEMU/OVMF, or physical-media execution blockers. No application,
-  helper, PolicyKit, or device-writing path imports this module yet.
+  cohort. The four-capture tool's optional read-only verifier accepts caller-pinned
+  readable regular-file descriptors, duplicates without seeking or reopening
+  them, copies each source into a sealed anonymous memfd, invokes hivex with
+  writing and unsafe parsing disabled, and rechecks source identity plus a
+  complete SHA-256 before publishing detached typed evidence. A separate
+  no-follow path entry point uses the same sealed-snapshot core. The tool
+  validates the whole JSON cohort before hive parsing and compares every
+  root/object/element value and store digest. This does not exclude an
+  uncooperative same-UID writer that can race and restore source bytes, establish
+  that Windows produced the inputs, or authorize hive/device writes. Source bytes
+  and returned handle collections are
+  bounded, but hivex still runs in-process without a wall-clock deadline,
+  cancellation, or native-crash isolation; this developer evidence tool is not a
+  privileged parsing boundary. Tests are synthetic and cannot remove native BCD
+  authoring, QEMU/OVMF, or physical-media execution blockers. No application,
+  helper, PolicyKit, or device-writing path imports these modules yet.
 - The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
   dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
   2.06/2.12/2.14 blank-media research bundles, plus the exact upstream UEFI

@@ -147,6 +147,7 @@ class DebianPackageTests(unittest.TestCase):
         self.assertNotIn("coreutils", fields)
         self.assertIn("Recommends: polkit-1-auth-agent", fields)
         self.assertIn("python3-zstandard | zstd", fields)
+        self.assertIn("Suggests: python3-hivex", fields)
         for forbidden in ("preinst", "postinst", "prerm", "postrm", "conffiles"):
             self.assertNotIn(forbidden, self.control)
 
@@ -154,6 +155,7 @@ class DebianPackageTests(unittest.TestCase):
         executable_paths = {
             "usr/bin/isopropyl",
             "usr/bin/isopropyl-cli",
+            "usr/bin/isopropyl-validate-windows-bcd-capture",
             "usr/libexec/isopropyl-device-helper",
         }
         for name, (member, _content) in self.data.items():
@@ -177,6 +179,8 @@ class DebianPackageTests(unittest.TestCase):
                 self.assertEqual(mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX), 0)
 
         required = {
+            "usr/bin/isopropyl-validate-windows-bcd-capture",
+            "usr/lib/isopropyl-tools/validate_windows_bcd_capture.py",
             "usr/libexec/isopropyl/syslinux_device_helper.py",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy",
@@ -220,6 +224,18 @@ class DebianPackageTests(unittest.TestCase):
         self.assertIn(
             "raise SystemExit(4)",
             self.data["usr/bin/isopropyl-cli"][1].decode("utf-8"),
+        )
+        validator_launcher = self.data[
+            "usr/bin/isopropyl-validate-windows-bcd-capture"
+        ][1].decode("utf-8")
+        self.assertTrue(validator_launcher.startswith("#!/usr/bin/python3 -I\n"))
+        self.assertIn(
+            "/usr/lib/isopropyl-tools/validate_windows_bcd_capture.py",
+            validator_launcher,
+        )
+        self.assertEqual(
+            self.data["usr/lib/isopropyl-tools/validate_windows_bcd_capture.py"][1],
+            (ROOT / "tools/validate_windows_bcd_capture.py").read_bytes(),
         )
         desktop = self.data[
             "usr/share/applications/io.github.codebooker.isopropyl.desktop"

@@ -96,11 +96,13 @@ wim_apply_backend.py
 wim_apply_protocol.py
 windows.py
 windows_bcd.py
+windows_bcd_hivex.py
 windows_bcd_oracle.py
 windows_bootex.py
 windows_downloads.py
 windows_paths.py
 windows_to_go.py
+windows_hive.py
 writer.py
 zip_overlay.py
 """.split()
@@ -122,6 +124,16 @@ COMPRESSED_DOCUMENTS = (
 PAYLOAD_FILES: tuple[tuple[str, str, int], ...] = (
     ("packaging/debian/isopropyl", "usr/bin/isopropyl", 0o755),
     ("packaging/debian/isopropyl-cli", "usr/bin/isopropyl-cli", 0o755),
+    (
+        "packaging/debian/isopropyl-validate-windows-bcd-capture",
+        "usr/bin/isopropyl-validate-windows-bcd-capture",
+        0o755,
+    ),
+    (
+        "tools/validate_windows_bcd_capture.py",
+        "usr/lib/isopropyl-tools/validate_windows_bcd_capture.py",
+        0o644,
+    ),
     (
         "helper/isopropyl-device-helper",
         "usr/libexec/isopropyl-device-helper",
@@ -404,6 +416,7 @@ def _control(version: str, architecture: str, installed_size: int) -> bytes:
         "Recommends: polkit-1-auth-agent, wimtools, qemu-utils, exfatprogs, "
         "udftools (>= 1.1), e2fsprogs, f3, xorriso, "
         "python3-zstandard | zstd, psmisc\n"
+        "Suggests: python3-hivex\n"
         "Homepage: https://github.com/codebooker/isopropyl\n"
         "Description: safety-first bootable USB and SD writer for Linux\n"
         " ISOpropyl provides a Qt interface and a confirmation-bound terminal\n"

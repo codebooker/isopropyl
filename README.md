@@ -291,12 +291,13 @@ expanded drive visibility are never persisted.
 Unsupported or ambiguous formats fail closed. Direct FFU/WIM/ESD device apply,
 executable Windows To Go (an internal fail-closed layout/capacity preview, a
 device-free anonymous-NTFS-image WIM backend certificate, and a non-authorizing
-typed Windows BCD differential-evidence contract now exist), and general
+typed Windows BCD differential-evidence contract plus read-only hive verifier
+now exist), and general
 device-facing BIOS/dual-firmware construction from arbitrary payloads remain
 roadmap work. The certification backend explicitly rejects block devices and is
 not a claim about hostile same-UID processes, Windows boot, or physical media.
-The BCD contract currently has synthetic tests only; it cannot create, modify,
-publish, or trust a boot hive.
+The BCD contract and hive-reader tests currently use synthetic evidence only;
+they cannot create, modify, publish, or trust a boot hive.
 
 ## Windows customization
 
@@ -402,6 +403,7 @@ Optional tools unlock additional workflows:
 | Zstandard images | Python `zstandard` or `zstd` |
 | Legacy Unix `.Z` images | `gzip` |
 | Busy-drive process names | `fuser` (`psmisc`) |
+| Read-only maintainer validation of captured Windows BCD hives | Python `hivex` (`python3-hivex`) |
 
 ISO mode also needs private temporary space for the extracted tree. WIM
 inspection or splitting can require several additional gigabytes. Missing
@@ -525,6 +527,30 @@ every root UID and any set-ID/file-capability-bearing tool, locks down its
 descriptor owner, creates only an anonymous 128 MiB regular NTFS image, and
 verifies the exact applied file and clean volume metadata. It never accepts or
 discovers a block device.
+
+Maintainers can also compare four Windows-captured BCD hives with their exact
+canonical oracle fixtures after installing `python3-hivex`:
+
+```bash
+python3 tools/validate_windows_bcd_capture.py \
+  --baseline baseline.json baseline.BCD \
+  --disk-guid disk-guid.json disk-guid.BCD \
+  --esp-guid esp-guid.json esp-guid.BCD \
+  --windows-guid windows-guid.json windows-guid.BCD
+```
+
+The Debian package also installs the isolated
+`isopropyl-validate-windows-bcd-capture` command with the same arguments.
+
+The command pins eight distinct regular-file descriptors, validates the entire
+one-GUID-at-a-time cohort before parsing any hive, copies each BCD into a sealed
+anonymous snapshot, and compares every typed registry value and store digest.
+It never edits a hive or device, and success is evidence matching—not Windows
+provenance, BCD-generation authority, boot certification, or permission to run
+the Windows To Go write path. No authentic Windows capture is bundled yet. Hive
+bytes and returned collections are bounded, but the optional native parser runs
+in-process without a wall-clock deadline or crash isolation; use this maintainer
+tool only on disposable copies and never as a privileged service boundary.
 
 Read [CONTRIBUTING.md](https://github.com/codebooker/isopropyl/blob/main/CONTRIBUTING.md) before changing a destructive path.
 Brand assets and usage guidance are in [BRANDING.md](https://github.com/codebooker/isopropyl/blob/main/BRANDING.md).

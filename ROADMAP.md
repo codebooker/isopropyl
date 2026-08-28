@@ -150,7 +150,11 @@ evidence.
   boot semantics from captured values, binds the complete frozen GPT geometry and
   Microsoft command provenance, and requires a four-run one-GUID-at-a-time
   differential set. Its unit fixtures are explicitly synthetic: Windows-generated
-  captures, native hivex construction/read-back, and QEMU still gate any hive use.
+  captures, native hivex construction, and QEMU still gate any hive use. A
+  read-only verifier now pins each captured hive descriptor, snapshots it into a
+  sealed memfd, decodes its typed registry tree with optional hivex, binds the
+  complete store digest/size, and compares a four-hive cohort without exposing a
+  write API. This is read-back evidence only and does not trust the fixtures.
   A candidate non-executable
   WIM-apply request contract now carries strictly validated claims for the
   parent, exact child geometry, WIM snapshot, edition index/expanded size, and
