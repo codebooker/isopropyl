@@ -70,6 +70,7 @@ class PartitionRole(str, Enum):
     EFI_SYSTEM = "efi-system"
     PERSISTENCE = "persistence"
     MICROSOFT_RESERVED = "microsoft-reserved"
+    WINDOWS_OS = "windows-os"
     UEFI_NTFS = "uefi-ntfs"
 
 
@@ -198,6 +199,7 @@ _GPT_TYPES: Mapping[Filesystem, str] = {
 _MBR_ROLE_TYPES: Mapping[PartitionRole, str] = {
     PartitionRole.EFI_SYSTEM: "ef",
     PartitionRole.PERSISTENCE: "83",
+    PartitionRole.WINDOWS_OS: "7",
     PartitionRole.UEFI_NTFS: "ef",
 }
 
@@ -206,6 +208,7 @@ _GPT_ROLE_TYPES: Mapping[PartitionRole, str] = {
     PartitionRole.EFI_SYSTEM: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
     PartitionRole.PERSISTENCE: "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
     PartitionRole.MICROSOFT_RESERVED: "E3C9E316-0B5C-4DB8-817D-F92DF00215AE",
+    PartitionRole.WINDOWS_OS: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     PartitionRole.UEFI_NTFS: "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
 }
 
@@ -214,6 +217,7 @@ _PARTITION_NAMES: Mapping[PartitionRole, str] = {
     PartitionRole.EFI_SYSTEM: "ISOpropyl boot",
     PartitionRole.PERSISTENCE: "ISOpropyl persistence",
     PartitionRole.MICROSOFT_RESERVED: "Microsoft reserved",
+    PartitionRole.WINDOWS_OS: "Windows",
     PartitionRole.UEFI_NTFS: "UEFI:NTFS",
 }
 
@@ -843,6 +847,8 @@ def _validate_partition_spec(
             raise FormatValidationError(
                 "A Microsoft Reserved Partition must be unformatted and use GPT"
             )
+    if spec.role is PartitionRole.WINDOWS_OS and spec.filesystem is not Filesystem.NTFS:
+        raise FormatValidationError("A Windows OS partition must use NTFS")
     if spec.bootable and table is not PartitionTable.MBR:
         raise FormatValidationError("The legacy bootable flag is valid only for MBR")
 
@@ -889,6 +895,7 @@ def validate_multi_plan(plan: MultiFormatPlan) -> None:
         if spec.role in {
             PartitionRole.EFI_SYSTEM,
             PartitionRole.MICROSOFT_RESERVED,
+            PartitionRole.WINDOWS_OS,
             PartitionRole.UEFI_NTFS,
         }:
             if spec.role in seen_singletons:

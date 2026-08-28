@@ -93,6 +93,7 @@ virtual.py
 vtsi.py
 wim.py
 windows.py
+windows_to_go.py
 windows_bootex.py
 windows_downloads.py
 windows_paths.py

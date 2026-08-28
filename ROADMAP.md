@@ -140,8 +140,12 @@ evidence.
   including every fallback architecture, manifest failure/cancellation behavior,
   Secure Boot acceptance or rejection, and post-write corruption. Expand beyond
   native FAT32 only after Casper/Ubuntu and UEFI:NTFS regressions are excluded.
-- Add Windows To Go through `wimlib` apply, offline BCD/SAN policy, and explicit
-  internal-disk behavior.
+- Complete the internal non-executable Windows To Go preview. It already binds
+  selected x64 Windows 8+ WIM metadata and expanded size to Rufus-compatible
+  512-byte-sector GPT geometry (260 MiB ESP, 128 MiB MSR, remaining NTFS).
+  Physical execution still requires descriptor-bound privileged `wimlib` block
+  apply, image-native BCD construction/read-back, offline SAN policy, explicit
+  internal-disk behavior, and QEMU/OVMF plus physical certification.
 - Physically certify the strict VTSI v1.0 restore path on representative Ventoy
   media; keep its exact-capacity and 512-byte logical-sector requirements. Add
   FFU/direct WIM/ESD input and FFU/UDF-image authoring output only after format

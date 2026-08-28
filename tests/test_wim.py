@@ -108,9 +108,21 @@ class WimInfoTests(unittest.TestCase):
         self.assertEqual(editions[0].service_pack_build, 0)
         self.assertEqual(editions[1].architecture, "amd64")
         self.assertEqual(editions[1].name, "Windows 11 Pro")
+        self.assertEqual(editions[1].expanded_bytes, 0)
         # `wimlib-imagex info --xml` emits UTF-16LE with a byte-order mark.
         utf16 = INFO_XML.decode("utf-8").replace("UTF-8", "UTF-16").encode("utf-16")
         self.assertEqual(parse_wim_info_xml(utf16), editions)
+
+    def test_parses_64_bit_expanded_image_size(self):
+        payload = INFO_XML.replace(
+            b'<IMAGE INDEX="2">',
+            b'<IMAGE INDEX="2"><TOTALBYTES>17179869184</TOTALBYTES>',
+        )
+        editions = parse_wim_info_xml(payload)
+        self.assertEqual(editions[1].expanded_bytes, 16 * 1024**3)
+        for value in (b"-1", b"9223372036854775808"):
+            with self.subTest(value=value), self.assertRaises(WimMetadataError):
+                parse_wim_info_xml(payload.replace(b"17179869184", value))
 
     def test_rejects_malformed_unsafe_or_incomplete_xml(self):
         invalid = (

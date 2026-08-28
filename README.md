@@ -289,7 +289,8 @@ expanded drive visibility are never persisted.
 | Additive `.zip` overlay | ISO mode option | One stored/deflated archive; additions only, no overwrites or links. |
 
 Unsupported or ambiguous formats fail closed. Direct FFU/WIM/ESD apply,
-Windows To Go, and general device-facing BIOS/dual-firmware construction from
+Executable Windows To Go (an internal fail-closed layout/capacity preview now
+exists), and general device-facing BIOS/dual-firmware construction from
 arbitrary payloads remain roadmap work.
 
 ## Windows customization

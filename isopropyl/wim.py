@@ -79,6 +79,7 @@ class WimEdition:
     minor_version: int
     build: int
     service_pack_build: int
+    expanded_bytes: int = 0
 
     @property
     def version(self) -> str:
@@ -446,6 +447,21 @@ def _optional_integer(parent: ET.Element, name: str, context: str) -> int:
     return parsed
 
 
+def _optional_u63(parent: ET.Element, name: str, context: str) -> int:
+    """Parse optional byte counts without the 32-bit metadata-field ceiling."""
+
+    item = _child(parent, name)
+    if item is None or item.text is None or not item.text.strip():
+        return 0
+    value = item.text.strip()
+    if not value.isascii() or not value.isdecimal():
+        raise WimMetadataError(f"Invalid numeric {context} {name}")
+    parsed = int(value)
+    if parsed > (1 << 63) - 1:
+        raise WimMetadataError(f"Out-of-range {context} {name}")
+    return parsed
+
+
 _ARCHITECTURES = {
     0: "x86",
     5: "arm",
@@ -467,14 +483,15 @@ def validate_wim_editions(editions: tuple[WimEdition, ...]) -> None:
     for item in editions:
         integer_values = (
             item.index, item.major_version, item.minor_version, item.build,
-            item.service_pack_build,
+            item.service_pack_build, item.expanded_bytes,
         )
         if any(not isinstance(value, int) or isinstance(value, bool) for value in integer_values):
             raise WimMetadataError("WIM edition contains invalid numeric metadata")
         if (
             item.index <= 0 or item.index in indexes or item.major_version < 0
             or item.minor_version < 0 or item.build <= 0 or item.service_pack_build < 0
-            or any(value > 2_147_483_647 for value in integer_values)
+            or any(value > 2_147_483_647 for value in integer_values[:-1])
+            or item.expanded_bytes < 0 or item.expanded_bytes > (1 << 63) - 1
         ):
             raise WimMetadataError("WIM edition contains ambiguous or invalid numeric metadata")
         indexes.add(item.index)
@@ -585,6 +602,7 @@ def parse_wim_info_xml(payload: bytes | str) -> tuple[WimEdition, ...]:
             minor_version=_integer(version, "MINOR", f"image {index} version"),
             build=_integer(version, "BUILD", f"image {index} version", minimum=1),
             service_pack_build=_optional_integer(version, "SPBUILD", f"image {index} version"),
+            expanded_bytes=_optional_u63(image, "TOTALBYTES", f"image {index}"),
         ))
     result = tuple(sorted(editions, key=lambda item: item.index))
     validate_wim_editions(result)
