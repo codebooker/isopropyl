@@ -93,10 +93,11 @@ virtual.py
 vtsi.py
 wim.py
 windows.py
-windows_to_go.py
+windows_bcd.py
 windows_bootex.py
 windows_downloads.py
 windows_paths.py
+windows_to_go.py
 writer.py
 zip_overlay.py
 """.split()
