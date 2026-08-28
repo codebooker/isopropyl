@@ -2485,6 +2485,148 @@ class WindowWriteMethodTests(unittest.TestCase):
             self.assertIsNone(self.window.windows_downloader)
             self.assertEqual(self.window.progress.value(), 1000)
 
+    def test_curated_windows_arm64_profile_updates_dialog_and_loads_exact_media(self):
+        release = next(
+            item for item in available_windows_images()
+            if item.architecture == "ARM64"
+        )
+        capability = "https://software.download.prss.microsoft.com/arm64-masked"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.filename
+
+            class FakeDownloader:
+                cancelled = False
+
+                def __init__(self):
+                    self.calls = []
+
+                def cancel(self) -> None:
+                    self.cancelled = True
+
+                def download(self, selected, output, progress, *, source_url=None):
+                    self.calls.append((selected, output, source_url))
+                    with output.open("wb") as stream:
+                        stream.truncate(selected.size)
+                    return DownloadedWindowsImage(
+                        output, selected.id, selected.size, selected.sha256,
+                    )
+
+            downloader = FakeDownloader()
+
+            def accept_catalog(dialog) -> int:
+                choices = dialog.findChild(QComboBox, "windowsDownloadRelease")
+                link = dialog.findChild(QLineEdit, "windowsDownloadUrl")
+                automatic = dialog.findChild(
+                    QCheckBox, "windowsAutomaticResolver"
+                )
+                details = dialog.findChild(QLabel, "muted")
+                assert choices is not None and link is not None
+                assert automatic is not None and details is not None
+                choices.setCurrentIndex(choices.findData(release))
+                self.assertIs(choices.currentData(), release)
+                self.assertIn("ARM64", link.placeholderText())
+                self.assertIn(release.filename, details.text())
+                self.assertIn(release.provenance_url, details.text())
+                self.assertTrue(automatic.isEnabled())
+                link.setText(capability)
+                return QDialog.DialogCode.Accepted
+
+            inspection = replace(
+                optical_windows_inspection(),
+                size=release.size,
+                architectures=("ARM64",),
+            )
+            with (
+                patch("isopropyl.app.QDialog.exec", new=accept_catalog),
+                patch("isopropyl.app.validate_microsoft_download_url"),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "ISO images (*.iso)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch("isopropyl.app.QMessageBox.information"),
+                patch("isopropyl.app.QMessageBox.critical") as critical,
+                patch("isopropyl.app.WindowsIsoDownloader", return_value=downloader),
+                patch("isopropyl.app.inspect_image", return_value=inspection),
+                patch("isopropyl.app.threading.Thread", ImmediateThread),
+                patch.object(self.window, "load_image") as load_image,
+            ):
+                self.window.download_windows_image()
+
+            self.assertEqual(
+                downloader.calls, [(release, destination, capability)]
+            )
+            load_image.assert_called_once_with(destination)
+            critical.assert_not_called()
+
+    def test_curated_windows_arm64_rejects_x64_inspection_after_publication(self):
+        release = next(
+            item for item in available_windows_images()
+            if item.architecture == "ARM64"
+        )
+        capability = "https://software.download.prss.microsoft.com/arm64-masked"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.filename
+
+            class FakeDownloader:
+                cancelled = False
+
+                def cancel(self) -> None:
+                    self.cancelled = True
+
+                def download(self, selected, output, progress, *, source_url=None):
+                    with output.open("wb") as stream:
+                        stream.truncate(selected.size)
+                    return DownloadedWindowsImage(
+                        output, selected.id, selected.size, selected.sha256,
+                    )
+
+            def accept_catalog(dialog) -> int:
+                choices = dialog.findChild(QComboBox, "windowsDownloadRelease")
+                link = dialog.findChild(QLineEdit, "windowsDownloadUrl")
+                assert choices is not None and link is not None
+                choices.setCurrentIndex(choices.findData(release))
+                link.setText(capability)
+                return QDialog.DialogCode.Accepted
+
+            wrong_architecture = replace(
+                optical_windows_inspection(), size=release.size,
+            )
+            with (
+                patch("isopropyl.app.QDialog.exec", new=accept_catalog),
+                patch("isopropyl.app.validate_microsoft_download_url"),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "ISO images (*.iso)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch("isopropyl.app.QMessageBox.warning") as warning,
+                patch("isopropyl.app.QMessageBox.critical") as critical,
+                patch(
+                    "isopropyl.app.WindowsIsoDownloader",
+                    return_value=FakeDownloader(),
+                ),
+                patch(
+                    "isopropyl.app.inspect_image",
+                    return_value=wrong_architecture,
+                ),
+                patch("isopropyl.app.threading.Thread", ImmediateThread),
+                patch.object(self.window, "load_image") as load_image,
+            ):
+                self.window.download_windows_image()
+
+            self.assertTrue(destination.exists())
+            warning.assert_called_once()
+            self.assertIn("inspection failed", warning.call_args.args[1])
+            load_image.assert_not_called()
+            critical.assert_not_called()
+
     def test_curated_windows_catalog_dialog_cancel_is_network_inactive(self):
         with (
             patch(

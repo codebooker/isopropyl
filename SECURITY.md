@@ -219,14 +219,16 @@ issue requesting a private contact channel without disclosing the vulnerability.
   provenance rather than mirror trust or remote scripts.
 - The Windows downloader is likewise network-inactive until the user selects
   **Download Windows…**, one immutable catalog object, an exact destination, a
-  source method, and final consent. Its initial scope is only the public Windows
-  11 25H2 v2 consumer multi-edition ISO in English (United States) for x64. The
-  catalog pins the exact Microsoft product/edition/SKU labels, official filename,
-  8,471,603,200-byte length, and Microsoft-published SHA-256. Before a private
-  partial is opened, ISOpropyl fetches the bounded official page as data and
-  requires its one English x64 hash row to equal the bundled pin. This is an
-  HTTPS-published hash, not a detached Microsoft signature; CDN ETags and API
-  metadata are never accepted as an artifact digest.
+  source method, and final consent. Its initial scope is the public Windows 11
+  25H2 v2 consumer multi-edition ISO in English (United States) for x64 and
+  ARM64. The closed, code-owned profile map binds each architecture to its exact
+  Microsoft page and connector download type. The catalog separately pins each
+  profile's exact Microsoft product/edition/SKU labels, official filename,
+  length, and Microsoft-published SHA-256. Before a private partial is opened,
+  ISOpropyl fetches that profile's bounded official page as data and requires
+  its one English hash row to equal the bundled pin. This is an HTTPS-published
+  hash, not a detached Microsoft signature; CDN ETags and API metadata are never
+  accepted as an artifact digest.
 - The recommended Windows path asks the user to generate a link in Microsoft's
   normal browser and paste it into a masked field. ISOpropyl accepts only the
   exact reviewed CDN origin and filename, canonical `t`/`P1`/`P2`/`P3`/`P4`
@@ -251,8 +253,9 @@ issue requesting a private contact channel without disclosing the vulnerability.
   filename, exact size, and SHA-256, so a future same-filename catalog entry
   cannot consume another artifact's partial. A checksum mismatch removes only
   the known-bad bound partial. After Windows publication, a
-  descriptor-identity-bound inspection
-  must prove an ISO9660 x64 Windows installer before the GUI can load it. ISOpropyl
+  descriptor-identity-bound inspection must prove an ISO9660 Windows installer
+  with exactly the catalog-selected x64 or ARM64 architecture before the GUI can
+  load it; a wrong, mixed, or unknown architecture set is rejected. ISOpropyl
   never proxies or redistributes Microsoft media, automates account/subscription
   access, or claims that a download grants a Windows license; Microsoft terms
   apply and ISOpropyl is unaffiliated with Microsoft.

@@ -21,13 +21,27 @@ from isopropyl.windows_downloads import (
     MicrosoftWindowsResolver, WindowsDownloadCancelled,
     WindowsDownloadCatalogError, WindowsDownloadError,
     WindowsIsoDownloader, available_windows_images, load_windows_image_catalog,
-    validate_microsoft_download_url,
+    validate_microsoft_download_url, windows_inspection_matches_release,
 )
+from isopropyl.images import ImageInspection
 
 
 NOW = dt.datetime(2026, 8, 28, 12, 0, tzinfo=dt.timezone.utc)
 SESSION = uuid.UUID("11111111-2222-4333-8444-555555555555")
 TOKEN = "secret-capability-token"
+OBSERVATIONS_PATH = Path(__file__).with_name(
+    "windows-profile-observations-v1.json"
+)
+
+
+def release_for(architecture: str):
+    matches = tuple(
+        release for release in available_windows_images()
+        if release.architecture == architecture
+    )
+    if len(matches) != 1:
+        raise AssertionError(f"expected one {architecture} Windows catalog entry")
+    return matches[0]
 
 
 class Response(BytesIO):
@@ -89,6 +103,9 @@ def link_document(release=None, *, uri: str | None = None, expiry: object = None
     uri = uri or image_url(release)
     if expiry is None:
         expiry = "2026-08-29T12:00:00Z"
+    download_type = downloads._WINDOWS_DOWNLOAD_PROFILES[
+        release.download_profile
+    ].download_type
     option = {
         "Name": release.filename,
         "Uri": uri,
@@ -96,12 +113,12 @@ def link_document(release=None, *, uri: str | None = None, expiry: object = None
         "Language": release.language_id,
         "LocalizedLanguage": release.language,
         "LocalizedProductDisplayName": release.localized_product_display_name,
-        "DownloadType": 1,
+        "DownloadType": download_type,
     }
     return json.dumps(
         {
             "DownloadExpirationDatetime": expiry,
-            "ProductDownload": {"Uri": uri, "DownloadType": 1},
+            "ProductDownload": {"Uri": uri, "DownloadType": download_type},
             "ProductDownloadOptions": [option],
             "ValidationContainer": {},
         },
@@ -145,9 +162,10 @@ def provenance_opener(release=None, *, sha256: str | None = None):
     return open_url, calls
 
 
-def small_release(payload: bytes):
+def small_release(payload: bytes, architecture: str = "x64"):
     return replace(
-        available_windows_images()[0], id="windows-test-english-x64",
+        release_for(architecture),
+        id=f"windows-test-english-{architecture.casefold()}",
         filename="windows-test.iso", image_path="/dbazure/windows-test.iso",
         size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
     )
@@ -157,32 +175,79 @@ def resume_stage(root: str | Path, release) -> Path:
     return Path(root) / downloads._verified.resume_stage_name(release)
 
 
+def installer_inspection(release, architectures: tuple[str, ...] | None = None):
+    return ImageInspection(
+        size=release.size,
+        kind="Optical ISO",
+        volume_label="WINDOWS",
+        has_mbr=False,
+        has_gpt=False,
+        is_iso9660=True,
+        looks_windows=True,
+        boot_modes=("UEFI",),
+        architectures=architectures or (release.architecture,),
+        bootloader="Windows Boot Manager",
+        has_windows_installer=True,
+        contents_scanned=True,
+    )
+
+
 class WindowsCatalogTests(unittest.TestCase):
     def test_bundled_catalog_is_exact_and_network_inactive(self):
         with patch("urllib.request.urlopen", side_effect=AssertionError("network")):
             releases = load_windows_image_catalog()
-        self.assertEqual(len(releases), 1)
-        release = releases[0]
-        self.assertEqual(release.id, "windows-11-25h2-v2-english-x64")
-        self.assertEqual(release.filename, "Win11_25H2_English_x64_v2.iso")
-        self.assertEqual(release.size, 8_471_603_200)
-        self.assertEqual(
-            release.sha256,
-            "768984706b909479417b2368438909440f2967ff05c6a9195ed2667254e465e3",
-        )
-        self.assertEqual(release.product_edition_id, "3321")
-        self.assertEqual(release.sku_id, "20046")
-        self.assertEqual(
-            release.image_hosts, ("software.download.prss.microsoft.com",)
-        )
+        self.assertEqual(len(releases), 2)
+        expected = {
+            "x64": (
+                "windows-11-25h2-v2-english-x64",
+                "windows11-x64-v1",
+                "Win11_25H2_English_x64_v2.iso",
+                8_471_603_200,
+                "768984706b909479417b2368438909440f2967ff05c6a9195ed2667254e465e3",
+                "3321", "20046",
+                "https://www.microsoft.com/en-us/software-download/windows11",
+            ),
+            "ARM64": (
+                "windows-11-25h2-v2-english-arm64",
+                "windows11-arm64-v1",
+                "Win11_25H2_English_Arm64_v2.iso",
+                7_994_415_104,
+                "638aa2c88e94385b00f4f178d071e3df0b7d9e335577a83bd533b7f2eb65adf0",
+                "3324", "20086",
+                "https://www.microsoft.com/en-us/software-download/windows11arm64",
+            ),
+        }
+        for release in releases:
+            with self.subTest(architecture=release.architecture):
+                values = expected[release.architecture]
+                self.assertEqual(release.id, values[0])
+                self.assertEqual(release.download_profile, values[1])
+                self.assertIs(release.direct_resolver_supported, True)
+                self.assertEqual(release.filename, values[2])
+                self.assertEqual(release.size, values[3])
+                self.assertEqual(release.sha256, values[4])
+                self.assertEqual(release.product_edition_id, values[5])
+                self.assertEqual(release.sku_id, values[6])
+                self.assertEqual(release.provenance_url, values[7])
+                self.assertEqual(
+                    release.image_hosts,
+                    ("software.download.prss.microsoft.com",),
+                )
         self.assertIs(available_windows_images()[0], available_windows_images()[0])
 
     def test_catalog_rejects_unknown_missing_and_unsafe_fields(self):
-        source = Path(downloads.__file__).with_name("data") / "windows-images-v1.json"
+        source = Path(downloads.__file__).with_name("data") / "windows-images-v2.json"
         original = json.loads(source.read_text())
         cases = []
         changed = json.loads(json.dumps(original)); changed["surprise"] = True
         cases.append(changed)
+        for key, value in (
+            ("catalog_version", 2.0),
+            ("resolver_version", 1.0),
+            ("resolver_version", True),
+        ):
+            changed = json.loads(json.dumps(original)); changed[key] = value
+            cases.append(changed)
         changed = json.loads(json.dumps(original)); del changed["images"][0]["sha256"]
         cases.append(changed)
         changed = json.loads(json.dumps(original)); changed["images"][0]["filename"] = "../bad.iso"
@@ -195,6 +260,36 @@ class WindowsCatalogTests(unittest.TestCase):
         cases.append(changed)
         changed = json.loads(json.dumps(original)); changed["images"][0]["provenance_url"] += "?mutable=1"
         cases.append(changed)
+        changed = json.loads(json.dumps(original)); changed["images"][0]["download_profile"] = "future-profile"
+        cases.append(changed)
+        changed = json.loads(json.dumps(original)); changed["images"][0]["download_profile"] = []
+        cases.append(changed)
+        changed = json.loads(json.dumps(original)); changed["images"][0]["architecture"] = "ARM64"
+        cases.append(changed)
+        changed = json.loads(json.dumps(original)); changed["images"][0]["direct_resolver_supported"] = 1
+        cases.append(changed)
+        for field in ("id", "filename", "image_path"):
+            changed = json.loads(json.dumps(original))
+            changed["images"][1][field] = changed["images"][0][field]
+            cases.append(changed)
+        changed = json.loads(json.dumps(original))
+        for field in ("product", "release", "edition", "language", "architecture"):
+            changed["images"][1][field] = changed["images"][0][field]
+        changed["images"][1]["download_profile"] = changed["images"][0]["download_profile"]
+        changed["images"][1]["provenance_url"] = changed["images"][0]["provenance_url"]
+        cases.append(changed)
+        changed = json.loads(json.dumps(original))
+        for left, right in ((0, 1), (1, 0)):
+            for field in ("download_profile", "architecture", "provenance_url"):
+                changed["images"][left][field] = original["images"][right][field]
+        cases.append(changed)
+        for field in (
+            "size", "sha256", "product_edition_id", "sku_id",
+            "product_display_name", "localized_product_display_name",
+        ):
+            changed = json.loads(json.dumps(original))
+            changed["images"][0][field] = changed["images"][1][field]
+            cases.append(changed)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "catalog.json"
             for value in cases:
@@ -202,6 +297,76 @@ class WindowsCatalogTests(unittest.TestCase):
                     path.write_text(json.dumps(value))
                     with self.assertRaises(WindowsDownloadCatalogError):
                         load_windows_image_catalog(path)
+
+    def test_post_download_inspection_is_exactly_architecture_bound(self):
+        for release, other in (
+            (release_for("x64"), release_for("ARM64")),
+            (release_for("ARM64"), release_for("x64")),
+        ):
+            valid = installer_inspection(release)
+            with self.subTest(architecture=release.architecture):
+                self.assertTrue(
+                    windows_inspection_matches_release(
+                        release, valid, release.size,
+                    )
+                )
+                invalid = (
+                    (replace(valid, architectures=(other.architecture,)), release.size),
+                    (
+                        replace(
+                            valid,
+                            architectures=(release.architecture, other.architecture),
+                        ),
+                        release.size,
+                    ),
+                    (
+                        replace(
+                            valid,
+                            architectures=(release.architecture, "IA-64"),
+                        ),
+                        release.size,
+                    ),
+                    (
+                        replace(
+                            valid,
+                            architectures=(release.architecture, "unknown"),
+                        ),
+                        release.size,
+                    ),
+                    (replace(valid, has_windows_installer=False), release.size),
+                    (replace(valid, contents_scanned=False), release.size),
+                    (replace(valid, is_iso9660=False), release.size),
+                    (replace(valid, size=release.size - 1), release.size),
+                    (valid, release.size - 1),
+                )
+                for inspection, observed_size in invalid:
+                    self.assertFalse(
+                        windows_inspection_matches_release(
+                            release, inspection, observed_size,
+                        )
+                    )
+
+    def test_future_browser_only_profile_fails_before_direct_network_or_staging(self):
+        release = replace(
+            release_for("x64"), direct_resolver_supported=False,
+        )
+        with patch.object(
+            downloads, "available_windows_images", return_value=(release,),
+        ):
+            with self.assertRaisesRegex(WindowsDownloadError, "browser-generated"):
+                MicrosoftWindowsResolver().resolve(
+                    release, opener=lambda *_a, **_k: self.fail("network used"),
+                )
+            with tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory) / release.filename
+                with self.assertRaisesRegex(
+                    WindowsDownloadError, "browser-generated",
+                ):
+                    WindowsIsoDownloader().download(
+                        release, destination,
+                        opener=lambda *_a, **_k: self.fail("network used"),
+                    )
+                self.assertEqual(os.listdir(directory), [])
 
 
 class MicrosoftResolverTests(unittest.TestCase):
@@ -242,10 +407,139 @@ class MicrosoftResolverTests(unittest.TestCase):
         self.assertTrue(all(request.get_method() == "GET" for request, _ in requests))
         self.assertTrue(all(request.get_header("Accept-encoding") == "identity" for request, _ in requests))
         self.assertIsNone(requests[3][0].get_header("Referer"))
-        self.assertEqual(requests[4][0].get_header("Referer"), downloads._REFERER)
+        self.assertEqual(
+            requests[4][0].get_header("Referer"), self.release.provenance_url,
+        )
         self.assertIn("productEditionId=3321", urls[3])
         self.assertIn("SKU=20046", urls[4])
         self.assertNotIn(TOKEN, "\n".join(urls))
+
+    def test_fixed_profile_requests_are_architecture_specific(self):
+        expected = {"x64": 1, "ARM64": 2}
+        for architecture, download_type in expected.items():
+            release = release_for(architecture)
+            with self.subTest(architecture=architecture):
+                opener, requests, remaining = successful_opener(release)
+                result = MicrosoftWindowsResolver().resolve(
+                    release, opener=opener, session_id=SESSION, now=NOW,
+                )
+                self.assertEqual(result.url, image_url(release))
+                self.assertEqual(remaining, [])
+                urls = [request.full_url for request, _ in requests]
+                self.assertIn(
+                    f"productEditionId={release.product_edition_id}", urls[3],
+                )
+                self.assertIn(f"SKU={release.sku_id}", urls[4])
+                self.assertEqual(
+                    requests[4][0].get_header("Referer"),
+                    release.provenance_url,
+                )
+                document = json.loads(link_document(release))
+                self.assertEqual(
+                    document["ProductDownload"]["DownloadType"], download_type,
+                )
+
+    def test_sanitized_live_profile_observations_bind_the_catalog_and_parser(self):
+        observations = json.loads(OBSERVATIONS_PATH.read_text())
+        self.assertEqual(observations["observation_date"], "2026-08-28")
+        self.assertIn("ephemeral", observations["method"])
+        for fact in observations["profiles"]:
+            release = release_for(fact["architecture"])
+            with self.subTest(architecture=release.architecture):
+                for field in (
+                    "download_profile", "provenance_url", "product_edition_id",
+                    "sku_id", "product_display_name",
+                    "localized_product_display_name", "filename", "image_path",
+                ):
+                    self.assertEqual(getattr(release, field), fact[field])
+                self.assertEqual(
+                    downloads._WINDOWS_DOWNLOAD_PROFILES[
+                        release.download_profile
+                    ].download_type,
+                    fact["download_type"],
+                )
+
+                uri = image_url(release)
+                sku = json.dumps(
+                    {
+                        "Skus": [
+                            {
+                                "Id": fact["sku_id"],
+                                "Language": "English",
+                                "LocalizedLanguage": "English (United States)",
+                                "LocalizedProductDisplayName": fact[
+                                    "localized_product_display_name"
+                                ],
+                                "ProductDisplayName": fact[
+                                    "product_display_name"
+                                ],
+                            }
+                        ],
+                        "ValidationContainer": {},
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                option = {
+                    "Name": fact["filename"],
+                    "Uri": uri,
+                    "ProductDisplayName": fact["product_display_name"],
+                    "Language": "English",
+                    "LocalizedLanguage": "English (United States)",
+                    "LocalizedProductDisplayName": fact[
+                        "localized_product_display_name"
+                    ],
+                    "DownloadType": fact["download_type"],
+                }
+                link_body = json.dumps(
+                    {
+                        "DownloadExpirationDatetime": "2026-08-29T12:00:00Z",
+                        "ProductDownload": {
+                            "Uri": uri,
+                            "DownloadType": fact["download_type"],
+                        },
+                        "ProductDownloadOptions": [option],
+                        "ValidationContainer": {},
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                opener, _, bodies = successful_opener(release)
+                bodies[3] = sku
+                bodies[4] = link_body
+                result = MicrosoftWindowsResolver().resolve(
+                    release, opener=opener, session_id=SESSION, now=NOW,
+                )
+                self.assertEqual(result.url, uri)
+
+    def test_cross_profile_url_and_download_type_are_rejected(self):
+        for release, other in (
+            (release_for("x64"), release_for("ARM64")),
+            (release_for("ARM64"), release_for("x64")),
+        ):
+            with self.subTest(architecture=release.architecture):
+                opener, _, bodies = successful_opener(release)
+                bodies[4] = link_document(release, uri=image_url(other))
+                with self.assertRaises(WindowsDownloadError):
+                    MicrosoftWindowsResolver().resolve(
+                        release, opener=opener, session_id=SESSION, now=NOW,
+                    )
+
+                with self.assertRaises(WindowsDownloadError):
+                    validate_microsoft_download_url(
+                        release, image_url(other), now=NOW,
+                    )
+
+                document = json.loads(link_document(release))
+                wrong_type = downloads._WINDOWS_DOWNLOAD_PROFILES[
+                    other.download_profile
+                ].download_type
+                document["ProductDownload"]["DownloadType"] = wrong_type
+                document["ProductDownloadOptions"][0]["DownloadType"] = wrong_type
+                opener, _, bodies = successful_opener(release)
+                bodies[4] = json.dumps(document).encode()
+                with self.assertRaises(WindowsDownloadError):
+                    MicrosoftWindowsResolver().resolve(
+                        release, opener=opener, session_id=SESSION, now=NOW,
+                    )
 
     def test_remote_challenge_is_never_executed(self):
         opener, _, bodies = successful_opener(self.release)
@@ -325,7 +619,17 @@ class MicrosoftResolverTests(unittest.TestCase):
         cases.append(changed)
         changed = json.loads(json.dumps(valid)); changed["ProductDownloadOptions"][0]["Language"] = "French"
         cases.append(changed)
+        changed = json.loads(json.dumps(valid)); changed["ProductDownloadOptions"][0]["Name"] = "other.iso"
+        cases.append(changed)
         changed = json.loads(json.dumps(valid)); changed["ProductDownloadOptions"][0]["DownloadType"] = 2
+        cases.append(changed)
+        changed = json.loads(json.dumps(valid)); changed["ProductDownload"]["Uri"] = image_url(
+            self.release,
+            query=(
+                "t=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff&P1=1788004800&"
+                "P2=602&P3=2&P4=abcdef0123456789abcdef0123456789"
+            ),
+        )
         cases.append(changed)
         changed = {"Errors": [{"Value": TOKEN}]}
         cases.append(changed)
@@ -407,6 +711,70 @@ class MicrosoftResolverTests(unittest.TestCase):
 
 
 class WindowsIsoDownloaderTests(unittest.TestCase):
+    def test_each_official_profile_hash_page_is_independently_bound(self):
+        x64 = release_for("x64")
+        arm64 = release_for("ARM64")
+        for release in (x64, arm64):
+            with self.subTest(architecture=release.architecture):
+                valid_page, _ = provenance_opener(release)
+                response = valid_page(
+                    downloads.urllib.request.Request(release.provenance_url),
+                    timeout=1,
+                )
+                downloads._verify_current_microsoft_hash(
+                    response.read(), release,
+                )
+
+                other = arm64 if release is x64 else x64
+                wrong_page, _ = provenance_opener(other)
+                response = wrong_page(
+                    downloads.urllib.request.Request(other.provenance_url),
+                    timeout=1,
+                )
+                with self.assertRaises(WindowsDownloadError):
+                    downloads._verify_current_microsoft_hash(
+                        response.read(), release,
+                    )
+
+    def test_arm64_browser_assisted_download_uses_its_own_profile(self):
+        payload = b"pinned ARM64 Windows installer ISO fixture"
+        release = small_release(payload, "ARM64")
+        requests = []
+
+        def opener(request, *, timeout):
+            requests.append(request)
+            return Response(
+                payload, request.full_url,
+                headers={"Content-Length": str(len(payload))},
+            )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            downloads, "available_windows_images", return_value=(release,),
+        ):
+            destination = Path(directory) / release.filename
+            page, calls = provenance_opener(release)
+            result = WindowsIsoDownloader().download(
+                release, destination, source_url=image_url(release),
+                opener=opener, now=NOW, provenance_opener=page,
+            )
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(result.release_id, release.id)
+            self.assertEqual(requests[0].full_url, image_url(release))
+            self.assertEqual(calls[0].full_url, release.provenance_url)
+
+    def test_resume_stage_names_cannot_cross_profiles(self):
+        payload = b"same payload identity"
+        x64 = small_release(payload, "x64")
+        arm64 = replace(
+            small_release(payload, "ARM64"),
+            filename=x64.filename,
+            image_path=x64.image_path,
+        )
+        self.assertNotEqual(
+            downloads._verified.resume_stage_name(x64),
+            downloads._verified.resume_stage_name(arm64),
+        )
+
     def test_browser_assisted_download_hashes_and_atomically_publishes(self):
         payload = b"pinned Windows installer ISO fixture"
         release = small_release(payload)

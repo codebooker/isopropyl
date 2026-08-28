@@ -11,7 +11,8 @@ test:
 install:
 	install -Dm755 isopropyl-gui $(DESTDIR)$(PREFIX)/bin/isopropyl
 	install -d $(DESTDIR)$(PYTHON_SITE)
-	cp -r isopropyl $(DESTDIR)$(PYTHON_SITE)/isopropyl
+	rm -rf -- "$(DESTDIR)$(PYTHON_SITE)/isopropyl"
+	cp -r -- isopropyl "$(DESTDIR)$(PYTHON_SITE)/isopropyl"
 	install -Dm644 data/io.github.codebooker.isopropyl.desktop $(DESTDIR)$(PREFIX)/share/applications/io.github.codebooker.isopropyl.desktop
 	install -Dm644 data/io.github.codebooker.isopropyl.svg $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/io.github.codebooker.isopropyl.svg
 	install -Dm644 data/icons/48x48/apps/io.github.codebooker.isopropyl.png $(DESTDIR)$(PREFIX)/share/icons/hicolor/48x48/apps/io.github.codebooker.isopropyl.png

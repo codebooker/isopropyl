@@ -94,7 +94,7 @@ from .linux_downloads import (
 from .windows_downloads import (
     DownloadedWindowsImage, WindowsDownloadCancelled, WindowsImageRelease,
     WindowsIsoDownloader, available_windows_images,
-    validate_microsoft_download_url,
+    validate_microsoft_download_url, windows_inspection_matches_release,
 )
 from .media_test import (
     MediaTestCancelled, MediaTestMode, MediaTestResult, MediaTestRunner,
@@ -1094,9 +1094,10 @@ class Window(QMainWindow):
         dialog.setMinimumWidth(660)
         layout = QVBoxLayout(dialog)
         notice = QLabel(
-            "ISOpropyl currently supports one exact public Microsoft image. The "
-            "recommended path is to generate a 24-hour link on Microsoft's page, "
-            "copy the 64-bit Download link, and paste it below. ISOpropyl never "
+            "ISOpropyl currently supports two exact public Microsoft images: "
+            "Windows 11 for x64 and ARM64. The recommended path is to generate a "
+            "24-hour link on the selected Microsoft page, copy the matching "
+            "architecture's Download link, and paste it below. ISOpropyl never "
             "saves or logs that capability link."
         )
         notice.setWordWrap(True)
@@ -1122,7 +1123,7 @@ class Window(QMainWindow):
         link.setObjectName("windowsDownloadUrl")
         link.setEchoMode(QLineEdit.EchoMode.Password)
         link.setPlaceholderText(
-            "Paste the temporary 64-bit Download link (masked and never stored)"
+            "Paste the temporary Download link (masked and never stored)"
         )
         link.setClearButtonEnabled(True)
         layout.addWidget(link)
@@ -1139,10 +1140,24 @@ class Window(QMainWindow):
         def update_details() -> None:
             selected = choices.currentData()
             if isinstance(selected, WindowsImageRelease):
+                automatic.setChecked(
+                    automatic.isChecked() and selected.direct_resolver_supported
+                )
+                automatic.setEnabled(selected.direct_resolver_supported)
+                resolver = (
+                    "available (Microsoft may reject it)"
+                    if selected.direct_resolver_supported
+                    else "unavailable; paste a browser-generated link"
+                )
                 details.setText(
                     f"Official filename: {selected.filename}\n"
                     f"Microsoft-published SHA-256: {selected.sha256}\n"
+                    f"Direct resolver: {resolver}\n"
                     f"Source and terms: {selected.provenance_url}"
+                )
+                link.setPlaceholderText(
+                    f"Paste the temporary {selected.architecture} Download link "
+                    "(masked and never stored)"
                 )
 
         choices.currentIndexChanged.connect(update_details)
@@ -1177,6 +1192,15 @@ class Window(QMainWindow):
             QMessageBox.critical(
                 self, "Windows catalog unavailable",
                 "The selected catalog entry is invalid.",
+            )
+            return
+        if automatic.isChecked() and not release.direct_resolver_supported:
+            link.clear()
+            QMessageBox.warning(
+                self,
+                "Microsoft link required",
+                "This Windows profile requires a browser-generated Microsoft "
+                "download link.",
             )
             return
         source_url = None if automatic.isChecked() else link.text().strip()
@@ -1278,15 +1302,12 @@ class Window(QMainWindow):
                     downloaded.path, expected_identity=identity,
                     cancel_check=check_cancelled,
                 )
-                if (
-                    identity[2] != release.size or inspection.size != release.size
-                    or not inspection.is_iso9660 or not inspection.contents_scanned
-                    or not inspection.has_windows_installer
-                    or "x64" not in inspection.architectures
+                if not windows_inspection_matches_release(
+                    release, inspection, identity[2]
                 ):
                     raise OSError(
-                        "The hash-verified file did not inspect as the pinned x64 "
-                        "Windows installer ISO"
+                        "The hash-verified file did not inspect as the pinned "
+                        f"{release.architecture} Windows installer ISO"
                     )
                 result: object = WindowsDownloadCompletion(
                     downloaded, inspection, identity,
@@ -1380,12 +1401,9 @@ class Window(QMainWindow):
                     and downloaded.size == token.release.size
                     and downloaded.sha256 == token.release.sha256
                     and result.identity == current_identity
-                    and current_identity[2] == token.release.size
-                    and result.inspection.size == token.release.size
-                    and result.inspection.is_iso9660
-                    and result.inspection.contents_scanned
-                    and result.inspection.has_windows_installer
-                    and "x64" in result.inspection.architectures
+                    and windows_inspection_matches_release(
+                        token.release, result.inspection, current_identity[2]
+                    )
                 )
         if not valid:
             self.status.setText("Windows ISO download returned an invalid result")

@@ -1,0 +1,64 @@
+{
+  "catalog_version": 2,
+  "resolver_version": 1,
+  "images": [
+    {
+      "id": "windows-11-25h2-v2-english-x64",
+      "download_profile": "windows11-x64-v1",
+      "direct_resolver_supported": true,
+      "product": "Windows 11",
+      "release": "25H2 v2",
+      "edition": "Consumer multi-edition",
+      "language": "English (United States)",
+      "language_id": "English",
+      "locale": "en-US",
+      "architecture": "x64",
+      "filename": "Win11_25H2_English_x64_v2.iso",
+      "image_path": "/dbazure/Win11_25H2_English_x64_v2.iso",
+      "size": 8471603200,
+      "sha256": "768984706b909479417b2368438909440f2967ff05c6a9195ed2667254e465e3",
+      "product_edition_id": "3321",
+      "sku_id": "20046",
+      "product_display_name": "Windows 11 25H2__V2",
+      "localized_product_display_name": "Windows 11  English",
+      "metadata_hosts": [
+        "ov-df.microsoft.com",
+        "vlscppe.microsoft.com",
+        "www.microsoft.com"
+      ],
+      "image_hosts": [
+        "software.download.prss.microsoft.com"
+      ],
+      "provenance_url": "https://www.microsoft.com/en-us/software-download/windows11"
+    },
+    {
+      "id": "windows-11-25h2-v2-english-arm64",
+      "download_profile": "windows11-arm64-v1",
+      "direct_resolver_supported": true,
+      "product": "Windows 11",
+      "release": "25H2 v2",
+      "edition": "Consumer multi-edition",
+      "language": "English (United States)",
+      "language_id": "English",
+      "locale": "en-US",
+      "architecture": "ARM64",
+      "filename": "Win11_25H2_English_Arm64_v2.iso",
+      "image_path": "/dbazure/Win11_25H2_English_Arm64_v2.iso",
+      "size": 7994415104,
+      "sha256": "638aa2c88e94385b00f4f178d071e3df0b7d9e335577a83bd533b7f2eb65adf0",
+      "product_edition_id": "3324",
+      "sku_id": "20086",
+      "product_display_name": "Windows 11 Arm64 25H2__V2",
+      "localized_product_display_name": "Windows 11 Arm64  English",
+      "metadata_hosts": [
+        "ov-df.microsoft.com",
+        "vlscppe.microsoft.com",
+        "www.microsoft.com"
+      ],
+      "image_hosts": [
+        "software.download.prss.microsoft.com"
+      ],
+      "provenance_url": "https://www.microsoft.com/en-us/software-download/windows11arm64"
+    }
+  ]
+}

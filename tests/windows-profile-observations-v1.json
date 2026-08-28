@@ -1,0 +1,30 @@
+{
+  "observation_date": "2026-08-28",
+  "method": "Microsoft public software-download connector responses parsed as inert JSON; ephemeral session, cookie, expiry, and capability-query values omitted",
+  "profiles": [
+    {
+      "architecture": "x64",
+      "download_profile": "windows11-x64-v1",
+      "provenance_url": "https://www.microsoft.com/en-us/software-download/windows11",
+      "product_edition_id": "3321",
+      "sku_id": "20046",
+      "download_type": 1,
+      "product_display_name": "Windows 11 25H2__V2",
+      "localized_product_display_name": "Windows 11  English",
+      "filename": "Win11_25H2_English_x64_v2.iso",
+      "image_path": "/dbazure/Win11_25H2_English_x64_v2.iso"
+    },
+    {
+      "architecture": "ARM64",
+      "download_profile": "windows11-arm64-v1",
+      "provenance_url": "https://www.microsoft.com/en-us/software-download/windows11arm64",
+      "product_edition_id": "3324",
+      "sku_id": "20086",
+      "download_type": 2,
+      "product_display_name": "Windows 11 Arm64 25H2__V2",
+      "localized_product_display_name": "Windows 11 Arm64  English",
+      "filename": "Win11_25H2_English_Arm64_v2.iso",
+      "image_path": "/dbazure/Win11_25H2_English_Arm64_v2.iso"
+    }
+  ]
+}

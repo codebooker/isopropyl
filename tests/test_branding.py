@@ -65,6 +65,18 @@ class BrandingTests(unittest.TestCase):
             all(target.startswith("https://") for target in image_targets),
             image_targets,
         )
+        release_assets = tuple(
+            target for target in image_targets
+            if target.endswith(("/data/isopropyl-hero.svg", "/data/screenshot.png"))
+        )
+        self.assertEqual(len(release_assets), 2)
+        for target in release_assets:
+            self.assertNotIn("/main/", target)
+            self.assertRegex(
+                target,
+                r"^https://raw\.githubusercontent\.com/codebooker/isopropyl/"
+                r"[0-9a-f]{40}/data/(?:isopropyl-hero\.svg|screenshot\.png)$",
+            )
         for document in (
             "BRANDING.md", "CONTRIBUTING.md", "FEATURE_MATRIX.md", "LICENSE",
             "ROADMAP.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md",

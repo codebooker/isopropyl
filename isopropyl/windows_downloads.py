@@ -30,9 +30,10 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from . import verified_download as _verified
+from .images import ImageInspection
 
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
 RESOLVER_VERSION = 1
 MAX_METADATA_BYTES = 256 * 1024
 MAX_EPHEMERAL_URL = 4096
@@ -47,7 +48,7 @@ CHALLENGE_RTICKS_RES = (
     re.compile(r"rticks\\?=\\?[\"']?\\?\+?([0-9]{1,32})"),
     re.compile(r"rticks\\=\\\"\\\+?([0-9]{1,32})"),
 )
-_ENGLISH_HASH_ROW_RE = re.compile(
+_ENGLISH_64_BIT_HASH_ROW_RE = re.compile(
     rb"<td[^>]{0,512}>\s*English 64-bit\s*</td>\s*"
     rb"<td[^>]{0,512}>\s*([A-Fa-f0-9]{64})\s*</td>",
     re.IGNORECASE | re.DOTALL,
@@ -67,9 +68,66 @@ _LINK_ENDPOINT = (
     "https://www.microsoft.com/software-download-connector/api/"
     "GetProductDownloadLinksBySku"
 )
-_REFERER = "https://www.microsoft.com/software-download/windows11"
 
 
+@dataclass(frozen=True)
+class _WindowsDownloadProfile:
+    architecture: str
+    provenance_url: str
+    download_type: int
+    hash_row: re.Pattern[bytes]
+    direct_resolver_capable: bool
+    release_id: str
+    product: str
+    release: str
+    edition: str
+    filename: str
+    size: int
+    sha256: str
+    product_edition_id: str
+    sku_id: str
+    product_display_name: str
+    localized_product_display_name: str
+
+
+_WINDOWS_DOWNLOAD_PROFILES = {
+    "windows11-x64-v1": _WindowsDownloadProfile(
+        architecture="x64",
+        provenance_url="https://www.microsoft.com/en-us/software-download/windows11",
+        download_type=1,
+        hash_row=_ENGLISH_64_BIT_HASH_ROW_RE,
+        direct_resolver_capable=True,
+        release_id="windows-11-25h2-v2-english-x64",
+        product="Windows 11",
+        release="25H2 v2",
+        edition="Consumer multi-edition",
+        filename="Win11_25H2_English_x64_v2.iso",
+        size=8_471_603_200,
+        sha256="768984706b909479417b2368438909440f2967ff05c6a9195ed2667254e465e3",
+        product_edition_id="3321",
+        sku_id="20046",
+        product_display_name="Windows 11 25H2__V2",
+        localized_product_display_name="Windows 11  English",
+    ),
+    "windows11-arm64-v1": _WindowsDownloadProfile(
+        architecture="ARM64",
+        provenance_url="https://www.microsoft.com/en-us/software-download/windows11arm64",
+        download_type=2,
+        hash_row=_ENGLISH_64_BIT_HASH_ROW_RE,
+        direct_resolver_capable=True,
+        release_id="windows-11-25h2-v2-english-arm64",
+        product="Windows 11",
+        release="25H2 v2",
+        edition="Consumer multi-edition",
+        filename="Win11_25H2_English_Arm64_v2.iso",
+        size=7_994_415_104,
+        sha256="638aa2c88e94385b00f4f178d071e3df0b7d9e335577a83bd533b7f2eb65adf0",
+        product_edition_id="3324",
+        sku_id="20086",
+        product_display_name="Windows 11 Arm64 25H2__V2",
+        localized_product_display_name="Windows 11 Arm64  English",
+    ),
+}
 class WindowsDownloadCatalogError(ValueError):
     """The bundled Windows-image catalog is malformed or unsafe."""
 
@@ -100,6 +158,8 @@ CancelCheck = Callable[[], None]
 @dataclass(frozen=True)
 class WindowsImageRelease:
     id: str
+    download_profile: str
+    direct_resolver_supported: bool
     product: str
     release: str
     edition: str
@@ -186,7 +246,7 @@ def load_windows_image_catalog(path: Path | None = None) -> tuple[WindowsImageRe
 
     if path is None:
         text = resources.files("isopropyl").joinpath(
-            "data/windows-images-v1.json"
+            "data/windows-images-v2.json"
         ).read_text(encoding="utf-8")
     else:
         text = path.read_text(encoding="utf-8")
@@ -197,16 +257,25 @@ def load_windows_image_catalog(path: Path | None = None) -> tuple[WindowsImageRe
     root = _exact_dict(
         root, {"catalog_version", "resolver_version", "images"}, "Catalog"
     )
-    if root["catalog_version"] != CATALOG_VERSION:
+    if (
+        type(root["catalog_version"]) is not int
+        or root["catalog_version"] != CATALOG_VERSION
+    ):
         raise WindowsDownloadCatalogError("Unsupported Windows-image catalog version")
-    if root["resolver_version"] != RESOLVER_VERSION:
+    if (
+        type(root["resolver_version"]) is not int
+        or root["resolver_version"] != RESOLVER_VERSION
+    ):
         raise WindowsDownloadCatalogError("Unsupported Microsoft resolver version")
     if type(root["images"]) is not list or not root["images"]:
         raise WindowsDownloadCatalogError("Windows-image catalog must contain images")
 
     fields = set(WindowsImageRelease.__dataclass_fields__)
     releases: list[WindowsImageRelease] = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_filenames: set[str] = set()
+    seen_paths: set[str] = set()
+    seen_selections: set[tuple[str, str, str, str, str]] = set()
     for raw in root["images"]:
         item = _exact_dict(raw, fields, "Catalog image")
         values = dict(item)
@@ -221,19 +290,58 @@ def load_windows_image_catalog(path: Path | None = None) -> tuple[WindowsImageRe
             release.language_id, release.locale, release.architecture,
             release.product_display_name, release.localized_product_display_name,
         )
+        profile = (
+            _WINDOWS_DOWNLOAD_PROFILES.get(release.download_profile)
+            if type(release.download_profile) is str
+            else None
+        )
+        if profile is None:
+            raise WindowsDownloadCatalogError("Catalog image metadata is invalid")
+        selection = (
+            release.product,
+            release.release,
+            release.edition,
+            release.language,
+            release.architecture,
+        )
         if (
             type(release.id) is not str or not SAFE_ID_RE.fullmatch(release.id)
-            or release.id in seen
+            or release.id in seen_ids
+            or type(release.direct_resolver_supported) is not bool
+            or (
+                release.direct_resolver_supported
+                and not profile.direct_resolver_capable
+            )
             or any(type(value) is not str or not value or len(value) > 128 for value in labels)
+            or release.id != profile.release_id
+            or release.product != profile.product
+            or release.release != profile.release
+            or release.edition != profile.edition
+            or release.architecture != profile.architecture
+            or release.provenance_url != profile.provenance_url
+            or release.filename != profile.filename
+            or release.size != profile.size
+            or release.sha256 != profile.sha256
+            or release.product_edition_id != profile.product_edition_id
+            or release.sku_id != profile.sku_id
+            or release.product_display_name != profile.product_display_name
+            or release.localized_product_display_name
+            != profile.localized_product_display_name
+            or release.language != "English (United States)"
+            or release.language_id != "English"
+            or release.locale != "en-US"
             or type(release.filename) is not str
             or not SAFE_FILENAME_RE.fullmatch(release.filename)
+            or release.filename in seen_filenames
             or type(release.image_path) is not str
             or release.image_path != f"/dbazure/{release.filename}"
+            or release.image_path in seen_paths
             or type(release.size) is not int or release.size <= 0
             or type(release.sha256) is not str or not SHA256_RE.fullmatch(release.sha256)
             or type(release.product_edition_id) is not str
             or not DECIMAL_RE.fullmatch(release.product_edition_id)
             or type(release.sku_id) is not str or not DECIMAL_RE.fullmatch(release.sku_id)
+            or selection in seen_selections
         ):
             raise WindowsDownloadCatalogError("Catalog image metadata is invalid")
         if release.metadata_hosts != (
@@ -241,7 +349,10 @@ def load_windows_image_catalog(path: Path | None = None) -> tuple[WindowsImageRe
         ) or release.image_hosts != ("software.download.prss.microsoft.com",):
             raise WindowsDownloadCatalogError("Catalog host allowlist is not supported")
         _catalog_url(release.provenance_url, release.metadata_hosts)
-        seen.add(release.id)
+        seen_ids.add(release.id)
+        seen_filenames.add(release.filename)
+        seen_paths.add(release.image_path)
+        seen_selections.add(selection)
         releases.append(release)
     return tuple(releases)
 
@@ -413,15 +524,20 @@ def _parse_sku(body: bytes, release: WindowsImageRelease) -> str:
 def _verify_current_microsoft_hash(
     body: bytes, release: WindowsImageRelease,
 ) -> None:
-    """Bind the bundled pin to the current official English x64 hash row."""
+    """Bind the bundled pin to its profile's current official English hash row."""
 
+    profile = _WINDOWS_DOWNLOAD_PROFILES[release.download_profile]
     edition_marker = f'<option value="{release.product_edition_id}">'.encode()
     if body.count(edition_marker) != 1:
         raise WindowsDownloadError("Microsoft product edition changed")
-    matches = [value.decode("ascii").casefold() for value in _ENGLISH_HASH_ROW_RE.findall(body)]
+    matches = [
+        value.decode("ascii").casefold()
+        for value in profile.hash_row.findall(body)
+    ]
     if matches != [release.sha256]:
         raise WindowsDownloadError(
-            "Microsoft's current English x64 SHA-256 no longer matches ISOpropyl's pin"
+            f"Microsoft's current English {release.architecture} SHA-256 no longer "
+            "matches ISOpropyl's pin"
         )
 
 
@@ -526,6 +642,7 @@ def validate_microsoft_download_url(
 def _parse_link(
     body: bytes, release: WindowsImageRelease, *, now: dt.datetime,
 ) -> ResolvedWindowsSource:
+    profile = _WINDOWS_DOWNLOAD_PROFILES[release.download_profile]
     root = _json_object(body, "download-link")
     expected = {
         "DownloadExpirationDatetime", "ProductDownload", "ProductDownloadOptions",
@@ -566,13 +683,16 @@ def _parse_link(
             or type(value["DownloadType"]) is not int
         ):
             raise WindowsDownloadError("Microsoft download-link option was invalid")
-        if value["DownloadType"] == 1:
+        if value["DownloadType"] == profile.download_type:
             matches.append(value)
     if len(matches) != 1:
         raise WindowsDownloadError("Pinned Microsoft architecture was not available")
     selected = matches[0]
     if (
-        selected["ProductDisplayName"] != release.product_display_name
+        product_download["DownloadType"] != profile.download_type
+        or product_download["Uri"] != selected["Uri"]
+        or selected["Name"] != release.filename
+        or selected["ProductDisplayName"] != release.product_display_name
         or selected["Language"] != release.language_id
         or selected["LocalizedLanguage"] != release.language
         or selected["LocalizedProductDisplayName"]
@@ -610,6 +730,11 @@ class MicrosoftWindowsResolver:
             or not any(release is item for item in catalog)
         ):
             raise WindowsDownloadCatalogError("Resolve release is not an exact catalog entry")
+        if not release.direct_resolver_supported:
+            raise WindowsDownloadError(
+                "The selected Windows profile requires a browser-generated "
+                "Microsoft download link"
+            )
         if (
             isinstance(overall_timeout, bool)
             or not isinstance(overall_timeout, (int, float))
@@ -693,7 +818,7 @@ class MicrosoftWindowsResolver:
             ),
         )
         link_body = _bounded_response(
-            opener, link_url, headers={"Referer": _REFERER},
+            opener, link_url, headers={"Referer": release.provenance_url},
             maximum=MAX_METADATA_BYTES, deadline=deadline,
             cancel_event=self._cancel_event, cancel_check=cancel_check,
         )
@@ -740,6 +865,11 @@ class WindowsIsoDownloader:
             )
         if source_url is not None and type(source_url) is not str:
             raise ValueError("Microsoft source URL must be an exact string")
+        if source_url is None and not release.direct_resolver_supported:
+            raise WindowsDownloadError(
+                "The selected Windows profile requires a browser-generated "
+                "Microsoft download link"
+            )
 
         def authorize_source(
             _download_opener: _verified.OpenUrl,
@@ -789,3 +919,34 @@ class WindowsIsoDownloader:
         return DownloadedWindowsImage(
             result.path, result.release_id, result.size, result.sha256,
         )
+
+
+def windows_inspection_matches_release(
+    release: WindowsImageRelease,
+    inspection: ImageInspection,
+    observed_size: int,
+) -> bool:
+    """Return whether a published ISO matches its exact catalog architecture."""
+
+    if (
+        type(release) is not WindowsImageRelease
+        or not any(release is item for item in available_windows_images())
+        or type(inspection) is not ImageInspection
+        or type(observed_size) is not int
+    ):
+        return False
+    profile = _WINDOWS_DOWNLOAD_PROFILES[release.download_profile]
+    if any(
+        type(architecture) is not str
+        for architecture in inspection.architectures
+    ):
+        return False
+    detected = frozenset(inspection.architectures)
+    return bool(
+        observed_size == release.size
+        and inspection.size == release.size
+        and inspection.is_iso9660
+        and inspection.contents_scanned
+        and inspection.has_windows_installer
+        and detected == frozenset({profile.architecture})
+    )

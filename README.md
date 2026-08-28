@@ -1,6 +1,6 @@
 <div align="center">
 
-![ISOpropyl — Bootable media, made simple](https://raw.githubusercontent.com/codebooker/isopropyl/main/data/isopropyl-hero.svg)
+![ISOpropyl — Bootable media, made simple](https://raw.githubusercontent.com/codebooker/isopropyl/aa5125e38d44eba7692c11e61add6816a10a12fb/data/isopropyl-hero.svg)
 
 [![Tests](https://github.com/codebooker/isopropyl/actions/workflows/test.yml/badge.svg)](https://github.com/codebooker/isopropyl/actions/workflows/test.yml)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-F6922E.svg)](https://github.com/codebooker/isopropyl/blob/main/LICENSE)
@@ -16,7 +16,7 @@ and end-to-end verification.**
 
 </div>
 
-![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/main/data/screenshot.png)
+![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/aa5125e38d44eba7692c11e61add6816a10a12fb/data/screenshot.png)
 
 <p align="center"><sub>Rendered with synthetic image and device metadata. No physical drive was written.</sub></p>
 
@@ -46,7 +46,7 @@ a feature-for-feature replacement.
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
 | **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, performs full or scan-and-skip logical zeroing, and runs bad-block or fake-capacity tests in separate warned workflows. |
 | **Linux image download** | Downloads the pinned Ubuntu LTS profile from distribution-owned infrastructure and verifies its signed checksum manifest. |
-| **Windows image download** | Acquires the exact current Windows 11 25H2 v2 English x64 consumer ISO directly from Microsoft, checks Microsoft's live published hash row, resumes privately, and verifies the complete SHA-256 before use. |
+| **Windows image download** | Acquires exact current Windows 11 25H2 v2 English x64 or ARM64 consumer media directly from Microsoft, checks the selected profile's live published hash row, resumes privately, and verifies the complete SHA-256 before use. |
 | **UEFI recovery media** | Builds a multi-architecture UEFI Shell drive from exact upstream payloads after explicit network consent. |
 
 For the exhaustive, evidence-based Rufus comparison, see the
@@ -139,24 +139,29 @@ the workflow to finish its required cleanup or post-commit verification.
    be replaced.
 5. Confirm the exact target and let ISOpropyl verify the finished filesystem.
 
-### Download the pinned Windows 11 ISO
+### Download a pinned Windows 11 ISO
 
-1. Choose **Download Windows…**, then open Microsoft's download page from the
-   dialog.
-2. Select the Windows 11 x64 multi-edition ISO and English, then copy the
-   generated **64-bit Download** link and paste it into ISOpropyl's masked field.
+1. Choose **Download Windows…**, then select the x64 or ARM64 profile.
+2. Click **Open Microsoft download page**. On that matching page, select the
+   Windows 11 multi-edition ISO and English, then copy the generated **Download**
+   link into ISOpropyl's masked field.
 3. Choose the exact official filename and review the release, language,
    architecture, size, SHA-256, destination, Microsoft terms, and license notice.
-4. Confirm networking. ISOpropyl rechecks the current Microsoft hash row,
+4. Confirm networking. ISOpropyl rechecks the selected profile's current
+   Microsoft hash row,
    validates the 24-hour link without logging it, downloads or safely resumes,
-   hashes the whole file, and inspects it as an x64 Windows installer before
-   loading it.
+   hashes the whole file, and requires inspection to find exactly the selected
+   installer architecture before loading it.
 
 The direct-resolver checkbox is an optional fallback and may be rejected by
 Microsoft. It downloads one bounded Microsoft JavaScript response as inert text
 but never evaluates or executes it. Fido and PowerShell are neither downloaded
 nor run, and ISO contents remain data only. ISOpropyl is not affiliated with
 Microsoft, and downloading installation media does not grant a Windows license.
+For ARM64 media, [Microsoft notes](https://learn.microsoft.com/en-us/windows/arm/iso)
+that some devices need manufacturer-provided drivers for the installation media
+to boot successfully; check the target device's support guidance before writing
+the drive.
 
 ### Logically zero a drive
 
