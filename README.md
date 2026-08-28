@@ -18,7 +18,7 @@ plans, Windows customization, and end-to-end verification.**
 
 </div>
 
-![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/aa5125e38d44eba7692c11e61add6816a10a12fb/data/screenshot.png)
+![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/453546a75cb91cfed56db9802d227fdfdc5e4e65/data/screenshot.png)
 
 <p align="center"><sub>Rendered with synthetic image and device metadata. No physical drive was written.</sub></p>
 
