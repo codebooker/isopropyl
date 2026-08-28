@@ -65,6 +65,11 @@ from .formatting import (
     PartitionTable as FormatPartitionTable, create_format_plan,
     restore_allocation_unit_sizes, restore_filesystem_geometry_supported,
 )
+from .fast_zero import (
+    FastZeroCancelled, FastZeroError, FastZeroPartialFailure,
+    FastZeroPartialResult, FastZeroPlan, FastZeroResult, FastZeroRunError,
+    FastZeroWorkflow,
+)
 from .images import (
     ChecksumCancelled, ImageInspection, ImageInspectionCancelled,
     calculate_checksums, classify_windows_installer_members,
@@ -137,6 +142,9 @@ from .windows import (
 from .zip_overlay import (
     ZipOverlayPlan, build_zip_overlay_plan,
 )
+
+
+FAST_ZERO_MODE = "fast-zero"
 
 
 class BackgroundPreparation:
@@ -269,6 +277,8 @@ class Bridge(QObject):
     linux_download_finished = pyqtSignal(object, object, object)
     raw_preparation_finished = pyqtSignal(object, object)
     raw_execution_finished = pyqtSignal(object, object)
+    fast_zero_preparation_finished = pyqtSignal(object, object)
+    fast_zero_execution_finished = pyqtSignal(object, object)
 
 
 class Window(QMainWindow):
@@ -305,6 +315,8 @@ class Window(QMainWindow):
         self.devices: list[Device] = []
         self.raw_workflow: RawWriteWorkflow | None = None
         self.raw_confirmation_dialog: QDialog | None = None
+        self.fast_zero_workflow: FastZeroWorkflow | None = None
+        self.fast_zero_confirmation_dialog: QDialog | None = None
         self.imager: DriveImager | VirtualDriveImager | None = None
         self.formatter: FormatExecutor | None = None
         self.media_runner: MediaTestRunner | None = None
@@ -390,6 +402,12 @@ class Window(QMainWindow):
         )
         self.bridge.raw_execution_finished.connect(
             self.on_raw_execution_finished
+        )
+        self.bridge.fast_zero_preparation_finished.connect(
+            self.on_fast_zero_preparation_finished
+        )
+        self.bridge.fast_zero_execution_finished.connect(
+            self.on_fast_zero_execution_finished
         )
         QShortcut(QKeySequence.StandardKey.Open, self, activated=self.choose_image)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_devices)
@@ -1884,6 +1902,7 @@ class Window(QMainWindow):
     def operation_active(self) -> bool:
         return any((
             self.raw_workflow,
+            self.fast_zero_workflow,
             self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner,
             self.extractor,
@@ -2433,6 +2452,11 @@ class Window(QMainWindow):
         if raw_workflow is not None:
             raw_workflow.close()
         self.raw_confirmation_dialog = None
+        fast_zero_workflow = self.fast_zero_workflow
+        self.fast_zero_workflow = None
+        if fast_zero_workflow is not None:
+            fast_zero_workflow.close()
+        self.fast_zero_confirmation_dialog = None
         self.imager = None
         self.formatter = None
         self.media_runner = None
@@ -2527,6 +2551,7 @@ class Window(QMainWindow):
         self.inspection_busy = False
         active = tuple(filter(None, (
             self.raw_workflow,
+            self.fast_zero_workflow,
             self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner, self.extractor,
             self.iso_stager, self.constructed_writer,
@@ -2546,6 +2571,8 @@ class Window(QMainWindow):
                 operation.cancel()
             if self.raw_confirmation_dialog is not None:
                 self.raw_confirmation_dialog.reject()
+            if self.fast_zero_confirmation_dialog is not None:
+                self.fast_zero_confirmation_dialog.reject()
         elif was_inspecting:
             self.status.setText("Image inspection cancelled")
             self.image_detail.setText("Image inspection cancelled")
@@ -3481,7 +3508,7 @@ class Window(QMainWindow):
         dialog.setMinimumWidth(600)
         layout = QVBoxLayout(dialog)
         warning = QLabel(
-            "Both choices destroy data. They perform logical writes only and are not "
+            "All choices destroy data. They perform logical writes only and are not "
             "hardware secure erase or sanitization commands."
         )
         warning.setWordWrap(True)
@@ -3497,6 +3524,10 @@ class Window(QMainWindow):
             f"{self.display_size(QUICK_BOUNDARY_BYTES)} only",
             EraseMode.QUICK_BOUNDARY_ZERO,
         )
+        mode.addItem(
+            "Fast zero — scan, skip zero blocks, zero the rest, verify all",
+            FAST_ZERO_MODE,
+        )
         layout.addWidget(mode)
         scope = QLabel(
             "Full mode writes one pass across the advertised logical address space. "
@@ -3506,6 +3537,27 @@ class Window(QMainWindow):
         scope.setWordWrap(True)
         scope.setObjectName("muted")
         layout.addWidget(scope)
+
+        def update_scope() -> None:
+            selected = mode.currentData()
+            if selected == FAST_ZERO_MODE:
+                scope.setText(
+                    "Fast zero reads the complete drive, skips chunks that are already "
+                    "entirely zero, writes zeroes to every other chunk, then reads the "
+                    "complete drive again to verify it. It can reduce writes on mostly-"
+                    "zero media, but it still scans and verifies the full capacity. "
+                    "The next step only prepares and revalidates the target plan; the "
+                    "drive is not unmounted or mutated until the exact typed "
+                    "confirmation is accepted."
+                )
+            else:
+                scope.setText(
+                    "Full mode writes one pass across the advertised logical address "
+                    "space. Quick mode only removes common partition, boot, and "
+                    "filesystem metadata; middle data remains recoverable."
+                )
+
+        mode.currentIndexChanged.connect(update_scope)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -3514,6 +3566,9 @@ class Window(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if mode.currentData() == FAST_ZERO_MODE:
+            self.start_fast_zero(device)
             return
         try:
             plan = build_erase_plan(
@@ -3594,6 +3649,344 @@ class Window(QMainWindow):
                 self.bridge.finished.emit(False, str(error))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def start_fast_zero(self, device: Device) -> None:
+        if self.operation_active:
+            return
+        try:
+            workflow = FastZeroWorkflow(
+                device,
+                size_unit_mode=self.size_unit_mode,
+            )
+        except FastZeroError as error:
+            QMessageBox.warning(self, "Fast zero unavailable", str(error))
+            return
+        self.fast_zero_workflow = workflow
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Preparing a verified fast-zero target plan…")
+
+        def work() -> None:
+            try:
+                plan = workflow.prepare()
+            except BaseException as error:
+                self.bridge.fast_zero_preparation_finished.emit(workflow, error)
+            else:
+                self.bridge.fast_zero_preparation_finished.emit(workflow, plan)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def fast_zero_progress_label(stage: str) -> str:
+        return {
+            "scanning": "Scanning and zeroing nonzero blocks",
+            "readback": "Verifying every block is zero",
+            "cleanup": "Durably clearing and verifying drive boundaries",
+        }.get(stage, stage.replace("-", " ").capitalize())
+
+    def on_fast_zero_preparation_finished(
+        self,
+        workflow: FastZeroWorkflow,
+        outcome: object,
+    ) -> None:
+        if workflow is not self.fast_zero_workflow:
+            workflow.close()
+            return
+        if isinstance(outcome, FastZeroCancelled):
+            self.release_fast_zero_workflow(
+                "Fast zero cancelled before target mutation.",
+                refresh=True,
+            )
+            return
+        if isinstance(outcome, BaseException):
+            self.logger.error("Fast-zero preparation failed: %s", outcome)
+            self.bridge.finished.emit(
+                False,
+                "Fast-zero preparation failed before target mutation.\n\n"
+                f"{outcome}",
+            )
+            return
+        if type(outcome) is not FastZeroPlan or outcome is not workflow.plan:
+            self.bridge.finished.emit(
+                False,
+                "Fast-zero preparation returned a non-authoritative target plan; "
+                "the target was not mutated.",
+            )
+            return
+
+        phrase = self.confirm_fast_zero_plan(outcome)
+        if phrase is None:
+            self.release_fast_zero_workflow(
+                "Fast zero cancelled before target mutation.",
+                refresh=False,
+            )
+            return
+        try:
+            workflow.confirm(phrase)
+        except FastZeroCancelled:
+            self.release_fast_zero_workflow(
+                "Fast zero cancelled before target mutation.",
+                refresh=True,
+            )
+            return
+        except FastZeroError as error:
+            self.bridge.finished.emit(
+                False,
+                "Fast-zero confirmation failed before target mutation.\n\n"
+                f"{error}",
+            )
+            return
+
+        self.logger.info(
+            "Confirmed fast zero: plan=%s target=%s diskseq=%s",
+            outcome.plan_sha256,
+            outcome.device.identity,
+            outcome.disk_sequence,
+        )
+        self.status.setText("Starting the authenticated fast-zero transaction…")
+
+        def progress(stage: str, done: int, total: int) -> None:
+            self.bridge.progress.emit(
+                done,
+                total,
+                self.fast_zero_progress_label(stage),
+            )
+
+        def work() -> None:
+            try:
+                result = workflow.execute(progress)
+            except BaseException as error:
+                self.bridge.fast_zero_execution_finished.emit(workflow, error)
+            else:
+                self.bridge.fast_zero_execution_finished.emit(workflow, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def confirm_fast_zero_plan(self, plan: FastZeroPlan) -> str | None:
+        device = plan.device
+        model = " ".join(
+            part.strip() for part in (device.vendor, device.model) if part.strip()
+        ) or "not reported"
+        serial = device.serial or device.wwn or "not reported"
+        warnings = "\n".join(f"• {warning}" for warning in plan.warnings)
+
+        dialog = QDialog(self)
+        dialog.setObjectName("fastZeroConfirmationDialog")
+        dialog.setWindowTitle("Final Fast Zero confirmation")
+        dialog.setMinimumWidth(720)
+        layout = QVBoxLayout(dialog)
+        warning = QLabel(
+            "ALL DATA ON THIS EXACT TARGET WILL BE LOGICALLY ERASED AFTER "
+            "CONFIRMATION"
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
+        layout.addWidget(warning)
+
+        details = QPlainTextEdit()
+        details.setObjectName("fastZeroConfirmationDetails")
+        details.setReadOnly(True)
+        details.setPlainText(
+            "Method: scan every chunk, skip chunks already entirely zero, "
+            "zero every other chunk, then verify the complete drive\n\n"
+            f"Target path: {device.path}\n"
+            f"Target model: {model}\n"
+            f"Target serial/WWN: {serial}\n"
+            f"Target capacity: {self.display_size(plan.target_capacity)} "
+            f"({plan.target_capacity:,} bytes)\n"
+            f"Logical sector: {plan.logical_sector_size:,} bytes\n"
+            f"Scan/write chunk: {self.display_size(plan.chunk_size)} "
+            f"({plan.chunk_size:,} bytes)\n"
+            "Exceptional cancellation/failure cleanup: first and last "
+            f"{self.display_size(plan.boundary_bytes)} "
+            f"({plan.boundary_bytes:,} bytes), with overlap counted once\n\n"
+            f"Warnings:\n{warnings}"
+        )
+        details.setMinimumHeight(300)
+        layout.addWidget(details)
+
+        instruction = QLabel(
+            "Type the exact phrase below to authorize this one target:\n"
+            f"{plan.confirmation_phrase}"
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+        phrase = QLineEdit()
+        phrase.setObjectName("fastZeroConfirmationPhrase")
+        phrase.setPlaceholderText(plan.confirmation_phrase)
+        layout.addWidget(phrase)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        start = buttons.addButton(
+            "Start Fast Zero",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        start.setObjectName("fastZeroConfirmButton")
+        start.setEnabled(False)
+        phrase.textChanged.connect(
+            lambda value: start.setEnabled(value == plan.confirmation_phrase)
+        )
+        start.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        self.fast_zero_confirmation_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return phrase.text()
+        finally:
+            if self.fast_zero_confirmation_dialog is dialog:
+                self.fast_zero_confirmation_dialog = None
+
+    def _fast_zero_accounting(
+        self,
+        result: FastZeroResult | FastZeroPartialResult,
+        *,
+        completed_only: bool = False,
+    ) -> str:
+        scanned = "completed scanning" if completed_only else "scanned"
+        wrote = "completed zeroing" if completed_only else "wrote"
+        return (
+            f"{scanned} {self.display_size(result.scanned_bytes)} "
+            f"({result.scanned_bytes:,} bytes), {wrote} "
+            f"{self.display_size(result.written_bytes)} "
+            f"({result.written_bytes:,} bytes), skipped "
+            f"{self.display_size(result.skipped_bytes)} "
+            f"({result.skipped_bytes:,} already-zero bytes), and verified "
+            f"{self.display_size(result.verified_bytes)} "
+            f"({result.verified_bytes:,} bytes)"
+        )
+
+    def _fast_zero_partial_message(
+        self,
+        partial: FastZeroPartialResult,
+        *,
+        cancelled: bool,
+    ) -> str:
+        if (
+            partial.cleanup_verified is not True
+            or partial.cleanup_durable is not True
+            or partial.cache_invalidated is not True
+            or partial.complete is not False
+        ):
+            return self._fast_zero_unknown_state_message(
+                "Fast zero stopped without valid cleanup evidence."
+            )
+        reason = "was cancelled" if cancelled else "failed"
+        failure = (
+            ""
+            if cancelled or type(partial) is not FastZeroPartialFailure
+            else f" Helper failure code: {partial.failure_code}."
+        )
+        return (
+            f"Fast zero {reason} after mutation began, so the drive is partially "
+            "erased. ISOpropyl "
+            f"{self._fast_zero_accounting(partial, completed_only=True)}.{failure} "
+            "These counters cover fully completed chunks; an interrupted in-flight "
+            "chunk may also have been partially changed.\n\n"
+            "Before stopping, ISOpropyl durably zeroed and verified "
+            f"{self.display_size(partial.boundary_cleanup_bytes)} "
+            f"({partial.boundary_cleanup_bytes:,} bytes) across the drive boundaries "
+            "and invalidated the kernel cache. Data outside those cleaned boundaries "
+            "may remain recoverable. Use Drive tools → Restore to create a new "
+            "filesystem."
+        )
+
+    @staticmethod
+    def _fast_zero_unknown_state_message(reason: str) -> str:
+        return (
+            f"{reason}\n\nISOpropyl did not receive authenticated proof of complete "
+            "verification or durable boundary cleanup, so the target state is "
+            "unknown. Keep the drive connected until activity stops, then restore "
+            "or inspect it before reuse."
+        )
+
+    def on_fast_zero_execution_finished(
+        self,
+        workflow: FastZeroWorkflow,
+        outcome: object,
+    ) -> None:
+        if workflow is not self.fast_zero_workflow:
+            workflow.close()
+            return
+        if isinstance(outcome, FastZeroCancelled):
+            if outcome.partial is None:
+                self.release_fast_zero_workflow(
+                    "Fast zero cancelled before target mutation.",
+                    refresh=True,
+                )
+            elif type(outcome.partial) is FastZeroPartialResult:
+                self.bridge.finished.emit(
+                    False,
+                    self._fast_zero_partial_message(
+                        outcome.partial,
+                        cancelled=True,
+                    ),
+                )
+            else:
+                self.bridge.finished.emit(
+                    False,
+                    self._fast_zero_unknown_state_message(
+                        "Fast zero was cancelled after execution began."
+                    ),
+                )
+            return
+        if isinstance(outcome, FastZeroRunError):
+            if type(outcome.partial) is FastZeroPartialFailure:
+                message = self._fast_zero_partial_message(
+                    outcome.partial,
+                    cancelled=False,
+                )
+            else:
+                message = self._fast_zero_unknown_state_message(str(outcome))
+            self.logger.error("Fast-zero execution failed: %s", outcome)
+            self.bridge.finished.emit(False, message)
+            return
+        if isinstance(outcome, BaseException):
+            self.logger.error("Fast-zero execution failed: %s", outcome)
+            self.bridge.finished.emit(
+                False,
+                self._fast_zero_unknown_state_message(str(outcome)),
+            )
+            return
+        if type(outcome) is not FastZeroResult or outcome is not workflow.result:
+            self.bridge.finished.emit(
+                False,
+                self._fast_zero_unknown_state_message(
+                    "The fast-zero helper returned a non-authoritative result."
+                ),
+            )
+            return
+        if outcome.written_bytes == 0:
+            activity = (
+                "Every scanned chunk was already zero, so no data chunks needed "
+                "rewriting."
+            )
+        else:
+            activity = (
+                f"ISOpropyl wrote {outcome.written_chunks:,} nonzero chunks and "
+                f"skipped {outcome.skipped_chunks:,} chunks that were already zero."
+            )
+        message = (
+            f"Fast zero complete: ISOpropyl {self._fast_zero_accounting(outcome)}. "
+            f"{activity} This was a logical overwrite, not a hardware secure erase. "
+            "Use Drive tools → Restore to create a new filesystem."
+        )
+        self.bridge.finished.emit(True, message)
+
+    def release_fast_zero_workflow(self, message: str, *, refresh: bool) -> None:
+        workflow = self.fast_zero_workflow
+        self.fast_zero_workflow = None
+        if workflow is not None:
+            workflow.close()
+        self.fast_zero_confirmation_dialog = None
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.set_busy(False)
+        self.status.setText(message)
+        if refresh:
+            self.refresh_devices()
 
     def test_media(self) -> None:
         device = self.selected_device()

@@ -51,7 +51,7 @@ Status meanings:
 | Bad-block passes | **Done** | Separate destructive `badblocks` workflow with 1–4 patterns, typed confirmation, progress, and identity rechecks. |
 | Fake-capacity detection | **Done** | Separate destructive `f3probe` workflow; availability depends on the system F3 package. |
 | Full zero | **Done** | Exact full-device zero pass with cancellation and revalidation. |
-| Rufus fast-zero | **Partial** | Boundary zero clears first/last 16 MiB; it is not Rufus’s whole-device scan that skips already-zero blocks. |
+| Rufus fast-zero | **Done** | A separate authenticated helper scans fixed 32 MiB chunks, skips only chunks that are exactly all-zero, zeroes every other chunk, flushes and invalidates caches, and accepts success only after a complete all-zero read-back. Target authorization binds exact removable USB/MMC identity, geometry, topology, typed consent, and Linux disk generation; the helper retains one exclusive descriptor through mutation and verification. Cancellation after COMMIT returns authenticated accounting only after identity-gated, durable, read-back-verified cleanup of the first/last 16 MiB; otherwise target state is reported unknown. This is logical zeroing, not hardware secure erase, and physical performance/cache certification remains. |
 | FreeDOS boot media | **Planned** | Prefer lawful FreeDOS payloads before considering MS-DOS. |
 | MS-DOS boot media | **Research** | Microsoft binary acquisition/licensing constraints apply. |
 | Microsoft ISO downloader | **Planned** | Must use official metadata without executing remote Fido-style scripts. |
@@ -160,7 +160,7 @@ Status meanings:
 | NTFS compression | **Research** | Low Linux-user value and boot compatibility risk. |
 | Dump optical media | **Done** | Normal visible tool. |
 | ESP/basic-data partition type toggle | **Research** | Current constructed GPT type needs firmware evidence; not a casual toggle. |
-| Zero/fast zero | **Partial** | Full zero and boundary metadata zero ship; see semantic difference above. |
+| Zero/fast zero | **Done** | Full zero, boundary metadata zero, and authenticated scan-and-skip fast zero ship; none is represented as hardware secure erase. |
 | Erase application settings | **Done** | Visible settings action. |
 | Preserve logs | **Done** | Rotating logs persist in XDG state. |
 | Disable size safety checks | **Policy** | Never supported. |

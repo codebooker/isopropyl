@@ -669,15 +669,22 @@ class InstallationTests(unittest.TestCase):
         host_uninstall = makefile.split("\nuninstall-host-helper:\n", 1)[1]
         self.assertNotIn("libexec/isopropyl-device-helper", ordinary_install)
         self.assertNotIn("polkit-1/actions", ordinary_install)
+        self.assertIn('test "$(PREFIX)" = "/usr"', host_install)
+        self.assertIn('test "$(PREFIX)" = "/usr"', host_uninstall)
         for asset in (
             "helper/isopropyl-device-helper",
             "isopropyl/syslinux_device_helper.py",
             "data/io.github.codebooker.isopropyl.policy",
             "data/io.github.codebooker.isopropyl.raw-write.policy",
+            "data/io.github.codebooker.isopropyl.fast-zero.policy",
         ):
             self.assertIn(asset, host_install)
         self.assertIn(
             "io.github.codebooker.isopropyl.raw-write.policy",
+            host_uninstall,
+        )
+        self.assertIn(
+            "io.github.codebooker.isopropyl.fast-zero.policy",
             host_uninstall,
         )
 
@@ -790,6 +797,7 @@ class InstallationTests(unittest.TestCase):
                 root / "usr/libexec/isopropyl/syslinux_device_helper.py": 0o644,
                 root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy": 0o644,
                 root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy": 0o644,
+                root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy": 0o644,
             }
             for path, mode in expected.items():
                 with self.subTest(path=path):
@@ -810,6 +818,17 @@ class InstallationTests(unittest.TestCase):
                 "io.github.codebooker.isopropyl.raw-write.policy"
             )
             self._assert_raw_policy(raw_policy_path)
+            fast_zero_policy = ET.parse(
+                root
+                / "usr/share/polkit-1/actions/"
+                "io.github.codebooker.isopropyl.fast-zero.policy"
+            ).getroot()
+            actions = fast_zero_policy.findall("action")
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(
+                actions[0].attrib,
+                {"id": "io.github.codebooker.isopropyl.fast-zero-drive"},
+            )
 
     @unittest.skipUnless(shutil.which("make"), "make is not installed")
     def test_ordinary_install_excludes_privileged_helper_and_policies(self):

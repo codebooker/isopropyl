@@ -4,15 +4,14 @@ from __future__ import annotations
 
 """Root-side versioned device transactions.
 
-This module is the narrow privileged half of the Syslinux and generic raw/DD
-image pipelines.  It does not trust the unprivileged plans or their serialized
-target observations.  The caller transfers one already prepared anonymous
-regular file; the selected exact protocol validates and hashes that seekable
-descriptor before opening a target.  The helper then derives safety properties
-from the opened block descriptor and kernel sysfs, retains one Linux exclusive
-block-device claim and one BSD lock through writing, durability, cache
-invalidation, and required read-back, and reports a bounded machine-readable
-result.
+This module is the narrow privileged half of the Syslinux, generic raw/DD, and
+target-only fast-zero pipelines.  It does not trust unprivileged plans or their
+serialized target observations.  Image-writing callers transfer one already
+prepared anonymous regular file; fast-zero accepts no source descriptor at all.
+The selected exact protocol derives safety properties from the opened block
+descriptor and kernel sysfs, retains one Linux exclusive block-device claim and
+one BSD lock through mutation, durability, cache invalidation, and required
+read-back, and reports a bounded machine-readable result.
 
 The command-line entry point is only suitable when imported by the installed,
 root-owned, isolated launcher.  Source-checkout and user-writable console
@@ -38,12 +37,15 @@ from pathlib import Path
 
 HELPER_PROFILE = "io.github.codebooker.isopropyl/syslinux-device-helper/v1"
 RAW_HELPER_PROFILE = "io.github.codebooker.isopropyl/raw-device-helper/v1"
+FAST_ZERO_HELPER_PROFILE = "io.github.codebooker.isopropyl/fast-zero-device-helper/v1"
 SECTOR_SIZE = 512
 COPY_BYTES = 4 * 1024 * 1024
 MAX_IMAGE_BYTES = 128 * 1024 * 1024 * 1024
 MAX_RAW_SOURCE_BYTES = 64 * 1024 * 1024 * 1024 * 1024
 MAX_RAW_TARGET_BYTES = 64 * 1024 * 1024 * 1024 * 1024 * 1024
 RAW_FRONT_GUARD_BYTES = 1024 * 1024
+FAST_ZERO_BOUNDARY_BYTES = 16 * 1024 * 1024
+FAST_ZERO_DEFAULT_CHUNK_BYTES = 32 * 1024 * 1024
 MAX_TOPOLOGY_NODES = 4_096
 MAX_DIAGNOSTIC_BYTES = 4_096
 CONTROL_TIMEOUT_SECONDS = 30.0
@@ -67,6 +69,7 @@ MIN_FAT32_CLUSTERS = 65_525
 
 PROTOCOL_MAGIC = b"ISOPROPYL-SYSLX1"
 RAW_PROTOCOL_MAGIC = b"ISOPROPYL-RAW001"
+FAST_ZERO_PROTOCOL_MAGIC = b"ISOPROPYL-ZERO01"
 PROTOCOL_VERSION = 1
 PACKET_READY = 1
 PACKET_REQUEST = 2
@@ -76,8 +79,18 @@ PACKET_PREPARED = 5
 PACKET_COMMIT = 6
 PACKET_CANCEL = 7
 PACKET_MUTATION_STARTED = 8
+PACKET_PARTIAL_CANCEL = 9
+PACKET_PARTIAL_FAILURE = 10
 OPERATION = "write-image-v1"
 RAW_OPERATION = "write-raw-image-v1"
+FAST_ZERO_OPERATION = "fast-zero-drive-v1"
+FAST_ZERO_FAILURE_NONE = 0
+FAST_ZERO_FAILURE_CANCELLED = 1
+FAST_ZERO_FAILURE_REQUEST = 2
+FAST_ZERO_FAILURE_TARGET = 3
+FAST_ZERO_FAILURE_VERIFICATION = 4
+FAST_ZERO_FAILURE_IO = 5
+FAST_ZERO_FAILURE_UNEXPECTED = 255
 PHASE_CODES = {
     "source-validation": 1,
     "writing": 2,
@@ -85,6 +98,14 @@ PHASE_CODES = {
     "readback": 4,
 }
 PHASE_NAMES = {value: key for key, value in PHASE_CODES.items()}
+FAST_ZERO_PHASE_CODES = {
+    "scanning": 1,
+    "readback": 2,
+    "cleanup": 3,
+}
+FAST_ZERO_PHASE_NAMES = {
+    value: key for key, value in FAST_ZERO_PHASE_CODES.items()
+}
 _HEADER = struct.Struct("!16sBBH")
 _REQUEST_PACKET = struct.Struct("!16sBBH16sIIQQIII32s")
 _PROGRESS_PACKET = struct.Struct("!16sBBH16sB3xQQ")
@@ -93,6 +114,10 @@ _MUTATION_PACKET = _CONTROL_PACKET
 _SUCCESS_PACKET = struct.Struct("!16sBBH16sIIQQIII32s32s32s")
 _RAW_REQUEST_PACKET = struct.Struct("!16sBBH16sIIQQIQB7s32s")
 _RAW_SUCCESS_PACKET = struct.Struct("!16sBBH16sIIQQIQIBB2s32s32s32s")
+_FAST_ZERO_REQUEST_PACKET = struct.Struct("!16sBBH16sIIQQII32s32s8s")
+_FAST_ZERO_RESULT_PACKET = struct.Struct(
+    "!16sBBH16sIIQQIIQQQQQQQQHBBBBB5s"
+)
 MAX_PROTOCOL_PACKET = max(
     _REQUEST_PACKET.size,
     _RAW_REQUEST_PACKET.size,
@@ -100,6 +125,8 @@ MAX_PROTOCOL_PACKET = max(
     _CONTROL_PACKET.size,
     _SUCCESS_PACKET.size,
     _RAW_SUCCESS_PACKET.size,
+    _FAST_ZERO_REQUEST_PACKET.size,
+    _FAST_ZERO_RESULT_PACKET.size,
 )
 INSTALLED_HELPER_SCRIPT = "/usr/libexec/isopropyl/syslinux_device_helper.py"
 
@@ -220,6 +247,47 @@ class RawHelperResult:
     final_verification: bool
     exclusive_open: bool
     cache_invalidated: bool
+
+
+@dataclass(frozen=True)
+class FastZeroHelperRequest:
+    request_id: bytes
+    profile: str
+    target_path: str
+    expected_major_minor: str
+    expected_disk_sequence: int
+    expected_target_size: int
+    expected_sector_size: int
+    chunk_size: int
+    plan_sha256: str
+    ready_sha256: str
+
+
+@dataclass(frozen=True)
+class FastZeroHelperResult:
+    request_id: bytes
+    profile: str
+    target_path: str
+    major_minor: str
+    disk_sequence: int
+    target_size: int
+    logical_sector_size: int
+    chunk_size: int
+    scanned_bytes: int
+    written_bytes: int
+    skipped_bytes: int
+    verified_bytes: int
+    scanned_chunks: int
+    written_chunks: int
+    skipped_chunks: int
+    boundary_cleanup_bytes: int
+    failure_code: int
+    outcome: str
+    exclusive_open: bool
+    cache_invalidated: bool
+    complete: bool
+    cleanup_verified: bool
+    durable: bool
 
 
 Progress = Callable[[str, int, int], None]
@@ -627,6 +695,53 @@ def validate_raw_helper_request(request: RawHelperRequest) -> None:
         raise HelperRequestError("The raw source digest is invalid")
     if type(request.final_verification) is not bool:
         raise HelperRequestError("The raw-device verification policy is invalid")
+
+
+def validate_fast_zero_helper_request(request: FastZeroHelperRequest) -> None:
+    """Validate the one fixed, target-only logical-zero profile."""
+
+    if type(request) is not FastZeroHelperRequest:
+        raise HelperRequestError("An exact fast-zero helper request is required")
+    if type(request.request_id) is not bytes or len(request.request_id) != 16:
+        raise HelperRequestError("The fast-zero request identifier is invalid")
+    if request.profile != FAST_ZERO_HELPER_PROFILE:
+        raise HelperRequestError("The fast-zero helper profile is unsupported")
+    if type(request.target_path) is not str or _TARGET_PATH.fullmatch(request.target_path) is None:
+        raise HelperRequestError("The fast-zero target path is invalid")
+    if (
+        type(request.expected_major_minor) is not str
+        or _MAJOR_MINOR.fullmatch(request.expected_major_minor) is None
+    ):
+        raise HelperRequestError("The expected fast-zero kernel identity is invalid")
+    if (
+        type(request.expected_disk_sequence) is not int
+        or isinstance(request.expected_disk_sequence, bool)
+        or not 0 < request.expected_disk_sequence <= 0xFFFFFFFFFFFFFFFF
+    ):
+        raise HelperRequestError("The expected fast-zero disk sequence is invalid")
+    sector = request.expected_sector_size
+    if (
+        type(sector) is not int
+        or isinstance(sector, bool)
+        or not 512 <= sector <= 4096
+        or sector & (sector - 1)
+        or type(request.expected_target_size) is not int
+        or isinstance(request.expected_target_size, bool)
+        or not sector <= request.expected_target_size <= MAX_RAW_TARGET_BYTES
+        or request.expected_target_size % sector
+    ):
+        raise HelperRequestError("The fast-zero target geometry is invalid")
+    if request.chunk_size != FAST_ZERO_DEFAULT_CHUNK_BYTES:
+        raise HelperRequestError("The fast-zero chunk profile is unsupported")
+    if request.chunk_size % sector:
+        raise HelperRequestError("The fast-zero chunk is not sector aligned")
+    if (
+        type(request.plan_sha256) is not str
+        or _SHA256.fullmatch(request.plan_sha256) is None
+        or type(request.ready_sha256) is not str
+        or _SHA256.fullmatch(request.ready_sha256) is None
+    ):
+        raise HelperRequestError("The fast-zero authorization receipts are invalid")
 
 
 def _status_snapshot(status: os.stat_result) -> tuple[int, ...]:
@@ -1940,6 +2055,422 @@ def execute_raw_helper_transaction(
                 pass
 
 
+def _validate_fast_zero_target_observation(
+    observation: KernelTargetObservation,
+    request: FastZeroHelperRequest,
+    device_number: int,
+    active: frozenset[int],
+) -> None:
+    if type(observation) is not KernelTargetObservation:
+        raise HelperTargetError("Kernel fast-zero target inspection returned invalid evidence")
+    if (
+        observation.device_number != device_number
+        or device_number not in observation.related_device_numbers
+        or observation.transport not in {"usb", "mmc"}
+        or not observation.removable
+        or observation.read_only
+        or observation.logical_sector_size != request.expected_sector_size
+        or observation.has_holders
+        or observation.disk_sequence != request.expected_disk_sequence
+    ):
+        raise HelperTargetError("Kernel fast-zero target safety properties do not match this request")
+    if observation.related_device_numbers & active:
+        raise HelperTargetError(
+            "The selected fast-zero target or one of its dependants is mounted or active swap",
+        )
+
+
+def _require_fast_zero_opened_target_identity(
+    descriptor: int,
+    request: FastZeroHelperRequest,
+    device_number: int,
+    operations: HelperOperations,
+    *,
+    verification: bool,
+) -> None:
+    error_type = HelperVerificationError if verification else HelperTargetError
+    try:
+        status = operations.fstat(descriptor)
+        size = operations.ioctl_u64(descriptor, BLKGETSIZE64)
+        disk_sequence = operations.ioctl_u64(descriptor, BLKGETDISKSEQ)
+        sector_size = operations.ioctl_uint(descriptor, BLKSSZGET)
+        read_only = operations.ioctl_uint(descriptor, BLKROGET)
+    except OSError as error:
+        raise error_type("Could not revalidate the opened fast-zero target identity") from error
+    if (
+        not stat.S_ISBLK(status.st_mode)
+        or status.st_rdev != device_number
+        or size != request.expected_target_size
+        or disk_sequence != request.expected_disk_sequence
+        or sector_size != request.expected_sector_size
+        or read_only != 0
+    ):
+        raise error_type("The opened fast-zero target is no longer the authorized disk generation")
+
+
+def _fast_zero_boundary_regions(size: int) -> tuple[tuple[int, int], ...]:
+    boundary = min(FAST_ZERO_BOUNDARY_BYTES, size)
+    if size <= 2 * boundary:
+        return ((0, size),)
+    return ((0, boundary), (size - boundary, boundary))
+
+
+def _fast_zero_failure_code(error: BaseException) -> int:
+    if isinstance(error, HelperCancelled):
+        return FAST_ZERO_FAILURE_CANCELLED
+    if isinstance(error, HelperRequestError):
+        return FAST_ZERO_FAILURE_REQUEST
+    if isinstance(error, HelperTargetError):
+        return FAST_ZERO_FAILURE_TARGET
+    if isinstance(error, HelperVerificationError):
+        return FAST_ZERO_FAILURE_VERIFICATION
+    if isinstance(error, HelperError):
+        return FAST_ZERO_FAILURE_IO
+    return FAST_ZERO_FAILURE_UNEXPECTED
+
+
+def _invalidate_fast_zero_cache(
+    descriptor: int,
+    operations: HelperOperations,
+    label: str,
+) -> None:
+    try:
+        _retry(lambda: operations.ioctl_void(descriptor, BLKFLSBUF), label)
+    except HelperError as error:
+        raise HelperVerificationError(_bounded(error, label)) from error
+
+
+def _require_fast_zero_cleanup_identity(
+    descriptor: int,
+    request: FastZeroHelperRequest,
+    device_number: int,
+    operations: HelperOperations,
+) -> None:
+    _require_fast_zero_opened_target_identity(
+        descriptor,
+        request,
+        device_number,
+        operations,
+        verification=True,
+    )
+    try:
+        current_path = operations.lstat(request.target_path)
+    except OSError as error:
+        raise HelperVerificationError(
+            "The fast-zero target path disappeared during boundary cleanup",
+        ) from error
+    if not stat.S_ISBLK(current_path.st_mode) or current_path.st_rdev != device_number:
+        raise HelperVerificationError(
+            "The fast-zero target path changed during boundary cleanup",
+        )
+    try:
+        _validate_fast_zero_target_observation(
+            operations.inspect_target(device_number),
+            request,
+            device_number,
+            operations.active_devices(),
+        )
+    except HelperTargetError as error:
+        raise HelperVerificationError(
+            "The fast-zero target topology changed during boundary cleanup",
+        ) from error
+
+
+def _fast_zero_result(
+    request: FastZeroHelperRequest,
+    *,
+    outcome: str,
+    scanned_bytes: int,
+    written_bytes: int,
+    skipped_bytes: int,
+    verified_bytes: int,
+    scanned_chunks: int,
+    written_chunks: int,
+    skipped_chunks: int,
+    cleanup_bytes: int = 0,
+    failure_code: int = FAST_ZERO_FAILURE_NONE,
+) -> FastZeroHelperResult:
+    return FastZeroHelperResult(
+        request.request_id,
+        FAST_ZERO_HELPER_PROFILE,
+        request.target_path,
+        request.expected_major_minor,
+        request.expected_disk_sequence,
+        request.expected_target_size,
+        request.expected_sector_size,
+        request.chunk_size,
+        scanned_bytes,
+        written_bytes,
+        skipped_bytes,
+        verified_bytes,
+        scanned_chunks,
+        written_chunks,
+        skipped_chunks,
+        cleanup_bytes,
+        failure_code,
+        outcome,
+        True,
+        True,
+        outcome == "success",
+        outcome != "success",
+        True,
+    )
+
+
+def _cleanup_fast_zero_boundaries(
+    descriptor: int,
+    request: FastZeroHelperRequest,
+    device_number: int,
+    operations: HelperOperations,
+    progress: Progress,
+) -> int:
+    _require_fast_zero_cleanup_identity(
+        descriptor,
+        request,
+        device_number,
+        operations,
+    )
+    regions = _fast_zero_boundary_regions(request.expected_target_size)
+    total = sum(size for _offset, size in regions)
+    progress("cleanup", 0, total)
+    zeros = b"\0" * min(FAST_ZERO_BOUNDARY_BYTES, request.expected_target_size)
+    for offset, size in regions:
+        _write_exact(descriptor, zeros[:size], offset, write_at=operations.pwrite)
+    _retry(
+        lambda: operations.fsync(descriptor),
+        "Could not make fast-zero boundary cleanup durable",
+    )
+    _invalidate_fast_zero_cache(
+        descriptor,
+        operations,
+        "Could not invalidate the fast-zero target cache after cleanup",
+    )
+    verified = 0
+    for offset, size in regions:
+        if _read_raw_target_exact(
+            descriptor,
+            offset,
+            size,
+            operations=operations,
+            label="fast-zero boundary cleanup read-back",
+        ) != zeros[:size]:
+            raise HelperVerificationError("The fast-zero boundary cleanup failed read-back")
+        verified += size
+        progress("cleanup", verified, total)
+    _require_fast_zero_cleanup_identity(
+        descriptor,
+        request,
+        device_number,
+        operations,
+    )
+    return total
+
+
+def execute_fast_zero_helper_transaction(
+    request: FastZeroHelperRequest,
+    *,
+    operations: HelperOperations = HelperOperations(),
+    progress: Progress = lambda _phase, _done, _total: None,
+    mutation_started: Callable[[], None] = lambda: None,
+    postcommit_cancel: Callable[[], None] = lambda: None,
+) -> FastZeroHelperResult:
+    """Scan and logically zero one exact removable disk under a same-FD lease."""
+
+    validate_fast_zero_helper_request(request)
+    try:
+        path_status = operations.lstat(request.target_path)
+    except OSError as error:
+        raise HelperTargetError(_bounded(error, "The selected fast-zero target is unavailable")) from error
+    if not stat.S_ISBLK(path_status.st_mode):
+        raise HelperTargetError("The fast-zero target path is not a block device")
+    expected_device_number = _parse_dev(request.expected_major_minor)
+    if path_status.st_rdev != expected_device_number:
+        raise HelperTargetError("The fast-zero target path changed kernel identity")
+    _validate_fast_zero_target_observation(
+        operations.inspect_target(expected_device_number),
+        request,
+        expected_device_number,
+        operations.active_devices(),
+    )
+
+    flags = (
+        os.O_RDWR
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    target_descriptor = -1
+    committed = False
+    scanned_bytes = written_bytes = skipped_bytes = verified_bytes = 0
+    scanned_chunks = written_chunks = skipped_chunks = 0
+    try:
+        try:
+            target_descriptor = operations.open(request.target_path, flags)
+        except OSError as error:
+            if error.errno == errno.EBUSY:
+                raise HelperTargetError("The fast-zero target is mounted, claimed, or busy") from error
+            raise HelperTargetError(
+                _bounded(error, "Could not exclusively open the fast-zero target"),
+            ) from error
+        try:
+            operations.flock(target_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise HelperTargetError("Another lock-aware process is using the fast-zero target") from error
+        _require_fast_zero_opened_target_identity(
+            target_descriptor,
+            request,
+            expected_device_number,
+            operations,
+            verification=False,
+        )
+        _validate_fast_zero_target_observation(
+            operations.inspect_target(expected_device_number),
+            request,
+            expected_device_number,
+            operations.active_devices(),
+        )
+        current_path = operations.lstat(request.target_path)
+        if not stat.S_ISBLK(current_path.st_mode) or current_path.st_rdev != expected_device_number:
+            raise HelperTargetError("The fast-zero target path was replaced after exclusive open")
+
+        mutation_started()
+        committed = True
+        _require_fast_zero_opened_target_identity(
+            target_descriptor,
+            request,
+            expected_device_number,
+            operations,
+            verification=False,
+        )
+        committed_path = operations.lstat(request.target_path)
+        if not stat.S_ISBLK(committed_path.st_mode) or committed_path.st_rdev != expected_device_number:
+            raise HelperTargetError("The fast-zero target path changed before mutation")
+        _validate_fast_zero_target_observation(
+            operations.inspect_target(expected_device_number),
+            request,
+            expected_device_number,
+            operations.active_devices(),
+        )
+
+        zeros = b"\0" * request.chunk_size
+        progress("scanning", 0, request.expected_target_size)
+        offset = 0
+        while offset < request.expected_target_size:
+            postcommit_cancel()
+            wanted = min(request.chunk_size, request.expected_target_size - offset)
+            block = _read_raw_target_exact(
+                target_descriptor,
+                offset,
+                wanted,
+                operations=operations,
+                label="fast-zero target scan",
+            )
+            if block == zeros[:wanted]:
+                skipped_bytes += wanted
+                skipped_chunks += 1
+            else:
+                _require_fast_zero_opened_target_identity(
+                    target_descriptor,
+                    request,
+                    expected_device_number,
+                    operations,
+                    verification=False,
+                )
+                _write_exact(target_descriptor, zeros[:wanted], offset, write_at=operations.pwrite)
+                written_bytes += wanted
+                written_chunks += 1
+            scanned_bytes += wanted
+            scanned_chunks += 1
+            offset += wanted
+            progress("scanning", offset, request.expected_target_size)
+        postcommit_cancel()
+        _retry(lambda: operations.fsync(target_descriptor), "Could not make fast-zero writes durable")
+        _invalidate_fast_zero_cache(
+            target_descriptor,
+            operations,
+            "Could not invalidate the fast-zero target cache",
+        )
+
+        progress("readback", 0, request.expected_target_size)
+        offset = 0
+        while offset < request.expected_target_size:
+            postcommit_cancel()
+            wanted = min(request.chunk_size, request.expected_target_size - offset)
+            block = _read_raw_target_exact(
+                target_descriptor,
+                offset,
+                wanted,
+                operations=operations,
+                label="fast-zero full read-back",
+            )
+            if block != zeros[:wanted]:
+                raise HelperVerificationError("The fast-zero target failed full zero read-back")
+            offset += wanted
+            verified_bytes += wanted
+            progress("readback", offset, request.expected_target_size)
+        postcommit_cancel()
+        _require_fast_zero_opened_target_identity(
+            target_descriptor,
+            request,
+            expected_device_number,
+            operations,
+            verification=True,
+        )
+        _validate_fast_zero_target_observation(
+            operations.inspect_target(expected_device_number),
+            request,
+            expected_device_number,
+            operations.active_devices(),
+        )
+        return _fast_zero_result(
+            request,
+            outcome="success",
+            scanned_bytes=scanned_bytes,
+            written_bytes=written_bytes,
+            skipped_bytes=skipped_bytes,
+            verified_bytes=verified_bytes,
+            scanned_chunks=scanned_chunks,
+            written_chunks=written_chunks,
+            skipped_chunks=skipped_chunks,
+        )
+    except BaseException as error:
+        if not committed or target_descriptor < 0:
+            raise
+        try:
+            cleanup_bytes = _cleanup_fast_zero_boundaries(
+                target_descriptor,
+                request,
+                expected_device_number,
+                operations,
+                progress,
+            )
+        except BaseException as cleanup_error:
+            original = _bounded(error, "The committed fast-zero transaction failed")
+            cleanup = _bounded(cleanup_error, "boundary cleanup could not be verified")
+            raise HelperVerificationError(
+                f"{original}; fast-zero boundary cleanup also failed: {cleanup}",
+            ) from error
+        return _fast_zero_result(
+            request,
+            outcome=("partial-cancel" if isinstance(error, HelperCancelled) else "partial-failure"),
+            scanned_bytes=scanned_bytes,
+            written_bytes=written_bytes,
+            skipped_bytes=skipped_bytes,
+            verified_bytes=verified_bytes,
+            scanned_chunks=scanned_chunks,
+            written_chunks=written_chunks,
+            skipped_chunks=skipped_chunks,
+            cleanup_bytes=cleanup_bytes,
+            failure_code=_fast_zero_failure_code(error),
+        )
+    finally:
+        if target_descriptor >= 0:
+            try:
+                operations.close(target_descriptor)
+            except OSError:
+                pass
+
+
 def pack_helper_request(
     request_id: bytes,
     major_number: int,
@@ -2153,6 +2684,115 @@ def unpack_raw_helper_request(
     return request
 
 
+def pack_fast_zero_helper_request(
+    request_id: bytes,
+    major_number: int,
+    minor_number: int,
+    disk_sequence: int,
+    target_size: int,
+    sector_size: int,
+    chunk_size: int,
+    plan_sha256: str,
+    ready_sha256: str,
+) -> bytes:
+    """Pack the fixed target-only fast-zero request (never with SCM_RIGHTS)."""
+
+    if (
+        type(request_id) is not bytes
+        or len(request_id) != 16
+        or type(major_number) is not int
+        or isinstance(major_number, bool)
+        or not 0 <= major_number <= 0xFFFFFFFF
+        or type(minor_number) is not int
+        or isinstance(minor_number, bool)
+        or not 0 <= minor_number <= 0xFFFFFFFF
+        or type(disk_sequence) is not int
+        or isinstance(disk_sequence, bool)
+        or not 0 < disk_sequence <= 0xFFFFFFFFFFFFFFFF
+        or type(target_size) is not int
+        or isinstance(target_size, bool)
+        or not 0 <= target_size <= 0xFFFFFFFFFFFFFFFF
+        or type(sector_size) is not int
+        or isinstance(sector_size, bool)
+        or not 0 <= sector_size <= 0xFFFFFFFF
+        or type(chunk_size) is not int
+        or isinstance(chunk_size, bool)
+        or not 0 <= chunk_size <= 0xFFFFFFFF
+        or type(plan_sha256) is not str
+        or _SHA256.fullmatch(plan_sha256) is None
+        or type(ready_sha256) is not str
+        or _SHA256.fullmatch(ready_sha256) is None
+    ):
+        raise HelperRequestError("The fast-zero request cannot be encoded")
+    return _FAST_ZERO_REQUEST_PACKET.pack(
+        FAST_ZERO_PROTOCOL_MAGIC,
+        PROTOCOL_VERSION,
+        PACKET_REQUEST,
+        0,
+        request_id,
+        major_number,
+        minor_number,
+        disk_sequence,
+        target_size,
+        sector_size,
+        chunk_size,
+        bytes.fromhex(plan_sha256),
+        bytes.fromhex(ready_sha256),
+        b"\0" * 8,
+    )
+
+
+def unpack_fast_zero_helper_request(
+    packet: bytes,
+    *,
+    sys_root: Path = Path("/sys"),
+) -> FastZeroHelperRequest:
+    if type(packet) is not bytes or len(packet) != _FAST_ZERO_REQUEST_PACKET.size:
+        raise HelperRequestError("The fast-zero request has the wrong size")
+    (
+        magic,
+        version,
+        packet_type,
+        reserved,
+        request_id,
+        major_number,
+        minor_number,
+        disk_sequence,
+        target_size,
+        sector_size,
+        chunk_size,
+        plan_digest,
+        ready_digest,
+        trailing_reserved,
+    ) = _FAST_ZERO_REQUEST_PACKET.unpack(packet)
+    if (
+        magic != FAST_ZERO_PROTOCOL_MAGIC
+        or version != PROTOCOL_VERSION
+        or packet_type != PACKET_REQUEST
+        or reserved != 0
+        or trailing_reserved != b"\0" * 8
+    ):
+        raise HelperRequestError("The fast-zero request is unsupported")
+    try:
+        device_number = os.makedev(major_number, minor_number)
+    except (OverflowError, ValueError) as error:
+        raise HelperRequestError("The fast-zero request has an invalid device number") from error
+    request = FastZeroHelperRequest(
+        request_id,
+        FAST_ZERO_HELPER_PROFILE,
+        _target_path_from_kernel(device_number, sys_root=sys_root),
+        f"{major_number}:{minor_number}",
+        disk_sequence,
+        target_size,
+        sector_size,
+        chunk_size,
+        plan_digest.hex(),
+        ready_digest.hex(),
+    )
+    validate_fast_zero_helper_request(request)
+    return request
+
+
 def unpack_server_packet(packet: bytes) -> tuple[object, ...]:
     """Strictly decode one trusted-helper packet for the GUI-side runner."""
 
@@ -2280,6 +2920,163 @@ def unpack_raw_server_packet(packet: bytes) -> tuple[object, ...]:
     raise HelperRequestError("The raw helper response has an invalid type or size")
 
 
+def _pack_fast_zero_result(result: FastZeroHelperResult) -> bytes:
+    if type(result) is not FastZeroHelperResult:
+        raise HelperError("The fast-zero helper result type is invalid")
+    packet_type = {
+        "success": PACKET_SUCCESS,
+        "partial-cancel": PACKET_PARTIAL_CANCEL,
+        "partial-failure": PACKET_PARTIAL_FAILURE,
+    }.get(result.outcome)
+    if packet_type is None:
+        raise HelperError("The fast-zero helper result outcome is invalid")
+    major_number, minor_number = (int(part) for part in result.major_minor.split(":", 1))
+    values = (
+        result.disk_sequence,
+        result.target_size,
+        result.logical_sector_size,
+        result.chunk_size,
+        result.scanned_bytes,
+        result.written_bytes,
+        result.skipped_bytes,
+        result.verified_bytes,
+        result.scanned_chunks,
+        result.written_chunks,
+        result.skipped_chunks,
+        result.boundary_cleanup_bytes,
+        result.failure_code,
+    )
+    if any(type(value) is not int or isinstance(value, bool) or value < 0 for value in values):
+        raise HelperError("The fast-zero helper result counters are invalid")
+    return _FAST_ZERO_RESULT_PACKET.pack(
+        FAST_ZERO_PROTOCOL_MAGIC,
+        PROTOCOL_VERSION,
+        packet_type,
+        0,
+        result.request_id,
+        major_number,
+        minor_number,
+        result.disk_sequence,
+        result.target_size,
+        result.logical_sector_size,
+        result.chunk_size,
+        result.scanned_bytes,
+        result.written_bytes,
+        result.skipped_bytes,
+        result.verified_bytes,
+        result.scanned_chunks,
+        result.written_chunks,
+        result.skipped_chunks,
+        result.boundary_cleanup_bytes,
+        result.failure_code,
+        int(result.exclusive_open),
+        int(result.cache_invalidated),
+        int(result.complete),
+        int(result.cleanup_verified),
+        int(result.durable),
+        b"\0" * 5,
+    )
+
+
+def unpack_fast_zero_server_packet(packet: bytes) -> tuple[object, ...]:
+    """Strictly decode one target-only fast-zero helper packet."""
+
+    if type(packet) is not bytes or len(packet) < _HEADER.size:
+        raise HelperRequestError("The fast-zero helper response is truncated")
+    magic, version, packet_type, reserved = _HEADER.unpack(packet[:_HEADER.size])
+    if magic != FAST_ZERO_PROTOCOL_MAGIC or version != PROTOCOL_VERSION or reserved != 0:
+        raise HelperRequestError("The fast-zero helper response is unsupported")
+    if packet_type == PACKET_READY and len(packet) == _HEADER.size:
+        return ("ready",)
+    if packet_type == PACKET_PREPARED and len(packet) == _CONTROL_PACKET.size:
+        _, _, _, _, request_id = _CONTROL_PACKET.unpack(packet)
+        return ("prepared", request_id)
+    if packet_type == PACKET_PROGRESS and len(packet) == _PROGRESS_PACKET.size:
+        _, _, _, _, request_id, phase_code, done, total = _PROGRESS_PACKET.unpack(packet)
+        phase = FAST_ZERO_PHASE_NAMES.get(phase_code)
+        if phase is None or done > total:
+            raise HelperRequestError("The fast-zero helper progress packet is invalid")
+        return ("progress", request_id, phase, done, total)
+    if packet_type == PACKET_MUTATION_STARTED and len(packet) == _MUTATION_PACKET.size:
+        _, _, _, _, request_id = _MUTATION_PACKET.unpack(packet)
+        return ("mutation-started", request_id)
+    if packet_type not in {PACKET_SUCCESS, PACKET_PARTIAL_CANCEL, PACKET_PARTIAL_FAILURE}:
+        raise HelperRequestError("The fast-zero helper response has an invalid type")
+    if len(packet) != _FAST_ZERO_RESULT_PACKET.size:
+        raise HelperRequestError("The fast-zero helper result has the wrong size")
+    unpacked = _FAST_ZERO_RESULT_PACKET.unpack(packet)
+    (
+        _, _, _, _, request_id, major_number, minor_number, disk_sequence,
+        target_size, sector_size, chunk_size, scanned_bytes, written_bytes,
+        skipped_bytes, verified_bytes, scanned_chunks, written_chunks,
+        skipped_chunks, cleanup_bytes, failure_code, exclusive_open,
+        cache_invalidated, complete, cleanup_verified, durable, trailing_reserved,
+    ) = unpacked
+    if (
+        any(flag not in {0, 1} for flag in (
+            exclusive_open, cache_invalidated, complete, cleanup_verified, durable,
+        ))
+        or trailing_reserved != b"\0" * 5
+        or scanned_bytes != written_bytes + skipped_bytes
+        or scanned_chunks != written_chunks + skipped_chunks
+        or scanned_bytes > target_size
+        or verified_bytes > target_size
+        or not exclusive_open
+        or not cache_invalidated
+        or not durable
+    ):
+        raise HelperRequestError("The fast-zero helper result accounting is invalid")
+    outcome = {
+        PACKET_SUCCESS: "success",
+        PACKET_PARTIAL_CANCEL: "partial-cancel",
+        PACKET_PARTIAL_FAILURE: "partial-failure",
+    }[packet_type]
+    if outcome == "success":
+        valid = (
+            complete
+            and not cleanup_verified
+            and cleanup_bytes == 0
+            and failure_code == FAST_ZERO_FAILURE_NONE
+            and scanned_bytes == target_size
+            and verified_bytes == target_size
+        )
+    else:
+        valid = (
+            not complete
+            and cleanup_verified
+            and 0 < cleanup_bytes <= target_size
+            and failure_code != FAST_ZERO_FAILURE_NONE
+            and (outcome != "partial-cancel" or failure_code == FAST_ZERO_FAILURE_CANCELLED)
+            and (outcome != "partial-failure" or failure_code != FAST_ZERO_FAILURE_CANCELLED)
+        )
+    if not valid:
+        raise HelperRequestError("The fast-zero helper result state is invalid")
+    return (
+        outcome,
+        request_id,
+        major_number,
+        minor_number,
+        disk_sequence,
+        target_size,
+        sector_size,
+        chunk_size,
+        scanned_bytes,
+        written_bytes,
+        skipped_bytes,
+        verified_bytes,
+        scanned_chunks,
+        written_chunks,
+        skipped_chunks,
+        cleanup_bytes,
+        failure_code,
+        bool(exclusive_open),
+        bool(cache_invalidated),
+        bool(complete),
+        bool(cleanup_verified),
+        bool(durable),
+    )
+
+
 def pack_helper_control(request_id: bytes, *, commit: bool) -> bytes:
     """Encode the only two client decisions accepted after root preflight."""
 
@@ -2306,6 +3103,18 @@ def pack_raw_helper_control(request_id: bytes, *, commit: bool) -> bytes:
     )
 
 
+def pack_fast_zero_helper_control(request_id: bytes, *, commit: bool) -> bytes:
+    if type(request_id) is not bytes or len(request_id) != 16 or type(commit) is not bool:
+        raise HelperRequestError("The fast-zero control decision cannot be encoded")
+    return _CONTROL_PACKET.pack(
+        FAST_ZERO_PROTOCOL_MAGIC,
+        PROTOCOL_VERSION,
+        PACKET_COMMIT if commit else PACKET_CANCEL,
+        0,
+        request_id,
+    )
+
+
 def _send_packet(channel: socket.socket, packet: bytes) -> None:
     try:
         count = channel.send(packet, socket.MSG_DONTWAIT)
@@ -2323,7 +3132,11 @@ class _ProtocolProgress:
         expected_uid: int,
         protocol_magic: bytes = PROTOCOL_MAGIC,
     ) -> None:
-        if protocol_magic not in {PROTOCOL_MAGIC, RAW_PROTOCOL_MAGIC}:
+        if protocol_magic not in {
+            PROTOCOL_MAGIC,
+            RAW_PROTOCOL_MAGIC,
+            FAST_ZERO_PROTOCOL_MAGIC,
+        }:
             raise HelperRequestError("The privileged protocol profile is invalid")
         self._channel = channel
         self._request_id = request_id
@@ -2373,7 +3186,12 @@ class _ProtocolProgress:
             self._connected = False
 
     def __call__(self, phase: str, done: int, total: int) -> None:
-        phase_code = PHASE_CODES.get(phase)
+        phase_codes = (
+            FAST_ZERO_PHASE_CODES
+            if self._protocol_magic == FAST_ZERO_PROTOCOL_MAGIC
+            else PHASE_CODES
+        )
+        phase_code = phase_codes.get(phase)
         if phase_code is None or type(done) is not int or type(total) is not int:
             raise HelperError("The privileged transaction emitted invalid progress")
         if not self._mutation_started:
@@ -2453,6 +3271,54 @@ def _receive_request(
             os.close(descriptor)
             raise HelperRequestError("Could not secure the privileged source descriptor") from error
         return packet, descriptor
+    finally:
+        for descriptor in received_fds:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _receive_target_only_request(
+    channel: socket.socket,
+    *,
+    expected_uid: int,
+) -> bytes:
+    """Receive one credential-bound request and reject every transferred FD."""
+
+    credentials_size = struct.calcsize("3i")
+    descriptor_size = array.array("i").itemsize
+    try:
+        channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        packet, ancillary, flags, _address = channel.recvmsg(
+            MAX_PROTOCOL_PACKET,
+            socket.CMSG_SPACE(credentials_size) + socket.CMSG_SPACE(descriptor_size),
+        )
+    except OSError as error:
+        raise HelperRequestError("Could not receive the fast-zero request") from error
+    if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+        raise HelperRequestError("The fast-zero request or ancillary data was truncated")
+    credentials: list[tuple[int, int, int]] = []
+    received_fds: list[int] = []
+    try:
+        for level, kind, value in ancillary:
+            if level != socket.SOL_SOCKET:
+                raise HelperRequestError("The fast-zero request contains unknown ancillary data")
+            if kind == socket.SCM_RIGHTS:
+                if len(value) % descriptor_size:
+                    raise HelperRequestError("The fast-zero descriptor list is malformed")
+                descriptors = array.array("i")
+                descriptors.frombytes(value)
+                received_fds.extend(int(item) for item in descriptors)
+            elif kind == socket.SCM_CREDENTIALS and len(value) == credentials_size:
+                credentials.append(struct.unpack("3i", value))
+            else:
+                raise HelperRequestError("The fast-zero request has invalid credentials")
+        if received_fds:
+            raise HelperRequestError("The target-only fast-zero request must not transfer descriptors")
+        if len(credentials) != 1 or credentials[0][1] != expected_uid:
+            raise HelperRequestError("The fast-zero request credentials do not match pkexec")
+        return packet
     finally:
         for descriptor in received_fds:
             try:
@@ -2541,6 +3407,31 @@ def _poll_cancel(
     ):
         raise HelperRequestError("COMMIT arrived before the privileged helper was prepared")
     raise HelperCancelled("The device transaction was cancelled before mutation")
+
+
+def _poll_fast_zero_postcommit_cancel(
+    channel: socket.socket,
+    *,
+    expected_uid: int,
+    request_id: bytes,
+) -> None:
+    """Poll one authenticated post-commit CANCEL only at chunk boundaries."""
+
+    try:
+        readable, _, _ = select.select([channel], [], [], 0)
+    except OSError as error:
+        raise HelperRequestError("Could not poll fast-zero cancellation") from error
+    if not readable:
+        return
+    if _receive_control(
+        channel,
+        expected_uid=expected_uid,
+        request_id=request_id,
+        timeout=0,
+        protocol_magic=FAST_ZERO_PROTOCOL_MAGIC,
+    ):
+        raise HelperRequestError("The fast-zero COMMIT decision was repeated")
+    raise HelperCancelled("The fast-zero transaction was cancelled after commit")
 
 
 def _protocol_channel(expected_uid: int) -> socket.socket:
@@ -2685,12 +3576,18 @@ def main(argv: list[str] | None = None) -> int:
             raise HelperRequestError("The device helper requires 64-bit Linux userspace")
         _verify_installed_helper()
         arguments = sys.argv[1:] if argv is None else argv
-        if len(arguments) != 1 or arguments[0] not in {OPERATION, RAW_OPERATION}:
+        if len(arguments) != 1 or arguments[0] not in {
+            OPERATION,
+            RAW_OPERATION,
+            FAST_ZERO_OPERATION,
+        }:
             raise HelperRequestError("The privileged helper operation is unsupported")
         operation = arguments[0]
-        protocol_magic = (
-            PROTOCOL_MAGIC if operation == OPERATION else RAW_PROTOCOL_MAGIC
-        )
+        protocol_magic = {
+            OPERATION: PROTOCOL_MAGIC,
+            RAW_OPERATION: RAW_PROTOCOL_MAGIC,
+            FAST_ZERO_OPERATION: FAST_ZERO_PROTOCOL_MAGIC,
+        }[operation]
         invoking_uid = _invoking_uid()
         _require_initial_namespaces()
         _harden_process(invoking_uid)
@@ -2699,15 +3596,21 @@ def main(argv: list[str] | None = None) -> int:
             channel,
             _HEADER.pack(protocol_magic, PROTOCOL_VERSION, PACKET_READY, 0),
         )
-        packet, source_descriptor = _receive_request(
-            channel,
-            expected_uid=invoking_uid,
-        )
-        request: HelperRequest | RawHelperRequest = (
-            unpack_helper_request(packet)
-            if operation == OPERATION
-            else unpack_raw_helper_request(packet)
-        )
+        if operation == FAST_ZERO_OPERATION:
+            packet = _receive_target_only_request(channel, expected_uid=invoking_uid)
+            request: HelperRequest | RawHelperRequest | FastZeroHelperRequest = (
+                unpack_fast_zero_helper_request(packet)
+            )
+        else:
+            packet, source_descriptor = _receive_request(
+                channel,
+                expected_uid=invoking_uid,
+            )
+            request = (
+                unpack_helper_request(packet)
+                if operation == OPERATION
+                else unpack_raw_helper_request(packet)
+            )
         progress = _ProtocolProgress(
             channel,
             request.request_id,
@@ -2730,7 +3633,7 @@ def main(argv: list[str] | None = None) -> int:
             _defer_ordinary_termination()
             progress.begin_mutation()
 
-        result: HelperResult | RawHelperResult
+        result: HelperResult | RawHelperResult | FastZeroHelperResult
         if type(request) is HelperRequest:
             result = execute_helper_transaction(
                 request,
@@ -2746,6 +3649,17 @@ def main(argv: list[str] | None = None) -> int:
                 invoking_uid=invoking_uid,
                 progress=progress,
                 mutation_started=begin_mutation,
+            )
+        elif type(request) is FastZeroHelperRequest:
+            result = execute_fast_zero_helper_transaction(
+                request,
+                progress=progress,
+                mutation_started=begin_mutation,
+                postcommit_cancel=lambda: _poll_fast_zero_postcommit_cancel(
+                    channel,
+                    expected_uid=invoking_uid,
+                    request_id=request.request_id,
+                ),
             )
         else:
             raise HelperRequestError("The privileged helper request type is unsupported")
@@ -2796,6 +3710,8 @@ def main(argv: list[str] | None = None) -> int:
                         else b"\0" * 32
                     ),
                 )
+            elif type(result) is FastZeroHelperResult:
+                response = _pack_fast_zero_result(result)
             else:
                 raise HelperError("The privileged helper result type is unsupported")
             _send_packet(channel, response)

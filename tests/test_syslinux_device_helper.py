@@ -12,6 +12,7 @@ import stat
 import struct
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from functools import lru_cache
 from dataclasses import replace
 from pathlib import Path
@@ -655,7 +656,638 @@ class HelperTransactionTests(unittest.TestCase):
         self.assertEqual(os.pread(self.harness.target.fileno(), 512, 0), b"\0" * 512)
 
 
+FAST_ZERO_TEST_CHUNK = 1024
+FAST_ZERO_TEST_SIZE = 3 * FAST_ZERO_TEST_CHUNK
+
+
+def fast_zero_request(*, sector: int = 512, size: int = FAST_ZERO_TEST_SIZE):
+    return helper.FastZeroHelperRequest(
+        REQUEST_ID,
+        helper.FAST_ZERO_HELPER_PROFILE,
+        "/dev/sdz",
+        "8:240",
+        DISK_SEQUENCE,
+        size,
+        sector,
+        FAST_ZERO_TEST_CHUNK,
+        "11" * 32,
+        "22" * 32,
+    )
+
+
+class FastZeroHarness:
+    def __init__(self, data: bytes) -> None:
+        self.target = tempfile.TemporaryFile()
+        self.target.write(data)
+        self.target.flush()
+        self.size = len(data)
+        self.target_fds: set[int] = set()
+        self.open_flags: list[int] = []
+        self.write_calls: list[tuple[int, bytes, int]] = []
+        self.read_calls: list[tuple[int, int, int]] = []
+        self.fsync_calls: list[int] = []
+        self.flush_calls: list[int] = []
+        self.close_calls: list[int] = []
+        self.flock_calls: list[tuple[int, int]] = []
+        self.progress: list[tuple[str, int, int]] = []
+        self.observation = KernelTargetObservation(
+            DEVICE_NUMBER,
+            frozenset({DEVICE_NUMBER, os.makedev(8, 241)}),
+            "usb",
+            True,
+            False,
+            512,
+            False,
+            DISK_SEQUENCE,
+        )
+
+    def close(self) -> None:
+        self.target.close()
+
+    def open_target(self, path: str, flags: int) -> int:
+        self.open_flags.append(flags)
+        descriptor = os.dup(self.target.fileno())
+        self.target_fds.add(descriptor)
+        return descriptor
+
+    def fstat(self, descriptor: int):
+        if descriptor in self.target_fds:
+            return fake_block_status()
+        return os.fstat(descriptor)
+
+    def pread(self, descriptor: int, size: int, offset: int) -> bytes:
+        self.read_calls.append((descriptor, size, offset))
+        return os.pread(descriptor, size, offset)
+
+    def pwrite(self, descriptor: int, data: bytes, offset: int) -> int:
+        self.write_calls.append((descriptor, bytes(data), offset))
+        return os.pwrite(descriptor, data, offset)
+
+    def operations(self, **overrides) -> HelperOperations:
+        def ioctl_uint(descriptor: int, operation: int) -> int:
+            if operation == BLKSSZGET:
+                return self.observation.logical_sector_size
+            if operation == BLKROGET:
+                return int(self.observation.read_only)
+            raise AssertionError(operation)
+
+        def ioctl_u64(descriptor: int, operation: int) -> int:
+            if operation == BLKGETSIZE64:
+                return self.size
+            if operation == BLKGETDISKSEQ:
+                return self.observation.disk_sequence
+            raise AssertionError(operation)
+
+        def ioctl_void(descriptor: int, operation: int) -> None:
+            if operation != BLKFLSBUF:
+                raise AssertionError(operation)
+            self.flush_calls.append(descriptor)
+
+        def fsync(descriptor: int) -> None:
+            self.fsync_calls.append(descriptor)
+            os.fsync(descriptor)
+
+        def flock(descriptor: int, operation: int) -> None:
+            self.flock_calls.append((descriptor, operation))
+
+        def close(descriptor: int) -> None:
+            self.close_calls.append(descriptor)
+            os.close(descriptor)
+
+        values = dict(
+            lstat=lambda _path: fake_block_status(),
+            fstat=self.fstat,
+            open=self.open_target,
+            close=close,
+            pread=self.pread,
+            pwrite=self.pwrite,
+            fsync=fsync,
+            flock=flock,
+            ioctl_uint=ioctl_uint,
+            ioctl_u64=ioctl_u64,
+            ioctl_void=ioctl_void,
+            inspect_target=lambda _dev: self.observation,
+            active_devices=lambda: frozenset(),
+        )
+        values.update(overrides)
+        return HelperOperations(**values)
+
+    def execute(self, **overrides):
+        operations = overrides.pop("operations", self.operations())
+        request = overrides.pop("request", fast_zero_request(size=self.size))
+        with patch.object(helper, "FAST_ZERO_DEFAULT_CHUNK_BYTES", FAST_ZERO_TEST_CHUNK):
+            return helper.execute_fast_zero_helper_transaction(
+                request,
+                operations=operations,
+                progress=lambda phase, done, total: self.progress.append((phase, done, total)),
+                **overrides,
+            )
+
+
+class FastZeroTransactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.harness = FastZeroHarness(
+            b"\0" * FAST_ZERO_TEST_CHUNK
+            + b"X" * FAST_ZERO_TEST_CHUNK
+            + b"\0" * FAST_ZERO_TEST_CHUNK,
+        )
+
+    def tearDown(self) -> None:
+        self.harness.close()
+
+    def test_mixed_target_skips_only_exact_zero_chunks_and_fully_verifies(self):
+        result = self.harness.execute()
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(result.scanned_bytes, FAST_ZERO_TEST_SIZE)
+        self.assertEqual(result.written_bytes, FAST_ZERO_TEST_CHUNK)
+        self.assertEqual(result.skipped_bytes, 2 * FAST_ZERO_TEST_CHUNK)
+        self.assertEqual((result.scanned_chunks, result.written_chunks, result.skipped_chunks), (3, 1, 2))
+        self.assertEqual(result.verified_bytes, FAST_ZERO_TEST_SIZE)
+        self.assertEqual(os.pread(self.harness.target.fileno(), FAST_ZERO_TEST_SIZE, 0), b"\0" * FAST_ZERO_TEST_SIZE)
+        target_fds = {call[0] for call in self.harness.write_calls}
+        target_fds.update(call[0] for call in self.harness.read_calls)
+        target_fds.update(self.harness.fsync_calls)
+        target_fds.update(self.harness.flush_calls)
+        self.assertEqual(len(target_fds), 1)
+        self.assertTrue(self.harness.open_flags[0] & os.O_EXCL)
+        self.assertTrue(self.harness.open_flags[0] & getattr(os, "O_NOFOLLOW", 0))
+        self.assertEqual(self.harness.flock_calls[0][1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertEqual(self.harness.close_calls, list(target_fds))
+
+    def test_all_zero_target_performs_no_writes(self):
+        self.harness.close()
+        self.harness = FastZeroHarness(b"\0" * FAST_ZERO_TEST_SIZE)
+        result = self.harness.execute()
+        self.assertEqual(result.written_bytes, 0)
+        self.assertEqual(result.skipped_bytes, FAST_ZERO_TEST_SIZE)
+        self.assertEqual(self.harness.write_calls, [])
+        self.assertTrue(result.durable)
+        self.assertTrue(result.cache_invalidated)
+
+    def test_postcommit_cancel_durably_zeros_and_verifies_boundary(self):
+        def cancelled() -> None:
+            raise helper.HelperCancelled("cancelled")
+
+        result = self.harness.execute(postcommit_cancel=cancelled)
+        self.assertEqual(result.outcome, "partial-cancel")
+        self.assertEqual(result.failure_code, helper.FAST_ZERO_FAILURE_CANCELLED)
+        self.assertEqual(result.boundary_cleanup_bytes, FAST_ZERO_TEST_SIZE)
+        self.assertTrue(result.cleanup_verified)
+        self.assertFalse(result.complete)
+        self.assertEqual(os.pread(self.harness.target.fileno(), FAST_ZERO_TEST_SIZE, 0), b"\0" * FAST_ZERO_TEST_SIZE)
+
+    def test_postcommit_disconnect_is_failure_with_exact_cleanup_progress(self):
+        def disconnected() -> None:
+            raise HelperRequestError("peer disconnected")
+
+        result = self.harness.execute(postcommit_cancel=disconnected)
+        self.assertEqual(result.outcome, "partial-failure")
+        self.assertEqual(result.failure_code, helper.FAST_ZERO_FAILURE_REQUEST)
+        self.assertEqual(
+            [item for item in self.harness.progress if item[0] == "cleanup"],
+            [
+                ("cleanup", 0, FAST_ZERO_TEST_SIZE),
+                ("cleanup", FAST_ZERO_TEST_SIZE, FAST_ZERO_TEST_SIZE),
+            ],
+        )
+
+    def test_failed_first_write_is_followed_by_verified_boundary_cleanup(self):
+        calls = 0
+
+        def fail_once(fd: int, data: bytes, offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError(errno.EIO, "injected")
+            return self.harness.pwrite(fd, data, offset)
+
+        result = self.harness.execute(
+            operations=self.harness.operations(pwrite=fail_once),
+        )
+        self.assertEqual(result.outcome, "partial-failure")
+        self.assertEqual(result.failure_code, helper.FAST_ZERO_FAILURE_IO)
+        self.assertTrue(result.cleanup_verified)
+        self.assertEqual(result.scanned_bytes, FAST_ZERO_TEST_CHUNK)
+        self.assertEqual(result.scanned_chunks, 1)
+        self.assertEqual(result.skipped_bytes, FAST_ZERO_TEST_CHUNK)
+        decoded = helper.unpack_fast_zero_server_packet(
+            helper._pack_fast_zero_result(result),
+        )
+        self.assertEqual(decoded[0], "partial-failure")
+        self.assertEqual(decoded[8], FAST_ZERO_TEST_CHUNK)
+        self.assertEqual(os.pread(self.harness.target.fileno(), FAST_ZERO_TEST_SIZE, 0), b"\0" * FAST_ZERO_TEST_SIZE)
+
+    def test_partial_chunk_write_reports_only_completed_chunks_and_packs(self):
+        attempted = 0
+
+        def partial_then_error(fd: int, data: bytes, offset: int) -> int:
+            nonlocal attempted
+            if offset >= FAST_ZERO_TEST_CHUNK and attempted == 0:
+                attempted = 1
+                count = len(data) // 2
+                os.pwrite(fd, data[:count], offset)
+                return count
+            if offset > FAST_ZERO_TEST_CHUNK and attempted == 1:
+                attempted = 2
+                raise OSError(errno.EIO, "injected after partial write")
+            return self.harness.pwrite(fd, data, offset)
+
+        result = self.harness.execute(
+            operations=self.harness.operations(pwrite=partial_then_error),
+        )
+        self.assertEqual(result.outcome, "partial-failure")
+        self.assertEqual(result.scanned_bytes, FAST_ZERO_TEST_CHUNK)
+        self.assertEqual(result.skipped_bytes, FAST_ZERO_TEST_CHUNK)
+        self.assertEqual(result.written_bytes, 0)
+        self.assertEqual(result.written_chunks, 0)
+        decoded = helper.unpack_fast_zero_server_packet(
+            helper._pack_fast_zero_result(result),
+        )
+        self.assertEqual(decoded[0], "partial-failure")
+        self.assertEqual(decoded[9], 0)
+        self.assertTrue(result.cleanup_verified)
+
+    def test_corrupt_readback_returns_partial_failure_after_cleanup(self):
+        corrupted = False
+
+        def corrupt_after_write(fd: int, data: bytes, offset: int) -> int:
+            nonlocal corrupted
+            count = self.harness.pwrite(fd, data, offset)
+            if not corrupted:
+                os.pwrite(fd, b"Y", 0)
+                corrupted = True
+            return count
+
+        result = self.harness.execute(
+            operations=self.harness.operations(pwrite=corrupt_after_write),
+        )
+        self.assertEqual(result.outcome, "partial-failure")
+        self.assertEqual(result.failure_code, helper.FAST_ZERO_FAILURE_VERIFICATION)
+        self.assertTrue(result.cleanup_verified)
+
+    def test_cleanup_is_skipped_if_disk_generation_changes(self):
+        calls = 0
+
+        def diskseq(_fd: int, operation: int) -> int:
+            nonlocal calls
+            if operation == BLKGETSIZE64:
+                return self.harness.size
+            if operation == BLKGETDISKSEQ:
+                calls += 1
+                return DISK_SEQUENCE if calls < 3 else DISK_SEQUENCE + 1
+            raise AssertionError(operation)
+
+        with self.assertRaisesRegex(HelperVerificationError, "cleanup also failed"):
+            self.harness.execute(
+                operations=self.harness.operations(ioctl_u64=diskseq),
+                postcommit_cancel=lambda: (_ for _ in ()).throw(helper.HelperCancelled("cancel")),
+            )
+
+    def test_cleanup_is_skipped_if_path_holders_or_mount_state_changes(self):
+        cancel = lambda: (_ for _ in ()).throw(helper.HelperCancelled("cancel"))
+
+        inspect_calls = 0
+
+        def holder_after_commit(_device: int):
+            nonlocal inspect_calls
+            inspect_calls += 1
+            return (
+                self.harness.observation
+                if inspect_calls < 4
+                else replace(self.harness.observation, has_holders=True)
+            )
+
+        with self.assertRaisesRegex(HelperVerificationError, "cleanup also failed"):
+            self.harness.execute(
+                operations=self.harness.operations(inspect_target=holder_after_commit),
+                postcommit_cancel=cancel,
+            )
+        self.assertEqual(self.harness.write_calls, [])
+
+        active_calls = 0
+
+        def mounted_after_commit():
+            nonlocal active_calls
+            active_calls += 1
+            return frozenset() if active_calls < 4 else frozenset({DEVICE_NUMBER})
+
+        with self.assertRaisesRegex(HelperVerificationError, "cleanup also failed"):
+            self.harness.execute(
+                operations=self.harness.operations(active_devices=mounted_after_commit),
+                postcommit_cancel=cancel,
+            )
+        self.assertEqual(self.harness.write_calls, [])
+
+        path_calls = 0
+
+        def replaced_path(_path: str):
+            nonlocal path_calls
+            path_calls += 1
+            return (
+                fake_block_status()
+                if path_calls < 4
+                else fake_block_status(os.makedev(8, 242))
+            )
+
+        with self.assertRaisesRegex(HelperVerificationError, "cleanup also failed"):
+            self.harness.execute(
+                operations=self.harness.operations(lstat=replaced_path),
+                postcommit_cancel=cancel,
+            )
+        self.assertEqual(self.harness.write_calls, [])
+
+    def test_short_and_interrupted_io_retries_without_changing_descriptor(self):
+        reads = writes = 0
+
+        def short_read(fd: int, size: int, offset: int) -> bytes:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise InterruptedError()
+            return os.pread(fd, min(size, 137), offset)
+
+        def short_write(fd: int, data: bytes, offset: int) -> int:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise InterruptedError()
+            return os.pwrite(fd, data[:137], offset)
+
+        result = self.harness.execute(
+            operations=self.harness.operations(pread=short_read, pwrite=short_write),
+        )
+        self.assertEqual(result.outcome, "success")
+        self.assertGreater(reads, 3)
+        self.assertGreater(writes, 1)
+
+    def test_interrupted_cache_invalidation_is_retried(self):
+        calls = 0
+
+        def interrupted_flush(fd: int, operation: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise InterruptedError()
+            if operation != BLKFLSBUF:
+                raise AssertionError(operation)
+            self.harness.flush_calls.append(fd)
+
+        result = self.harness.execute(
+            operations=self.harness.operations(ioctl_void=interrupted_flush),
+        )
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(calls, 2)
+
+    def test_zero_io_progress_fails_closed(self):
+        calls = 0
+
+        def zero_once(fd: int, data: bytes, offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return 0
+            return self.harness.pwrite(fd, data, offset)
+
+        result = self.harness.execute(
+            operations=self.harness.operations(
+                pwrite=zero_once,
+            ),
+        )
+        self.assertEqual(result.outcome, "partial-failure")
+        self.assertTrue(result.cleanup_verified)
+
+    def test_root_policy_rejects_fixed_usb_mmc_and_live_topology(self):
+        cases = (
+            replace(self.harness.observation, removable=False),
+            replace(self.harness.observation, transport="mmc", removable=False),
+            replace(self.harness.observation, has_holders=True),
+            replace(self.harness.observation, read_only=True),
+        )
+        for observation in cases:
+            with self.subTest(observation=observation), self.assertRaises(HelperTargetError):
+                self.harness.execute(
+                    operations=self.harness.operations(inspect_target=lambda _dev, value=observation: value),
+                )
+        with self.assertRaisesRegex(HelperTargetError, "mounted or active swap"):
+            self.harness.execute(
+                operations=self.harness.operations(active_devices=lambda: frozenset({DEVICE_NUMBER})),
+            )
+        self.harness.observation = replace(self.harness.observation, transport="mmc")
+        self.assertEqual(self.harness.execute().outcome, "success")
+
+    def test_opened_capacity_sector_and_final_diskseq_are_revalidated(self):
+        def wrong_capacity(_fd: int, operation: int) -> int:
+            if operation == BLKGETSIZE64:
+                return self.harness.size + 512
+            if operation == BLKGETDISKSEQ:
+                return DISK_SEQUENCE
+            raise AssertionError(operation)
+
+        with self.assertRaises(HelperTargetError):
+            self.harness.execute(operations=self.harness.operations(ioctl_u64=wrong_capacity))
+        self.assertEqual(self.harness.write_calls, [])
+
+        self.harness.observation = replace(self.harness.observation, logical_sector_size=4096)
+        with self.assertRaises(HelperTargetError):
+            self.harness.execute()
+
+        self.harness.observation = replace(self.harness.observation, logical_sector_size=512)
+        calls = 0
+
+        def changing_diskseq(_fd: int, operation: int) -> int:
+            nonlocal calls
+            if operation == BLKGETSIZE64:
+                return self.harness.size
+            if operation == BLKGETDISKSEQ:
+                calls += 1
+                return DISK_SEQUENCE if calls < 4 else DISK_SEQUENCE + 1
+            raise AssertionError(operation)
+
+        with self.assertRaisesRegex(HelperVerificationError, "cleanup also failed"):
+            self.harness.execute(
+                operations=self.harness.operations(ioctl_u64=changing_diskseq),
+            )
+
+    def test_partial_tail_chunk_is_scanned_written_and_verified_exactly(self):
+        self.harness.close()
+        data = b"\0" * (2 * FAST_ZERO_TEST_CHUNK) + b"T" * 512
+        self.harness = FastZeroHarness(data)
+        result = self.harness.execute()
+        self.assertEqual(result.scanned_bytes, len(data))
+        self.assertEqual(result.verified_bytes, len(data))
+        self.assertEqual(result.written_bytes, 512)
+        self.assertEqual((result.scanned_chunks, result.written_chunks), (3, 1))
+
+    def test_request_geometry_profile_and_receipts_are_strict(self):
+        base = fast_zero_request()
+        invalid = (
+            replace(base, expected_sector_size=1000),
+            replace(base, expected_target_size=513),
+            replace(base, chunk_size=2048),
+            replace(base, plan_sha256="AA" * 32),
+            replace(base, profile="wrong"),
+        )
+        with patch.object(helper, "FAST_ZERO_DEFAULT_CHUNK_BYTES", FAST_ZERO_TEST_CHUNK):
+            for request in invalid:
+                with self.subTest(request=request), self.assertRaises(HelperRequestError):
+                    helper.validate_fast_zero_helper_request(request)
+
+
 class ProtocolTests(unittest.TestCase):
+    def test_fast_zero_request_is_fixed_target_only_binary(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            helper,
+            "FAST_ZERO_DEFAULT_CHUNK_BYTES",
+            FAST_ZERO_TEST_CHUNK,
+        ):
+            sys_root = Path(directory)
+            block = sys_root / "dev" / "block" / "8:240"
+            block.mkdir(parents=True)
+            (block / "uevent").write_text("DEVNAME=sdz\n", encoding="ascii")
+            packet = helper.pack_fast_zero_helper_request(
+                REQUEST_ID,
+                8,
+                240,
+                DISK_SEQUENCE,
+                FAST_ZERO_TEST_SIZE,
+                512,
+                FAST_ZERO_TEST_CHUNK,
+                "11" * 32,
+                "22" * 32,
+            )
+            request = helper.unpack_fast_zero_helper_request(packet, sys_root=sys_root)
+            self.assertEqual(request.target_path, "/dev/sdz")
+            self.assertEqual(request.plan_sha256, "11" * 32)
+            self.assertEqual(request.ready_sha256, "22" * 32)
+            self.assertNotIn(b"/dev/", packet)
+            for candidate in (
+                packet[:-1],
+                packet + b"x",
+                b"X" + packet[1:],
+                packet[:-1] + b"\1",
+            ):
+                with self.subTest(length=len(candidate)), self.assertRaises(HelperRequestError):
+                    helper.unpack_fast_zero_helper_request(candidate, sys_root=sys_root)
+
+    def test_fast_zero_server_result_shape_flags_and_accounting_are_strict(self):
+        result = helper.FastZeroHelperResult(
+            REQUEST_ID,
+            helper.FAST_ZERO_HELPER_PROFILE,
+            "/dev/sdz",
+            "8:240",
+            DISK_SEQUENCE,
+            FAST_ZERO_TEST_SIZE,
+            512,
+            FAST_ZERO_TEST_CHUNK,
+            FAST_ZERO_TEST_SIZE,
+            FAST_ZERO_TEST_CHUNK,
+            2 * FAST_ZERO_TEST_CHUNK,
+            FAST_ZERO_TEST_SIZE,
+            3,
+            1,
+            2,
+            0,
+            0,
+            "success",
+            True,
+            True,
+            True,
+            False,
+            True,
+        )
+        packet = helper._pack_fast_zero_result(result)
+        decoded = helper.unpack_fast_zero_server_packet(packet)
+        self.assertEqual(decoded[:2], ("success", REQUEST_ID))
+        self.assertEqual(decoded[8:15], (FAST_ZERO_TEST_SIZE, FAST_ZERO_TEST_CHUNK, 2 * FAST_ZERO_TEST_CHUNK, FAST_ZERO_TEST_SIZE, 3, 1, 2))
+        for candidate in (
+            packet[:-1],
+            packet + b"x",
+            packet[:-1] + b"\1",
+            packet[:18] + b"\x00\x01" + packet[20:],
+        ):
+            with self.subTest(length=len(candidate)), self.assertRaises(HelperRequestError):
+                helper.unpack_fast_zero_server_packet(candidate)
+
+        partial = replace(
+            result,
+            outcome="partial-cancel",
+            scanned_bytes=0,
+            written_bytes=0,
+            skipped_bytes=0,
+            verified_bytes=0,
+            scanned_chunks=0,
+            written_chunks=0,
+            skipped_chunks=0,
+            boundary_cleanup_bytes=FAST_ZERO_TEST_SIZE,
+            failure_code=helper.FAST_ZERO_FAILURE_CANCELLED,
+            complete=False,
+            cleanup_verified=True,
+        )
+        self.assertEqual(
+            helper.unpack_fast_zero_server_packet(helper._pack_fast_zero_result(partial))[0],
+            "partial-cancel",
+        )
+
+    def test_fast_zero_receiver_rejects_scm_rights_and_authenticates_plain_request(self):
+        packet = b"request"
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            child.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            parent.send(packet)
+            self.assertEqual(
+                helper._receive_target_only_request(child, expected_uid=os.getuid()),
+                packet,
+            )
+        finally:
+            parent.close()
+            child.close()
+
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            child.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            with tempfile.TemporaryFile() as source:
+                parent.sendmsg(
+                    [packet],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [source.fileno()]))],
+                )
+                with self.assertRaisesRegex(HelperRequestError, "must not transfer"):
+                    helper._receive_target_only_request(child, expected_uid=os.getuid())
+        finally:
+            parent.close()
+            child.close()
+
+    def test_fast_zero_control_and_progress_use_separate_magic(self):
+        control = helper.pack_fast_zero_helper_control(REQUEST_ID, commit=True)
+        self.assertEqual(control[:16], helper.FAST_ZERO_PROTOCOL_MAGIC)
+        with self.assertRaises(HelperRequestError):
+            helper.unpack_server_packet(
+                helper._PROGRESS_PACKET.pack(
+                    helper.FAST_ZERO_PROTOCOL_MAGIC,
+                    helper.PROTOCOL_VERSION,
+                    helper.PACKET_PROGRESS,
+                    0,
+                    REQUEST_ID,
+                    helper.FAST_ZERO_PHASE_CODES["cleanup"],
+                    1,
+                    2,
+                ),
+            )
+        self.assertEqual(
+            helper.unpack_fast_zero_server_packet(
+                helper._PROGRESS_PACKET.pack(
+                    helper.FAST_ZERO_PROTOCOL_MAGIC,
+                    helper.PROTOCOL_VERSION,
+                    helper.PACKET_PROGRESS,
+                    0,
+                    REQUEST_ID,
+                    helper.FAST_ZERO_PHASE_CODES["cleanup"],
+                    1,
+                    2,
+                ),
+            ),
+            ("progress", REQUEST_ID, "cleanup", 1, 2),
+        )
+
     def test_request_is_fixed_binary_and_target_path_comes_from_kernel(self):
         with tempfile.TemporaryDirectory() as directory:
             sys_root = Path(directory)
@@ -948,6 +1580,47 @@ class KernelInspectionTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(found, frozenset({os.makedev(0, 29), backing}))
+
+
+class FastZeroPackagingPolicyTests(unittest.TestCase):
+    def test_policy_is_exact_and_not_part_of_ordinary_install(self):
+        root = Path(__file__).resolve().parents[1]
+        policy_path = root / "data" / "io.github.codebooker.isopropyl.fast-zero.policy"
+        policy = ET.parse(policy_path).getroot()
+        action = policy.find("action")
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.attrib, {"id": "io.github.codebooker.isopropyl.fast-zero-drive"})
+        self.assertEqual(action.findtext("description"), "Fast-zero a removable USB or SD drive")
+        self.assertEqual(
+            action.findtext("message"),
+            "Authentication is required to scan and logically zero the selected removable USB or SD target",
+        )
+        defaults = action.find("defaults")
+        self.assertIsNotNone(defaults)
+        assert defaults is not None
+        self.assertEqual(
+            {child.tag: child.text for child in defaults},
+            {"allow_any": "no", "allow_inactive": "no", "allow_active": "auth_admin"},
+        )
+        annotations = {
+            item.attrib["key"]: item.text
+            for item in action.findall("annotate")
+        }
+        self.assertEqual(
+            annotations,
+            {
+                "org.freedesktop.policykit.exec.path": "/usr/libexec/isopropyl-device-helper",
+                "org.freedesktop.policykit.exec.argv1": helper.FAST_ZERO_OPERATION,
+            },
+        )
+
+        makefile = (root / "Makefile").read_text(encoding="utf-8")
+        install_section, uninstall_section = makefile.split("uninstall-host-helper:", 1)
+        ordinary_install = install_section.split("install-host-helper:", 1)[0]
+        self.assertNotIn(policy_path.name, ordinary_install)
+        self.assertIn(policy_path.name, install_section)
+        self.assertIn(policy_path.name, uninstall_section)
 
 
 if __name__ == "__main__":

@@ -581,6 +581,49 @@ large-media, and physical boot tests remain mandatory for release confidence.
 All GUI raw, compressed, virtual, and VTSI inputs now use this broker, and a
 failed or unavailable broker transaction never falls back to the legacy DD path.
 
+## Fast-zero boundary
+
+Fast zero is a separate target-only privileged protocol. It accepts no source
+descriptor, pathname-selected payload, shell command, or legacy `dd` fallback.
+Before showing the final typed confirmation, planning binds the exact removable
+USB/MMC device, model, serial/WWN, major:minor, capacity, logical sector size,
+complete related-device topology, kernel disk generation, fixed 32 MiB chunk
+size, warnings, and executor profile. No unmount or target mutation occurs during
+planning or while the confirmation dialog is open.
+
+After confirmation, the coordinator revalidates and unmounts the same target.
+The fixed root helper derives the device path from the authorized major:minor,
+rejects mounted filesystems, swap, holders, read-only or non-removable targets,
+opens it once with `O_RDWR | O_EXCL | O_NOFOLLOW`, takes a nonblocking exclusive
+lock, and checks geometry, sysfs topology, and `BLKGETDISKSEQ` on that retained
+descriptor. An authenticated PREPARED → COMMIT/CANCEL boundary is the final
+pre-mutation decision.
+
+After COMMIT, every logical byte is read in aligned 32 MiB chunks. A chunk is
+skipped only when it is exactly all zero; every other chunk is overwritten with
+zeroes. Success requires exact scan/write/skip accounting, `fsync`, device-cache
+invalidation, a complete all-zero read-back, and a final identity/topology check.
+Post-COMMIT cancellation is polled between chunks and travels over the same
+authenticated channel. Before returning a partial cancellation or failure, the
+helper re-establishes complete path, descriptor, disk-generation, mount/swap,
+holder, geometry, and topology evidence, then durably zeroes and reads back the
+first and last 16 MiB (counting overlap once). If that proof changes or cleanup
+cannot be verified, no cleanup claim is made and the target state is reported
+unknown.
+
+Successful accounting is exact for every chunk. Partial-result counters cover
+only fully completed chunks: if a kernel write accepts a prefix and a later
+write to that same chunk fails, the uncompleted in-flight chunk may also have
+changed. The GUI states that limitation instead of presenting the completed-
+chunk counter as an exact physical-write total.
+
+Fast zero is a logical host overwrite. It is not ATA Secure Erase, NVMe Sanitize,
+cryptographic erasure, or proof that a flash controller erased remapped or spare
+cells. `O_EXCL` and `flock` remain advisory against hostile or uncooperative
+privileged writers. Installed-PolicyKit VM tests, hot-unplug/replacement tests,
+cache/power-loss tests, large-media performance measurements, and representative
+physical-device certification remain release gates.
+
 ## Boot-time corruption-check boundary
 
 The default-off boot-time option is deliberately narrower than its payload

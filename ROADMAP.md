@@ -19,10 +19,14 @@ evidence.
    overlay refusal, VTSI expansion and exact-capacity restore, and cleanup failures
    without weakening identity checks.
 3. Certify the shipped GUI raw broker's retained same-descriptor ownership,
-   PREPARED/COMMIT boundary, cache handling, and failure recovery, then extend
+   PREPARED/COMMIT boundary, cache handling, and failure recovery. Include the
+   fast-zero profile's 32 MiB scan/skip behavior, complete all-zero read-back,
+   authenticated post-COMMIT cancellation, and identity-gated first/last 16 MiB
+   cleanup on representative flash, USB SSD, SD, 512e, and 4Kn media. Then extend
    that privileged broker/private-namespace design across the other destructive
    transactions. Continue describing Linux BSD locks as advisory rather than
-   claiming they exclude uncooperative privileged writers.
+   claiming they exclude uncooperative privileged writers, and never present
+   logical zeroing as ATA/NVMe sanitization or hardware secure erase.
 4. Confirm the GPT partition type and removable-media fallback loaders across a
    documented firmware matrix.
 5. Ship reproducible native packages and at least one portable format with signed

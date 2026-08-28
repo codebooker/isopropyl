@@ -11,7 +11,7 @@
 
 [Install](#install-from-source) · [Quick start](#quick-start) · [Features](#highlights) · [Safety](#safety-by-design) · [Rufus parity](FEATURE_MATRIX.md) · [Roadmap](ROADMAP.md)
 
-<sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; FULL READ-BACK VERIFICATION</sub>
+<sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; VERIFIED WRITING &amp; FAST ZERO</sub>
 
 </div>
 
@@ -42,7 +42,7 @@ a feature-for-feature replacement.
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, and can generate a reviewed `autounattend.xml` for setup, privacy, account, and quality-of-life options. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
-| **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, securely erases media, and runs bad-block or fake-capacity tests in separate warned workflows. |
+| **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, performs full or scan-and-skip logical zeroing, and runs bad-block or fake-capacity tests in separate warned workflows. |
 | **Linux image download** | Downloads the pinned Ubuntu LTS profile from distribution-owned infrastructure and verifies its signed checksum manifest. |
 | **UEFI recovery media** | Builds a multi-architecture UEFI Shell drive from exact upstream payloads after explicit network consent. |
 
@@ -65,9 +65,10 @@ python -m pip install .
 isopropyl
 ```
 
-Raw/DD writes use ISOpropyl's fixed privileged host integration; there is no
-fallback to a pathname-based `dd` writer. Install that integration explicitly
-from the same trusted checkout before testing raw writes:
+Raw/DD writes and verified fast zero use ISOpropyl's fixed privileged host
+integration; neither has a pathname-based `dd` fallback. Install that
+integration explicitly from the same trusted checkout before testing either
+workflow:
 
 ```bash
 sudo make install-host-helper PREFIX=/usr
@@ -111,6 +112,19 @@ For development, replace `python -m pip install .` with
 4. Optionally add one bounded, additive ZIP overlay. Existing ISO files cannot
    be replaced.
 5. Confirm the exact target and let ISOpropyl verify the finished filesystem.
+
+### Logically zero a drive
+
+1. Open **Drive tools…**, choose **Erase drive…**, and select **Fast zero**.
+2. Review the exact target identity and type the displayed authorization phrase.
+3. ISOpropyl scans every byte, skips only chunks that are already entirely zero,
+   overwrites every other chunk, flushes device caches, and reads the whole drive
+   back before reporting success.
+
+Fast zero is a logical overwrite, not ATA/NVMe Secure Erase, sanitization, or a
+guarantee against flash-controller remapping. Cancellation after writing begins
+durably clears and verifies the first and last 16 MiB when target identity remains
+provable; otherwise ISOpropyl reports the target state as unknown.
 
 Useful shortcuts: <kbd>Ctrl</kbd>+<kbd>O</kbd> opens an image,
 <kbd>Ctrl</kbd>+<kbd>R</kbd> refreshes targets,
@@ -176,7 +190,7 @@ ISOpropyl treats every target write as a destructive transaction:
 - backup, capture, extraction, and staging outputs are created without
   overwriting existing files.
 
-The raw-device broker goes further. Its separate Syslinux and raw/DD profiles
+The raw-device broker goes further. Its separate Syslinux, raw/DD, and fast-zero profiles
 bind the kernel's disk-generation sequence before typed confirmation,
 check that generation again through sysfs and `BLKGETDISKSEQ`, and retain one
 exclusive target descriptor through writing, durability, cache invalidation,
@@ -205,10 +219,11 @@ Core requirements:
 - `sfdisk` plus `mkfs.vfat` for FAT32 ISO mode, or `mkfs.ntfs` for large-file
   UEFI:NTFS media.
 
-The raw-device broker additionally requires 64-bit Linux, kernel
-`diskseq` sysfs data, the `BLKGETDISKSEQ` ioctl, a filesystem supporting strict
-anonymous `O_TMPFILE` snapshots, and enough private workspace for a fully
-allocated expanded image. It fails closed when any requirement is absent.
+The raw-device broker and verified fast zero require 64-bit Linux, kernel
+`diskseq` sysfs data, and the `BLKGETDISKSEQ` ioctl. Raw-image writing also
+requires a filesystem supporting strict anonymous `O_TMPFILE` snapshots and
+enough private workspace for a fully allocated expanded image. Each workflow
+fails closed when one of its requirements is absent.
 
 Optional tools unlock additional workflows:
 

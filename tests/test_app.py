@@ -21,7 +21,8 @@ from PyQt6.QtWidgets import (
 )
 
 from isopropyl.app import (
-    BackgroundPreparation, ChecksumToken, IsoStagingPreparationRequest,
+    FAST_ZERO_MODE, BackgroundPreparation, ChecksumToken,
+    IsoStagingPreparationRequest,
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
     StagedDbxConfirmation,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
@@ -41,6 +42,11 @@ from isopropyl.dbx import (
 )
 from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
+)
+from isopropyl.fast_zero import (
+    FastZeroCancelled, FastZeroHelperUnavailable, FastZeroPartialFailure,
+    FastZeroPartialResult, FastZeroPlan, FastZeroPlanError, FastZeroResult,
+    FastZeroRunError,
 )
 from isopropyl.images import ChecksumCancelled, ImageInspection, ImageMember
 from isopropyl.eltorito import inspect_eltorito_file
@@ -225,6 +231,168 @@ class FakeRawWorkflow:
         ):
             self.progress_stages.append(stage)
             progress(stage, 4096, 4096)
+        return self.result
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def fake_fast_zero_plan(target: Device | None = None) -> FastZeroPlan:
+    selected = target or device()
+    plan = object.__new__(FastZeroPlan)
+    values = {
+        "device": selected,
+        "disk_sequence": 41,
+        "target_capacity": selected.size,
+        "logical_sector_size": selected.logical_sector_size,
+        "chunk_size": 4 * 1024**2,
+        "boundary_bytes": min(16 * 1024**2, selected.size),
+        "warnings": (
+            "THIS OPERATION IS DESTRUCTIVE AND CANNOT BE UNDONE.",
+            "Cancelling after mutation begins leaves a partial erase.",
+        ),
+        "confirmation_phrase": (
+            f"FAST ZERO {selected.path} {selected.major_minor}"
+        ),
+        "plan_sha256": "f" * 64,
+    }
+    for name, value in values.items():
+        object.__setattr__(plan, name, value)
+    return plan
+
+
+def fake_fast_zero_result(
+    target: Device | None = None,
+    *,
+    written_bytes: int = 0,
+) -> FastZeroResult:
+    selected = target or device()
+    chunk_size = 4 * 1024**2
+    written_chunks = (
+        (written_bytes + chunk_size - 1) // chunk_size if written_bytes else 0
+    )
+    scanned_chunks = (selected.size + chunk_size - 1) // chunk_size
+    return FastZeroResult(
+        request_id="request",
+        plan_sha256="f" * 64,
+        ready_sha256="e" * 64,
+        target_path=selected.path,
+        major_minor=selected.major_minor,
+        disk_sequence=41,
+        target_capacity=selected.size,
+        logical_sector_size=selected.logical_sector_size,
+        chunk_size=chunk_size,
+        scanned_bytes=selected.size,
+        written_bytes=written_bytes,
+        skipped_bytes=selected.size - written_bytes,
+        verified_bytes=selected.size,
+        scanned_chunks=scanned_chunks,
+        written_chunks=written_chunks,
+        skipped_chunks=scanned_chunks - written_chunks,
+        boundary_cleanup_bytes=0,
+        cleanup_verified=False,
+        cleanup_durable=True,
+        exclusive_open=True,
+        cache_invalidated=True,
+        complete=True,
+        cancellation_deferred=False,
+    )
+
+
+def fake_fast_zero_partial(
+    target: Device | None = None,
+    *,
+    failure_code: int | None = None,
+) -> FastZeroPartialResult:
+    selected = target or device()
+    chunk_size = 4 * 1024**2
+    scanned = 3 * chunk_size
+    values = {
+        "request_id": "request",
+        "plan_sha256": "f" * 64,
+        "ready_sha256": "e" * 64,
+        "target_path": selected.path,
+        "major_minor": selected.major_minor,
+        "disk_sequence": 41,
+        "target_capacity": selected.size,
+        "logical_sector_size": selected.logical_sector_size,
+        "chunk_size": chunk_size,
+        "scanned_bytes": scanned,
+        "written_bytes": 2 * chunk_size,
+        "skipped_bytes": chunk_size,
+        "verified_bytes": 0,
+        "scanned_chunks": 3,
+        "written_chunks": 2,
+        "skipped_chunks": 1,
+        "boundary_cleanup_bytes": min(selected.size, 32 * 1024**2),
+        "cleanup_verified": True,
+        "cleanup_durable": True,
+        "exclusive_open": True,
+        "cache_invalidated": True,
+        "complete": False,
+    }
+    if failure_code is None:
+        return FastZeroPartialResult(**values)
+    return FastZeroPartialFailure(**values, failure_code=failure_code)
+
+
+class FakeFastZeroWorkflow:
+    def __init__(
+        self,
+        target: Device | None = None,
+        *,
+        result: FastZeroResult | None = None,
+        prepare_error: BaseException | None = None,
+        execute_error: BaseException | None = None,
+    ) -> None:
+        self.device = target or device()
+        self.plan = fake_fast_zero_plan(self.device)
+        self.result = result or fake_fast_zero_result(self.device)
+        self.prepare_error = prepare_error
+        self.execute_error = execute_error
+        self.prepared = False
+        self.confirmed_phrase: str | None = None
+        self.executed = False
+        self.cancelled = False
+        self.closed = False
+        self.progress_stages: list[str] = []
+
+    def prepare(self) -> FastZeroPlan:
+        if self.cancelled:
+            raise FastZeroCancelled("cancelled")
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        self.prepared = True
+        return self.plan
+
+    def confirm(self, phrase: str) -> object:
+        if self.cancelled:
+            raise FastZeroCancelled("cancelled")
+        if phrase != self.plan.confirmation_phrase:
+            raise FastZeroPlanError("confirmation mismatch")
+        self.confirmed_phrase = phrase
+        return object()
+
+    def execute(self, progress) -> FastZeroResult:
+        if self.cancelled:
+            raise FastZeroCancelled("cancelled")
+        self.executed = True
+        if self.execute_error is not None:
+            partial = getattr(self.execute_error, "partial", None)
+            progress("scanning", 3 * self.plan.chunk_size, self.plan.target_capacity)
+            if partial is not None:
+                progress(
+                    "cleanup",
+                    partial.boundary_cleanup_bytes,
+                    partial.boundary_cleanup_bytes,
+                )
+            raise self.execute_error
+        for stage in ("scanning", "readback"):
+            self.progress_stages.append(stage)
+            progress(stage, self.plan.target_capacity, self.plan.target_capacity)
         return self.result
 
     def cancel(self) -> None:
@@ -2753,6 +2921,357 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.device_refresh_busy)
         self.assertTrue(self.window.device_combo.isEnabled())
         self.assertEqual(self.window.selected_device(), replacement)
+
+
+class WindowFastZeroTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
+            self.window = Window()
+        self.window.size_unit_mode = SizeUnitMode.SI
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+
+    def tearDown(self) -> None:
+        self.window.fast_zero_workflow = None
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+        self.settings_home.cleanup()
+
+    def _select_fast_zero(self, dialog: QDialog) -> int:
+        selector = dialog.findChild(QComboBox)
+        self.assertIsNotNone(selector)
+        index = selector.findData(FAST_ZERO_MODE)
+        self.assertGreaterEqual(index, 0)
+        selector.setCurrentIndex(index)
+        return QDialog.DialogCode.Accepted
+
+    def test_selector_is_truthful_and_fast_zero_never_reaches_legacy_erase_or_dd(self):
+        workflow = FakeFastZeroWorkflow()
+        observed: dict[str, object] = {}
+        forbidden = AssertionError("legacy dd-backed erase path was reached")
+
+        def select(dialog: QDialog) -> int:
+            selector = dialog.findChild(QComboBox)
+            observed["choices"] = tuple(
+                selector.itemText(index) for index in range(selector.count())
+            )
+            result = self._select_fast_zero(dialog)
+            observed["scope"] = "\n".join(
+                label.text() for label in dialog.findChildren(QLabel)
+            )
+            return result
+
+        def confirm(plan: FastZeroPlan) -> str:
+            self.assertIs(plan, workflow.plan)
+            self.assertIs(self.window.fast_zero_workflow, workflow)
+            self.assertTrue(self.window.operation_active)
+            return plan.confirmation_phrase
+
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=workflow) as factory,
+            patch("isopropyl.app.QDialog.exec", new=select),
+            patch.object(
+                self.window,
+                "confirm_fast_zero_plan",
+                side_effect=confirm,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.build_erase_plan", side_effect=forbidden),
+            patch("isopropyl.app.EraseRunner", side_effect=forbidden),
+            patch("isopropyl.erase.resolve_erase_tools", side_effect=forbidden),
+            patch("isopropyl.erase.erase_command", side_effect=forbidden),
+            patch("isopropyl.app.QMessageBox.information") as information,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.erase_drive()
+
+        self.assertIn(
+            "Fast zero — scan, skip zero blocks, zero the rest, verify all",
+            observed["choices"],
+        )
+        self.assertIn("All choices destroy data", observed["scope"])
+        self.assertIn("reads the complete drive", observed["scope"])
+        self.assertIn("skips chunks", observed["scope"])
+        factory.assert_called_once_with(
+            self.window.devices[0],
+            size_unit_mode=SizeUnitMode.SI,
+        )
+        self.assertTrue(workflow.prepared)
+        self.assertEqual(
+            workflow.confirmed_phrase,
+            workflow.plan.confirmation_phrase,
+        )
+        self.assertTrue(workflow.executed)
+        self.assertEqual(workflow.progress_stages, ["scanning", "readback"])
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        message = information.call_args.args[2]
+        self.assertIn("Every scanned chunk was already zero", message)
+        self.assertIn("no data chunks needed rewriting", message)
+        self.assertIn(f"{workflow.result.target_capacity:,} bytes", message)
+
+    def test_final_dialog_discloses_exact_target_method_and_phrase(self):
+        plan = fake_fast_zero_plan()
+        observed: dict[str, object] = {}
+
+        def inspect(dialog: QDialog) -> int:
+            details = dialog.findChild(
+                QPlainTextEdit,
+                "fastZeroConfirmationDetails",
+            )
+            phrase = dialog.findChild(QLineEdit, "fastZeroConfirmationPhrase")
+            button = dialog.findChild(QPushButton, "fastZeroConfirmButton")
+            observed["details"] = details.toPlainText()
+            observed["initially_enabled"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase.lower())
+            observed["wrong_enabled"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase)
+            observed["exact_enabled"] = button.isEnabled()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            phrase = self.window.confirm_fast_zero_plan(plan)
+
+        details = str(observed["details"])
+        self.assertEqual(phrase, plan.confirmation_phrase)
+        self.assertFalse(observed["initially_enabled"])
+        self.assertFalse(observed["wrong_enabled"])
+        self.assertTrue(observed["exact_enabled"])
+        self.assertIn("scan every chunk", details)
+        self.assertIn("skip chunks already entirely zero", details)
+        self.assertIn("verify the complete drive", details)
+        self.assertIn(plan.device.path, details)
+        self.assertIn("ISOpropyl Test Drive", details)
+        self.assertIn("SERIAL", details)
+        self.assertIn(f"{plan.target_capacity:,} bytes", details)
+        self.assertIn(f"{plan.chunk_size:,} bytes", details)
+        self.assertIn(f"{plan.boundary_bytes:,} bytes", details)
+        self.assertIn(plan.warnings[0], details)
+
+    def test_typed_rejection_releases_preparation_without_mutation(self):
+        workflow = FakeFastZeroWorkflow()
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=workflow),
+            patch.object(self.window, "confirm_fast_zero_plan", return_value=None),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.start_fast_zero(self.window.devices[0])
+
+        self.assertTrue(workflow.prepared)
+        self.assertIsNone(workflow.confirmed_phrase)
+        self.assertFalse(workflow.executed)
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertIn("before target mutation", self.window.status.text())
+
+    def test_helper_unavailable_and_target_drift_fail_before_mutation(self):
+        failures = (
+            FastZeroHelperUnavailable("fast-zero helper unavailable"),
+            FastZeroPlanError("selected target changed during planning"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                workflow = FakeFastZeroWorkflow(prepare_error=failure)
+                with (
+                    patch(
+                        "isopropyl.app.FastZeroWorkflow",
+                        return_value=workflow,
+                    ),
+                    patch("isopropyl.app.threading.Thread", ImmediateThread),
+                    patch("isopropyl.app.QMessageBox.critical") as critical,
+                    patch.object(self.window, "refresh_devices"),
+                ):
+                    self.window.start_fast_zero(self.window.devices[0])
+
+                self.assertFalse(workflow.prepared)
+                self.assertFalse(workflow.executed)
+                self.assertTrue(workflow.closed)
+                self.assertFalse(self.window.operation_active)
+                message = critical.call_args.args[2]
+                self.assertIn("before target mutation", message)
+                self.assertIn(str(failure), message)
+
+    def test_precommit_cancel_reports_no_mutation_and_releases_owner(self):
+        workflow = FakeFastZeroWorkflow(
+            execute_error=FastZeroCancelled("cancel won before COMMIT"),
+        )
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=workflow),
+            patch.object(
+                self.window,
+                "confirm_fast_zero_plan",
+                return_value=workflow.plan.confirmation_phrase,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_fast_zero(self.window.devices[0])
+
+        self.assertTrue(workflow.executed)
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertEqual(
+            self.window.status.text(),
+            "Fast zero cancelled before target mutation.",
+        )
+
+    def test_postcommit_cancel_reports_partial_accounting_and_cleanup(self):
+        partial = fake_fast_zero_partial()
+        workflow = FakeFastZeroWorkflow(
+            execute_error=FastZeroCancelled(
+                "cancelled after COMMIT",
+                partial=partial,
+            ),
+        )
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=workflow),
+            patch.object(
+                self.window,
+                "confirm_fast_zero_plan",
+                return_value=workflow.plan.confirmation_phrase,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_fast_zero(self.window.devices[0])
+
+        message = critical.call_args.args[2]
+        self.assertIn("cancelled after mutation began", message)
+        self.assertIn("partially erased", message)
+        self.assertIn(f"{partial.scanned_bytes:,} bytes", message)
+        self.assertIn(f"{partial.written_bytes:,} bytes", message)
+        self.assertIn(f"{partial.boundary_cleanup_bytes:,} bytes", message)
+        self.assertIn("completed zeroing", message)
+        self.assertIn("in-flight chunk may also have been partially changed", message)
+        self.assertIn("durably zeroed and verified", message)
+        self.assertIn("may remain recoverable", message)
+        self.assertTrue(workflow.closed)
+
+    def test_postcommit_failure_reports_code_and_authenticated_cleanup(self):
+        partial = fake_fast_zero_partial(failure_code=9)
+        assert type(partial) is FastZeroPartialFailure
+        workflow = FakeFastZeroWorkflow(
+            execute_error=FastZeroRunError(
+                "helper failed",
+                partial=partial,
+            ),
+        )
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=workflow),
+            patch.object(
+                self.window,
+                "confirm_fast_zero_plan",
+                return_value=workflow.plan.confirmation_phrase,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_fast_zero(self.window.devices[0])
+
+        message = critical.call_args.args[2]
+        self.assertIn("failed after mutation began", message)
+        self.assertIn("Helper failure code: 9", message)
+        self.assertIn("invalidated the kernel cache", message)
+        self.assertTrue(workflow.closed)
+
+    def test_failure_without_partial_evidence_reports_unknown_target_state(self):
+        workflow = FakeFastZeroWorkflow(
+            execute_error=FastZeroRunError("helper connection was lost"),
+        )
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=workflow),
+            patch.object(
+                self.window,
+                "confirm_fast_zero_plan",
+                return_value=workflow.plan.confirmation_phrase,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_fast_zero(self.window.devices[0])
+
+        message = critical.call_args.args[2]
+        self.assertIn("helper connection was lost", message)
+        self.assertIn("target state is unknown", message)
+        self.assertNotIn("before target mutation", message)
+        self.assertTrue(workflow.closed)
+
+    def test_stale_completions_close_only_stale_owner(self):
+        current = FakeFastZeroWorkflow()
+        stale = FakeFastZeroWorkflow()
+        self.window.fast_zero_workflow = current
+
+        self.window.on_fast_zero_preparation_finished(stale, stale.plan)
+        self.window.on_fast_zero_execution_finished(stale, stale.result)
+
+        self.assertTrue(stale.closed)
+        self.assertFalse(current.closed)
+        self.assertIs(self.window.fast_zero_workflow, current)
+
+    def test_cancel_and_close_fan_out_to_active_workflow(self):
+        pending: list[object] = []
+
+        class DeferredThread:
+            def __init__(thread_self, *, target, daemon=False):
+                pending.append(target)
+
+            def start(thread_self):
+                pass
+
+        workflow = FakeFastZeroWorkflow()
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=workflow),
+            patch("isopropyl.app.threading.Thread", DeferredThread),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_fast_zero(self.window.devices[0])
+            self.assertTrue(self.window.operation_active)
+            self.window.cancel()
+            self.assertTrue(workflow.cancelled)
+            pending.pop(0)()
+
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+
+        close_workflow = FakeFastZeroWorkflow()
+        event = Mock()
+        with (
+            patch("isopropyl.app.FastZeroWorkflow", return_value=close_workflow),
+            patch("isopropyl.app.threading.Thread", DeferredThread),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_fast_zero(self.window.devices[0])
+            self.window.closeEvent(event)
+            self.assertTrue(close_workflow.cancelled)
+            pending.pop(0)()
+
+        event.ignore.assert_called_once()
+        event.accept.assert_not_called()
+        self.assertTrue(close_workflow.closed)
+        self.assertFalse(self.window.operation_active)
 
 
 class WindowZipOverlayTests(unittest.TestCase):
