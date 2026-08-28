@@ -446,9 +446,20 @@ lifecycle lock, so closing the owner cannot cause descriptor-number reuse to
 splice another process file into an active stream. Patch, poison, and close are
 serialized; failures never publish a scratch path or attempt rollback.
 
-This is still not authorization to write a device. The staged Syslinux decision,
-builder, patch transaction, and target must first be joined by one witnessed
-production ISO plan. A privileged executor with transaction-wide target
+For the supported Syslinux staging profile, matching full-content manifests are
+built immediately before and after atomic publication. A non-init receipt binds
+the exact originally minted manifest, staging-plan identity, public result
+fields, and final namespace; cloned/refreshed result dataclasses lose authority.
+The backend-only composite revalidates that live receipt without reopening the
+ISO, binds both exact bundle roles, the selected root or nested config directory,
+root loader, and private FAT32 plan, then performs builder → patch → final
+attestation without exposing an unpatched owner. Its public entry point accepts
+no injectable builder or transaction capable of retaining the anonymous
+descriptor, and it returns only the patched-attested stream owner.
+
+This is still not authorization to write a device. The authenticated
+ISO-to-patched-image pipeline and target must first be joined by one witnessed
+target/device plan. A privileged executor with transaction-wide target
 ownership, exact device read-back, QEMU/SeaBIOS and OVMF gates, and physical BIOS
 testing remain mandatory before the GUI can offer BIOS construction. Until then,
 hybrid media should use verified DD mode to preserve its existing boot layout.

@@ -74,8 +74,10 @@ bundle membership, no-follow descriptor-bound atomic caching, parent-path
 revalidation, and pre-use verification under one caller-visible deadline. The
 UEFI:NTFS GUI obtains explicit consent before acquisition, and its privileged
 writer consumes verified in-memory bytes instead of the cache path. No GUI or
-BIOS executor consumes the GRUB/Syslinux bundles, and GRUB bundles deliberately
-do not satisfy detected-image dependency keys.
+device-facing BIOS executor consumes the GRUB/Syslinux bundles. A backend-only,
+device-unreachable Syslinux composite can consume the exact two supported bundle
+roles only after authenticated ISO staging; GRUB bundles deliberately do not
+satisfy detected-image dependency keys.
 
 Every additional catalog entry requires documented upstream provenance, license
 review, exact version/custom-build compatibility, size and digest review,
