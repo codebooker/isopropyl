@@ -149,9 +149,15 @@ evidence.
   fixtures and QEMU therefore gate any hive use. A candidate non-executable
   WIM-apply request contract now carries strictly validated claims for the
   parent, exact child geometry, WIM snapshot, edition index/expanded size, and
-  plan receipts. Physical execution still requires privileged re-attestation,
-  descriptor-bound privileged `wimlib` block apply, complete image-native BCD
-  construction/read-back, offline SAN policy, explicit internal-disk behavior,
+  plan receipts. A device-free backend now certifies the exact inherited-fd
+  `wimlib` apply against a fresh anonymous regular NTFS image while the owner is
+  non-dumpable, the target is advisory-locked, the source is kernel-leased, and
+  all complete hashes are cancellable and time-bounded. It explicitly rejects
+  block devices and does not claim resistance to a hostile same-UID process.
+  Physical execution still requires privileged topology/mount
+  re-attestation, PREPARED → COMMIT, block-target contamination recovery,
+  complete image-native BCD construction/read-back, offline SAN policy,
+  explicit internal-disk behavior,
   and QEMU/OVMF plus physical certification.
 - Physically certify the strict VTSI v1.0 restore path on representative Ventoy
   media; keep its exact-capacity and 512-byte logical-sector requirements. Add

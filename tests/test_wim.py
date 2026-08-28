@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +27,7 @@ from isopropyl.wim import (
     WimSplitExecutor,
     WimToolUnavailable,
     WimValidationError,
+    _stop_process,
     create_extract_plan,
     create_split_plan,
     extract_command,
@@ -373,6 +377,122 @@ class WimInfoTests(unittest.TestCase):
             )
         self.assertFalse(seen[0][1]["shell"])
         self.assertEqual(seen[0][1]["stdin"], subprocess.DEVNULL)
+
+    def test_bounded_runner_accepts_only_explicit_safe_environment_and_cwd(self):
+        calls = []
+
+        def popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return FakeProcess(argv, **kwargs)
+
+        result = run_bounded_command(
+            [TOOL, "--version"],
+            timeout_seconds=1,
+            max_output=1024,
+            popen=popen,
+            environment={"LC_ALL": "C", "TZ": "UTC"},
+            working_directory="/",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(calls[0][1]["env"], {"LC_ALL": "C", "TZ": "UTC"})
+        self.assertEqual(calls[0][1]["cwd"], "/")
+        self.assertTrue(calls[0][1]["close_fds"])
+        self.assertFalse(calls[0][1]["start_new_session"])
+        for environment, directory in (
+            ({"BAD=KEY": "value"}, "/"),
+            ({"KEY": "bad\0value"}, "/"),
+            ({"KEY": True}, "/"),
+            ({"KEY": "value"}, "relative"),
+            ({"KEY": "value"}, "/tmp/../tmp"),
+        ):
+            with self.subTest(environment=environment, directory=directory), self.assertRaises(
+                WimValidationError,
+            ):
+                run_bounded_command(
+                    [TOOL, "--version"],
+                    timeout_seconds=1,
+                    max_output=1024,
+                    popen=popen,
+                    environment=environment,  # type: ignore[arg-type]
+                    working_directory=directory,
+                )
+
+    def test_group_cleanup_kills_descendants_after_leader_exit(self):
+        process = FakeProcess([TOOL], code=0)
+        process.pid = 4242
+        group_checks = 0
+        signals = []
+
+        def killpg(_pid, requested):
+            nonlocal group_checks
+            signals.append(requested)
+            if requested == 0:
+                group_checks += 1
+                if group_checks >= 3:
+                    raise ProcessLookupError
+
+        with (
+            patch("isopropyl.wim.os.killpg", side_effect=killpg),
+            patch("isopropyl.wim.time.monotonic", side_effect=(0, 3, 3, 6)),
+        ):
+            _stop_process(process, process_group=True)
+        self.assertIn(signal.SIGTERM, signals)
+        self.assertIn(signal.SIGKILL, signals)
+
+    def test_group_cleanup_reaps_real_forked_term_ignoring_descendant(self):
+        cancelled = threading.Event()
+        leader_pids = []
+        timer = threading.Timer(0.25, cancelled.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(WimCancelled):
+                run_bounded_command(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os,signal,time;"
+                        "pid=os.fork();"
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN) "
+                        "if pid == 0 else None;"
+                        "time.sleep(30)",
+                    ),
+                    timeout_seconds=10,
+                    max_output=1024,
+                    cancel_event=cancelled,
+                    process_started=lambda process: leader_pids.append(process.pid),
+                    new_session=True,
+                )
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertEqual(len(leader_pids), 1)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(leader_pids[0], 0)
+
+    def test_success_rejects_and_reaps_left_behind_descendant(self):
+        leader_pids = []
+        started = time.monotonic()
+        with self.assertRaisesRegex(WimCommandError, "descendant"):
+            run_bounded_command(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os,signal,time;"
+                    "pid=os.fork();"
+                    "(os.close(1),os.close(2),"
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN),"
+                    "time.sleep(30)) if pid == 0 else os._exit(0)",
+                ),
+                timeout_seconds=10,
+                max_output=1024,
+                process_started=lambda process: leader_pids.append(process.pid),
+                new_session=True,
+            )
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertEqual(len(leader_pids), 1)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(leader_pids[0], 0)
 
 
 class WimExtractTests(unittest.TestCase):

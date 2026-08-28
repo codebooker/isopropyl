@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import io
 import os
+import queue
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -12,7 +14,7 @@ import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -276,33 +278,95 @@ def _bounded_reader(
     sink: bytearray,
     limit: int,
     overflow: threading.Event,
+    failures: queue.SimpleQueue[BaseException],
 ) -> None:
     try:
-        while True:
-            block = stream.read(64 * 1024)
-            if not block:
-                return
-            remaining = max(0, limit + 1 - len(sink))
-            if remaining:
-                sink.extend(block[:remaining])
-            if len(sink) > limit:
-                overflow.set()
+        try:
+            while True:
+                block = stream.read(64 * 1024)
+                if not block:
+                    return
+                remaining = max(0, limit + 1 - len(sink))
+                if remaining:
+                    sink.extend(block[:remaining])
+                if len(sink) > limit:
+                    overflow.set()
+        except BaseException as error:
+            failures.put(error)
     finally:
-        stream.close()
+        try:
+            stream.close()
+        except BaseException as error:
+            failures.put(error)
 
 
-def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+def _stop_process(
+    process: subprocess.Popen[bytes],
+    *,
+    process_group: bool = False,
+) -> None:
+    pid = getattr(process, "pid", None)
+    group = process_group and type(pid) is int and pid > 1
+
+    def group_exists() -> bool:
+        if not group:
+            return False
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            raise WimCommandError(
+                "Could not attest the wimlib-imagex process group",
+            ) from error
+        return True
+
+    if process.poll() is not None and not group_exists():
         return
     try:
-        process.terminate()
+        if group:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            process.terminate()
     except ProcessLookupError:
         return
+    except OSError as error:
+        raise WimCommandError("Could not stop the wimlib-imagex process group") from error
+
+    deadline = time.monotonic() + 2
+    if group:
+        while time.monotonic() < deadline and group_exists():
+            process.poll()
+            time.sleep(0.01)
+        if group_exists():
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            except OSError as error:
+                raise WimCommandError(
+                    "Could not kill the wimlib-imagex process group",
+                ) from error
+            kill_deadline = time.monotonic() + 2
+            while time.monotonic() < kill_deadline and group_exists():
+                process.poll()
+                time.sleep(0.01)
+            if group_exists():
+                raise WimCommandError("The wimlib-imagex process group did not exit")
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired as error:
+            raise WimCommandError("The wimlib-imagex process was not reaped") from error
+        return
+
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=2)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired as error:
+            raise WimCommandError("The wimlib-imagex process did not exit") from error
 
 
 def run_bounded_command(
@@ -314,6 +378,9 @@ def run_bounded_command(
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
     pass_fds: Sequence[int] = (),
+    environment: Mapping[str, str] | None = None,
+    working_directory: str | None = None,
+    new_session: bool = False,
 ) -> CommandResult:
     """Run fixed argv without a shell while bounding time and captured output."""
 
@@ -328,41 +395,82 @@ def run_bounded_command(
     bound_fds = tuple(pass_fds)
     if any(type(descriptor) is not int or descriptor < 0 for descriptor in bound_fds):
         raise WimValidationError("Inherited WIM descriptors must be non-negative integers")
-
-    try:
-        process = popen(
-            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL, shell=False, pass_fds=bound_fds,
+    if environment is not None and (
+        not isinstance(environment, Mapping)
+        or any(
+            type(key) is not str
+            or not key
+            or "\0" in key
+            or "=" in key
+            or type(value) is not str
+            or "\0" in value
+            for key, value in environment.items()
         )
+    ):
+        raise WimValidationError("The WIM command environment is invalid")
+    if working_directory is not None and (
+        type(working_directory) is not str
+        or not os.path.isabs(working_directory)
+        or os.path.normpath(working_directory) != working_directory
+    ):
+        raise WimValidationError("The WIM command working directory is invalid")
+    if type(new_session) is not bool:
+        raise WimValidationError("The WIM command session policy is invalid")
+
+    launch_options: dict[str, object] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "shell": False,
+        "close_fds": True,
+        "pass_fds": bound_fds,
+        "start_new_session": new_session,
+    }
+    if environment is not None:
+        launch_options["env"] = dict(environment)
+    if working_directory is not None:
+        launch_options["cwd"] = working_directory
+    try:
+        process = popen(list(argv), **launch_options)
     except OSError as error:
         raise WimCommandError("Could not start wimlib-imagex") from error
     if process_started is not None:
         try:
             process_started(process)
-        except Exception:
-            _stop_process(process)
-            raise
+        except BaseException as error:
+            _stop_process(process, process_group=new_session)
+            raise WimCommandError("The wimlib-imagex process callback failed") from error
     if process.stdout is None or process.stderr is None:
-        _stop_process(process)
+        _stop_process(process, process_group=new_session)
         raise WimCommandError("Could not capture wimlib-imagex output")
 
     stdout = bytearray()
     stderr = bytearray()
     overflow = threading.Event()
-    readers = (
-        threading.Thread(
-            target=_bounded_reader,
-            args=(process.stdout, stdout, max_output, overflow),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_bounded_reader,
-            args=(process.stderr, stderr, max_output, overflow),
-            daemon=True,
-        ),
-    )
-    for reader in readers:
-        reader.start()
+    reader_failures: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
+    readers: tuple[threading.Thread, ...] = ()
+    started_readers: list[threading.Thread] = []
+    try:
+        readers = (
+            threading.Thread(
+                target=_bounded_reader,
+                args=(process.stdout, stdout, max_output, overflow, reader_failures),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_bounded_reader,
+                args=(process.stderr, stderr, max_output, overflow, reader_failures),
+                daemon=True,
+            ),
+        )
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
+    except BaseException as error:
+        _stop_process(process, process_group=new_session)
+        for reader in started_readers:
+            reader.join(timeout=2)
+        raise WimCommandError("Could not start wimlib-imagex output readers") from error
 
     deadline = time.monotonic() + timeout_seconds
     failure: WimError | None = None
@@ -373,22 +481,47 @@ def run_bounded_command(
         if overflow.is_set():
             failure = WimCommandError("wimlib-imagex produced too much output")
             break
+        if not reader_failures.empty():
+            failure = WimCommandError("Could not read wimlib-imagex output")
+            break
         if time.monotonic() >= deadline:
             failure = WimCommandError("wimlib-imagex timed out")
             break
         time.sleep(0.01)
 
     if failure is not None:
-        _stop_process(process)
+        _stop_process(process, process_group=new_session)
     for reader in readers:
-        reader.join(timeout=2)
+        try:
+            reader.join(timeout=2)
+        except BaseException as error:
+            _stop_process(process, process_group=new_session)
+            raise WimCommandError("Could not join wimlib-imagex output readers") from error
     if any(reader.is_alive() for reader in readers):
-        _stop_process(process)
+        _stop_process(process, process_group=new_session)
         raise WimCommandError("Could not finish reading wimlib-imagex output")
+    if not reader_failures.empty() and failure is None:
+        failure = WimCommandError("Could not read wimlib-imagex output")
     if overflow.is_set() and failure is None:
         failure = WimCommandError("wimlib-imagex produced too much output")
     if cancel_event is not None and cancel_event.is_set():
         failure = WimCancelled("WIM operation was cancelled")
+    if failure is None and new_session:
+        pid = getattr(process, "pid", None)
+        if type(pid) is int and pid > 1:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                raise WimCommandError(
+                    "Could not attest successful wimlib-imagex process cleanup",
+                ) from error
+            else:
+                _stop_process(process, process_group=True)
+                failure = WimCommandError(
+                    "wimlib-imagex left a descendant process running",
+                )
     if failure is not None:
         raise failure
     return CommandResult(process.returncode or 0, bytes(stdout), bytes(stderr))

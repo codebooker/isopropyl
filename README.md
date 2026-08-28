@@ -288,10 +288,12 @@ expanded drive visibility are never persisted.
 | Downloaded FreeDOS 1.4 LiteUSB/FullUSB `.img` | Authenticated raw snapshot | Exact official x86 BIOS/Legacy/CSM image; fixed 32 MiB or 1 GiB layout is not expanded to fill the target. |
 | Additive `.zip` overlay | ISO mode option | One stored/deflated archive; additions only, no overwrites or links. |
 
-Unsupported or ambiguous formats fail closed. Direct FFU/WIM/ESD apply,
-Executable Windows To Go (an internal fail-closed layout/capacity preview now
-exists), and general device-facing BIOS/dual-firmware construction from
-arbitrary payloads remain roadmap work.
+Unsupported or ambiguous formats fail closed. Direct FFU/WIM/ESD device apply,
+executable Windows To Go (an internal fail-closed layout/capacity preview and a
+device-free anonymous-NTFS-image WIM backend certification now exist), and general
+device-facing BIOS/dual-firmware construction from arbitrary payloads remain
+roadmap work. The certification backend explicitly rejects block devices and is
+not a claim about hostile same-UID processes, Windows boot, or physical media.
 
 ## Windows customization
 
@@ -507,6 +509,19 @@ privileged device transaction, or physical media. The real integration test is
 explicitly opt-in rather than part of the device-free default suite. A locally
 reproduced observation is retained as
 [`certifications/syslinux-6.03-seabios-2026-08-28.json`](https://github.com/codebooker/isopropyl/blob/main/certifications/syslinux-6.03-seabios-2026-08-28.json).
+
+Maintainers with `wimlib-imagex`, `mkntfs`, and the ntfs-3g inspection tools can
+also reproduce the unprivileged, device-free WIM apply certificate:
+
+```bash
+python3 tools/certify_wim_apply_backend.py --run
+```
+
+The harness drops active capability sets, sets Linux `no_new_privs`, rejects
+every root UID and any set-ID/file-capability-bearing tool, locks down its
+descriptor owner, creates only an anonymous 128 MiB regular NTFS image, and
+verifies the exact applied file and clean volume metadata. It never accepts or
+discovers a block device.
 
 Read [CONTRIBUTING.md](https://github.com/codebooker/isopropyl/blob/main/CONTRIBUTING.md) before changing a destructive path.
 Brand assets and usage guidance are in [BRANDING.md](https://github.com/codebooker/isopropyl/blob/main/BRANDING.md).

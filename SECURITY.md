@@ -166,6 +166,24 @@ issue requesting a private contact channel without disclosing the vulnerability.
   UEFI:NTFS, WIM, and persistence paths time-bound their local command wrappers
   and use bounded terminate/kill/reap handling; a future dedicated privileged
   helper remains the stronger process-control boundary.
+- The Windows To Go WIM-apply backend is currently a device-free certification
+  primitive, not a device writer. It accepts only a fresh owner-only, unlinked
+  regular-file NTFS image and rejects block devices. The descriptor owner is
+  non-dumpable, the target is held under an advisory lock, the source is held
+  under a kernel read lease, both inherited descriptors and the complete
+  source/fresh-target digests are re-attested with cancellation and attestation
+  deadlines, primary and backup NTFS boot sectors are frozen, and wimlib runs in
+  a new process group with a fixed argv, allowlisted environment, bounded
+  diagnostics, descendant-aware terminate/kill/reap, and
+  failure-as-contamination semantics. The opt-in certification first drops and
+  then rejects all active capability sets, sets Linux `no_new_privs`, rejects
+  set-ID or file-capability-bearing tools and any real/effective/saved/fs root
+  UID, proves an empty fresh root, reads the exact applied fixture bytes
+  through ntfs-3g, and verifies clean NTFS metadata before and after. It does not
+  claim resistance to a hostile same-UID process attacking the short-lived
+  external tool. None of this authorizes physical media: privileged topology,
+  mount, GPT/NTFS, PREPARED → COMMIT, cancellation-recovery, and physical-boot
+  gates remain unimplemented.
 - The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
   dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
   2.06/2.12/2.14 blank-media research bundles, plus the exact upstream UEFI
