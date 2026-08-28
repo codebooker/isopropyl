@@ -468,7 +468,11 @@ def _scan_tree(
             directory_fd, parent_parts = stack.pop()
             try:
                 try:
-                    names = os.listdir(directory_fd)
+                    scan_fd = os.open(".", _DIR_FLAGS, dir_fd=directory_fd)
+                    try:
+                        names = os.listdir(scan_fd)
+                    finally:
+                        os.close(scan_fd)
                 except OSError as error:
                     raise RuntimeValidationSafetyError(
                         f"Could not enumerate the private staging tree: {error}"

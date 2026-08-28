@@ -22,7 +22,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QTabWidget,
     QVBoxLayout, QWidget,
 )
@@ -91,6 +92,11 @@ from .logging_setup import read_log, setup_logging
 from .linux_downloads import (
     DownloadedLinuxImage, LinuxDownloadCancelled, LinuxImageRelease,
     LinuxIsoDownloader, available_linux_images,
+)
+from .freedos_downloads import (
+    DownloadedFreeDosImage, FreeDosDownloadCancelled, FreeDosImageRelease,
+    FreeDosUsbDownloader, available_freedos_images,
+    freedos_inspection_matches_release,
 )
 from .windows_downloads import (
     DownloadedWindowsImage, WindowsDownloadCancelled, WindowsImageRelease,
@@ -260,6 +266,21 @@ class LinuxDownloadToken:
 
 
 @dataclass(frozen=True)
+class FreeDosDownloadToken:
+    generation: int
+    operation: FreeDosUsbDownloader
+    release: FreeDosImageRelease
+    destination: Path
+
+
+@dataclass(frozen=True)
+class FreeDosDownloadCompletion:
+    image: DownloadedFreeDosImage
+    inspection: ImageInspection
+    identity: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
 class WindowsDownloadToken:
     generation: int
     operation: WindowsIsoDownloader
@@ -296,6 +317,7 @@ class Bridge(QObject):
     casper_preparation_finished = pyqtSignal(object, object, object)
     device_refresh_finished = pyqtSignal(object, object)
     linux_download_finished = pyqtSignal(object, object, object)
+    freedos_download_finished = pyqtSignal(object, object, object)
     windows_download_finished = pyqtSignal(object, object, object)
     raw_preparation_finished = pyqtSignal(object, object)
     raw_execution_finished = pyqtSignal(object, object)
@@ -326,6 +348,9 @@ class Window(QMainWindow):
         self.linux_download_generation = 0
         self.linux_downloader: LinuxIsoDownloader | None = None
         self.linux_download_token: LinuxDownloadToken | None = None
+        self.freedos_download_generation = 0
+        self.freedos_downloader: FreeDosUsbDownloader | None = None
+        self.freedos_download_token: FreeDosDownloadToken | None = None
         self.windows_download_generation = 0
         self.windows_downloader: WindowsIsoDownloader | None = None
         self.windows_download_token: WindowsDownloadToken | None = None
@@ -421,6 +446,9 @@ class Window(QMainWindow):
         self.bridge.device_refresh_finished.connect(self.on_devices_refreshed)
         self.bridge.linux_download_finished.connect(
             self.on_linux_download_finished
+        )
+        self.bridge.freedos_download_finished.connect(
+            self.on_freedos_download_finished
         )
         self.bridge.windows_download_finished.connect(
             self.on_windows_download_finished
@@ -668,27 +696,39 @@ class Window(QMainWindow):
         layout.addWidget(subtitle)
 
         self.source_card = self.card(
-            "1", "Disk image", "Choose a Linux or Windows ISO, or a raw disk image"
+            "1", "Disk image",
+            "Choose a Linux or Windows ISO, a FreeDOS USB image, or a raw disk image",
         )
         source_row = QHBoxLayout()
         self.image_label = QLabel("No image selected")
         self.image_label.setObjectName("muted")
         choose = QPushButton("Choose image…")
         choose.clicked.connect(self.choose_image)
-        self.linux_download_button = QPushButton("Download Linux…")
-        self.linux_download_button.setToolTip(
-            "Explicitly download an ISO from ISOpropyl's small signed Linux catalog."
+        download = QPushButton("Download official image…")
+        download.setToolTip(
+            "Choose a curated Linux ISO, Windows ISO, or FreeDOS USB image. "
+            "Networking always requires confirmation."
         )
-        self.linux_download_button.clicked.connect(self.download_linux_image)
-        self.windows_download_button = QPushButton("Download Windows…")
-        self.windows_download_button.setToolTip(
-            "Download one exact Windows ISO directly from Microsoft and verify its "
-            "Microsoft-published SHA-256."
+        download_menu = QMenu(download)
+        linux_download = download_menu.addAction("Download Linux ISO…")
+        linux_download.setToolTip(
+            "Use ISOpropyl's small signed Linux catalog."
         )
-        self.windows_download_button.clicked.connect(self.download_windows_image)
+        linux_download.triggered.connect(self.download_linux_image)
+        windows_download = download_menu.addAction("Download Windows ISO…")
+        windows_download.setToolTip(
+            "Acquire an exact Windows ISO from Microsoft and verify its hash."
+        )
+        windows_download.triggered.connect(self.download_windows_image)
+        freedos_download = download_menu.addAction("Download FreeDOS USB image…")
+        freedos_download.setToolTip(
+            "Acquire an official checksum-pinned FreeDOS 1.4 USB image for "
+            "legacy BIOS/CSM x86 systems."
+        )
+        freedos_download.triggered.connect(self.download_freedos_image)
+        download.setMenu(download_menu)
         source_row.addWidget(self.image_label, 1)
-        source_row.addWidget(self.linux_download_button)
-        source_row.addWidget(self.windows_download_button)
+        source_row.addWidget(download)
         source_row.addWidget(choose)
         self.source_card.layout().addLayout(source_row)
         image_tools = QHBoxLayout()
@@ -1074,6 +1114,330 @@ class Window(QMainWindow):
             f"{token.release.release}.\n\n{result.path}",
         )
         self.load_image(result.path)
+
+    def download_freedos_image(self) -> None:
+        if self.operation_active or self.inspection_busy:
+            return
+        try:
+            releases = available_freedos_images()
+        except Exception as error:
+            QMessageBox.critical(self, "FreeDOS catalog unavailable", str(error))
+            return
+        if not releases:
+            QMessageBox.warning(
+                self, "FreeDOS catalog unavailable",
+                "No curated FreeDOS USB images are available.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Download checksum-pinned FreeDOS")
+        dialog.setMinimumWidth(660)
+        layout = QVBoxLayout(dialog)
+        notice = QLabel(
+            "Choose an official FreeDOS 1.4 USB image. Networking starts only "
+            "after you choose a destination and consent. ISOpropyl checks the "
+            "official verification page, requires its built-in archive checksum, "
+            "validates the exact ZIP catalog, and independently verifies the "
+            "extracted disk image."
+        )
+        notice.setObjectName("freedosDownloadNotice")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        choices = QComboBox()
+        choices.setObjectName("freedosDownloadRelease")
+        for index, release in enumerate(releases):
+            recommendation = " · recommended" if index == 0 else ""
+            choices.addItem(
+                f"FreeDOS {release.release} · {release.edition}{recommendation} "
+                f"· {self.display_size(release.image_size)} image",
+                release,
+            )
+        layout.addWidget(choices)
+        details = QLabel()
+        details.setObjectName("freedosDownloadDetails")
+        details.setWordWrap(True)
+        layout.addWidget(details)
+        firmware_notice = QLabel(
+            "Compatibility: x86 PCs using legacy BIOS or UEFI Legacy/CSM mode. "
+            "Native UEFI, Secure Boot, ARM, and RISC-V are not supported. The "
+            "fixed-size image does not automatically expand to fill a larger drive; "
+            "middle bytes beyond the image may retain old data unless you full-zero "
+            "the drive first."
+        )
+        firmware_notice.setObjectName("freedosFirmwareNotice")
+        firmware_notice.setWordWrap(True)
+        layout.addWidget(firmware_notice)
+        trust_notice = QLabel(
+            "FreeDOS does not publish a detached signature for these archives. "
+            "This is checksum-pinned integrity against ISOpropyl's reviewed release "
+            "catalog, not publisher-signature verification."
+        )
+        trust_notice.setObjectName("freedosTrustNotice")
+        trust_notice.setWordWrap(True)
+        layout.addWidget(trust_notice)
+
+        def update_details() -> None:
+            selected = choices.currentData()
+            if isinstance(selected, FreeDosImageRelease):
+                details.setText(
+                    f"Official archive: {selected.archive_filename} "
+                    f"({self.display_size(selected.archive_size)})\n"
+                    f"Output image: {selected.image_filename} "
+                    f"({self.display_size(selected.image_size)})\n"
+                    f"Pinned archive SHA-256: {selected.archive_sha256}\n"
+                    f"Reviewed image SHA-256: {selected.image_sha256}\n"
+                    f"Source: {selected.provenance_url}\n"
+                    f"Release and license report: {selected.release_report_url}"
+                )
+
+        choices.currentIndexChanged.connect(update_details)
+        update_details()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Choose destination…"
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        release = choices.currentData()
+        if not isinstance(release, FreeDosImageRelease) or release not in releases:
+            QMessageBox.critical(
+                self, "FreeDOS catalog unavailable",
+                "The selected catalog entry is invalid.",
+            )
+            return
+
+        downloads = Path.home() / "Downloads"
+        starting_directory = downloads if downloads.is_dir() else Path.home()
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save verified FreeDOS disk image",
+            str(starting_directory / release.image_filename),
+            "Raw disk images (*.img)",
+        )
+        if not filename:
+            return
+        destination = Path(filename)
+        if destination.name != release.image_filename:
+            QMessageBox.warning(
+                self, "Keep the official filename",
+                f"This catalog entry must be saved as {release.image_filename}. "
+                "Choose the destination again without renaming it.",
+            )
+            return
+        if not destination.is_absolute():
+            QMessageBox.warning(
+                self, "Choose an absolute destination",
+                "Choose a normal local folder.",
+            )
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "Download and verify FreeDOS image?",
+            f"Download FreeDOS {release.release} {release.edition}\n\n"
+            f"Official archive: {release.archive_url}\n"
+            f"Archive download: {self.display_size(release.archive_size)}\n"
+            f"Expanded image: {self.display_size(release.image_size)}\n"
+            f"Destination: {destination}\n\n"
+            "This x86 image boots only through legacy BIOS or UEFI Legacy/CSM. "
+            "ISOpropyl will compare the official checksum page with its built-in "
+            "pin, verify the complete archive, and verify the extracted image. "
+            "A cancelled archive transfer remains in a private resumable directory; "
+            "a verified cached archive can be reused without networking. Downloaded "
+            "bytes are never executed. FreeDOS and its included packages retain "
+            "their upstream licenses, and ISOpropyl is not affiliated with the "
+            f"FreeDOS Project. Release report: {release.release_report_url}",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        downloader = FreeDosUsbDownloader()
+        self.freedos_download_generation += 1
+        token = FreeDosDownloadToken(
+            self.freedos_download_generation, downloader, release, destination,
+        )
+        self.freedos_downloader = downloader
+        self.freedos_download_token = token
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Corroborating the official FreeDOS checksum…")
+        self.logger.info(
+            "Confirmed FreeDOS USB image download: release=%s destination=%s",
+            release.id, destination,
+        )
+
+        def work() -> None:
+            downloaded: DownloadedFreeDosImage | None = None
+            try:
+                downloaded = downloader.download(
+                    release, destination,
+                    lambda done, total: self.bridge.progress.emit(
+                        done, total, "Downloading and expanding FreeDOS image",
+                    ),
+                )
+                identity = image_identity(downloaded.path)
+                if downloaded.identity != identity[:4]:
+                    raise OSError(
+                        "The published FreeDOS image identity changed before inspection"
+                    )
+
+                def check_cancelled() -> None:
+                    if downloader.cancelled:
+                        raise FreeDosDownloadCancelled(
+                            "FreeDOS image inspection was cancelled"
+                        )
+
+                self.bridge.status_changed.emit(
+                    "Inspecting the verified FreeDOS disk image…"
+                )
+                inspection = inspect_image(
+                    downloaded.path, expected_identity=identity,
+                    cancel_check=check_cancelled,
+                )
+                if not freedos_inspection_matches_release(release, inspection):
+                    raise OSError(
+                        "The hash-verified file did not inspect as the pinned "
+                        "FreeDOS USB image"
+                    )
+                result: object = FreeDosDownloadCompletion(
+                    downloaded, inspection, identity,
+                )
+                error: object = None
+            except Exception as caught:
+                # A returned downloader result is the publication commit point.
+                result = downloaded
+                error = caught
+            self.bridge.freedos_download_finished.emit(token, result, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_freedos_download_finished(
+        self, token: FreeDosDownloadToken, result: object, error: object,
+    ) -> None:
+        if (
+            token is not self.freedos_download_token
+            or token.operation is not self.freedos_downloader
+            or token.generation != self.freedos_download_generation
+        ):
+            return
+        self.freedos_downloader = None
+        self.freedos_download_token = None
+        self.set_busy(False)
+        if error is not None:
+            shaped_result = valid_downloaded_freedos_result(result)
+            try:
+                published_identity = (
+                    image_identity(result.path)[:4]
+                    if shaped_result else None
+                )
+            except OSError:
+                published_identity = None
+            published = (
+                shaped_result
+                and result.path == token.destination
+                and result.release_id == token.release.id
+                and result.size == token.release.image_size
+                and result.sha256 == token.release.image_sha256
+                and result.archive_sha256 == token.release.archive_sha256
+                and valid_freedos_publication_identity(result.identity)
+                and result.identity[2] == result.size
+                and result.identity == published_identity
+            )
+            if published:
+                self.progress.setValue(1000)
+                cancelled = (
+                    isinstance(error, FreeDosDownloadCancelled)
+                    or token.operation.cancelled
+                )
+                outcome = "cancelled" if cancelled else "failed"
+                inspection_phrase = "was cancelled" if cancelled else "failed"
+                self.status.setText(
+                    f"Verified FreeDOS image saved; inspection {outcome}"
+                )
+                self.logger.warning(
+                    "Verified FreeDOS image saved but post-download inspection %s: "
+                    "release=%s destination=%s error_type=%s",
+                    outcome, result.release_id, result.path, type(error).__name__,
+                )
+                QMessageBox.warning(
+                    self,
+                    f"FreeDOS image saved; inspection {outcome}",
+                    "The download completed, passed both checksum checks, and was "
+                    f"published to:\n{result.path}\n\n"
+                    f"Later FreeDOS image inspection {inspection_phrase}, so ISOpropyl "
+                    "did not load the file. Select it manually later to inspect it "
+                    "again. There is no incomplete download to resume.",
+                )
+                return
+            if isinstance(error, FreeDosDownloadCancelled) or token.operation.cancelled:
+                message = (
+                    "FreeDOS image download cancelled. Choose the same destination "
+                    "later to resume the private partial transfer, or reuse a "
+                    "completed verified archive safely."
+                )
+                self.logger.info(message)
+                self.status.setText(message)
+            else:
+                self.logger.warning("FreeDOS image download failed safely: %s", error)
+                self.status.setText("FreeDOS image download did not complete")
+                QMessageBox.critical(self, "FreeDOS download failed", str(error))
+            return
+        valid = (
+            type(result) is FreeDosDownloadCompletion
+            and valid_downloaded_freedos_result(result.image)
+            and valid_freedos_completion_identity(result.identity)
+        )
+        if valid:
+            downloaded = result.image
+            try:
+                current_identity = image_identity(downloaded.path)
+            except OSError:
+                valid = False
+            else:
+                valid = (
+                    downloaded.path == token.destination
+                    and downloaded.release_id == token.release.id
+                    and downloaded.size == token.release.image_size
+                    and downloaded.sha256 == token.release.image_sha256
+                    and downloaded.archive_sha256 == token.release.archive_sha256
+                    and valid_freedos_publication_identity(downloaded.identity)
+                    and downloaded.identity == current_identity[:4]
+                    and result.identity == current_identity
+                    and freedos_inspection_matches_release(
+                        token.release, result.inspection,
+                    )
+                )
+        if not valid:
+            self.status.setText("FreeDOS download returned an invalid result")
+            QMessageBox.critical(
+                self, "FreeDOS download failed",
+                "The background downloader returned an invalid bound FreeDOS image.",
+            )
+            return
+        self.progress.setValue(1000)
+        self.status.setText("Verified FreeDOS USB image downloaded")
+        self.logger.info(
+            "Verified FreeDOS image downloaded: release=%s destination=%s "
+            "archive_sha256=%s image_sha256=%s",
+            result.image.release_id, result.image.path,
+            result.image.archive_sha256, result.image.sha256,
+        )
+        QMessageBox.information(
+            self, "FreeDOS image ready",
+            f"Downloaded, checksum-verified, and inspected FreeDOS "
+            f"{token.release.release} {token.release.edition}.\n\n"
+            f"{result.image.path}\n\n"
+            "Write it in DD mode to an x86 system that supports legacy BIOS/CSM.",
+        )
+        self.load_image(result.image.path)
 
     def download_windows_image(self) -> None:
         if self.operation_active or self.inspection_busy:
@@ -2306,6 +2670,7 @@ class Window(QMainWindow):
             self.checksum_preparer,
             self.iso_staging_preparer,
             self.linux_downloader,
+            self.freedos_downloader,
             self.windows_downloader,
         ))
 
@@ -2714,9 +3079,19 @@ class Window(QMainWindow):
         dialog.setWindowTitle("Final authenticated raw-write confirmation")
         dialog.setMinimumWidth(720)
         layout = QVBoxLayout(dialog)
-        warning = QLabel(
-            "ALL DATA ON THIS EXACT TARGET WILL BE ERASED AFTER CONFIRMATION"
+        retained_gap = max(
+            0,
+            plan.target_capacity - plan.source_size - plan.logical_sector_size,
         )
+        warning = QLabel(
+            (
+                "THIS IS NOT A FULL-DRIVE ERASE: THE IMAGE RANGE AND FINAL "
+                "TARGET SECTOR WILL BE OVERWRITTEN"
+            )
+            if retained_gap else
+            "ALL BYTES ON THIS EXACT TARGET WILL BE OVERWRITTEN AFTER CONFIRMATION"
+        )
+        warning.setObjectName("rawWriteDestructionWarning")
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
         layout.addWidget(warning)
@@ -2952,6 +3327,7 @@ class Window(QMainWindow):
             self.checksum_preparer,
             self.iso_staging_preparer,
             self.linux_downloader,
+            self.freedos_downloader,
             self.windows_downloader,
         )))
         if active:
@@ -7592,6 +7968,30 @@ def image_identity(path: Path) -> tuple[int, int, int, int, int]:
     return (
         info.st_dev, info.st_ino, info.st_size,
         info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def valid_freedos_publication_identity(value: object) -> bool:
+    return (
+        type(value) is tuple
+        and len(value) == 4
+        and all(type(field) is int and field >= 0 for field in value)
+    )
+
+
+def valid_freedos_completion_identity(value: object) -> bool:
+    return (
+        type(value) is tuple
+        and len(value) == 5
+        and all(type(field) is int and field >= 0 for field in value)
+    )
+
+
+def valid_downloaded_freedos_result(value: object) -> bool:
+    return (
+        type(value) is DownloadedFreeDosImage
+        and type(value.path) is type(Path())
+        and valid_freedos_publication_identity(value.identity)
     )
 
 

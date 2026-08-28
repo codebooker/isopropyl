@@ -205,7 +205,8 @@ issue requesting a private contact channel without disclosing the vulnerability.
   remain removable so a failed download cannot become permanent cache debris.
 
 - The curated Linux downloader is network-inactive until the user chooses
-  **Download Linux…**, a catalog entry, an exact destination filename, and final
+  **Download official image… → Download Linux ISO…**, a catalog entry, an
+  exact destination filename, and final
   consent. The initial catalog pins Ubuntu 24.04.4 LTS Desktop amd64 plus the
   exact release URL, size, SHA-256, signed checksum manifest, detached signature,
   and Ubuntu CD Image signing fingerprint. A fixed root-owned `gpgv` is invoked
@@ -217,8 +218,49 @@ issue requesting a private contact channel without disclosing the vulnerability.
   and no-overwrite publication are rechecked. Downloaded bytes are data only and
   are never executed. Catalog expansion requires new distribution-owned signing
   provenance rather than mirror trust or remote scripts.
+- The FreeDOS downloader is network-inactive until the user chooses **Download
+  official image… → Download FreeDOS USB image…**, one exact FreeDOS 1.4
+  LiteUSB or FullUSB catalog entry, its exact
+  destination filename, and final consent. ISOpropyl bundles catalog metadata,
+  not FreeDOS media, and downloads the ZIP directly from the official
+  `download.freedos.org` origin at runtime. Each catalog entry pins the exact
+  archive filename, length, and SHA-256 recorded from FreeDOS's official
+  `verify.txt`, plus the exact ordered three-member ZIP catalog and a separately
+  reviewed SHA-256 for the inner disk image. Before archive transfer, the live
+  bounded official verification page must contain exactly the cataloged SHA-256
+  row. FreeDOS does not publish a detached signature for these archives: the
+  project pin is the trust anchor, and the live HTTPS row is corroboration rather
+  than cryptographic proof of publisher authorship.
+- FreeDOS archive transfer uses a private, resumable exact-range download and a
+  complete descriptor rehash. Extraction accepts only the cataloged ordinary,
+  deflated image, VMDK descriptor, and readme entries with exact names, order,
+  modes, sizes, compressed sizes, and CRCs; only the selected image is written
+  to an exclusively created private file. Its reviewed inner SHA-256 is checked
+  during extraction and again before no-overwrite publication, followed by
+  exact MBR partition, FAT type, volume label, and 512-byte-sector checks. A
+  descriptor-bound inspection must then identify the published result as the
+  expected raw MBR, BIOS-only x86 FreeDOS image before the GUI loads it. Archive
+  and image contents remain data and are never executed on Linux.
+- The verified FreeDOS image is handed to ISOpropyl's ordinary authenticated
+  DD/raw broker; the downloader does not introduce a separate BIOS writer. The
+  official LiteUSB and FullUSB images are fixed at 32 MiB and 1 GiB respectively,
+  so their partitions and filesystems are not expanded to fill a larger target.
+  As with any shorter raw source, bytes between the image end and the physical
+  target tail are not claimed to be erased. These releases target
+  Intel-compatible x86 BIOS or UEFI Legacy/CSM only. They have no native UEFI,
+  Secure Boot, ARM, or RISC-V path; Secure Boot must be disabled, and systems
+  without CSM are unsupported.
+- The source-checkout-only FreeDOS boot certificate is explicitly opt-in and
+  refuses root or set-ID QEMU execution. It rechecks one exact catalog image,
+  copies it into a sealed read-only memory file, hashes and executes QEMU through
+  a bound descriptor, uses TCG, snapshot mode, no network or monitor, and QEMU's
+  seccomp sandbox, and accepts only ordered markers rendered contiguously on a
+  bounded 80x25 terminal model. It opens no host block device. This establishes
+  narrow SeaBIOS emulator evidence only; it is not physical USB, firmware,
+  Secure Boot, or hardware certification.
 - The Windows downloader is likewise network-inactive until the user selects
-  **Download Windows…**, one immutable catalog object, an exact destination, a
+  **Download official image… → Download Windows ISO…**, one immutable catalog
+  object, an exact destination, a
   source method, and final consent. Its initial scope is the public Windows 11
   25H2 v2 consumer multi-edition ISO in English (United States) for x64 and
   ARM64. The closed, code-owned profile map binds each architecture to its exact

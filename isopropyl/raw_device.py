@@ -526,19 +526,31 @@ def _probe_live_target(path: str) -> _LiveTargetObservation:
 def _warnings(
     device: Device,
     final_verification_requested: bool,
+    source_size: int,
 ) -> tuple[str, ...]:
     final_verification = (
         "A complete final SHA-256 read-back is requested."
         if final_verification_requested
         else "Only the mandatory pre-activation read-back is requested."
     )
-    return (
+    warnings = [
         f"Everything on {device.path} may be permanently overwritten.",
         "The raw profile requires a cache-invalidated pre-activation read-back.",
         final_verification,
         "Execution requires one privileged descriptor and lock; no fallback "
         "executor is permitted.",
-    )
+    ]
+    retained_gap = max(0, device.size - source_size - SECTOR_SIZE)
+    if retained_gap:
+        warnings.insert(
+            1,
+            f"The target is larger than the image: {retained_gap} middle bytes "
+            "are outside the image and final sanitized sector, are not erased, "
+            "and may retain previous data. Use Drive tools… → Erase drive with "
+            "zeros… → Full zero pass first if "
+            "you need a complete logical erase.",
+        )
+    return tuple(warnings)
 
 
 def _device_payload(device: Device) -> dict[str, object]:
@@ -766,6 +778,7 @@ def _validate_static_relationships(
     expected_warnings = _warnings(
         plan.device,
         plan.final_verification_requested,
+        plan.source_size,
     )
     expected_phrase = f"WRITE RAW {plan.device.path} {plan.device.major_minor}"
     for label, value in (
@@ -896,7 +909,9 @@ def build_raw_device_write_plan(
     target_status = _validate_target_node(device)
     observation = _validate_live_target(device, target_status)
     disk_sequence = _read_disk_sequence(device.major_minor)
-    warnings = _warnings(device, final_verification)
+    warnings = _warnings(
+        device, final_verification, source_evidence.source_size,
+    )
     candidate = RawDeviceWritePlan(
         source_evidence,
         device,

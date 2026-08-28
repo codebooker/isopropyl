@@ -190,6 +190,8 @@ class DebianPackageTests(unittest.TestCase):
             "usr/share/doc/isopropyl/ROADMAP.md.gz",
             "usr/share/doc/isopropyl/THIRD_PARTY_NOTICES.md.gz",
             "usr/share/doc/isopropyl/LICENSE.gz",
+            "usr/lib/python3/dist-packages/isopropyl/freedos_downloads.py",
+            "usr/lib/python3/dist-packages/isopropyl/data/freedos-images-v1.json",
             "usr/lib/python3/dist-packages/isopropyl/data/windows-images-v2.json",
         }
         self.assertTrue(required.issubset(self.data))

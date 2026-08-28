@@ -10,7 +10,7 @@ isopropyl \- safety-focused bootable USB and SD media writer
 is a graphical Linux application for inspecting disk images and writing them
 to removable USB and SD media. It supports authenticated raw/DD writes,
 filesystem-aware ISO construction, verification, guarded drive tools, and
-selected Linux and Windows image downloads.
+selected Linux, Windows, and FreeDOS image downloads.
 .PP
 Run ISOpropyl as a regular desktop user. Narrow destructive operations are
 delegated to a fixed PolicyKit helper. The application refuses to run as root.
@@ -23,6 +23,19 @@ beside the launcher. Destructive confirmations are never persisted.
 .TP
 .I image
 Open one disk image when the application starts.
+.SH FREEDOS DOWNLOADS
+The explicit FreeDOS workflow downloads the official FreeDOS 1.4 LiteUSB or
+FullUSB archive directly at runtime; ISOpropyl does not bundle FreeDOS media.
+It requires the live official checksum row to match the project-pinned archive
+SHA-256, validates the exact ZIP catalog, and independently verifies the selected
+inner image before loading it into the guarded DD/raw workflow. FreeDOS does not
+publish a detached signature for these archives.
+.PP
+These fixed 32 MiB and 1 GiB images support Intel-compatible x86 BIOS or UEFI
+Legacy/CSM boot only. They do not support native UEFI, Secure Boot, ARM, or
+RISC-V, and a larger target's remaining capacity is not added to the image.
+Middle bytes beyond the image are not erased and may retain previous data;
+perform a full zero first when complete logical erasure is required.
 .SH SAFETY
 Writing an image destroys data on the selected target. Verify the displayed
 device path, model, capacity, and serial number. Keep post-write verification

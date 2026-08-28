@@ -39,6 +39,7 @@ conflicts.py
 constructed.py
 data/bootloaders-v2.json
 data/distro-write-policies-v1.json
+data/freedos-images-v1.json
 data/io.github.codebooker.isopropyl.svg
 data/linux-images-v1.json
 data/microsoft-dbx-authenticode-v1.json
@@ -53,6 +54,7 @@ extraction.py
 fast_zero.py
 fat_image.py
 formatting.py
+freedos_downloads.py
 images.py
 iso.py
 iso_staging.py

@@ -138,15 +138,22 @@ evidence.
   scope until they preserve the same bounded, no-overwrite namespace and exact-byte
   binding.
 - Firmware-test the implemented explicit-consent five-architecture UEFI Shell
-  workflow and every fallback path with Secure Boot disabled. Add FreeDOS and
-  advanced blank bootloader workflows with lawful, verified payload sources.
+  workflow and every fallback path with Secure Boot disabled. Physically certify
+  the implemented official FreeDOS 1.4 LiteUSB/FullUSB acquisition and guarded
+  raw-write handoff on representative x86 BIOS and UEFI Legacy/CSM systems, with
+  Secure Boot disabled and both exact fixed image sizes. Keep native UEFI,
+  Secure Boot, ARM, RISC-V, image expansion, and advanced blank-bootloader
+  construction out of scope until each has an independently verifiable design.
 - Expand the implemented signed, resumable Ubuntu LTS download profile only with
   distribution-owned signing metadata and maintained release fixtures. Expand
   the implemented hash-pinned Windows 11 25H2 v2 English x64/ARM64 downloader
   only through reviewed language/release profiles, official live hash provenance,
   and sanitized service fixtures. Keep the browser-assisted route available,
   treat connector drift as a hard stop, and never execute remotely supplied
-  scripts.
+  scripts. Expand FreeDOS only through exact official archives with separately
+  reviewed archive catalogs and inner image hashes; retain the project-pinned
+  archive digest plus live official-row corroboration, and adopt a detached
+  publisher signature if FreeDOS makes one available.
 
 ## Product quality
 

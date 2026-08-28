@@ -6,5 +6,5 @@ Icon=io.github.codebooker.isopropyl
 Terminal=false
 Type=Application
 Categories=System;
-Keywords=USB;ISO;image;bootable;writer;
+Keywords=USB;ISO;image;bootable;writer;FreeDOS;
 MimeType=application/x-iso9660-image;application/x-raw-disk-image;

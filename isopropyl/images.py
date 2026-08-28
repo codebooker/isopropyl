@@ -420,6 +420,18 @@ def classify_boot_paths(
     paths: list[str], *, members: Sequence[ImageMember] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...], str, bool]:
     normalized = {path.replace("\\", "/").casefold().lstrip("/") for path in paths}
+    regular_files = (
+        {
+            member.path.replace("\\", "/").casefold().lstrip("/")
+            for member in members
+            if member.kind == "file" and member.size > 0
+        }
+        if members is not None else set()
+    )
+    freedos_markers = {
+        "kernel.sys", "command.com", "fdconfig.sys", "fdauto.bat", "setup.bat",
+    }
+    has_freedos = bool(members is not None and freedos_markers <= regular_files)
     architecture_files = {
         "efi/boot/bootx64.efi": "x64",
         "efi/boot/bootia32.efi": "x86",
@@ -434,13 +446,17 @@ def classify_boot_paths(
         label for filename, label in architecture_files.items() if filename in normalized
     )
     has_uefi = bool(architectures) or any(path.startswith("efi/boot/") for path in normalized)
+    if has_freedos and "x86" not in architectures:
+        architectures += ("x86",)
     bios_markers = (
         "isolinux/isolinux.bin", "syslinux/syslinux.bin", "boot/grub/i386-pc/eltorito.img",
         "bootmgr", "grldr", "freeldr.sys",
     )
-    has_bios = any(marker in normalized for marker in bios_markers)
+    has_bios = has_freedos or any(marker in normalized for marker in bios_markers)
     modes = tuple(mode for mode, present in (("BIOS", has_bios), ("UEFI", has_uefi)) if present)
-    if any("isolinux" in path or "syslinux" in path for path in normalized):
+    if has_freedos:
+        bootloader = "FreeDOS"
+    elif any("isolinux" in path or "syslinux" in path for path in normalized):
         bootloader = "Syslinux/Isolinux"
     elif any("grub" in path for path in normalized):
         bootloader = "GRUB"

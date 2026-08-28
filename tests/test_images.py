@@ -921,6 +921,63 @@ Folder = -
         self.assertEqual(bootloader, "Windows Boot Manager")
         self.assertTrue(windows)
 
+    def test_classifies_complete_regular_freedos_root_markers(self):
+        paths = [
+            "KERNEL.SYS", "COMMAND.COM", "FDCONFIG.SYS", "FDAUTO.BAT",
+            "SETUP.BAT",
+        ]
+        members = tuple(
+            ImageMember(path, index + 1, "file")
+            for index, path in enumerate(paths)
+        )
+
+        modes, architectures, bootloader, windows = classify_boot_paths(
+            paths, members=members,
+        )
+
+        self.assertEqual(modes, ("BIOS",))
+        self.assertEqual(architectures, ("x86",))
+        self.assertEqual(bootloader, "FreeDOS")
+        self.assertFalse(windows)
+
+    def test_freedos_paths_without_a_member_catalog_are_not_authoritative(self):
+        paths = [
+            "kernel.sys", "command.com", "fdconfig.sys", "fdauto.bat",
+            "setup.bat",
+        ]
+
+        modes, architectures, bootloader, windows = classify_boot_paths(paths)
+
+        self.assertEqual(modes, ())
+        self.assertEqual(architectures, ())
+        self.assertEqual(bootloader, "Unknown")
+        self.assertFalse(windows)
+
+    def test_incomplete_or_unsafe_freedos_markers_are_not_classified(self):
+        paths = [
+            "kernel.sys", "command.com", "fdconfig.sys", "fdauto.bat",
+            "setup.bat",
+        ]
+        complete = tuple(ImageMember(path, 1, "file") for path in paths)
+        cases = {
+            "incomplete": complete[:-1],
+            "directory": complete[:-1] + (ImageMember("setup.bat", 1, "directory"),),
+            "symlink": complete[:-1] + (
+                ImageMember("setup.bat", 1, "symlink", "real-setup.bat"),
+            ),
+            "zero-size": complete[:-1] + (ImageMember("setup.bat", 0, "file"),),
+        }
+
+        for name, members in cases.items():
+            with self.subTest(case=name):
+                modes, architectures, bootloader, windows = classify_boot_paths(
+                    paths, members=members,
+                )
+                self.assertEqual(modes, ())
+                self.assertEqual(architectures, ())
+                self.assertEqual(bootloader, "Unknown")
+                self.assertFalse(windows)
+
     def test_classifies_up_to_four_total_canonical_and_nested_regular_wims(self):
         paths = (
             "sources/install.wim",

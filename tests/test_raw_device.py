@@ -395,6 +395,11 @@ class RawDevicePlanTests(unittest.TestCase):
                 plan = self.plan(source=_source(source_size=size))
                 self.assertEqual(plan.source_size, size)
                 self.assertEqual(plan.target_capacity, TARGET_SIZE)
+                retained_gap = max(0, TARGET_SIZE - size - 512)
+                self.assertEqual(
+                    any("may retain previous data" in item for item in plan.warnings),
+                    bool(retained_gap),
+                )
         with self.assertRaisesRegex(RawDevicePlanError, "larger than"):
             self.plan(source=_source(source_size=TARGET_SIZE + 1))
         with self.assertRaisesRegex(RawDevicePlanError, "exceeds"):

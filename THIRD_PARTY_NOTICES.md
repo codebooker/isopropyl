@@ -62,6 +62,44 @@ and the required signing fingerprint is
 `843938DF228D22F7B3742BC0D94AA3F0EFE21092`. The key is data, not executable
 code, and no downloaded image or script is executed.
 
+## FreeDOS 1.4 USB images
+
+ISOpropyl contains no FreeDOS media. When the user explicitly starts and
+confirms **Download official image… → Download FreeDOS USB image…**, it
+downloads one unmodified archive directly
+from the [official FreeDOS 1.4 download service](https://www.freedos.org/download/)
+for local extraction and use with ISOpropyl's existing guarded DD/raw writer:
+
+- `FD14-LiteUSB.zip`: 17,671,175 bytes, SHA-256
+  `857dcd2ebf9d3d094320154db5fb5b830acba6fb98f981a95a0ca7ab3350338b`;
+  its exact catalog is `FD14LITE.img`, `FD14LITE.vmdk`, and `readme.txt`.
+  The independently reviewed 33,554,432-byte `FD14LITE.img` SHA-256 is
+  `f539d456b792594bc3ca59d4e0f4c23d4f1fee73370c1390b2da245400718d36`.
+- `FD14-FullUSB.zip`: 668,803,454 bytes, SHA-256
+  `cd440cd165f5a8a184870cb615f525af182660c15f9bcf1e9d198ca19cedcaff`;
+  its exact catalog is `FD14FULL.img`, `FD14FULL.vmdk`, and `readme.txt`.
+  The independently reviewed 1,073,741,824-byte `FD14FULL.img` SHA-256 is
+  `42648c500166de117beb4520968b2eddd4604826fe9284c29959792a19a07d86`.
+
+The outer archive digests are project pins recorded from FreeDOS's
+[official checksum page](https://www.freedos.org/download/verify.txt), whose
+one exact matching row must still be present after network consent. FreeDOS
+does not provide a detached publisher signature for these archives, so that
+live HTTPS row corroborates the bundled project pin but does not replace a
+signature. ISOpropyl additionally enforces the complete reviewed ZIP catalog,
+including member order, type, mode, size, compressed size, and CRC, extracts
+only the image member, and verifies the independent inner-image digest before
+publication. See the official [FreeDOS 1.4 release report](https://download.freedos.org/1.4/report.html)
+and the archive's `readme.txt` for upstream release and license information.
+
+The official images are fixed-size Intel-compatible x86 MBR media for BIOS or
+UEFI Legacy/CSM boot. They do not provide native UEFI, Secure Boot, ARM, or
+RISC-V support, and ISOpropyl does not enlarge their partitions to consume a
+larger drive. The FreeDOS name is used descriptively to identify the upstream
+project and its official media. ISOpropyl is independent of, and is not
+affiliated with, sponsored by, or endorsed by the FreeDOS Project; all names,
+marks, copyrights, and component licenses remain with their respective holders.
+
 ## UEFI Shell release payloads
 
 - Upstream release: [UEFI Shell 26H1](https://github.com/pbatard/UEFI-Shell/releases/tag/26H1)

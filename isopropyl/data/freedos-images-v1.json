@@ -1,0 +1,111 @@
+{
+  "catalog_version": 1,
+  "images": [
+    {
+      "id": "freedos-1.4-liteusb-x86",
+      "project": "FreeDOS",
+      "release": "1.4",
+      "edition": "LiteUSB",
+      "architecture": "Intel-compatible x86",
+      "firmware": "Legacy BIOS or UEFI Legacy/CSM",
+      "archive_filename": "FD14-LiteUSB.zip",
+      "archive_size": 17671175,
+      "archive_sha256": "857dcd2ebf9d3d094320154db5fb5b830acba6fb98f981a95a0ca7ab3350338b",
+      "archive_url": "https://download.freedos.org/1.4/FD14-LiteUSB.zip",
+      "image_filename": "FD14LITE.img",
+      "image_size": 33554432,
+      "image_sha256": "f539d456b792594bc3ca59d4e0f4c23d4f1fee73370c1390b2da245400718d36",
+      "partition_type": 4,
+      "partition_start_lba": 63,
+      "partition_sectors": 65457,
+      "volume_label": "FD14-LITE",
+      "filesystem": "FAT16",
+      "hashes_url": "https://www.freedos.org/download/verify.txt",
+      "provenance_url": "https://www.freedos.org/download/",
+      "release_report_url": "https://download.freedos.org/1.4/report.html",
+      "allowed_hosts": ["download.freedos.org", "www.freedos.org"],
+      "members": [
+        {
+          "name": "FD14LITE.img",
+          "role": "disk-image",
+          "size": 33554432,
+          "compressed_size": 17668460,
+          "crc32": "6118c1bb",
+          "sha256": "f539d456b792594bc3ca59d4e0f4c23d4f1fee73370c1390b2da245400718d36",
+          "unix_mode": 33261
+        },
+        {
+          "name": "FD14LITE.vmdk",
+          "role": "vmdk-descriptor",
+          "size": 525,
+          "compressed_size": 264,
+          "crc32": "4e7c880e",
+          "sha256": "1ea1e0bee2c2f92b16c7eef13e33b6671e72cae6c3a297ddc77c93708ad1e9e8",
+          "unix_mode": 33188
+        },
+        {
+          "name": "readme.txt",
+          "role": "readme",
+          "size": 5661,
+          "compressed_size": 1975,
+          "crc32": "470e6a22",
+          "sha256": "7a1fed2e368e8d99405b1e900ccc7843c83f9a75e78b4ebf723b8b6aa3092943",
+          "unix_mode": 33188
+        }
+      ]
+    },
+    {
+      "id": "freedos-1.4-fullusb-x86",
+      "project": "FreeDOS",
+      "release": "1.4",
+      "edition": "FullUSB",
+      "architecture": "Intel-compatible x86",
+      "firmware": "Legacy BIOS or UEFI Legacy/CSM",
+      "archive_filename": "FD14-FullUSB.zip",
+      "archive_size": 668803454,
+      "archive_sha256": "cd440cd165f5a8a184870cb615f525af182660c15f9bcf1e9d198ca19cedcaff",
+      "archive_url": "https://download.freedos.org/1.4/FD14-FullUSB.zip",
+      "image_filename": "FD14FULL.img",
+      "image_size": 1073741824,
+      "image_sha256": "42648c500166de117beb4520968b2eddd4604826fe9284c29959792a19a07d86",
+      "partition_type": 12,
+      "partition_start_lba": 63,
+      "partition_sectors": 2096577,
+      "volume_label": "FD14-FULL",
+      "filesystem": "FAT32",
+      "hashes_url": "https://www.freedos.org/download/verify.txt",
+      "provenance_url": "https://www.freedos.org/download/",
+      "release_report_url": "https://download.freedos.org/1.4/report.html",
+      "allowed_hosts": ["download.freedos.org", "www.freedos.org"],
+      "members": [
+        {
+          "name": "FD14FULL.img",
+          "role": "disk-image",
+          "size": 1073741824,
+          "compressed_size": 668800734,
+          "crc32": "13a626d4",
+          "sha256": "42648c500166de117beb4520968b2eddd4604826fe9284c29959792a19a07d86",
+          "unix_mode": 33261
+        },
+        {
+          "name": "FD14FULL.vmdk",
+          "role": "vmdk-descriptor",
+          "size": 530,
+          "compressed_size": 269,
+          "crc32": "483df895",
+          "sha256": "532aabc6b1a64012f45e8ae3d5790eed75a6ab941fcd4140b07415a248e8c144",
+          "unix_mode": 33188
+        },
+        {
+          "name": "readme.txt",
+          "role": "readme",
+          "size": 5661,
+          "compressed_size": 1975,
+          "crc32": "470e6a22",
+          "sha256": "7a1fed2e368e8d99405b1e900ccc7843c83f9a75e78b4ebf723b8b6aa3092943",
+          "unix_mode": 33188
+        }
+      ]
+    }
+  ]
+}

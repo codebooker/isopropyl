@@ -431,21 +431,31 @@ def _expected_stage_files(
     )
 
 
+def _list_directory(directory_fd: int) -> list[str]:
+    """List through a fresh open file description, not a stale directory cursor."""
+
+    scan_fd = os.open(".", _DIR_FLAGS, dir_fd=directory_fd)
+    try:
+        return os.listdir(scan_fd)
+    finally:
+        os.close(scan_fd)
+
+
 def _inspect_stage_tree(
     root_fd: int,
     architectures: tuple[str, ...],
 ) -> tuple[StagedUefiShellFile, ...]:
     expected = _expected_stage_files(architectures)
-    if set(os.listdir(root_fd)) != {"EFI", "README.txt"}:
+    if set(_list_directory(root_fd)) != {"EFI", "README.txt"}:
         raise UefiShellSafetyError("The UEFI Shell staging root has unexpected entries")
     efi_fd = os.open("EFI", _DIR_FLAGS, dir_fd=root_fd)
     try:
-        if set(os.listdir(efi_fd)) != {"BOOT"}:
+        if set(_list_directory(efi_fd)) != {"BOOT"}:
             raise UefiShellSafetyError("The staged EFI directory has unexpected entries")
         boot_fd = os.open("BOOT", _DIR_FLAGS, dir_fd=efi_fd)
         try:
             wanted_boot = {PurePosixPath(path).name for path, _size, _digest in expected[1:]}
-            if set(os.listdir(boot_fd)) != wanted_boot:
+            if set(_list_directory(boot_fd)) != wanted_boot:
                 raise UefiShellSafetyError("The staged EFI/BOOT directory is not exact")
             files = [StagedUefiShellFile(
                 "README.txt", expected[0][1], expected[0][2],

@@ -23,8 +23,9 @@
       It can inspect common boot layouts, calculate and compare checksums, stream
       compressed disk images, explicitly download Ubuntu LTS media authenticated
       through its signed checksum manifest, acquire and hash-verify exact public
-      Windows 11 x64 and ARM64 ISOs directly from Microsoft, restore validated
-      VTSI sparse disk images, privately
+      Windows 11 x64 and ARM64 ISOs directly from Microsoft, download and verify
+      official FreeDOS 1.4 LiteUSB or FullUSB images for x86 BIOS/Legacy/CSM
+      systems, restore validated VTSI sparse disk images, privately
       decode and convert compressed virtual disk images, select Windows WIM/ESD
       editions, customize supported Windows installers,
       add bounded ZIP overlays to eligible ISO-mode media without replacing files,
@@ -46,6 +47,7 @@
     <keyword>ZIP</keyword>
     <keyword>bootable</keyword>
     <keyword>disk image</keyword>
+    <keyword>FreeDOS</keyword>
   </keywords>
   <content_rating type="oars-1.1"/>
   <branding>
@@ -61,7 +63,7 @@
   <releases>
     <release version="0.1.0" date="2026-08-27" type="development">
       <description>
-        <p>Initial alpha with DD and UEFI FAT32/UEFI:NTFS ISO writing, signed Ubuntu and exact hash-pinned Microsoft Windows 11 x64/ARM64 ISO downloads, additive ZIP overlays, image analysis, Windows edition selection and customization, raw/VHD/VHDX drive backup, nine restore filesystems, erasure, and media testing.</p>
+        <p>Initial alpha with DD and UEFI FAT32/UEFI:NTFS ISO writing, signed Ubuntu, exact hash-pinned Microsoft Windows 11 x64/ARM64 ISO downloads, official FreeDOS 1.4 LiteUSB/FullUSB archives checked with project-pinned outer and reviewed inner-image hashes, additive ZIP overlays, image analysis, Windows edition selection and customization, raw/VHD/VHDX drive backup, nine restore filesystems, erasure, and media testing.</p>
       </description>
     </release>
   </releases>

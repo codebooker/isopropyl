@@ -59,6 +59,7 @@ identity, and require an explicit confirmation.
 | **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, performs full or scan-and-skip logical zeroing, and runs bad-block or fake-capacity tests in separate warned workflows. |
 | **Linux image download** | Downloads the pinned Ubuntu LTS profile from distribution-owned infrastructure and verifies its signed checksum manifest. |
 | **Windows image download** | Acquires exact current Windows 11 25H2 v2 English x64 or ARM64 consumer media directly from Microsoft, checks the selected profile's live published hash row, resumes privately, and verifies the complete SHA-256 before use. |
+| **FreeDOS image download** | Downloads the official FreeDOS 1.4 LiteUSB or FullUSB archive at runtime, corroborates the project-pinned archive SHA-256 against FreeDOS's live verification page, validates the exact ZIP catalog and reviewed inner image hash, then loads the image into the guarded raw writer. |
 | **UEFI recovery media** | Builds a multi-architecture UEFI Shell drive from exact upstream payloads after explicit network consent. |
 
 For the exhaustive, evidence-based Rufus comparison, see the
@@ -182,7 +183,8 @@ the workflow to finish its required cleanup or post-commit verification.
 
 ### Download a pinned Windows 11 ISO
 
-1. Choose **Download Windows…**, then select the x64 or ARM64 profile.
+1. Open **Download official image… → Download Windows ISO…**, then select
+   the x64 or ARM64 profile.
 2. Click **Open Microsoft download page**. On that matching page, select the
    Windows 11 multi-edition ISO and English, then copy the generated **Download**
    link into ISOpropyl's masked field.
@@ -204,9 +206,37 @@ that some devices need manufacturer-provided drivers for the installation media
 to boot successfully; check the target device's support guidance before writing
 the drive.
 
+### Download an official FreeDOS 1.4 USB image
+
+1. Open **Download official image… → Download FreeDOS USB image…**, then
+   select **LiteUSB** (32 MiB image) or **FullUSB** (1 GiB image) and an exact
+   destination filename.
+2. Review the edition, fixed image size, x86 firmware limits, archive and image
+   SHA-256 values, upstream licensing/non-affiliation notice, and destination.
+3. Confirm networking. ISOpropyl downloads the archive directly from FreeDOS,
+   requires its exact current SHA-256 row on FreeDOS's verification page, checks
+   the complete three-member ZIP catalog, and extracts only the cataloged disk
+   image into private staging.
+4. After an independent full inner-image hash and structural check, ISOpropyl
+   loads the image for the same guarded DD/raw workflow used by local images.
+
+FreeDOS does not provide a detached signature for these archives. The bundled
+project pin—recorded from the official verification page—is therefore the trust
+anchor; the live exact row is corroboration, not a publisher-signature check.
+No FreeDOS media is bundled with ISOpropyl. These fixed MBR images boot only on
+Intel-compatible x86 systems using BIOS or UEFI Legacy/CSM mode: they do not
+provide native UEFI or Secure Boot support and do not support ARM or RISC-V.
+Secure Boot must be disabled, and many newer systems no longer offer CSM.
+Writing does not enlarge the image's partition or filesystem. The guarded raw
+writer sanitizes the physical final sector, but middle bytes beyond the 32 MiB
+LiteUSB or 1 GiB FullUSB image are not erased and may retain previous data. Use
+**Drive tools… → Erase drive with zeros… → Full zero pass** first if complete
+logical erasure is required.
+
 ### Logically zero a drive
 
-1. Open **Drive tools…**, choose **Erase drive…**, and select **Fast zero**.
+1. Open **Drive tools…**, choose **Erase drive with zeros…**, and select **Fast
+   zero — scan, skip zero blocks, zero the rest, verify all**.
 2. Review the exact target identity and type the displayed authorization phrase.
 3. ISOpropyl scans every byte, skips only chunks that are already entirely zero,
    overwrites every other chunk, flushes device caches, and reads the whole drive
@@ -237,11 +267,12 @@ expanded drive visibility are never persisted.
 | VHD, VHDX, QCOW, QCOW2 | Convert to authenticated snapshot | Requires `qemu-img`; backing files, QCOW2 external data files, encryption, and corrupt metadata are rejected. |
 | Compressed virtual disk | Decode and convert to snapshot | Exactly one supported wrapper; nested compression is rejected. |
 | VTSI v1.0 | Sparse restore | Requires an exact-capacity target with 512-byte logical sectors. |
+| Downloaded FreeDOS 1.4 LiteUSB/FullUSB `.img` | Authenticated raw snapshot | Exact official x86 BIOS/Legacy/CSM image; fixed 32 MiB or 1 GiB layout is not expanded to fill the target. |
 | Additive `.zip` overlay | ISO mode option | One stored/deflated archive; additions only, no overwrites or links. |
 
 Unsupported or ambiguous formats fail closed. Direct FFU/WIM/ESD apply,
-Windows To Go, FreeDOS, and general device-facing BIOS/dual-firmware creation
-remain roadmap work.
+Windows To Go, and general device-facing BIOS/dual-firmware construction from
+arbitrary payloads remain roadmap work.
 
 ## Windows customization
 
@@ -375,6 +406,9 @@ writes risk-free; test with expendable media and keep verification enabled.
   udisks2, and the required formatter.
 - **Secure Boot fails:** signature integrity is not a firmware trust verdict.
   UEFI Shell media currently require Secure Boot to be disabled.
+- **A FreeDOS drive does not boot:** FreeDOS 1.4 LiteUSB and FullUSB are x86
+  BIOS images. Disable Secure Boot and enable Legacy/CSM mode if the firmware
+  provides it; native UEFI-only, ARM, and RISC-V systems are unsupported.
 - **A write or inspection fails:** open **View log**, then export diagnostics.
   Sensitive drive and image details are omitted by default.
 
@@ -402,6 +436,19 @@ appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
 The suite contains more than 1,500 tests and never writes a real `/dev` node.
+From a source checkout, maintainers with an already extracted, catalog-matching
+FreeDOS image can reproduce the device-free SeaBIOS smoke certificate explicitly:
+
+```bash
+python3 tools/certify_freedos_boot.py --run /path/to/FD14LITE.img
+```
+
+The harness rechecks the exact filename, size, and SHA-256 before and after a
+bounded QEMU TCG boot; it passes only a sealed, read-only in-memory snapshot,
+uses QEMU's seccomp sandbox and snapshot mode, rejects root or set-ID execution,
+disables networking and KVM, and never opens a host block device. This is
+emulator evidence, not physical firmware or USB-media certification.
+
 Read [CONTRIBUTING.md](https://github.com/codebooker/isopropyl/blob/main/CONTRIBUTING.md) before changing a destructive path.
 Brand assets and usage guidance are in [BRANDING.md](https://github.com/codebooker/isopropyl/blob/main/BRANDING.md).
 

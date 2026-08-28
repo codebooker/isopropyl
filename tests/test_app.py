@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 
 from isopropyl.app import (
     FAST_ZERO_MODE, BackgroundPreparation, ChecksumToken,
+    FreeDosDownloadToken,
     IsoStagingPreparationRequest,
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
     StagedDbxConfirmation,
@@ -59,6 +60,9 @@ from isopropyl.iso import (
 )
 from isopropyl.iso_staging import IsoStagingPlan
 from isopropyl.linux_downloads import DownloadedLinuxImage, available_linux_images
+from isopropyl.freedos_downloads import (
+    DownloadedFreeDosImage, FreeDosDownloadCancelled, available_freedos_images,
+)
 from isopropyl.windows_downloads import (
     DownloadedWindowsImage, WindowsDownloadCancelled, available_windows_images,
 )
@@ -152,6 +156,26 @@ def ubuntu_casper_inspection() -> ImageInspection:
     )
 
 
+def freedos_inspection(size: int) -> ImageInspection:
+    return ImageInspection(
+        size=size,
+        kind="Raw disk image",
+        volume_label="FD14-LITE",
+        has_mbr=True,
+        has_gpt=False,
+        is_iso9660=False,
+        looks_windows=False,
+        boot_modes=("BIOS",),
+        architectures=("x86",),
+        bootloader="FreeDOS",
+        has_windows_installer=False,
+        contents_scanned=True,
+        partition_table_valid=True,
+        partition_table_kind="mbr",
+        partition_table_sector_size=512,
+    )
+
+
 class ImmediateThread:
     """Run a Window background closure synchronously in headless tests."""
 
@@ -171,7 +195,11 @@ def fake_raw_plan(target: Device | None = None) -> RawDeviceWritePlan:
         "source_sha256": "a" * 64,
         "target_capacity": (target or device()).size,
         "logical_sector_size": 512,
-        "warnings": ("The target will be overwritten.",),
+        "warnings": (
+            "The target will be overwritten.",
+            "The middle capacity outside the image and final sanitized sector "
+            "is not erased and may retain previous data.",
+        ),
         "confirmation_phrase": "WRITE RAW /dev/sdz 65:144",
         "plan_sha256": "b" * 64,
     }
@@ -2434,6 +2462,293 @@ class WindowWriteMethodTests(unittest.TestCase):
 
         downloader.assert_not_called()
 
+    def test_curated_freedos_requires_consent_inspects_then_loads(self):
+        release = available_freedos_images()[0]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.image_filename
+
+            class FakeDownloader:
+                cancelled = False
+
+                def __init__(self):
+                    self.calls = []
+
+                def cancel(self) -> None:
+                    self.cancelled = True
+
+                def download(self, selected, output, progress):
+                    self.calls.append((selected, output))
+                    with output.open("wb") as stream:
+                        stream.truncate(selected.image_size)
+                    progress(
+                        selected.archive_size + selected.image_size,
+                        selected.archive_size + selected.image_size,
+                    )
+                    return DownloadedFreeDosImage(
+                        output, selected.id, selected.image_size,
+                        selected.image_sha256, selected.archive_sha256,
+                        app_module.image_identity(output)[:4],
+                    )
+
+            downloader = FakeDownloader()
+            observed: dict[str, object] = {}
+
+            def accept_catalog(dialog) -> int:
+                choices = dialog.findChild(QComboBox, "freedosDownloadRelease")
+                details = dialog.findChild(QLabel, "freedosDownloadDetails")
+                firmware = dialog.findChild(QLabel, "freedosFirmwareNotice")
+                trust = dialog.findChild(QLabel, "freedosTrustNotice")
+                assert choices is not None and details is not None
+                assert firmware is not None and trust is not None
+                self.assertIs(choices.currentData(), release)
+                observed["details"] = details.text()
+                observed["firmware"] = firmware.text()
+                observed["trust"] = trust.text()
+                return QDialog.DialogCode.Accepted
+
+            inspection = freedos_inspection(release.image_size)
+            with (
+                patch("isopropyl.app.QDialog.exec", new=accept_catalog),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "Raw disk images (*.img)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ) as question,
+                patch("isopropyl.app.QMessageBox.information"),
+                patch("isopropyl.app.QMessageBox.critical") as critical,
+                patch("isopropyl.app.FreeDosUsbDownloader", return_value=downloader),
+                patch("isopropyl.app.inspect_image", return_value=inspection) as inspect,
+                patch("isopropyl.app.threading.Thread", ImmediateThread),
+                patch.object(self.window, "load_image") as load_image,
+            ):
+                self.window.download_freedos_image()
+
+            self.assertEqual(downloader.calls, [(release, destination)])
+            inspect.assert_called_once()
+            self.assertEqual(inspect.call_args.args, (destination,))
+            self.assertEqual(
+                inspect.call_args.kwargs["expected_identity"][2],
+                release.image_size,
+            )
+            load_image.assert_called_once_with(destination)
+            critical.assert_not_called()
+            self.assertIn(release.archive_sha256, observed["details"])
+            self.assertIn(release.image_sha256, observed["details"])
+            self.assertIn(release.release_report_url, observed["details"])
+            self.assertIn("legacy BIOS", observed["firmware"])
+            self.assertIn("Secure Boot", observed["firmware"])
+            self.assertIn("retain old data", observed["firmware"])
+            self.assertIn("not publisher-signature", observed["trust"])
+            self.assertIn("upstream licenses", question.call_args.args[2])
+            self.assertIsNone(self.window.freedos_downloader)
+            self.assertEqual(self.window.progress.value(), 1000)
+
+    def test_curated_freedos_catalog_cancel_is_network_inactive(self):
+        with (
+            patch(
+                "isopropyl.app.QDialog.exec",
+                return_value=QDialog.DialogCode.Rejected,
+            ),
+            patch("isopropyl.app.FreeDosUsbDownloader") as downloader,
+        ):
+            self.window.download_freedos_image()
+
+        downloader.assert_not_called()
+
+    def test_curated_freedos_final_consent_precedes_downloader(self):
+        release = available_freedos_images()[0]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.image_filename
+            with (
+                patch(
+                    "isopropyl.app.QDialog.exec",
+                    return_value=QDialog.DialogCode.Accepted,
+                ),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "Raw disk images (*.img)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Cancel,
+                ),
+                patch("isopropyl.app.FreeDosUsbDownloader") as downloader,
+            ):
+                self.window.download_freedos_image()
+
+            downloader.assert_not_called()
+            self.assertFalse(destination.exists())
+
+    def test_curated_freedos_rejects_renamed_destination(self):
+        release = available_freedos_images()[0]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "renamed.img"
+            with (
+                patch(
+                    "isopropyl.app.QDialog.exec",
+                    return_value=QDialog.DialogCode.Accepted,
+                ),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "Raw disk images (*.img)"),
+                ),
+                patch("isopropyl.app.QMessageBox.warning") as warning,
+                patch("isopropyl.app.QMessageBox.question") as question,
+                patch("isopropyl.app.FreeDosUsbDownloader") as downloader,
+            ):
+                self.window.download_freedos_image()
+
+            self.assertIn(release.image_filename, warning.call_args.args[2])
+            question.assert_not_called()
+            downloader.assert_not_called()
+
+    def test_postcommit_freedos_inspection_failure_reports_saved_file(self):
+        release = available_freedos_images()[0]
+        destination = Path(self.settings_home.name) / release.image_filename
+        with destination.open("wb") as stream:
+            stream.truncate(release.image_size)
+        operation = Mock(cancelled=False)
+        token = FreeDosDownloadToken(1, operation, release, destination)
+        published = DownloadedFreeDosImage(
+            destination, release.id, release.image_size,
+            release.image_sha256, release.archive_sha256,
+            app_module.image_identity(destination)[:4],
+        )
+        self.window.freedos_download_generation = 1
+        self.window.freedos_downloader = operation
+        self.window.freedos_download_token = token
+
+        with (
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window, "load_image") as load_image,
+        ):
+            self.window.on_freedos_download_finished(
+                token, published, OSError("inspection failed"),
+            )
+
+        self.assertTrue(destination.exists())
+        self.assertIn("saved; inspection failed", self.window.status.text())
+        self.assertIn("no incomplete download to resume", warning.call_args.args[2])
+        load_image.assert_not_called()
+        critical.assert_not_called()
+
+    def test_malformed_freedos_publication_identity_fails_closed(self):
+        release = available_freedos_images()[0]
+        destination = Path(self.settings_home.name) / release.image_filename
+        with destination.open("wb") as stream:
+            stream.truncate(release.image_size)
+        operation = Mock(cancelled=False)
+        token = FreeDosDownloadToken(1, operation, release, destination)
+        malformed = DownloadedFreeDosImage(
+            destination, release.id, release.image_size,
+            release.image_sha256, release.archive_sha256, (),
+        )
+        self.window.freedos_download_generation = 1
+        self.window.freedos_downloader = operation
+        self.window.freedos_download_token = token
+
+        with (
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.on_freedos_download_finished(
+                token, malformed, OSError("inspection failed"),
+            )
+
+        self.assertEqual(
+            self.window.status.text(), "FreeDOS image download did not complete",
+        )
+        critical.assert_called_once()
+        warning.assert_not_called()
+
+    def test_malformed_freedos_publication_path_fails_closed(self):
+        release = available_freedos_images()[0]
+        destination = Path(self.settings_home.name) / release.image_filename
+        operation = Mock(cancelled=False)
+        token = FreeDosDownloadToken(1, operation, release, destination)
+        malformed = DownloadedFreeDosImage(
+            str(destination), release.id, release.image_size,
+            release.image_sha256, release.archive_sha256, (),
+        )
+        self.window.freedos_download_generation = 1
+        self.window.freedos_downloader = operation
+        self.window.freedos_download_token = token
+
+        with (
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.on_freedos_download_finished(
+                token, malformed, OSError("inspection failed"),
+            )
+
+        self.assertEqual(
+            self.window.status.text(), "FreeDOS image download did not complete",
+        )
+        critical.assert_called_once()
+        warning.assert_not_called()
+
+    def test_malformed_freedos_completion_image_fails_closed(self):
+        release = available_freedos_images()[0]
+        destination = Path(self.settings_home.name) / release.image_filename
+        operation = Mock(cancelled=False)
+        token = FreeDosDownloadToken(1, operation, release, destination)
+        malformed = app_module.FreeDosDownloadCompletion(
+            None, freedos_inspection(release.image_size), (),
+        )
+        self.window.freedos_download_generation = 1
+        self.window.freedos_downloader = operation
+        self.window.freedos_download_token = token
+
+        with patch("isopropyl.app.QMessageBox.critical") as critical:
+            self.window.on_freedos_download_finished(token, malformed, None)
+
+        self.assertEqual(
+            self.window.status.text(), "FreeDOS download returned an invalid result",
+        )
+        critical.assert_called_once()
+
+    def test_stale_freedos_completion_cannot_clear_current_operation(self):
+        release = available_freedos_images()[0]
+        destination = Path(self.settings_home.name) / release.image_filename
+        stale_operation = Mock(cancelled=False)
+        current_operation = Mock(cancelled=False)
+        stale = FreeDosDownloadToken(1, stale_operation, release, destination)
+        current = FreeDosDownloadToken(2, current_operation, release, destination)
+        self.window.freedos_download_generation = 2
+        self.window.freedos_downloader = current_operation
+        self.window.freedos_download_token = current
+
+        try:
+            with patch.object(self.window, "set_busy") as set_busy:
+                self.window.on_freedos_download_finished(
+                    stale, None, OSError("stale worker failed"),
+                )
+
+            self.assertIs(self.window.freedos_downloader, current_operation)
+            self.assertIs(self.window.freedos_download_token, current)
+            set_busy.assert_not_called()
+        finally:
+            self.window.freedos_downloader = None
+            self.window.freedos_download_token = None
+
+    def test_cancel_fans_out_to_active_freedos_downloader(self):
+        operation = Mock(cancelled=False)
+        self.window.freedos_downloader = operation
+
+        try:
+            self.window.cancel()
+
+            operation.cancel.assert_called_once_with()
+            self.assertEqual(self.window.status.text(), "Stopping…")
+            self.assertFalse(self.window.cancel_button.isEnabled())
+        finally:
+            self.window.freedos_downloader = None
+
     def test_curated_windows_pasted_link_requires_consent_inspects_then_loads(self):
         release = available_windows_images()[0]
         capability = "https://software.download.prss.microsoft.com/masked?secret"
@@ -3359,9 +3674,11 @@ class WindowWriteMethodTests(unittest.TestCase):
 
         def inspect(dialog: QDialog) -> int:
             details = dialog.findChild(QPlainTextEdit, "rawWriteConfirmationDetails")
+            warning = dialog.findChild(QLabel, "rawWriteDestructionWarning")
             phrase = dialog.findChild(QLineEdit, "rawWriteConfirmationPhrase")
             button = dialog.findChild(QPushButton, "rawWriteConfirmButton")
             observed["details"] = details.toPlainText()
+            observed["warning"] = warning.text()
             observed["initially_enabled"] = button.isEnabled()
             phrase.setText(plan.confirmation_phrase.lower())
             observed["wrong_enabled"] = button.isEnabled()
@@ -3383,6 +3700,25 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("ISOpropyl Test Drive", details)
         self.assertIn("SERIAL", details)
         self.assertIn(plan.warnings[0], details)
+        self.assertIn("NOT A FULL-DRIVE ERASE", observed["warning"])
+        self.assertIn("may retain previous data", details)
+
+    def test_equal_size_raw_confirmation_truthfully_says_every_byte_is_overwritten(self):
+        selected = device(size=4096)
+        plan = fake_raw_plan(selected)
+        observed: dict[str, str] = {}
+
+        def inspect(dialog: QDialog) -> int:
+            warning = dialog.findChild(QLabel, "rawWriteDestructionWarning")
+            observed["warning"] = warning.text()
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            phrase = self.window.confirm_raw_write_plan(plan)
+
+        self.assertIsNone(phrase)
+        self.assertIn("ALL BYTES", observed["warning"])
+        self.assertNotIn("NOT A FULL-DRIVE ERASE", observed["warning"])
 
     def test_iso_dispatch_rebuilds_a_fresh_target_sized_plan(self):
         self.window.rebuild_write_recommendation(preserve_selection=False)

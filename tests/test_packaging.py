@@ -39,6 +39,8 @@ class SourceInstallTests(unittest.TestCase):
             )
 
             self.assertTrue((package / "app.py").is_file())
+            self.assertTrue((package / "freedos_downloads.py").is_file())
+            self.assertTrue((data / "freedos-images-v1.json").is_file())
             self.assertTrue((data / "windows-images-v2.json").is_file())
             self.assertFalse((data / "windows-images-v1.json").exists())
             self.assertFalse((package / "stale-marker").exists())
