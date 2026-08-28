@@ -39,10 +39,11 @@ def _render() -> int:
     app_module.list_devices = lambda _include_external=False: [target]
     window = Window()
 
-    image_name = "Windows_11_24H2_English_x64.iso"
+    image_name = "Win11_25H2_English_x64_v2.iso"
+    image_size = 8_471_603_200
     window.image = Path("/home/demo/Downloads") / image_name
     window.inspection = ImageInspection(
-        size=5_420_000_000,
+        size=image_size,
         kind="Optical ISO",
         volume_label="CCCOMA_X64FRE_EN-US_DV9",
         has_mbr=True,
@@ -69,8 +70,8 @@ def _render() -> int:
             ),
         ),
     )
-    window.inspection_identity = (1, 2, 5_420_000_000, 4)
-    window.image_label.setText(f"{image_name}  ·  5.4 GB")
+    window.inspection_identity = (1, 2, image_size, 4)
+    window.image_label.setText(f"{image_name}  ·  8.5 GB")
     window.image_label.setToolTip(str(window.image))
     window.windows_button.setEnabled(True)
     window.iso_plan_button.setEnabled(True)

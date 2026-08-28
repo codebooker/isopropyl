@@ -1,28 +1,29 @@
 <div align="center">
 
-![ISOpropyl — Bootable media, made simple](data/isopropyl-hero.svg)
+![ISOpropyl — Bootable media, made simple](https://raw.githubusercontent.com/codebooker/isopropyl/main/data/isopropyl-hero.svg)
 
 [![Tests](https://github.com/codebooker/isopropyl/actions/workflows/test.yml/badge.svg)](https://github.com/codebooker/isopropyl/actions/workflows/test.yml)
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-F6922E.svg)](LICENSE)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-F6922E.svg)](https://github.com/codebooker/isopropyl/blob/main/LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux-252B35.svg?logo=linux&logoColor=white)](#requirements)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-5B6574.svg)](#project-status)
 
-**A capable, safety-first USB image writer built for Linux.**
+**Create Linux and Windows installation media with clear choices, guarded writes,
+and end-to-end verification.**
 
-[Install](#install-from-source) · [Quick start](#quick-start) · [Features](#highlights) · [Safety](#safety-by-design) · [Rufus parity](FEATURE_MATRIX.md) · [Roadmap](ROADMAP.md)
+[Install](#install-from-source) · [Quick start](#quick-start) · [Features](#highlights) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
 
 <sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; VERIFIED WRITING &amp; FAST ZERO</sub>
 
 </div>
 
-![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](data/screenshot.png)
+![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/main/data/screenshot.png)
 
 <p align="center"><sub>Rendered with synthetic image and device metadata. No physical drive was written.</sub></p>
 
-ISOpropyl makes bootable USB and SD media without running an entire graphical
-application as root. It pairs an approachable Qt interface with explicit write
-methods, detailed preflight inspection, narrow privilege boundaries, and
-verification after writing.
+ISOpropyl turns Linux and Windows images into bootable USB and SD media without
+running an entire graphical application as root. It pairs an approachable Qt
+interface with explicit write methods, detailed preflight inspection, narrow
+privilege boundaries, and verification after writing.
 
 It is inspired by Rufus, but it is a Linux-native project—not a port and not yet
 a feature-for-feature replacement.
@@ -44,10 +45,11 @@ a feature-for-feature replacement.
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
 | **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, performs full or scan-and-skip logical zeroing, and runs bad-block or fake-capacity tests in separate warned workflows. |
 | **Linux image download** | Downloads the pinned Ubuntu LTS profile from distribution-owned infrastructure and verifies its signed checksum manifest. |
+| **Windows image download** | Acquires the exact current Windows 11 25H2 v2 English x64 consumer ISO directly from Microsoft, checks Microsoft's live published hash row, resumes privately, and verifies the complete SHA-256 before use. |
 | **UEFI recovery media** | Builds a multi-architecture UEFI Shell drive from exact upstream payloads after explicit network consent. |
 
 For the exhaustive, evidence-based Rufus comparison, see the
-[feature matrix](FEATURE_MATRIX.md).
+[feature matrix](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md).
 
 ## Install from source
 
@@ -112,6 +114,25 @@ For development, replace `python -m pip install .` with
 4. Optionally add one bounded, additive ZIP overlay. Existing ISO files cannot
    be replaced.
 5. Confirm the exact target and let ISOpropyl verify the finished filesystem.
+
+### Download the pinned Windows 11 ISO
+
+1. Choose **Download Windows…**, then open Microsoft's download page from the
+   dialog.
+2. Select the Windows 11 x64 multi-edition ISO and English, then copy the
+   generated **64-bit Download** link and paste it into ISOpropyl's masked field.
+3. Choose the exact official filename and review the release, language,
+   architecture, size, SHA-256, destination, Microsoft terms, and license notice.
+4. Confirm networking. ISOpropyl rechecks the current Microsoft hash row,
+   validates the 24-hour link without logging it, downloads or safely resumes,
+   hashes the whole file, and inspects it as an x64 Windows installer before
+   loading it.
+
+The direct-resolver checkbox is an optional fallback and may be rejected by
+Microsoft. It downloads one bounded Microsoft JavaScript response as inert text
+but never evaluates or executes it. Fido and PowerShell are neither downloaded
+nor run, and ISO contents remain data only. ISOpropyl is not affiliated with
+Microsoft, and downloading installation media does not grant a Windows license.
 
 ### Logically zero a drive
 
@@ -210,7 +231,7 @@ VTSI, virtual, and compressed-virtual raw inputs, but the backend remains alpha
 software pending installed-integration VM race/hot-swap tests and representative
 physical-media certification.
 
-See [SECURITY.md](SECURITY.md) for the complete threat model and private
+See [SECURITY.md](https://github.com/codebooker/isopropyl/blob/main/SECURITY.md) for the complete threat model and private
 vulnerability-reporting guidance.
 
 ## Requirements
@@ -297,8 +318,8 @@ and mocked destructive boundaries, but CI does not write physical media. Broad
 distribution, desktop, Wayland/X11, firmware, Secure Boot, card-reader, and
 hardware testing is still required. BIOS controls remain intentionally hidden.
 
-The honest capability audit lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md);
-planned work and release gates live in [ROADMAP.md](ROADMAP.md).
+The honest capability audit lives in [FEATURE_MATRIX.md](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md);
+planned work and release gates live in [ROADMAP.md](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md).
 
 ## Development
 
@@ -309,18 +330,18 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-The suite contains more than 1,000 tests and never writes a real `/dev` node.
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing a destructive path.
-Brand assets and usage guidance are in [BRANDING.md](BRANDING.md).
+The suite contains more than 1,500 tests and never writes a real `/dev` node.
+Read [CONTRIBUTING.md](https://github.com/codebooker/isopropyl/blob/main/CONTRIBUTING.md) before changing a destructive path.
+Brand assets and usage guidance are in [BRANDING.md](https://github.com/codebooker/isopropyl/blob/main/BRANDING.md).
 
 ## Credits
 
 ISOpropyl is inspired by the clarity and capability of
 [Rufus](https://github.com/pbatard/rufus) and is independently implemented for
 Linux. Adapted behavior, optional boot payloads, provenance, and licenses are
-recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+recorded in [THIRD_PARTY_NOTICES.md](https://github.com/codebooker/isopropyl/blob/main/THIRD_PARTY_NOTICES.md).
 
 ## License
 
 ISOpropyl is free software under the
-[GNU Affero General Public License v3.0 or later](LICENSE).
+[GNU Affero General Public License v3.0 or later](https://github.com/codebooker/isopropyl/blob/main/LICENSE).

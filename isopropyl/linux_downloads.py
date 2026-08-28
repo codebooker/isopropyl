@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from . import verified_download as _verified
+
 
 CATALOG_VERSION = 1
 MAX_METADATA_SIZE = 64 * 1024
@@ -86,12 +88,22 @@ class LinuxDownloadCatalogError(ValueError):
     """The bundled Linux-image catalog is malformed or unsafe."""
 
 
-class LinuxDownloadError(RuntimeError):
+class LinuxDownloadError(_verified.VerifiedDownloadError):
     """A curated Linux image could not be securely downloaded."""
 
 
-class LinuxDownloadCancelled(LinuxDownloadError):
+class LinuxDownloadCancelled(
+    LinuxDownloadError, _verified.VerifiedDownloadCancelled,
+):
     """The caller cancelled a Linux-image download."""
+
+
+_LINUX_DOWNLOAD_POLICY = _verified.DownloadErrorPolicy(
+    error_type=LinuxDownloadError,
+    cancelled_type=LinuxDownloadCancelled,
+    subject="Linux image",
+    hash_authority="signed",
+)
 
 
 class DownloadResponse(Protocol):
@@ -288,7 +300,9 @@ def _open_response(
     except Exception as error:
         if isinstance(error, urllib.error.HTTPError):
             error.close()
-        raise LinuxDownloadError(f"Download connection failed: {error}") from error
+        raise LinuxDownloadError(
+            f"Download connection failed: {_verified.safe_error_detail(error)}"
+        ) from error
     try:
         _check_cancel(cancel_event, cancel_check)
         _deadline_check(deadline)
@@ -311,7 +325,9 @@ def _response_blocks(
         try:
             block = response.read(READ_SIZE)
         except Exception as error:
-            raise LinuxDownloadError(f"Download read failed: {error}") from error
+            raise LinuxDownloadError(
+                f"Download read failed: {_verified.safe_error_detail(error)}"
+            ) from error
         _check_cancel(cancel_event, cancel_check)
         _deadline_check(deadline)
         if not block:
@@ -561,7 +577,9 @@ def _assert_destination_absent(parent_fd: int, name: str) -> None:
 
 
 def _open_stage(parent_fd: int, name: str) -> tuple[int, str, os.stat_result]:
-    stage_name = f".{name}.isopropyl-download"
+    if not _verified.is_resume_stage_name(name):
+        raise LinuxDownloadError("Download resume directory identity is invalid")
+    stage_name = name
     try:
         os.mkdir(stage_name, mode=0o700, dir_fd=parent_fd)
     except FileExistsError:
@@ -644,27 +662,17 @@ def _verify_completed_partial(
     cancel_event: threading.Event, cancel_check: CancelCheck | None,
 ) -> tuple[os.stat_result, str]:
     """Re-read exact final bytes and freeze descriptor/path identity for publish."""
-
-    before = os.fstat(descriptor)
-    named_before = os.stat("partial", dir_fd=stage_fd, follow_symlinks=False)
-    if (
-        not _same_file(before, named_before) or not stat.S_ISREG(before.st_mode)
-        or before.st_nlink != 1 or before.st_size != release.size
-    ):
-        raise LinuxDownloadError("Completed partial image changed before final verification")
-    digest = _hash_partial(
-        descriptor, release.size, deadline=deadline, cancel_event=cancel_event,
+    return _verified.verify_completed_partial(
+        stage_fd,
+        descriptor,
+        release,
+        deadline=deadline,
+        cancel_event=cancel_event,
         cancel_check=cancel_check,
-    ).hexdigest()
-    _check_cancel(cancel_event, cancel_check)
-    _deadline_check(deadline)
-    after = os.fstat(descriptor)
-    named_after = os.stat("partial", dir_fd=stage_fd, follow_symlinks=False)
-    if not _same_file(before, after) or not _same_file(after, named_after):
-        raise LinuxDownloadError("Completed partial image changed during final verification")
-    if not hmac.compare_digest(digest, release.sha256):
-        raise LinuxDownloadError("Completed image failed its final signed SHA-256 checksum")
-    return after, digest
+        policy=_LINUX_DOWNLOAD_POLICY,
+        hash_partial_fn=_hash_partial,
+        same_file_fn=_same_file,
+    )
 
 
 def _revalidate_stage(parent_fd: int, name: str, descriptor: int, expected: os.stat_result) -> None:
@@ -692,88 +700,25 @@ def _download_image(
     opener: OpenUrl, progress: Progress | None, *, deadline: float,
     cancel_event: threading.Event, cancel_check: CancelCheck | None,
 ) -> tuple[os.stat_result, str]:
-    done = initial.st_size
-    digest = _hash_partial(
-        descriptor, done, deadline=deadline, cancel_event=cancel_event,
+    return _verified.download_image(
+        release,
+        release.image_url,
+        descriptor,
+        initial,
+        opener,
+        progress,
+        deadline=deadline,
+        cancel_event=cancel_event,
         cancel_check=cancel_check,
+        policy=_LINUX_DOWNLOAD_POLICY,
+        hash_partial_fn=_hash_partial,
+        open_response_fn=_open_response,
+        response_blocks_fn=_response_blocks,
+        validate_response_url_fn=_validate_response_url,
+        response_status_fn=_status,
+        response_header_fn=_header,
+        parse_decimal_header_fn=_parse_decimal_header,
     )
-    if done == release.size:
-        value = digest.hexdigest()
-        if not hmac.compare_digest(value, release.sha256):
-            raise LinuxDownloadError("Completed partial download has the wrong checksum")
-        if progress is not None:
-            progress(done, release.size)
-        return os.fstat(descriptor), value
-    filesystem = os.fstatvfs(descriptor)
-    available = filesystem.f_bavail * filesystem.f_frsize
-    if available < release.size - done + FREE_SPACE_RESERVE:
-        raise LinuxDownloadError("Not enough free space for the image and safety reserve")
-    headers = {"Accept-Encoding": "identity"}
-    if done:
-        headers["Range"] = f"bytes={done}-"
-    request = urllib.request.Request(release.image_url, headers=headers)
-    response = _open_response(
-        opener, request, deadline=deadline, cancel_event=cancel_event,
-        cancel_check=cancel_check,
-    )
-    try:
-        _validate_response_url(response, release.image_url)
-        status = _status(response)
-        if _header(response, "Content-Encoding") not in (None, "identity"):
-            raise LinuxDownloadError("Image response used an unexpected content encoding")
-        content_length = _parse_decimal_header(
-            _header(response, "Content-Length"), "Content-Length"
-        )
-        if done and status == 200:
-            if content_length != release.size:
-                raise LinuxDownloadError("Restart response has the wrong exact size")
-            os.ftruncate(descriptor, 0)
-            os.fsync(descriptor)
-            done = 0
-            digest = hashlib.sha256()
-        elif done and status == 206:
-            expected_range = f"bytes {done}-{release.size - 1}/{release.size}"
-            if _header(response, "Content-Range") != expected_range:
-                raise LinuxDownloadError("Resume response has the wrong Content-Range")
-        elif not done and status != 200:
-            raise LinuxDownloadError("Image server returned an unexpected HTTP status")
-        elif done and status not in (200, 206):
-            raise LinuxDownloadError("Image server refused a safe resume")
-        expected_body = release.size - done
-        if content_length != expected_body:
-            raise LinuxDownloadError("Image response has the wrong exact size")
-        os.lseek(descriptor, done, os.SEEK_SET)
-        if progress is not None:
-            progress(done, release.size)
-        for block in _response_blocks(
-            response, deadline=deadline, cancel_event=cancel_event,
-            cancel_check=cancel_check,
-        ):
-            if done + len(block) > release.size:
-                raise LinuxDownloadError("Image response exceeded its cataloged size")
-            view = memoryview(block)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise LinuxDownloadError("Could not write the partial image")
-                view = view[written:]
-            digest.update(block)
-            done += len(block)
-            if progress is not None:
-                progress(done, release.size)
-        if done != release.size:
-            raise LinuxDownloadError("Image download ended before its exact size")
-        value = digest.hexdigest()
-        if not hmac.compare_digest(value, release.sha256):
-            raise LinuxDownloadError("Downloaded image failed its signed SHA-256 checksum")
-        os.fsync(descriptor)
-        final = os.fstat(descriptor)
-        return final, value
-    finally:
-        try:
-            response.close()
-        except Exception:
-            pass
 
 
 class LinuxIsoDownloader:
@@ -808,153 +753,48 @@ class LinuxIsoDownloader:
             or not any(release is item for item in catalog)
         ):
             raise LinuxDownloadCatalogError("Download release is not an exact catalog entry")
-        if (
-            isinstance(overall_timeout, bool) or not isinstance(overall_timeout, (int, float))
-            or not 0 < overall_timeout <= MAX_DOWNLOAD_TIMEOUT
-        ):
-            raise ValueError("Download timeout must be between 0 and 24 hours")
-        native_path_type = type(Path())
-        if type(destination) is not native_path_type:
-            raise ValueError("Download destination must be an exact native pathlib.Path")
-        if not destination.is_absolute():
-            raise ValueError("Download destination must be an absolute pathlib.Path")
-        destination_name = destination.name
-        destination_parent = destination.parent
-        if (
-            type(destination_name) is not str
-            or type(destination_parent) is not native_path_type
-        ):
-            raise ValueError("Download destination path primitives are invalid")
-        if destination_name != release.filename:
-            raise ValueError("Download destination must retain the exact cataloged filename")
-        deadline = time.monotonic() + float(overall_timeout)
-        parent_fd = stage_fd = partial_fd = -1
-        stage_name = ""
-        stage_identity: os.stat_result | None = None
-        remove_bad_partial = False
-        published_identity: tuple[int, int] | None = None
-        committed = False
-        try:
-            parent_fd = _open_absolute_directory(destination_parent)
-            _assert_destination_absent(parent_fd, destination_name)
-            _check_cancel(self._cancel_event, cancel_check)
+
+        def authorize_source(
+            selected_opener: OpenUrl,
+            deadline: float,
+            cancel_event: threading.Event,
+            selected_cancel_check: CancelCheck | None,
+        ) -> _verified.ResolvedDownloadSource:
             _verify_release_metadata(
-                release, opener, deadline=deadline, cancel_event=self._cancel_event,
-                cancel_check=cancel_check,
+                release, selected_opener, deadline=deadline,
+                cancel_event=cancel_event, cancel_check=selected_cancel_check,
             )
-            # Metadata is authenticated before the resumable on-disk state is touched.
-            _assert_destination_absent(parent_fd, destination_name)
-            stage_fd, stage_name, stage_identity = _open_stage(parent_fd, destination_name)
-            partial_fd, initial = _open_partial(stage_fd, release.size)
-            _download_image(
-                release, partial_fd, initial, opener, progress, deadline=deadline,
-                cancel_event=self._cancel_event, cancel_check=cancel_check,
-            )
-            assert stage_identity is not None
-            _revalidate_stage(parent_fd, stage_name, stage_fd, stage_identity)
-            _revalidate_directory(destination_parent, parent_fd)
-            _check_cancel(self._cancel_event, cancel_check)
-            _deadline_check(deadline)
-            os.fsync(partial_fd)
-            os.fsync(stage_fd)
-            final, digest = _verify_completed_partial(
-                stage_fd, partial_fd, release, deadline=deadline,
-                cancel_event=self._cancel_event, cancel_check=cancel_check,
-            )
-            # The verifier's pre-stat cancellation/deadline check is the final
-            # boundary. Both cancel_check and a supplied Event.is_set may be
-            # caller code, so os.link must be the very next operation.
-            try:
-                os.link(
-                    "partial", destination_name, src_dir_fd=stage_fd,
-                    dst_dir_fd=parent_fd, follow_symlinks=False,
-                )
-            except FileExistsError as error:
-                raise LinuxDownloadError(
-                    "Download destination appeared and was not overwritten"
-                ) from error
-            committed = True
-            published_identity = (final.st_dev, final.st_ino)
-            try:
-                os.fsync(parent_fd)
-            except OSError:
-                pass
+            return _verified.ResolvedDownloadSource(release.image_url)
 
-            # Cleanup is deliberately best-effort after commit. It must never
-            # convert a verified published image into an ambiguous failure.
-            cleanup_private = False
-            try:
-                linked = os.fstat(partial_fd)
-                named_partial = os.stat(
-                    "partial", dir_fd=stage_fd, follow_symlinks=False,
-                )
-                named_destination = os.stat(
-                    destination_name, dir_fd=parent_fd, follow_symlinks=False,
-                )
-                if (
-                    _same_file(linked, named_partial)
-                    and _same_file(linked, named_destination)
-                    and stat.S_ISREG(linked.st_mode) and linked.st_nlink == 2
-                    and linked.st_size == release.size
-                    and linked.st_mtime_ns == final.st_mtime_ns
-                    and (linked.st_dev, linked.st_ino) == published_identity
-                ):
-                    os.unlink("partial", dir_fd=stage_fd)
-                    cleanup_private = True
-            except OSError:
-                pass
-
-            if cleanup_private:
-                try:
-                    _revalidate_stage(parent_fd, stage_name, stage_fd, stage_identity)
-                    named_stage = os.stat(
-                        stage_name, dir_fd=parent_fd, follow_symlinks=False,
-                    )
-                    if (
-                        stat.S_ISDIR(named_stage.st_mode)
-                        and (named_stage.st_dev, named_stage.st_ino)
-                        == (stage_identity.st_dev, stage_identity.st_ino)
-                    ):
-                        os.rmdir(stage_name, dir_fd=parent_fd)
-                except (LinuxDownloadError, OSError):
-                    pass
-            try:
-                os.fsync(parent_fd)
-            except OSError:
-                pass
-
-            # Link success is absolute commit. Even a subsequent identity check
-            # could race a same-user namespace mutation, so nothing below the
-            # commit point is permitted to turn the verified result into failure.
-            return DownloadedLinuxImage(destination, release.id, release.size, digest)
-        except LinuxDownloadCancelled:
-            raise
-        except LinuxDownloadError as error:
-            remove_bad_partial = "checksum" in str(error).casefold()
-            raise
-        except (OSError, urllib.error.URLError) as error:
-            raise LinuxDownloadError(f"Linux image download failed safely: {error}") from error
-        finally:
-            if partial_fd >= 0:
-                try:
-                    os.close(partial_fd)
-                except OSError:
-                    if not committed:
-                        raise
-            if remove_bad_partial and stage_fd >= 0:
-                try:
-                    os.unlink("partial", dir_fd=stage_fd)
-                except OSError:
-                    pass
-            if stage_fd >= 0:
-                try:
-                    os.close(stage_fd)
-                except OSError:
-                    if not committed:
-                        raise
-            if parent_fd >= 0:
-                try:
-                    os.close(parent_fd)
-                except OSError:
-                    if not committed:
-                        raise
+        # Pass the module-level functions as late-bound seams.  Besides keeping
+        # the Linux API stable, this preserves the fault-injection coverage that
+        # audits the no-callback gap immediately before publication.
+        result = _verified.execute_verified_download(
+            release,
+            destination,
+            authorize_source,
+            progress,
+            cancel_event=self._cancel_event,
+            cancel_check=cancel_check,
+            overall_timeout=overall_timeout,
+            opener=opener,
+            policy=_LINUX_DOWNLOAD_POLICY,
+            open_absolute_directory_fn=_open_absolute_directory,
+            assert_destination_absent_fn=_assert_destination_absent,
+            open_stage_fn=_open_stage,
+            open_partial_fn=_open_partial,
+            download_image_fn=lambda selected, source, descriptor, initial,
+            selected_opener, selected_progress, **kwargs: _download_image(
+                selected, descriptor, initial, selected_opener,
+                selected_progress, **kwargs,
+            ),
+            revalidate_stage_fn=_revalidate_stage,
+            revalidate_directory_fn=_revalidate_directory,
+            check_cancel_fn=_check_cancel,
+            deadline_check_fn=_deadline_check,
+            verify_completed_partial_fn=_verify_completed_partial,
+            same_file_fn=_same_file,
+        )
+        return DownloadedLinuxImage(
+            result.path, result.release_id, result.size, result.sha256,
+        )

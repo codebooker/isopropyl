@@ -26,7 +26,7 @@ from isopropyl.app import (
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
     StagedDbxConfirmation,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
-    ZipOverlayPlanningToken,
+    WindowsDownloadToken, ZipOverlayPlanningToken,
 )
 from isopropyl.authenticode import AuthenticodeIntegrityState, AuthenticodeResult
 from isopropyl.backup import VHD_MAX_SIZE
@@ -57,6 +57,9 @@ from isopropyl.iso import (
 )
 from isopropyl.iso_staging import IsoStagingPlan
 from isopropyl.linux_downloads import DownloadedLinuxImage, available_linux_images
+from isopropyl.windows_downloads import (
+    DownloadedWindowsImage, WindowsDownloadCancelled, available_windows_images,
+)
 from isopropyl.extraction import SafeIsoExtractor
 from isopropyl.persistence import ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES
 from isopropyl.runtime_validation import (
@@ -2413,6 +2416,244 @@ class WindowWriteMethodTests(unittest.TestCase):
             self.window.download_linux_image()
 
         downloader.assert_not_called()
+
+    def test_curated_windows_pasted_link_requires_consent_inspects_then_loads(self):
+        release = available_windows_images()[0]
+        capability = "https://software.download.prss.microsoft.com/masked?secret"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.filename
+
+            class FakeDownloader:
+                cancelled = False
+
+                def __init__(self):
+                    self.calls = []
+
+                def cancel(self) -> None:
+                    self.cancelled = True
+
+                def download(self, selected, output, progress, *, source_url=None):
+                    self.calls.append((selected, output, source_url))
+                    with output.open("wb") as stream:
+                        stream.truncate(selected.size)
+                    progress(selected.size, selected.size)
+                    return DownloadedWindowsImage(
+                        output, selected.id, selected.size, selected.sha256,
+                    )
+
+            downloader = FakeDownloader()
+
+            def accept_catalog(dialog) -> int:
+                choices = dialog.findChild(QComboBox, "windowsDownloadRelease")
+                link = dialog.findChild(QLineEdit, "windowsDownloadUrl")
+                assert choices is not None and link is not None
+                self.assertIs(choices.currentData(), release)
+                link.setText(capability)
+                return QDialog.DialogCode.Accepted
+
+            inspection = replace(optical_windows_inspection(), size=release.size)
+            with (
+                patch("isopropyl.app.QDialog.exec", new=accept_catalog),
+                patch("isopropyl.app.validate_microsoft_download_url"),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "ISO images (*.iso)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch("isopropyl.app.QMessageBox.information"),
+                patch("isopropyl.app.QMessageBox.critical") as critical,
+                patch("isopropyl.app.WindowsIsoDownloader", return_value=downloader),
+                patch("isopropyl.app.inspect_image", return_value=inspection) as inspect,
+                patch("isopropyl.app.threading.Thread", ImmediateThread),
+                patch.object(self.window, "load_image") as load_image,
+            ):
+                self.window.download_windows_image()
+
+            self.assertEqual(
+                downloader.calls, [(release, destination, capability)]
+            )
+            inspect.assert_called_once()
+            self.assertEqual(inspect.call_args.args, (destination,))
+            self.assertEqual(
+                inspect.call_args.kwargs["expected_identity"][2], release.size,
+            )
+            load_image.assert_called_once_with(destination)
+            critical.assert_not_called()
+            self.assertIsNone(self.window.windows_downloader)
+            self.assertEqual(self.window.progress.value(), 1000)
+
+    def test_curated_windows_catalog_dialog_cancel_is_network_inactive(self):
+        with (
+            patch(
+                "isopropyl.app.QDialog.exec",
+                return_value=QDialog.DialogCode.Rejected,
+            ),
+            patch("isopropyl.app.validate_microsoft_download_url") as validate,
+            patch("isopropyl.app.WindowsIsoDownloader") as downloader,
+        ):
+            self.window.download_windows_image()
+
+        validate.assert_not_called()
+        downloader.assert_not_called()
+
+    def test_curated_windows_final_consent_precedes_downloader_and_network(self):
+        release = available_windows_images()[0]
+        capability = "https://software.download.prss.microsoft.com/masked?secret"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.filename
+
+            def accept_catalog(dialog) -> int:
+                link = dialog.findChild(QLineEdit, "windowsDownloadUrl")
+                assert link is not None
+                link.setText(capability)
+                return QDialog.DialogCode.Accepted
+
+            with (
+                patch("isopropyl.app.QDialog.exec", new=accept_catalog),
+                patch("isopropyl.app.validate_microsoft_download_url"),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "ISO images (*.iso)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Cancel,
+                ),
+                patch("isopropyl.app.WindowsIsoDownloader") as downloader,
+            ):
+                self.window.download_windows_image()
+
+        downloader.assert_not_called()
+        self.assertFalse(destination.exists())
+
+    def test_curated_windows_rejects_non_installer_after_hash_verification(self):
+        release = available_windows_images()[0]
+        capability = "https://software.download.prss.microsoft.com/masked?secret"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / release.filename
+
+            class FakeDownloader:
+                cancelled = False
+
+                def cancel(self) -> None:
+                    self.cancelled = True
+
+                def download(self, selected, output, progress, *, source_url=None):
+                    with output.open("wb") as stream:
+                        stream.truncate(selected.size)
+                    return DownloadedWindowsImage(
+                        output, selected.id, selected.size, selected.sha256,
+                    )
+
+            def accept_catalog(dialog) -> int:
+                link = dialog.findChild(QLineEdit, "windowsDownloadUrl")
+                assert link is not None
+                link.setText(capability)
+                return QDialog.DialogCode.Accepted
+
+            not_windows = replace(
+                optical_windows_inspection(), size=release.size,
+                has_windows_installer=False,
+            )
+            with (
+                patch("isopropyl.app.QDialog.exec", new=accept_catalog),
+                patch("isopropyl.app.validate_microsoft_download_url"),
+                patch(
+                    "isopropyl.app.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "ISO images (*.iso)"),
+                ),
+                patch(
+                    "isopropyl.app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch("isopropyl.app.QMessageBox.warning") as warning,
+                patch("isopropyl.app.QMessageBox.critical") as critical,
+                patch("isopropyl.app.WindowsIsoDownloader", return_value=FakeDownloader()),
+                patch("isopropyl.app.inspect_image", return_value=not_windows),
+                patch("isopropyl.app.threading.Thread", ImmediateThread),
+                patch.object(self.window, "load_image") as load_image,
+            ):
+                self.window.download_windows_image()
+
+            load_image.assert_not_called()
+            self.assertTrue(destination.exists())
+            warning.assert_called_once()
+            self.assertIn("passed SHA-256 verification", warning.call_args.args[2])
+            self.assertIn("did not load", warning.call_args.args[2])
+            critical.assert_not_called()
+
+    def test_postcommit_windows_inspection_cancel_reports_saved_file(self):
+        release = available_windows_images()[0]
+        destination = Path(self.settings_home.name) / release.filename
+        destination.write_bytes(b"published fixture")
+        operation = Mock(cancelled=True)
+        token = WindowsDownloadToken(1, operation, release, destination)
+        published = DownloadedWindowsImage(
+            destination, release.id, release.size, release.sha256,
+        )
+        self.window.windows_download_generation = 1
+        self.window.windows_downloader = operation
+        self.window.windows_download_token = token
+
+        with (
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window, "load_image") as load_image,
+        ):
+            self.window.on_windows_download_finished(
+                token, published,
+                WindowsDownloadCancelled("inspection cancelled"),
+            )
+
+        self.assertTrue(destination.exists())
+        self.assertIn("saved; inspection cancelled", self.window.status.text())
+        self.assertIn("no incomplete download to resume", warning.call_args.args[2])
+        load_image.assert_not_called()
+        critical.assert_not_called()
+
+    def test_stale_windows_download_completion_cannot_clear_current_operation(self):
+        release = available_windows_images()[0]
+        destination = Path(self.settings_home.name) / release.filename
+        stale_operation = Mock(cancelled=False)
+        current_operation = Mock(cancelled=False)
+        stale = WindowsDownloadToken(
+            1, stale_operation, release, destination,
+        )
+        current = WindowsDownloadToken(
+            2, current_operation, release, destination,
+        )
+        self.window.windows_download_generation = 2
+        self.window.windows_downloader = current_operation
+        self.window.windows_download_token = current
+
+        try:
+            with patch.object(self.window, "set_busy") as set_busy:
+                self.window.on_windows_download_finished(
+                    stale, None, OSError("stale worker failed"),
+                )
+
+            self.assertIs(self.window.windows_downloader, current_operation)
+            self.assertIs(self.window.windows_download_token, current)
+            set_busy.assert_not_called()
+        finally:
+            self.window.windows_downloader = None
+            self.window.windows_download_token = None
+
+    def test_cancel_fans_out_to_active_windows_downloader(self):
+        operation = Mock(cancelled=False)
+        self.window.windows_downloader = operation
+
+        try:
+            self.window.cancel()
+
+            operation.cancel.assert_called_once_with()
+            self.assertEqual(self.window.status.text(), "Stopping…")
+            self.assertFalse(self.window.cancel_button.isEnabled())
+        finally:
+            self.window.windows_downloader = None
 
     def test_drive_backup_filter_selects_raw_vhd_or_vhdx_backend_and_suffix(self):
         invocations = []

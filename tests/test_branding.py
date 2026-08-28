@@ -57,6 +57,20 @@ class BrandingTests(unittest.TestCase):
         self.assertFalse(screenshot.isNull())
         self.assertEqual((screenshot.width(), screenshot.height()), (1080, 920))
 
+    def test_package_readme_uses_host_independent_asset_and_document_links(self):
+        readme = (ROOT / "README.md").read_text("utf-8")
+        image_targets = re.findall(r"!\[[^]]*\]\(([^)]+)\)", readme)
+        self.assertGreaterEqual(len(image_targets), 2)
+        self.assertTrue(
+            all(target.startswith("https://") for target in image_targets),
+            image_targets,
+        )
+        for document in (
+            "BRANDING.md", "CONTRIBUTING.md", "FEATURE_MATRIX.md", "LICENSE",
+            "ROADMAP.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md",
+        ):
+            self.assertNotIn(f"]({document})", readme)
+
     def test_desktop_and_appstream_identity_are_consistent(self):
         desktop = (ROOT / "data" / f"{APP_ID}.desktop").read_text("utf-8")
         self.assertIn("Name=ISOpropyl\n", desktop)

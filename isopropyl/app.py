@@ -14,10 +14,10 @@ from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QSettings, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, QTimer, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import (
-    QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QShortcut,
-    QTextCursor,
+    QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon,
+    QKeySequence, QShortcut, QTextCursor,
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
@@ -90,6 +90,11 @@ from .logging_setup import read_log, setup_logging
 from .linux_downloads import (
     DownloadedLinuxImage, LinuxDownloadCancelled, LinuxImageRelease,
     LinuxIsoDownloader, available_linux_images,
+)
+from .windows_downloads import (
+    DownloadedWindowsImage, WindowsDownloadCancelled, WindowsImageRelease,
+    WindowsIsoDownloader, available_windows_images,
+    validate_microsoft_download_url,
 )
 from .media_test import (
     MediaTestCancelled, MediaTestMode, MediaTestResult, MediaTestRunner,
@@ -253,6 +258,21 @@ class LinuxDownloadToken:
     destination: Path
 
 
+@dataclass(frozen=True)
+class WindowsDownloadToken:
+    generation: int
+    operation: WindowsIsoDownloader
+    release: WindowsImageRelease
+    destination: Path
+
+
+@dataclass(frozen=True)
+class WindowsDownloadCompletion:
+    image: DownloadedWindowsImage
+    inspection: ImageInspection
+    identity: tuple[int, int, int, int, int]
+
+
 class Bridge(QObject):
     # PyQt's plain `int` maps to a signed 32-bit C++ int. Disk images routinely
     # exceed that, so keep byte counters as Python objects across threads.
@@ -275,6 +295,7 @@ class Bridge(QObject):
     casper_preparation_finished = pyqtSignal(object, object, object)
     device_refresh_finished = pyqtSignal(object, object)
     linux_download_finished = pyqtSignal(object, object, object)
+    windows_download_finished = pyqtSignal(object, object, object)
     raw_preparation_finished = pyqtSignal(object, object)
     raw_execution_finished = pyqtSignal(object, object)
     fast_zero_preparation_finished = pyqtSignal(object, object)
@@ -304,6 +325,9 @@ class Window(QMainWindow):
         self.linux_download_generation = 0
         self.linux_downloader: LinuxIsoDownloader | None = None
         self.linux_download_token: LinuxDownloadToken | None = None
+        self.windows_download_generation = 0
+        self.windows_downloader: WindowsIsoDownloader | None = None
+        self.windows_download_token: WindowsDownloadToken | None = None
         self.zip_overlay_plan: ZipOverlayPlan | None = None
         self.zip_overlay_merge: AdditiveOverlayMerge | None = None
         self.zip_overlay_generation = 0
@@ -396,6 +420,9 @@ class Window(QMainWindow):
         self.bridge.device_refresh_finished.connect(self.on_devices_refreshed)
         self.bridge.linux_download_finished.connect(
             self.on_linux_download_finished
+        )
+        self.bridge.windows_download_finished.connect(
+            self.on_windows_download_finished
         )
         self.bridge.raw_preparation_finished.connect(
             self.on_raw_preparation_finished
@@ -639,7 +666,9 @@ class Window(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
-        self.source_card = self.card("1", "Disk image", "Choose a Linux ISO or raw disk image")
+        self.source_card = self.card(
+            "1", "Disk image", "Choose a Linux or Windows ISO, or a raw disk image"
+        )
         source_row = QHBoxLayout()
         self.image_label = QLabel("No image selected")
         self.image_label.setObjectName("muted")
@@ -650,8 +679,15 @@ class Window(QMainWindow):
             "Explicitly download an ISO from ISOpropyl's small signed Linux catalog."
         )
         self.linux_download_button.clicked.connect(self.download_linux_image)
+        self.windows_download_button = QPushButton("Download Windows…")
+        self.windows_download_button.setToolTip(
+            "Download one exact Windows ISO directly from Microsoft and verify its "
+            "Microsoft-published SHA-256."
+        )
+        self.windows_download_button.clicked.connect(self.download_windows_image)
         source_row.addWidget(self.image_label, 1)
         source_row.addWidget(self.linux_download_button)
+        source_row.addWidget(self.windows_download_button)
         source_row.addWidget(choose)
         self.source_card.layout().addLayout(source_row)
         image_tools = QHBoxLayout()
@@ -1037,6 +1073,339 @@ class Window(QMainWindow):
             f"{token.release.release}.\n\n{result.path}",
         )
         self.load_image(result.path)
+
+    def download_windows_image(self) -> None:
+        if self.operation_active or self.inspection_busy:
+            return
+        try:
+            releases = available_windows_images()
+        except Exception as error:
+            QMessageBox.critical(self, "Windows catalog unavailable", str(error))
+            return
+        if not releases:
+            QMessageBox.warning(
+                self, "Windows catalog unavailable",
+                "No curated Microsoft Windows images are available.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Download a verified Windows ISO")
+        dialog.setMinimumWidth(660)
+        layout = QVBoxLayout(dialog)
+        notice = QLabel(
+            "ISOpropyl currently supports one exact public Microsoft image. The "
+            "recommended path is to generate a 24-hour link on Microsoft's page, "
+            "copy the 64-bit Download link, and paste it below. ISOpropyl never "
+            "saves or logs that capability link."
+        )
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        choices = QComboBox()
+        choices.setObjectName("windowsDownloadRelease")
+        for release in releases:
+            choices.addItem(
+                f"{release.product} {release.release} · {release.language} · "
+                f"{release.architecture} · {self.display_size(release.size)}",
+                release,
+            )
+        layout.addWidget(choices)
+        details = QLabel()
+        details.setObjectName("muted")
+        details.setWordWrap(True)
+        layout.addWidget(details)
+
+        open_page = QPushButton("Open Microsoft download page")
+        open_page.setObjectName("windowsDownloadOpenPage")
+        layout.addWidget(open_page)
+        link = QLineEdit()
+        link.setObjectName("windowsDownloadUrl")
+        link.setEchoMode(QLineEdit.EchoMode.Password)
+        link.setPlaceholderText(
+            "Paste the temporary 64-bit Download link (masked and never stored)"
+        )
+        link.setClearButtonEnabled(True)
+        layout.addWidget(link)
+        automatic = QCheckBox(
+            "Try ISOpropyl's privacy-minimal direct Microsoft resolver instead"
+        )
+        automatic.setObjectName("windowsAutomaticResolver")
+        automatic.setToolTip(
+            "Fetches bounded Microsoft challenge data as inert text and never "
+            "executes JavaScript, PowerShell, or Fido. Microsoft may reject it."
+        )
+        layout.addWidget(automatic)
+
+        def update_details() -> None:
+            selected = choices.currentData()
+            if isinstance(selected, WindowsImageRelease):
+                details.setText(
+                    f"Official filename: {selected.filename}\n"
+                    f"Microsoft-published SHA-256: {selected.sha256}\n"
+                    f"Source and terms: {selected.provenance_url}"
+                )
+
+        choices.currentIndexChanged.connect(update_details)
+        update_details()
+        open_page.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl(str(choices.currentData().provenance_url))
+            ) if isinstance(choices.currentData(), WindowsImageRelease) else None
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        accept = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        accept.setText("Choose destination…")
+
+        def update_accept() -> None:
+            link.setEnabled(not automatic.isChecked())
+            accept.setEnabled(automatic.isChecked() or bool(link.text().strip()))
+
+        link.textChanged.connect(update_accept)
+        automatic.toggled.connect(update_accept)
+        update_accept()
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            link.clear()
+            return
+        release = choices.currentData()
+        if not isinstance(release, WindowsImageRelease) or release not in releases:
+            link.clear()
+            QMessageBox.critical(
+                self, "Windows catalog unavailable",
+                "The selected catalog entry is invalid.",
+            )
+            return
+        source_url = None if automatic.isChecked() else link.text().strip()
+        link.clear()
+        if source_url is not None:
+            try:
+                validate_microsoft_download_url(release, source_url)
+            except Exception as error:
+                QMessageBox.warning(
+                    self, "Microsoft link is not accepted", str(error),
+                )
+                return
+
+        downloads = Path.home() / "Downloads"
+        starting_directory = downloads if downloads.is_dir() else Path.home()
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save verified Windows ISO",
+            str(starting_directory / release.filename), "ISO images (*.iso)",
+        )
+        if not filename:
+            return
+        destination = Path(filename)
+        if destination.name != release.filename:
+            QMessageBox.warning(
+                self, "Keep the official filename",
+                f"This catalog entry must be saved as {release.filename}. Choose "
+                "the destination again without renaming it.",
+            )
+            return
+        if not destination.is_absolute():
+            QMessageBox.warning(
+                self, "Choose an absolute destination", "Choose a normal local folder.",
+            )
+            return
+        source_description = (
+            "the masked Microsoft link you supplied"
+            if source_url is not None
+            else "Microsoft's direct resolver (which Microsoft may reject)"
+        )
+        confirmation = QMessageBox.question(
+            self,
+            "Download and verify Windows ISO?",
+            f"Download {release.product} {release.release}\n"
+            f"{release.edition} · {release.language} · {release.architecture}\n\n"
+            f"Source: {release.provenance_url}\n"
+            f"Method: {source_description}\n"
+            f"Size: {self.display_size(release.size)}\n"
+            f"Expected SHA-256: {release.sha256}\n"
+            f"Destination: {destination}\n\n"
+            "A cancelled transfer remains in a private resumable directory. "
+            "Downloaded bytes and Microsoft scripts are never executed. This "
+            "does not grant a Windows license; Microsoft terms apply. ISOpropyl "
+            "is not affiliated with Microsoft.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        downloader = WindowsIsoDownloader()
+        self.windows_download_generation += 1
+        token = WindowsDownloadToken(
+            self.windows_download_generation, downloader, release, destination,
+        )
+        self.windows_downloader = downloader
+        self.windows_download_token = token
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Resolving a pinned Microsoft download…")
+        self.logger.info(
+            "Confirmed Windows ISO download: release=%s destination=%s method=%s",
+            release.id, destination,
+            "browser-assisted" if source_url is not None else "direct-resolver",
+        )
+
+        def work() -> None:
+            downloaded: DownloadedWindowsImage | None = None
+            try:
+                downloaded = downloader.download(
+                    release, destination,
+                    lambda done, total: self.bridge.progress.emit(
+                        done, total, "Downloading Microsoft Windows ISO",
+                    ),
+                    source_url=source_url,
+                )
+                identity = image_identity(downloaded.path)
+
+                def check_cancelled() -> None:
+                    if downloader.cancelled:
+                        raise WindowsDownloadCancelled(
+                            "Windows image verification was cancelled"
+                        )
+
+                self.bridge.status_changed.emit(
+                    "Inspecting the verified Windows installer ISO…"
+                )
+                inspection = inspect_image(
+                    downloaded.path, expected_identity=identity,
+                    cancel_check=check_cancelled,
+                )
+                if (
+                    identity[2] != release.size or inspection.size != release.size
+                    or not inspection.is_iso9660 or not inspection.contents_scanned
+                    or not inspection.has_windows_installer
+                    or "x64" not in inspection.architectures
+                ):
+                    raise OSError(
+                        "The hash-verified file did not inspect as the pinned x64 "
+                        "Windows installer ISO"
+                    )
+                result: object = WindowsDownloadCompletion(
+                    downloaded, inspection, identity,
+                )
+                error: object = None
+            except Exception as caught:
+                # A returned downloader result is the publication commit point.
+                # Preserve it so a later inspection failure is never reported as
+                # an incomplete download with impossible resume instructions.
+                result = downloaded
+                error = caught
+            self.bridge.windows_download_finished.emit(token, result, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_windows_download_finished(
+        self, token: WindowsDownloadToken, result: object, error: object,
+    ) -> None:
+        if (
+            token is not self.windows_download_token
+            or token.operation is not self.windows_downloader
+            or token.generation != self.windows_download_generation
+        ):
+            return
+        self.windows_downloader = None
+        self.windows_download_token = None
+        self.set_busy(False)
+        if error is not None:
+            published = (
+                isinstance(result, DownloadedWindowsImage)
+                and result.path == token.destination
+                and result.release_id == token.release.id
+                and result.size == token.release.size
+                and result.sha256 == token.release.sha256
+            )
+            if published:
+                self.progress.setValue(1000)
+                cancelled = (
+                    isinstance(error, WindowsDownloadCancelled)
+                    or token.operation.cancelled
+                )
+                outcome = "cancelled" if cancelled else "failed"
+                inspection_phrase = "was cancelled" if cancelled else "failed"
+                self.status.setText(
+                    f"Verified Windows ISO saved; inspection {outcome}"
+                )
+                self.logger.warning(
+                    "Verified Windows ISO saved but post-download inspection %s: "
+                    "release=%s destination=%s error_type=%s",
+                    outcome, result.release_id, result.path, type(error).__name__,
+                )
+                QMessageBox.warning(
+                    self,
+                    f"Windows ISO saved; inspection {outcome}",
+                    "The download completed, passed SHA-256 verification, and was "
+                    f"published to:\n{result.path}\n\n"
+                    f"Later Windows installer inspection {inspection_phrase}, so ISOpropyl did "
+                    "not load the file. Select it manually later to inspect it again. "
+                    "There is no incomplete download to resume.",
+                )
+                return
+            if isinstance(error, WindowsDownloadCancelled) or token.operation.cancelled:
+                message = (
+                    "Windows ISO download cancelled. Use a fresh Microsoft link and "
+                    "choose the same destination later to resume safely."
+                )
+                self.logger.info(message)
+                self.status.setText(message)
+            else:
+                self.logger.warning("Windows ISO download failed safely: %s", error)
+                self.status.setText("Windows ISO download did not complete")
+                message = str(error)
+                if "rejected the download-link request" in message:
+                    message += (
+                        "\n\nMicrosoft blocked the direct resolver. Open Microsoft's "
+                        "download page and use the masked paste-link method instead."
+                    )
+                QMessageBox.critical(self, "Windows download failed", message)
+            return
+        valid = isinstance(result, WindowsDownloadCompletion)
+        if valid:
+            downloaded = result.image
+            try:
+                current_identity = image_identity(downloaded.path)
+            except OSError:
+                valid = False
+            else:
+                valid = (
+                    downloaded.path == token.destination
+                    and downloaded.release_id == token.release.id
+                    and downloaded.size == token.release.size
+                    and downloaded.sha256 == token.release.sha256
+                    and result.identity == current_identity
+                    and current_identity[2] == token.release.size
+                    and result.inspection.size == token.release.size
+                    and result.inspection.is_iso9660
+                    and result.inspection.contents_scanned
+                    and result.inspection.has_windows_installer
+                    and "x64" in result.inspection.architectures
+                )
+        if not valid:
+            self.status.setText("Windows ISO download returned an invalid result")
+            QMessageBox.critical(
+                self, "Windows download failed",
+                "The background downloader returned an invalid bound Windows image.",
+            )
+            return
+        self.progress.setValue(1000)
+        self.status.setText("Verified Windows installer ISO downloaded")
+        self.logger.info(
+            "Verified Windows ISO downloaded: release=%s destination=%s sha256=%s",
+            result.image.release_id, result.image.path, result.image.sha256,
+        )
+        QMessageBox.information(
+            self, "Windows ISO ready",
+            f"Downloaded, hash-verified, and inspected {token.release.product} "
+            f"{token.release.release}.\n\n{result.image.path}",
+        )
+        self.load_image(result.image.path)
 
     def load_image(self, path: Path) -> None:
         try:
@@ -1918,6 +2287,7 @@ class Window(QMainWindow):
             self.checksum_preparer,
             self.iso_staging_preparer,
             self.linux_downloader,
+            self.windows_downloader,
         ))
 
     def confirm_write(self) -> None:
@@ -2563,6 +2933,7 @@ class Window(QMainWindow):
             self.checksum_preparer,
             self.iso_staging_preparer,
             self.linux_downloader,
+            self.windows_downloader,
         )))
         if active:
             self.status.setText("Stopping…")

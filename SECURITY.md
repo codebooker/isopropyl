@@ -217,6 +217,45 @@ issue requesting a private contact channel without disclosing the vulnerability.
   and no-overwrite publication are rechecked. Downloaded bytes are data only and
   are never executed. Catalog expansion requires new distribution-owned signing
   provenance rather than mirror trust or remote scripts.
+- The Windows downloader is likewise network-inactive until the user selects
+  **Download Windows…**, one immutable catalog object, an exact destination, a
+  source method, and final consent. Its initial scope is only the public Windows
+  11 25H2 v2 consumer multi-edition ISO in English (United States) for x64. The
+  catalog pins the exact Microsoft product/edition/SKU labels, official filename,
+  8,471,603,200-byte length, and Microsoft-published SHA-256. Before a private
+  partial is opened, ISOpropyl fetches the bounded official page as data and
+  requires its one English x64 hash row to equal the bundled pin. This is an
+  HTTPS-published hash, not a detached Microsoft signature; CDN ETags and API
+  metadata are never accepted as an artifact digest.
+- The recommended Windows path asks the user to generate a link in Microsoft's
+  normal browser and paste it into a masked field. ISOpropyl accepts only the
+  exact reviewed CDN origin and filename, canonical `t`/`P1`/`P2`/`P3`/`P4`
+  query, and a bounded future expiry. The complete capability URL, cookies,
+  session ID, and signature query are never logged, displayed after acceptance,
+  stored in settings, or placed in resume state. They are transport state only;
+  resume identity remains the exact filename, size, release ID, language,
+  architecture, and SHA-256. Connector cookies and referers are not forwarded to
+  the CDN, and redirects are disabled.
+- The separately selected direct Windows resolver uses a fresh in-memory cookie
+  jar and fixed exact Microsoft origins. It reads the bounded `mdt.js` response
+  only as untrusted ASCII to extract two opaque challenge fields; no JavaScript,
+  PowerShell, Fido, HTML, or ISO byte is evaluated or executed. Response schemas,
+  list/string sizes, product labels, SKU, architecture, expiration, host, path,
+  and query shape are strict. Microsoft can reject this privacy-minimal path, and
+  ISOpropyl does not retry around regional, policy, entitlement, or anti-abuse
+  decisions. The browser-assisted path remains available.
+- Windows and Linux use the same authority-neutral private `0700` resume stage,
+  singly linked `0600` partial, exact range/length/encoding rules, free-space
+  reserve, complete partial rehash, immediate no-overwrite hardlink commit, and
+  post-commit semantics. Each stage name is derived from the release ID,
+  filename, exact size, and SHA-256, so a future same-filename catalog entry
+  cannot consume another artifact's partial. A checksum mismatch removes only
+  the known-bad bound partial. After Windows publication, a
+  descriptor-identity-bound inspection
+  must prove an ISO9660 x64 Windows installer before the GUI can load it. ISOpropyl
+  never proxies or redistributes Microsoft media, automates account/subscription
+  access, or claims that a download grants a Windows license; Microsoft terms
+  apply and ISOpropyl is unaffiliated with Microsoft.
 - Windows customization can be injected only through the UEFI ISO staging path;
   an existing answer file is never overwritten. A selected WIM/ESD index is
   re-inspected through one inherited no-follow descriptor and bound to its exact

@@ -75,6 +75,10 @@ def small_release(payload: bytes):
     )
 
 
+def resume_stage(root: str | Path, release) -> Path:
+    return Path(root) / downloads._verified.resume_stage_name(release)
+
+
 class LinuxDownloadTests(unittest.TestCase):
     def test_bundled_catalog_is_exact_and_network_inactive(self):
         with patch("urllib.request.urlopen", side_effect=AssertionError("network")):
@@ -247,7 +251,7 @@ class LinuxDownloadTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), payload)
             self.assertEqual(result.path, destination)
             self.assertEqual(result.sha256, release.sha256)
-            self.assertFalse((Path(directory) / f".{release.filename}.isopropyl-download").exists())
+            self.assertFalse(resume_stage(directory, release).exists())
             self.assertEqual(progress[-1], (len(payload), len(payload)))
             self.assertEqual([done for done, _total in progress], sorted(done for done, _total in progress))
 
@@ -256,7 +260,7 @@ class LinuxDownloadTests(unittest.TestCase):
         prefix = payload[:12345]
         with tempfile.TemporaryDirectory() as directory:
             release = small_release(payload)
-            stage = Path(directory) / f".{release.filename}.isopropyl-download"
+            stage = resume_stage(directory, release)
             stage.mkdir(mode=0o700)
             partial = stage / "partial"
             partial.write_bytes(prefix)
@@ -281,7 +285,7 @@ class LinuxDownloadTests(unittest.TestCase):
         updates: list[tuple[int, int]] = []
         with tempfile.TemporaryDirectory() as directory:
             release = small_release(payload)
-            stage = Path(directory) / f".{release.filename}.isopropyl-download"
+            stage = resume_stage(directory, release)
             stage.mkdir(mode=0o700)
             (stage / "partial").write_bytes(b"old")
             (stage / "partial").chmod(0o600)
@@ -298,7 +302,7 @@ class LinuxDownloadTests(unittest.TestCase):
         prefix = payload[:100]
         with tempfile.TemporaryDirectory() as directory:
             release = small_release(payload)
-            stage = Path(directory) / f".{release.filename}.isopropyl-download"
+            stage = resume_stage(directory, release)
             stage.mkdir(mode=0o700)
             partial = stage / "partial"
             partial.write_bytes(prefix)
@@ -320,7 +324,7 @@ class LinuxDownloadTests(unittest.TestCase):
             response = Response(payload, "https://releases.ubuntu.com/other.iso")
             with self.assertRaisesRegex(LinuxDownloadError, "redirected"):
                 self._download(payload, directory, lambda *_args, **_kwargs: response)
-            partial = Path(directory) / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(directory, release) / "partial"
             self.assertTrue(partial.exists())
             self.assertEqual(partial.stat().st_size, 0)
 
@@ -334,7 +338,7 @@ class LinuxDownloadTests(unittest.TestCase):
                     payload, directory,
                     lambda *_args, **_kwargs: Response(wrong, release.image_url),
                 )
-            partial = Path(directory) / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(directory, release) / "partial"
             self.assertFalse(partial.exists())
             self.assertFalse((Path(directory) / release.filename).exists())
 
@@ -401,7 +405,7 @@ class LinuxDownloadTests(unittest.TestCase):
                 )
             self.assertEqual(result.path, destination)
             self.assertEqual(destination.read_bytes(), b"unrelated replacement")
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             self.assertEqual(partial.read_bytes(), payload)
 
     def test_signed_metadata_failure_does_not_create_resume_state(self):
@@ -499,7 +503,7 @@ class LinuxDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             destination = root / release.filename
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
 
             class MutatingEvent(threading.Event):
                 armed = False
@@ -545,7 +549,7 @@ class LinuxDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             destination = root / release.filename
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             calls = 0
 
             def mutate_before_link(path, descriptor):
@@ -580,7 +584,7 @@ class LinuxDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             destination = root / release.filename
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             final_hash_finished = False
             mutated = False
 
@@ -621,7 +625,7 @@ class LinuxDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             destination = root / release.filename
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             verifier_returned = False
             mutated = False
 
@@ -709,7 +713,7 @@ class LinuxDownloadTests(unittest.TestCase):
                 )
             self.assertEqual(result.path, destination)
             self.assertEqual(destination.read_bytes(), payload)
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             self.assertTrue(partial.exists())
             self.assertEqual(destination.stat().st_ino, partial.stat().st_ino)
 
@@ -766,7 +770,7 @@ class LinuxDownloadTests(unittest.TestCase):
                         opener=lambda *_args, **_kwargs: Response(payload, release.image_url),
                     )
             self.assertFalse(destination.exists())
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             self.assertEqual(partial.read_bytes(), payload)
 
     def test_read_error_during_final_prelink_reread_preserves_complete_partial(self):
@@ -796,7 +800,7 @@ class LinuxDownloadTests(unittest.TestCase):
                         opener=lambda *_args, **_kwargs: Response(payload, release.image_url),
                     )
             self.assertFalse(destination.exists())
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             self.assertEqual(partial.read_bytes(), payload)
 
     def test_deadline_during_final_prelink_reread_preserves_complete_partial(self):
@@ -826,7 +830,7 @@ class LinuxDownloadTests(unittest.TestCase):
                         opener=lambda *_args, **_kwargs: Response(payload, release.image_url),
                     )
             self.assertFalse(destination.exists())
-            partial = root / f".{release.filename}.isopropyl-download/partial"
+            partial = resume_stage(root, release) / "partial"
             self.assertEqual(partial.read_bytes(), payload)
 
     def test_default_transport_installs_no_redirect_handler(self):
@@ -938,7 +942,7 @@ class LinuxDownloadTests(unittest.TestCase):
         real_verify = downloads._verify_completed_partial
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            stage = root / f".{release.filename}.isopropyl-download"
+            stage = resume_stage(root, release)
             moved = root / "moved-stage"
 
             def swap_stage(*args, **kwargs):
@@ -965,7 +969,7 @@ class LinuxDownloadTests(unittest.TestCase):
         release = small_release(payload)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            stage = root / f".{release.filename}.isopropyl-download"
+            stage = resume_stage(root, release)
             stage.mkdir(mode=0o700)
             outside = root / "outside"
             outside.write_bytes(b"keep")

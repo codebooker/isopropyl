@@ -22,7 +22,8 @@
     <p>
       It can inspect common boot layouts, calculate and compare checksums, stream
       compressed disk images, explicitly download a signed and verified Ubuntu
-      LTS image, restore validated VTSI sparse disk images, privately
+      LTS image, acquire and hash-verify a pinned public Windows 11 ISO directly
+      from Microsoft, restore validated VTSI sparse disk images, privately
       decode and convert compressed virtual disk images, select Windows WIM/ESD
       editions, customize supported Windows installers,
       add bounded ZIP overlays to eligible ISO-mode media without replacing files,
@@ -59,7 +60,7 @@
   <releases>
     <release version="0.1.0" date="2026-08-27" type="development">
       <description>
-        <p>Initial alpha with DD and UEFI FAT32/UEFI:NTFS ISO writing, a signed Ubuntu LTS downloader, additive ZIP overlays, image analysis, Windows edition selection and customization, raw/VHD/VHDX drive backup, nine restore filesystems, erasure, and media testing.</p>
+        <p>Initial alpha with DD and UEFI FAT32/UEFI:NTFS ISO writing, signed Ubuntu and hash-pinned Microsoft Windows ISO downloaders, additive ZIP overlays, image analysis, Windows edition selection and customization, raw/VHD/VHDX drive backup, nine restore filesystems, erasure, and media testing.</p>
       </description>
     </release>
   </releases>

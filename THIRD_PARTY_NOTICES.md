@@ -28,6 +28,27 @@ AGPL-3.0-or-later through GPLv3/AGPLv3 section 13. Each covered component retain
 its license, and the AGPL network-source requirements apply to the combination.
 Rufus and ISOpropyl provide these commands without warranty.
 
+## Fido Microsoft download protocol reference
+
+- Reviewed source: Fido [`Fido.ps1`](https://github.com/pbatard/Fido/blob/3d47260b8915385c58e20c73e24b36e9a9536f3f/Fido.ps1#L593-L812)
+  at commit `3d47260b8915385c58e20c73e24b36e9a9536f3f`
+- Copyright © 2019–2026 Pete Batard and contributors
+- License: GPL-3.0-or-later
+
+Fido's fixed Microsoft request sequence and exact endpoint behavior informed
+ISOpropyl's independently written, fail-closed Python resolver. ISOpropyl does
+not bundle, download, import, or execute Fido or PowerShell. Microsoft's
+`mdt.js` response is handled only as bounded untrusted text and is never
+evaluated. The GPL-3.0-or-later reference is compatible with this project's
+AGPL-3.0-or-later license through GPLv3/AGPLv3 section 13.
+
+The Windows catalog records public factual release metadata and a SHA-256 from
+[Microsoft's Windows 11 download page](https://www.microsoft.com/en-us/software-download/windows11).
+Microsoft retains all rights in Windows and its services. ISOpropyl downloads
+media directly from Microsoft on the user's machine, does not redistribute it,
+does not grant a Windows license, and is not affiliated with or endorsed by
+Microsoft. Microsoft's terms apply.
+
 ## Ubuntu CD Image signing key
 
 ISOpropyl embeds the public `ubuntu-keyring-2012-cdimage.gpg` keyring solely to

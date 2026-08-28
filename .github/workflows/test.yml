@@ -26,5 +26,8 @@ jobs:
       - run: appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
       - run: python -m json.tool isopropyl/data/bootloaders-v2.json > /dev/null
       - run: python -m json.tool isopropyl/data/distro-write-policies-v1.json > /dev/null
+      - run: python -m json.tool isopropyl/data/linux-images-v1.json > /dev/null
+      - run: python -m json.tool isopropyl/data/windows-images-v1.json > /dev/null
+      - run: cd /tmp && python -c "from isopropyl.windows_downloads import available_windows_images; r = available_windows_images(); assert len(r) == 1 and r[0].filename == 'Win11_25H2_English_x64_v2.iso'"
       - run: python -m pip wheel --no-deps . --wheel-dir /tmp/isopropyl-wheel
-      - run: python -c "import glob,zipfile; n=zipfile.ZipFile(glob.glob('/tmp/isopropyl-wheel/*.whl')[0]).namelist(); assert 'isopropyl/data/io.github.codebooker.isopropyl.svg' in n; assert 'isopropyl/data/distro-write-policies-v1.json' in n; assert any(x.endswith('/THIRD_PARTY_NOTICES.md') for x in n); assert any(x.endswith('/CERTVALIDATOR-MIT.txt') for x in n)"
+      - run: python -c "import glob,zipfile; n=zipfile.ZipFile(glob.glob('/tmp/isopropyl-wheel/*.whl')[0]).namelist(); assert 'isopropyl/data/io.github.codebooker.isopropyl.svg' in n; assert 'isopropyl/data/distro-write-policies-v1.json' in n; assert 'isopropyl/data/windows-images-v1.json' in n; assert any(x.endswith('/THIRD_PARTY_NOTICES.md') for x in n); assert any(x.endswith('/CERTVALIDATOR-MIT.txt') for x in n)"

@@ -141,9 +141,12 @@ evidence.
   workflow and every fallback path with Secure Boot disabled. Add FreeDOS and
   advanced blank bootloader workflows with lawful, verified payload sources.
 - Expand the implemented signed, resumable Ubuntu LTS download profile only with
-  distribution-owned signing metadata and maintained release fixtures. Add a
-  signed opt-in Microsoft ISO downloader separately; never execute remotely
-  supplied scripts.
+  distribution-owned signing metadata and maintained release fixtures. Expand
+  the implemented hash-pinned Windows 11 25H2 v2 English x64 downloader only
+  through reviewed language/release profiles, official live hash provenance,
+  and sanitized service fixtures. Keep the browser-assisted route available,
+  treat connector drift as a hard stop, and never execute remotely supplied
+  scripts.
 
 ## Product quality
 
