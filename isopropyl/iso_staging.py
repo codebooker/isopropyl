@@ -25,12 +25,15 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from .staging_tree import (
+    StagingTreeManifest,
     StagingTreeSafetyError,
+    build_staging_tree_manifest,
     scan_staging_tree,
+    validate_staging_tree_manifest,
 )
 from .boot_identity import (
     BootloaderAnalysis,
@@ -168,6 +171,7 @@ _RENAME_NOREPLACE = 1
 _WIM_PART = re.compile(r"install(?:(?P<number>[2-9][0-9]*))?\.swm", re.IGNORECASE)
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
 _CATALOG_WITNESS_TOKEN = object()
+_RESULT_WITNESS_TOKEN = object()
 _SYSLINUX_BIND_TIMEOUT_SECONDS = 60.0
 
 
@@ -245,8 +249,31 @@ class IsoStagingProgress:
 
 @dataclass(frozen=True)
 class IsoStagingResult:
-    """Published tree metadata; ``catalog_digest`` binds ``staged_entries``."""
+    """Published tree metadata and an optional authenticated tree receipt.
 
+    Syslinux-capable results carry a complete post-publication content manifest.
+    Ordinary UEFI-only staging avoids that additional full-tree hashing cost.
+    """
+
+    destination: Path
+    image_identity: FileIdentity
+    catalog_digest: str
+    directories: int
+    files: int
+    bytes_staged: int
+    wim_parts: tuple[str, ...]
+    autounattend_added: bool
+    tree_manifest: StagingTreeManifest | None = field(default=None, repr=False)
+    _receipt: _PublishedReceipt | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+
+
+@dataclass(frozen=True)
+class _PublishedReceipt:
+    token: object
+    plan: IsoStagingPlan = field(repr=False, compare=False)
+    manifest: StagingTreeManifest = field(repr=False)
     destination: Path
     image_identity: FileIdentity
     catalog_digest: str
@@ -1529,6 +1556,156 @@ def validate_iso_staging_plan(
         raise IsoStagingSafetyError("Could not determine staging free space") from error
 
 
+def validate_published_syslinux_staging(
+    plan: IsoStagingPlan,
+    result: IsoStagingResult,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> StagingTreeManifest:
+    """Reauthenticate one published Syslinux tree without reopening its ISO.
+
+    The ordinary planning validator cannot run after publication because its
+    extraction contract requires a destination that does not yet exist.  This
+    narrower boundary therefore accepts only the exact plan object witnessed by
+    its executor, rejects later WIM/answer-file transforms, and rebuilds the
+    complete descriptor-safe content manifest from the published directory.
+    """
+
+    if cancel_check is not None:
+        cancel_check()
+    if type(plan) is not IsoStagingPlan:
+        raise IsoStagingSafetyError("An exact ISO staging plan is required")
+    receipt = result._receipt if type(result) is IsoStagingResult else None
+    if (
+        type(result) is not IsoStagingResult
+        or type(receipt) is not _PublishedReceipt
+        or receipt.token is not _RESULT_WITNESS_TOKEN
+        or receipt.plan is not plan
+        or receipt.manifest is not result.tree_manifest
+        or (
+            receipt.destination,
+            receipt.image_identity,
+            receipt.catalog_digest,
+            receipt.directories,
+            receipt.files,
+            receipt.bytes_staged,
+            receipt.wim_parts,
+            receipt.autounattend_added,
+        )
+        != (
+            result.destination,
+            result.image_identity,
+            result.catalog_digest,
+            result.directories,
+            result.files,
+            result.bytes_staged,
+            result.wim_parts,
+            result.autounattend_added,
+        )
+    ):
+        raise IsoStagingSafetyError(
+            "An authentic result for this exact ISO staging plan is required",
+        )
+    if (
+        type(plan.syslinux_staging) is not SyslinuxStagingPlan
+        or type(plan.syslinux_c32_bundle) is not BoundBootBundle
+        or type(plan.syslinux_payload_bundle) is not BoundBootBundle
+        or type(plan.syslinux_analysis) is not BootloaderAnalysis
+    ):
+        raise IsoStagingSafetyError(
+            "The published staging plan has no complete Syslinux binding",
+        )
+    if any((
+        plan.wim_source is not None,
+        plan.wim_selection is not None,
+        plan.wimlib_imagex is not None,
+        plan.autounattend_xml is not None,
+        plan.windows_customization is not None,
+        plan.windows_architecture is not None,
+    )):
+        raise IsoStagingSafetyError(
+            "The initial Syslinux image profile does not compose with Windows transforms",
+        )
+    if _validate_write_plan(plan.write_plan, plan.effective_entries) is not None:
+        raise IsoStagingSafetyError(
+            "The initial Syslinux image profile requires an unsplit FAT32 tree",
+        )
+    rebuilt_entries, rebuilt_bytes = _merge_syslinux_staging_catalog(
+        plan.effective_entries,
+        plan.syslinux_staging,
+    )
+    if (
+        rebuilt_entries != plan.staged_entries
+        or rebuilt_bytes != plan.syslinux_content_bytes
+        or _catalog_digest(rebuilt_entries) != plan.staged_catalog_digest
+    ):
+        raise IsoStagingSafetyError(
+            "The published Syslinux catalog binding is inconsistent",
+        )
+
+    scalar_shape = (
+        isinstance(result.destination, Path)
+        and result.destination == plan.destination
+        and result.image_identity == plan.image_identity
+        and result.catalog_digest == plan.staged_catalog_digest
+        and type(result.directories) is int
+        and result.directories > 0
+        and type(result.files) is int
+        and result.files > 0
+        and type(result.bytes_staged) is int
+        and result.bytes_staged >= 0
+        and type(result.wim_parts) is tuple
+        and not result.wim_parts
+        and result.autounattend_added is False
+        and type(result.tree_manifest) is StagingTreeManifest
+    )
+    if not scalar_shape:
+        raise IsoStagingSafetyError(
+            "The published Syslinux result fields are invalid or inconsistent",
+        )
+    manifest = result.tree_manifest
+    assert manifest is not None
+    try:
+        validate_staging_tree_manifest(
+            manifest,
+            cancel_check=cancel_check,
+        )
+    except StagingTreeSafetyError as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    if manifest.root != plan.destination:
+        raise IsoStagingSafetyError(
+            "The published staging manifest belongs to another directory",
+        )
+
+    expected_directories = _expected_directories(plan.staged_entries)
+    actual_directories = {
+        _case_key(item.path): item.path for item in manifest.directories
+    }
+    expected_files = {
+        _case_key(entry.path): _ScannedFile(entry.path, entry.size)
+        for entry in plan.staged_entries
+        if entry.kind is EntryKind.FILE
+    }
+    actual_files = {
+        _case_key(item.path): _ScannedFile(item.path, item.size)
+        for item in manifest.files
+    }
+    if (
+        actual_directories != expected_directories
+        or actual_files != expected_files
+        or result.directories != len(manifest.directories)
+        or result.files != len(manifest.files)
+        or result.bytes_staged != manifest.total_bytes
+        or result.bytes_staged != plan.content_bytes
+    ):
+        raise IsoStagingSafetyError(
+            "The published tree does not match its complete Syslinux staging catalog",
+        )
+    if cancel_check is not None:
+        cancel_check()
+    return manifest
+
+
 @dataclass(frozen=True)
 class _ScannedFile:
     path: str
@@ -2698,6 +2875,30 @@ class IsoStagingExecutor:
                 plan,
                 self._check_cancelled,
             )
+            private_manifest: StagingTreeManifest | None = None
+            if plan.syslinux_staging is not None:
+                manifest_file_limit = (
+                    FAT32_MAX_FILE_SIZE
+                    if plan.write_plan.layout is not None
+                    and plan.write_plan.layout.main_filesystem is FileSystem.FAT32
+                    else None
+                )
+                try:
+                    private_manifest = build_staging_tree_manifest(
+                        tree,
+                        max_file_bytes=manifest_file_limit,
+                        cancel_check=self._check_cancelled,
+                    )
+                except StagingTreeSafetyError as error:
+                    raise IsoStagingSafetyError(str(error)) from error
+                if (
+                    private_manifest.source_directories != directories
+                    or private_manifest.source_files != files
+                    or private_manifest.total_bytes != sum(item.size for item in files)
+                ):
+                    raise IsoStagingSafetyError(
+                        "The private Syslinux tree changed before publication",
+                    )
             _check_parent(plan, parent_fd)
             if os.path.lexists(plan.destination):
                 raise IsoStagingSafetyError("The staging destination appeared before publication")
@@ -2706,6 +2907,26 @@ class IsoStagingExecutor:
             committed = True
             os.fsync(parent_fd)
             total_bytes = sum(item.size for item in files)
+            published_manifest: StagingTreeManifest | None = None
+            if private_manifest is not None:
+                try:
+                    # Publication is the commit point.  Finish the receipt even
+                    # if cancellation arrives now so callers never receive an
+                    # unauthenticated success for an already-visible tree.
+                    published_manifest = build_staging_tree_manifest(
+                        plan.destination,
+                        max_file_bytes=manifest_file_limit,
+                    )
+                except StagingTreeSafetyError as error:
+                    raise IsoStagingSafetyError(str(error)) from error
+                if (
+                    published_manifest.manifest_sha256
+                    != private_manifest.manifest_sha256
+                    or published_manifest.total_bytes != total_bytes
+                ):
+                    raise IsoStagingSafetyError(
+                        "The Syslinux staging tree changed during publication",
+                    )
             result = IsoStagingResult(
                 destination=plan.destination,
                 image_identity=plan.image_identity,
@@ -2715,7 +2936,26 @@ class IsoStagingExecutor:
                 bytes_staged=total_bytes,
                 wim_parts=wim_parts,
                 autounattend_added=answer_added,
+                tree_manifest=published_manifest,
             )
+            if published_manifest is not None:
+                object.__setattr__(
+                    result,
+                    "_receipt",
+                    _PublishedReceipt(
+                        _RESULT_WITNESS_TOKEN,
+                        plan,
+                        published_manifest,
+                        result.destination,
+                        result.image_identity,
+                        result.catalog_digest,
+                        result.directories,
+                        result.files,
+                        result.bytes_staged,
+                        result.wim_parts,
+                        result.autounattend_added,
+                    ),
+                )
             try:
                 progress(IsoStagingProgress(
                     "Complete", "", total_bytes, total_bytes,

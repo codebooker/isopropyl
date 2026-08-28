@@ -791,6 +791,8 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual((result.files, result.bytes_staged), (2, 13))
             self.assertEqual(result.wim_parts, ())
             self.assertFalse(result.autounattend_added)
+            self.assertIsNone(result.tree_manifest)
+            self.assertIsNone(result._receipt)
             self.assertTrue((result.destination / "EFI/BOOT/BOOTX64.EFI").is_file())
             self.assertEqual(updates[-1].stage, "Complete")
             self.assertEqual(updates[-1].fraction, 1.0)
@@ -892,6 +894,54 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual(result.files, 7)
             self.assertTrue(descriptor_reads)
             self.assertTrue(all(descriptor is not None for _, descriptor in descriptor_reads))
+            assert result.tree_manifest is not None
+            self.assertEqual(
+                result.tree_manifest.total_bytes,
+                result.bytes_staged,
+            )
+            with (
+                patch(
+                    "isopropyl.iso_staging.validate_iso_staging_plan",
+                    side_effect=AssertionError("must not reopen the ISO plan"),
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=AssertionError("must not reread the ISO"),
+                ),
+            ):
+                self.assertIs(
+                    iso_staging.validate_published_syslinux_staging(plan, result),
+                    result.tree_manifest,
+                )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "authentic result"):
+                iso_staging.validate_published_syslinux_staging(
+                    plan,
+                    replace(result, bytes_staged=result.bytes_staged + 1),
+                )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "authentic result"):
+                iso_staging.validate_published_syslinux_staging(
+                    replace(plan),
+                    result,
+                )
+
+            readme = result.destination / "README.txt"
+            original = readme.stat()
+            readme.write_bytes(b"other")
+            os.utime(
+                readme,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "changed"):
+                iso_staging.validate_published_syslinux_staging(plan, result)
+            refreshed = replace(
+                result,
+                tree_manifest=iso_staging.build_staging_tree_manifest(
+                    result.destination,
+                ),
+            )
+            self.assertIsNone(refreshed._receipt)
+            with self.assertRaisesRegex(IsoStagingSafetyError, "authentic result"):
+                iso_staging.validate_published_syslinux_staging(plan, refreshed)
 
     def test_syslinux_private_staging_requires_both_exact_bundle_roles(self):
         entries = syslinux_entries()
@@ -916,6 +966,98 @@ class IsoStagingTests(unittest.TestCase):
                         write_plan=write_plan(entries),
                         **kwargs,
                     )
+
+    def test_syslinux_receipt_rejects_same_size_publication_mutation(self):
+        entries = syslinux_entries()
+        payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+        }
+
+        def populate_sources(tree: Path, _image: Path) -> None:
+            for relative, data in payloads.items():
+                tree.joinpath(*Path(relative).parts).write_bytes(data)
+
+        def mutating_publisher(source: Path, destination: Path, parent_fd: int) -> None:
+            iso_staging._rename_noreplace(source, destination, parent_fd)
+            target = destination / "README.txt"
+            before = target.stat()
+            target.write_bytes(b"other")
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    return_value=syslinux_analysis(),
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=lambda _image, member, **_kwargs: payloads[member],
+                ),
+            ):
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    write_plan=write_plan(entries),
+                    syslinux_c32_bundle=syslinux_c32_bundle(),
+                )
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "changed during publication",
+                ):
+                    IsoStagingExecutor(
+                        extractor=FakeExtractor(mutate=populate_sources),
+                        publisher=mutating_publisher,
+                    ).execute(plan)
+            self.assertTrue(plan.destination.is_dir())
+
+    def test_syslinux_receipt_uses_the_selected_filesystem_file_limit(self):
+        entries = syslinux_entries()
+        payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+        }
+
+        def populate_sources(tree: Path, _image: Path) -> None:
+            for relative, data in payloads.items():
+                tree.joinpath(*Path(relative).parts).write_bytes(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_manifest = iso_staging.build_staging_tree_manifest
+            limits = []
+
+            def manifest(*args, **kwargs):
+                limits.append(kwargs.get("max_file_bytes", "omitted"))
+                return real_manifest(*args, **kwargs)
+
+            with (
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    return_value=syslinux_analysis(),
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=lambda _image, member, **_kwargs: payloads[member],
+                ),
+                patch(
+                    "isopropyl.iso_staging.build_staging_tree_manifest",
+                    side_effect=manifest,
+                ),
+            ):
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    write_plan=write_plan(entries, filesystem=FileSystem.NTFS),
+                    syslinux_c32_bundle=syslinux_c32_bundle(),
+                )
+                result = IsoStagingExecutor(
+                    extractor=FakeExtractor(mutate=populate_sources),
+                ).execute(plan)
+            self.assertIsNotNone(result.tree_manifest)
+            self.assertEqual(limits, [None, None])
 
     def test_syslinux_private_staging_reuses_exact_existing_c32(self):
         entries = syslinux_entries(existing_c32=True)
