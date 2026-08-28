@@ -18,7 +18,7 @@ evidence.
    mount conflicts, overlay mutation/CRC/decompression failure, target-resident
    overlay refusal, VTSI expansion and exact-capacity restore, and cleanup failures
    without weakening identity checks.
-3. Certify the shipped GUI raw broker's retained same-descriptor ownership,
+3. Certify the shipped GUI/CLI raw broker's retained same-descriptor ownership,
    PREPARED/COMMIT boundary, cache handling, and failure recovery. Include the
    fast-zero profile's 32 MiB scan/skip behavior, complete all-zero read-back,
    authenticated post-COMMIT cancellation, and identity-gated first/last 16 MiB
@@ -150,6 +150,11 @@ evidence.
 
 ## Product quality
 
+- Extend the implemented safety-equivalent `isopropyl-cli` beyond raw/DD only
+  when a filesystem-aware ISO transaction can preserve the same exact target,
+  staging-residency, transformation-review, and typed-confirmation invariants.
+  Keep unattended destructive confirmation, target indexes, globs, and substring
+  matching out of scope.
 - Continue applying the bounded-worker and stale-result pattern used by device
   discovery to any future host probes that could delay the UI.
 - Localization, system/high-contrast appearance, keyboard and screen-reader QA.

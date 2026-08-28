@@ -36,6 +36,9 @@ Issues = "https://github.com/codebooker/isopropyl/issues"
 [project.gui-scripts]
 isopropyl = "isopropyl.app:main"
 
+[project.scripts]
+isopropyl-cli = "isopropyl.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["isopropyl*"]
 

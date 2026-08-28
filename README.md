@@ -39,6 +39,7 @@ a feature-for-feature replacement.
 | Capability | What ISOpropyl does |
 |---|---|
 | **Authenticated raw writing** | Expands every supported raw input into a private anonymous snapshot, shows its SHA-256 and exact target in a typed confirmation, then uses a guarded PolicyKit transaction with mandatory pre-activation read-back and optional full verification. |
+| **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and a second typed warning for fixed USB disks or risky image profiles. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, and can generate a reviewed `autounattend.xml` for setup, privacy, account, quality-of-life, and Windows 11 Secure Boot policy options. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
@@ -66,6 +67,10 @@ python -m pip install --upgrade pip
 python -m pip install .
 isopropyl
 ```
+
+That installation provides both the Qt application (`isopropyl`) and the
+non-Qt raw writer (`isopropyl-cli`). Both remain unprivileged coordinators; the
+fixed host helper below owns the narrow root transaction.
 
 Raw/DD writes and verified fast zero use ISOpropyl's fixed privileged host
 integration; neither has a pathname-based `dd` fallback. Install that
@@ -102,6 +107,25 @@ For development, replace `python -m pip install .` with
 4. Keep **Verify after writing** enabled, allow private snapshot preparation,
    then check the expanded size, SHA-256, target identity, and warnings in the
    final dialog before typing its exact authorization phrase.
+
+### Write from a terminal
+
+List the protected target inventory, then name one exact whole-disk path:
+
+```bash
+isopropyl-cli list
+isopropyl-cli write path/to/image.iso --target /dev/sdX
+```
+
+The CLI performs the same identity-bound inspection, anonymous expansion,
+PolicyKit transaction, activation ordering, and read-back as the GUI. It refuses
+non-interactive input, target indexes, globs, and automatic confirmation. Full
+post-activation SHA-256 verification is enabled by default. The explicit
+`--no-final-verification` switch retains mandatory pre-activation read-back but
+requires an extra typed warning. Fixed USB HDDs/SSDs require both
+`--include-usb-hard-drives` and that same extra warning; internal disks remain
+ineligible. `SIGINT` and `SIGTERM` request authenticated cancellation and wait for
+the workflow to finish its required cleanup or post-commit verification.
 
 ### Rebuild an eligible ISO
 
@@ -217,8 +241,8 @@ ISOpropyl treats every target write as a destructive transaction:
 - backup, capture, extraction, and staging outputs are created without
   overwriting existing files.
 
-The raw-device broker goes further. Its separate Syslinux, raw/DD, and fast-zero profiles
-bind the kernel's disk-generation sequence before typed confirmation,
+The raw-device broker goes further. Its separate Syslinux, raw/DD, and fast-zero
+profiles bind the kernel's disk-generation sequence before typed confirmation,
 check that generation again through sysfs and `BLKGETDISKSEQ`, and retain one
 exclusive target descriptor through writing, durability, cache invalidation,
 and read-back. Generic raw writes first deactivate a 1 MiB front guard plus the
@@ -226,13 +250,13 @@ source and physical target tail sectors, verify the inactive bulk data, then
 activate the source tail and front guard last. A later failure revalidates the
 same disk generation before attempting to zero every activation region again.
 Linux block `O_EXCL` and `flock` reduce races but do not exclude an uncooperative
-raw writer. The GUI now uses this broker exclusively for plain, compressed,
+raw writer. The GUI and CLI use this broker exclusively for plain, compressed,
 VTSI, virtual, and compressed-virtual raw inputs, but the backend remains alpha
 software pending installed-integration VM race/hot-swap tests and representative
 physical-media certification.
 
-See [SECURITY.md](https://github.com/codebooker/isopropyl/blob/main/SECURITY.md) for the complete threat model and private
-vulnerability-reporting guidance.
+See [SECURITY.md](https://github.com/codebooker/isopropyl/blob/main/SECURITY.md)
+for the complete threat model and private vulnerability-reporting guidance.
 
 ## Requirements
 
@@ -241,7 +265,7 @@ Core requirements:
 - Linux, Python 3.10 or newer, and PyQt6 6.5 through 6.x;
 - `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`
   (`dd` remains used by bounded backup, optical, erase, and constructed-media
-  tools, but not by the GUI raw-image writer);
+  tools, but not by the GUI or CLI raw-image writer);
 - 7-Zip (`7z`) for bounded ISO cataloging and extraction; and
 - `sfdisk` plus `mkfs.vfat` for FAT32 ISO mode, or `mkfs.ntfs` for large-file
   UEFI:NTFS media.
@@ -271,24 +295,24 @@ optional tools disable the relevant path instead of weakening validation.
 
 ## Privileged host integration
 
-The GUI raw/DD path transfers only a fully allocated, re-attested anonymous
-snapshot to a fixed root-owned helper. It supports images shorter than the
-target, mandatory pre-activation verification, optional complete final
+The GUI and CLI raw/DD paths transfer only a fully allocated, re-attested
+anonymous snapshot to a fixed root-owned helper. They support images shorter
+than the target, mandatory pre-activation verification, optional complete final
 verification, and stale physical-tail sanitation. The same helper also contains
 a separate backend-only path for a narrowly supported Syslinux FAT32 image.
 These privileged paths are:
 
 - not installed by `pip install` or the ordinary `make install` target;
-- required for every GUI raw/DD write, with failure closed when the exact host
-  integration is missing or unsafe;
+- required for every GUI or CLI raw/DD write, with failure closed when the exact
+  host integration is missing or unsafe;
 - limited to eligible removable or explicitly revealed external USB media and
   512-byte logical sectors (the Syslinux profile additionally requires exact
   matched 6.03/6.04 payloads); and
 - still gated on native-helper hardening, an installed PolicyKit integration
   test, QEMU SeaBIOS/OVMF results, and representative physical media.
 
-Distribution integrators can stage the isolated launcher, helper, and two exact
-PolicyKit actions with `make install-host-helper PREFIX=/usr`. Source testers
+Distribution integrators can stage the isolated launcher, helper, and three
+exact PolicyKit actions with `make install-host-helper PREFIX=/usr`. Source testers
 must invoke it with root privileges as shown above. It does not make alpha media
 writes risk-free; test with expendable media and keep verification enabled.
 

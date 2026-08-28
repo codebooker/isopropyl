@@ -28,7 +28,7 @@ issue requesting a private contact channel without disclosing the vulnerability.
   and the restore dialog selects GPT when reported geometry makes that conclusion
   possible. Missing sector metadata remains provisional until the pre-unmount
   discovery check.
-- The image pathname selected in the UI is bound by device, inode, size, mtime,
+- The image pathname selected in the GUI or CLI is bound by device, inode, size, mtime,
   and ctime to the completed inspection, rechecked after final DD consent, and
   passed as an expected identity into the writer's one `O_NOFOLLOW` descriptor.
   Raw and compressed bytes are streamed from that descriptor, never reopened by
@@ -569,10 +569,10 @@ QEMU/SeaBIOS and OVMF results, hot-swap/unplug races, and representative physica
 media remain mandatory before the GUI can offer BIOS construction. Until then,
 hybrid media should use verified DD mode to preserve their existing layout.
 
-## GUI raw/DD broker boundary
+## GUI and CLI raw/DD broker boundary
 
 The generic raw profile is separate from the backend-only Syslinux profile and
-is the GUI's sole DD/raw executor. It has no legacy writer fallback. Every
+is the GUI and CLI's sole DD/raw executor. It has no legacy writer fallback. Every
 plain, compressed, VTSI, virtual, or compressed-virtual input is bound through
 one already-open outer-source descriptor and expanded into one stable private
 `0700` snapshot workspace. Planning binds source device, inode, size, mtime,
@@ -599,6 +599,28 @@ transition on that same disk generation. The expanded source is capped at
 64 TiB; the target is independently capped at 64 PiB and may be larger than the
 source. Images smaller than 1024 bytes or not aligned to 512 bytes fail before
 confirmation under this initial protocol.
+
+The headless entry point adds no alternate authority. It accepts only one
+canonical exact `/dev/...` path that uniquely matches the same protected device
+inventory; indexes, globs, substrings, internal/root-backed disks, read-only
+targets, and non-hot-pluggable fixed disks are rejected before a workflow is
+created. Fixed hot-pluggable USB HDDs/SSDs require an explicit command-line flag
+and an extra exact preparation phrase. Risky raw profiles and the explicit
+full-final-verification opt-out require that same second interactive boundary.
+The final phrase comes only from the authoritative target plan and is compared
+before `confirm()` is invoked. Standard input must be a terminal, so pipes and
+unattended jobs cannot approve erasure.
+
+CLI inspection first freezes source device, inode, size, mtime, and ctime, passes
+that identity into `inspect_image()`, and rechecks it after exact target
+discovery. The CLI never imports Qt, invokes `dd`, constructs helper messages, or
+calls the privileged protocol directly. Its `SIGINT`/`SIGTERM` handler only sets
+a cooperative cancellation event; a pre-existing watcher thread calls the bound
+workflow's lock-taking `cancel()` outside signal-handler context. The synchronous
+caller then waits for that dispatch and the same pre-COMMIT cancellation,
+authenticated cleanup, or post-COMMIT verified completion rules described below.
+Terminal device listings omit serial/WWN values, while the privileged plan still
+binds them internally.
 
 The user-side coordinator verifies one separate exact PolicyKit action whose
 prompt states that caller-supplied data will overwrite the selected target. It
@@ -631,7 +653,7 @@ between a shorter source and the physical target tail. `O_EXCL` and `flock` do
 not stop a hostile or uncooperative nonexclusive block writer. Native-helper,
 installed PolicyKit/SCM_RIGHTS VM, cache/power-loss, hot-unplug, replacement,
 large-media, and physical boot tests remain mandatory for release confidence.
-All GUI raw, compressed, virtual, and VTSI inputs now use this broker, and a
+All GUI and CLI raw, compressed, virtual, and VTSI inputs now use this broker, and a
 failed or unavailable broker transaction never falls back to the legacy DD path.
 
 ## Fast-zero boundary
