@@ -421,9 +421,12 @@ issue requesting a private contact channel without disclosing the vulnerability.
 - Diagnostics omit drive identifiers, mount paths, ISO member lists, and logs by
   default. ISOpropyl contains no telemetry.
 
-## Experimental backend-only Syslinux BIOS boundary
+## Experimental Syslinux BIOS developer boundary
 
-The GUI-facing BIOS path remains disabled. Its implemented groundwork accepts
+Ordinary GUI launches keep the BIOS path disabled. A per-process
+`ISOPROPYL_EXPERIMENTAL_SYSLINUX=1` developer opt-in may expose only this narrow
+profile; the variable grants no privilege and bypasses none of the receipts,
+PolicyKit, target, or read-back checks below. The implemented boundary accepts
 only exact Syslinux `6.03-2014-10-06` or `6.04-pre1` immutable bundles whose
 family, purpose, license, provenance, artifact order, size, catalog digest, and
 fresh SHA-256 all match a second consumer-local pin set. It reproduces upstream's
@@ -483,8 +486,10 @@ accounting to match. A second exact-byte pass immediately precedes publication;
 the existing final-tree scan separately covers later WIM and answer-file
 transformations. The initial profile requires every Syslinux identity, config,
 and reused C32 byte to originate in the base ISO; overlay/embedded-origin
-evidence fails closed. It never downloads a bundle, replaces media content, or
-authorizes a device write; the normal GUI caller supplies neither Syslinux bundle.
+evidence fails closed. The staging policy itself never downloads a bundle,
+replaces media content, or authorizes a device write. The developer workflow
+obtains both exact bundles only after explicit consent, retains their immutable
+bytes through confirmation, and has no system-tool or prefix-match fallback.
 
 The next boundary is now executable only on an already-open, owner-only `0600`
 anonymous regular file with zero directory links, `O_RDWR` access, no `O_APPEND`,
@@ -548,8 +553,8 @@ For the supported Syslinux staging profile, matching full-content manifests are
 built immediately before and after atomic publication. A non-init receipt binds
 the exact originally minted manifest, staging-plan identity, public result
 fields, and final namespace; cloned/refreshed result dataclasses lose authority.
-The backend-only composite revalidates that live receipt without reopening the
-ISO, binds both exact bundle roles, the selected root or nested config directory,
+The developer-preview composite revalidates that live receipt without reopening
+the ISO, binds both exact bundle roles, the selected root or nested config directory,
 root loader, and private FAT32 plan, then performs builder → patch → final
 attestation without exposing an unpatched owner. Its public entry point accepts
 no injectable builder or transaction capable of retaining the anonymous
@@ -572,8 +577,9 @@ receipts prevent in-process substitution; they are not serialized privilege
 credentials. Planning and confirmation do not prepare an image, unmount, or open
 the target for I/O.
 
-A separately installed root-owned executor now implements that boundary without
-making it GUI-reachable. The unprivileged coordinator verifies fixed root-owned
+A separately installed root-owned executor implements that boundary. It is
+reachable from the GUI only after the explicit developer opt-in. The unprivileged
+one-shot coordinator verifies fixed root-owned
 paths and one exact PolicyKit action, prepares and re-attests the anonymous image,
 unmounts, mints a fresh target receipt, and transfers the source descriptor over
 an authenticated `AF_UNIX/SOCK_SEQPACKET` channel. No target pathname crosses the
@@ -599,8 +605,11 @@ identity checks. It durably blanks only the legacy MBR/primary GPT header, then
 durably blanks the standard backup GPT header at the final LBA; it does not wipe
 a broad live-data tail. An interruption between those metadata steps occurs
 before source streaming and can leave the old GPT recoverable from its backup.
-It then writes all non-activation bytes, flushes and invalidates caches, verifies them,
-rechecks the disk generation, and writes sector zero last. A second flush/cache
+It then writes all non-activation bytes, flushes and invalidates caches, verifies
+them, rechecks the disk generation, and exact-reads sector zero to prove all 512
+bytes are still inactive before writing the source MBR last. A failed inactive
+proof takes the same durable emergency-deactivation path and never activates the
+source MBR. A second flush/cache
 invalidation and full SHA-256 read-back are mandatory. Post-activation failures
 attempt same-descriptor MBR deactivation only after the disk generation and
 geometry are re-established; cleanup is skipped and reported if media identity
@@ -610,13 +619,18 @@ Linux block `O_EXCL` excludes competing exclusive holders, and `flock` coordinat
 lock-aware peers; neither is absolute ownership against an uncooperative raw
 `O_RDWR` writer. The Python helper is therefore provisional. A native hardened
 implementation, installed pkexec/PolicyKit+SCM_RIGHTS testing in a root-owned VM,
-QEMU/SeaBIOS and OVMF results, hot-swap/unplug races, and representative physical
-media remain mandatory before the GUI can offer BIOS construction. Until then,
+OVMF retained-UEFI results, hot-swap/unplug races, and representative physical
+media remain mandatory before normal GUI exposure. The device-free production
+pipeline locally passed a sealed, networkless QEMU TCG/SeaBIOS
+bootstrap/config-prompt certificate on 2026-08-28; the retained observation
+records the exact QEMU version and SHA-256 and therefore depends on trust in that
+emulator binary. This is not device-helper, UEFI, operating-system, or
+physical-media certification. Until the remaining gates close,
 hybrid media should use verified DD mode to preserve their existing layout.
 
 ## GUI and CLI raw/DD broker boundary
 
-The generic raw profile is separate from the backend-only Syslinux profile and
+The generic raw profile is separate from the default-off Syslinux developer profile and
 is the GUI and CLI's sole DD/raw executor. It has no legacy writer fallback. Every
 plain, compressed, VTSI, virtual, or compressed-virtual input is bound through
 one already-open outer-source descriptor and expanded into one stable private

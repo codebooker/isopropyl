@@ -83,6 +83,7 @@ syslinux_fat.py
 syslinux_iso_fat32.py
 syslinux_staging.py
 syslinux_transaction.py
+syslinux_workflow.py
 timestamps.py
 uefi.py
 uefi_ntfs.py

@@ -500,7 +500,7 @@ def _validate_static_relationships(
     private = plan.composite_plan.private_plan
     expected_profile = _firmware_profile(plan.composite_plan)
     expected_warnings = _warnings(plan.device, expected_profile)
-    expected_phrase = f"WRITE BIOS {plan.device.path} {plan.device.major_minor}"
+    expected_phrase = f"WRITE DUAL {plan.device.path} {plan.device.major_minor}"
     for label, value in (
         ("composite plan", plan.composite_plan_sha256),
         ("private plan", plan.private_plan_sha256),
@@ -610,7 +610,7 @@ def build_syslinux_device_write_plan(
         True,
         REQUIRED_EXECUTOR_PROFILE,
         _warnings(device, firmware_profile),
-        f"WRITE BIOS {device.path} {device.major_minor}",
+        f"WRITE DUAL {device.path} {device.major_minor}",
         "",
     )
     plan = SyslinuxDeviceWritePlan(

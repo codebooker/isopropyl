@@ -1378,9 +1378,39 @@ def execute_helper_transaction(
         )
 
         # Sector zero is the commit marker.  It is written only after the rest
-        # of the image is durable and verified, then durability/cache eviction
-        # and a complete physical-path read-back are required again.
+        # of the image is durable and verified.  Prove that cache invalidation
+        # did not expose stale activation metadata before writing the marker.
+        # From this proof onward, every failure takes the durable emergency
+        # deactivation path because sector zero must be treated as potentially
+        # active even when the proof itself fails.
         activation_attempted = True
+        inactive_mbr = bytearray()
+        while len(inactive_mbr) < SECTOR_SIZE:
+            wanted = SECTOR_SIZE - len(inactive_mbr)
+            try:
+                block = operations.pread(
+                    target_descriptor,
+                    wanted,
+                    len(inactive_mbr),
+                )
+            except InterruptedError:
+                continue
+            except OSError as error:
+                raise HelperVerificationError(
+                    _bounded(error, "The inactive target MBR read-back failed"),
+                ) from error
+            if type(block) is not bytes or not block or len(block) > wanted:
+                raise HelperVerificationError(
+                    "The inactive target MBR read-back made invalid progress",
+                )
+            inactive_mbr.extend(block)
+        if any(inactive_mbr):
+            raise HelperVerificationError(
+                "The target sector zero is not inactive before MBR activation",
+            )
+
+        # After activation, durability/cache eviction and a complete
+        # physical-path read-back are required again.
         _write_exact(
             target_descriptor,
             source_mbr,

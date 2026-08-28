@@ -147,7 +147,7 @@ class SyslinuxDevicePlanTests(unittest.TestCase):
         self.assertEqual(plan.required_executor_profile, REQUIRED_EXECUTOR_PROFILE)
         self.assertEqual(
             plan.confirmation_phrase,
-            "WRITE BIOS /dev/sdz 65:144",
+            "WRITE DUAL /dev/sdz 65:144",
         )
         self.assertEqual(len(plan.plan_sha256), 64)
         self.assertIn("permanently erased", plan.warnings[0])
@@ -167,7 +167,7 @@ class SyslinuxDevicePlanTests(unittest.TestCase):
         for wrong in (
             plan.confirmation_phrase.lower(),
             plan.confirmation_phrase + " ",
-            "WRITE BIOS /dev/sdy 65:144",
+            "WRITE DUAL /dev/sdy 65:144",
             "",
         ):
             with self.subTest(wrong=wrong), self.assertRaisesRegex(

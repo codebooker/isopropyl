@@ -340,6 +340,13 @@ class SyslinuxDeviceWriteRunner:
         with self._process_lock:
             self._process = process
 
+    @property
+    def committed(self) -> bool:
+        """Whether the helper has crossed the irreversible COMMIT boundary."""
+
+        with self._process_lock:
+            return self._commit_sent
+
     def cancel(self) -> None:
         with self._process_lock:
             self._cancelled.set()

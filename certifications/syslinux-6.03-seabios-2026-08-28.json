@@ -1,0 +1,134 @@
+{
+  "bootloader_bundles": [
+    {
+      "artifacts": [
+        {
+          "name": "ldlinux.c32",
+          "sha256": "5cef9ad0d0ca04097262241686c6c3a7306ab9b9cdf24b9d4ee3b16af01a5af2",
+          "size": 122308
+        }
+      ],
+      "family": "syslinux",
+      "license": "GPL-2.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.03",
+      "purpose": "blank-bios-module",
+      "version": "6.03-2014-10-06"
+    },
+    {
+      "artifacts": [
+        {
+          "name": "ldlinux.bss",
+          "sha256": "8814e576abc1aa44dde943b0caaee833a5810142614adeeb4cc725e78a5045b7",
+          "size": 512
+        },
+        {
+          "name": "ldlinux.sys",
+          "sha256": "3f1206e0cc45dbe180e73adaeb221bfc7d5a800095738549390379d7d0282ac3",
+          "size": 68599
+        }
+      ],
+      "family": "syslinux",
+      "license": "GPL-2.0-or-later",
+      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.03",
+      "purpose": "matched-bios-payloads",
+      "version": "6.03-2014-10-06"
+    }
+  ],
+  "capture": {
+    "elapsed_seconds": 0.409,
+    "method": "qemu-curses-private-pty-80x25-screen",
+    "terminal_stream_bytes": 558
+  },
+  "certified": true,
+  "isolation": {
+    "acceleration": "tcg",
+    "attached_host_block_devices": [],
+    "firmware": "SeaBIOS",
+    "network": "none",
+    "qemu_executable_set_id": false,
+    "qemu_seccomp": true,
+    "qemu_seccomp_policy": "on,obsolete=deny,spawn=deny,resourcecontrol=deny",
+    "snapshot": true,
+    "source_read_only": true,
+    "source_sealed_memfd": true,
+    "unprivileged_process": true
+  },
+  "markers": [
+    "Booting from Hard Disk...",
+    "SYSLINUX 6.03",
+    "ISOPROPYL-SYSLINUX-6.03-CERTIFIED",
+    "boot:"
+  ],
+  "pipeline": {
+    "bytes_verified": 238157,
+    "composite_plan_sha256": "b1da9076db81283be82b1121d7c335cb53ed6fe8eaf989584f82b18a59bb976c",
+    "directories_verified": 3,
+    "files_verified": 6,
+    "final_image_sha256": "78a06a27f5f677545c66d33db5c063bd417ba44098390fb322e2cd17c5793ed2",
+    "final_manifest_sha256": "612c23ec7b98c3e7ab30ceb9115ad92e227751f14d1d824ffb0024dea332764f",
+    "private_plan_sha256": "99270020d34b98ac2ea4a0193bf89f76e9cb46067988e0a311f9c780d30f9737",
+    "staging_catalog_sha256": "e54b218c453368c15a3d134a6ba86bc00fec27720d6e4035ea27f679ac4d8b4e",
+    "staging_manifest_sha256": "cf07918dd9e97592d06ee054fe38ac8bb4504c64cd19e57159657f0dda30316a",
+    "transaction_plan_sha256": "b9254440e9c8c59c5c362b6f1c1c42b8a2b23fa9d4b7517474c4c46547efcd2b",
+    "unpatched_image_sha256": "24eac54e77bacaf17320807e8164ab0d2230723c84dbabfc637b9daad17ef39d"
+  },
+  "prepared_image": {
+    "sealed_memfd": true,
+    "sha256": "78a06a27f5f677545c66d33db5c063bd417ba44098390fb322e2cd17c5793ed2",
+    "size": 36888576
+  },
+  "profile": "syslinux-6.03-extracted-iso-fat32-seabios",
+  "qemu": {
+    "executable": "/usr/bin/qemu-system-x86_64",
+    "sha256": "0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc",
+    "version": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)"
+  },
+  "schema_version": 1,
+  "scope": {
+    "bios_bootstrap_and_config_certified": true,
+    "kernel_or_operating_system_certified": false,
+    "physical_media_certified": false,
+    "privileged_device_transaction_certified": false,
+    "secure_boot_certified": false,
+    "uefi_certified": false
+  },
+  "source_archive": {
+    "filename": "syslinux-6.03.tar.xz",
+    "members": [
+      {
+        "archive_path": "syslinux-6.03/bios/core/isolinux.bin",
+        "artifact_name": "isolinux.bin",
+        "sha256": "c5e4e775a7aada9aa2b227806724c52c66625b88699b3f167b5ec690a7addb91",
+        "size": 45056
+      },
+      {
+        "archive_path": "syslinux-6.03/bios/core/ldlinux.bss",
+        "artifact_name": "ldlinux.bss",
+        "sha256": "8814e576abc1aa44dde943b0caaee833a5810142614adeeb4cc725e78a5045b7",
+        "size": 512
+      },
+      {
+        "archive_path": "syslinux-6.03/bios/core/ldlinux.sys",
+        "artifact_name": "ldlinux.sys",
+        "sha256": "3f1206e0cc45dbe180e73adaeb221bfc7d5a800095738549390379d7d0282ac3",
+        "size": 68599
+      },
+      {
+        "archive_path": "syslinux-6.03/bios/com32/elflink/ldlinux/ldlinux.c32",
+        "artifact_name": "ldlinux.c32",
+        "sha256": "5cef9ad0d0ca04097262241686c6c3a7306ab9b9cdf24b9d4ee3b16af01a5af2",
+        "size": 122308
+      }
+    ],
+    "sha256": "26d3986d2bea109d5dc0e4f8c4822a459276cf021125e8c9f23c3cca5d8c850e",
+    "size": 6855224,
+    "upstream_checksum_url": "https://www.kernel.org/pub/linux/utils/boot/syslinux/sha256sums.asc",
+    "upstream_url": "https://www.kernel.org/pub/linux/utils/boot/syslinux/syslinux-6.03.tar.xz"
+  },
+  "source_iso": {
+    "inert_uefi_fixture": true,
+    "sha256": "55dfd14a7d2c92eaad578ae1bc59894434853406a7630094694f85f8593e5310",
+    "size": 423936,
+    "uefi_certified": false
+  }
+}

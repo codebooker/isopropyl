@@ -454,6 +454,10 @@ def read_archive_member_with_7z(
         if process.poll() is None:
             process.kill()
             process.wait()
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
 
 
 def analyze_iso_bootloaders(

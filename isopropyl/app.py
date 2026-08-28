@@ -38,7 +38,8 @@ from .dbx import (
     StagedDbxPayload, assess_staged_dbx, merge_staged_dbx_analyses,
 )
 from .bootloaders import (
-    CatalogError, bundle_for_dependency, delete_cached_artifacts, inventory_cache,
+    BoundBootBundle, CatalogError, bundle_for_dependency,
+    delete_cached_artifacts, inventory_cache, load_catalog, prepare_bundle,
 )
 from .casper_media import (
     CasperMediaCancelled, CasperMediaExecutor, CasperStagingExecutor,
@@ -131,6 +132,17 @@ from .settings import (
     SettingsStore, application_settings, parse_application_arguments,
     portable_settings_path, settings_sync_error, settings_sync_was_committed,
 )
+from .syslinux_device import (
+    SyslinuxDeviceWritePlan,
+)
+from .syslinux_device_runner import (
+    SyslinuxDeviceHelperUnavailable, SyslinuxDeviceWriteResult,
+    resolve_syslinux_helper_installation,
+)
+from .syslinux_transaction import MAX_SYSLINUX_REGULAR_IMAGE_BYTES
+from .syslinux_workflow import (
+    SyslinuxWorkflowError, SyslinuxWorkflowInputs, SyslinuxWriteWorkflow,
+)
 from .writer import WriteCancelled
 from .uefi import SignatureTableState
 from .uefi_ntfs import (
@@ -185,6 +197,14 @@ class PendingIsoWrite:
     persistence_profile: CasperCompatibilityProfile | None = None
     persistence_bytes: int = 0
     runtime_validation: PreparedRuntimeValidation | None = None
+    syslinux_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedSyslinuxWrite:
+    pending: PendingIsoWrite
+    workflow: SyslinuxWriteWorkflow
+    plan: SyslinuxDeviceWritePlan
 
 
 @dataclass
@@ -236,6 +256,7 @@ class IsoStagingPreparationRequest:
     persistence_profile: CasperCompatibilityProfile | None
     persistence_bytes: int
     runtime_validation_requested: bool = False
+    syslinux_dependency_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -306,6 +327,8 @@ class Bridge(QObject):
     checksums_finished = pyqtSignal(object, object)
     zip_overlay_finished = pyqtSignal(object, object)
     iso_staging_preparation_finished = pyqtSignal(object, object)
+    syslinux_preparation_finished = pyqtSignal(object, object)
+    syslinux_execution_finished = pyqtSignal(object, object)
     staged_dbx_confirmation_requested = pyqtSignal(object)
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
@@ -374,6 +397,8 @@ class Window(QMainWindow):
         self.optical_runner: OpticalCaptureRunner | None = None
         self.extractor: SafeIsoExtractor | None = None
         self.iso_stager: IsoStagingExecutor | None = None
+        self.syslinux_workflow: SyslinuxWriteWorkflow | None = None
+        self.syslinux_confirmation_dialog: QDialog | None = None
         self.windows_wim_extractor: SafeIsoExtractor | None = None
         self.constructed_writer: ConstructedMediaExecutor | None = None
         self.uefi_ntfs_writer: UefiNtfsExecutor | None = None
@@ -417,6 +442,12 @@ class Window(QMainWindow):
         self.bridge.zip_overlay_finished.connect(self.on_zip_overlay_finished)
         self.bridge.iso_staging_preparation_finished.connect(
             self.on_iso_staging_preparation_finished
+        )
+        self.bridge.syslinux_preparation_finished.connect(
+            self.on_syslinux_preparation_finished
+        )
+        self.bridge.syslinux_execution_finished.connect(
+            self.on_syslinux_execution_finished
         )
         self.bridge.staged_dbx_confirmation_requested.connect(
             self.on_staged_dbx_confirmation_requested
@@ -2659,6 +2690,7 @@ class Window(QMainWindow):
             self.optical_runner,
             self.extractor,
             self.iso_stager,
+            self.syslinux_workflow,
             self.windows_wim_extractor,
             self.constructed_writer,
             self.uefi_ntfs_writer,
@@ -2908,6 +2940,97 @@ class Window(QMainWindow):
             image, device.path, device.identity,
         )
         self.start_constructed_iso_write(list(base_entries), plan)
+
+    def eligible_syslinux_dependency(
+        self,
+        inspection: ImageInspection,
+        write_plan: WritePlan,
+        device: Device,
+    ) -> str | None:
+        """Return the exact optional Syslinux BIOS dependency for this write.
+
+        The first GUI profile deliberately upgrades an otherwise executable
+        native UEFI/FAT32 plan to dual firmware.  It never broadens the normal
+        planner or relaxes the backend's removable/512-byte/size policy.
+        """
+
+        layout = write_plan.layout
+        dependency = inspection.bootloader_dependency
+        if (
+            inspection.bootloader != "Syslinux/Isolinux"
+            or inspection.bootloader_identity_ambiguous
+            or type(dependency) is not str
+            or not dependency.startswith("syslinux:")
+            or dependency.count(":") != 1
+            or layout is None
+            or layout.boot_strategy is not BootStrategy.IMAGE_NATIVE
+            or layout.main_filesystem.value != "fat32"
+            or layout.partition_count != 1
+            or layout.bios_bootable
+            or not layout.uefi_bootable
+            or write_plan.transformations
+            or not write_plan.executable
+            or not device.removable
+            or device.read_only
+            or device.transport not in {"usb", "mmc"}
+            or device.logical_sector_size != 512
+            or device.size <= 0
+            or device.size > MAX_SYSLINUX_REGULAR_IMAGE_BYTES
+            or device.size % 512
+            or self.windows_options.enabled
+            or self.zip_overlay_plan is not None
+            or inspection.embedded_uefi_fat is not None
+            or self.selected_persistence_bytes()
+            or self.runtime_validation.isChecked()
+        ):
+            return None
+        try:
+            bundle = bundle_for_dependency(dependency)
+            catalog_details = self.syslinux_catalog_details(dependency)
+        except CatalogError:
+            return None
+        return dependency if bundle is not None and catalog_details is not None else None
+
+    @staticmethod
+    def experimental_syslinux_gui_enabled() -> bool:
+        """Require an explicit per-process opt-in while the helper is provisional."""
+
+        return os.environ.get("ISOPROPYL_EXPERIMENTAL_SYSLINUX") == "1"
+
+    @staticmethod
+    def syslinux_catalog_details(
+        dependency: str,
+    ) -> tuple[int, tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None:
+        """Summarize both immutable bundles without touching the cache/network."""
+
+        if type(dependency) is not str or dependency.count(":") != 1:
+            return None
+        family, version = dependency.split(":", 1)
+        if family != "syslinux" or not version:
+            return None
+        catalog = load_catalog()
+        bundles = tuple(
+            catalog.find_bundle(family, version, purpose)
+            for purpose in ("blank-bios-module", "matched-bios-payloads")
+        )
+        if any(bundle is None for bundle in bundles):
+            return None
+        resources = []
+        for bundle in bundles:
+            assert bundle is not None
+            for name in bundle.artifact_names:
+                resource = catalog.find(family, version, name)
+                if resource is None:
+                    return None
+                resources.append(resource)
+        return (
+            sum(resource.size for resource in resources),
+            tuple(resource.name for resource in resources),
+            tuple(dict.fromkeys(bundle.license for bundle in bundles if bundle)),
+            tuple(dict.fromkeys(
+                bundle.provenance_url for bundle in bundles if bundle
+            )),
+        )
 
     def start_write(
         self,
@@ -3194,6 +3317,14 @@ class Window(QMainWindow):
             self.refresh_devices()
 
     def on_progress(self, done: int, total: int, stage: str) -> None:
+        if (
+            self.syslinux_workflow is not None
+            and stage.split(" ·", 1)[0]
+            in {"writing", "preactivation-readback", "readback"}
+        ):
+            # These phases are observed only after the helper's COMMIT.  A late
+            # cancel cannot safely interrupt durability/read-back and is deferred.
+            self.cancel_button.setEnabled(False)
         if total <= 0:
             self.progress.setValue(0)
             self.status.setText(f"{stage}…")
@@ -3228,6 +3359,11 @@ class Window(QMainWindow):
         self.optical_runner = None
         self.extractor = None
         self.iso_stager = None
+        syslinux_workflow = self.syslinux_workflow
+        self.syslinux_workflow = None
+        if syslinux_workflow is not None:
+            syslinux_workflow.close()
+        self.syslinux_confirmation_dialog = None
         self.iso_staging_preparer = None
         self.iso_staging_token = None
         self.windows_wim_extractor = None
@@ -3319,6 +3455,7 @@ class Window(QMainWindow):
             self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner, self.extractor,
             self.iso_stager, self.constructed_writer,
+            self.syslinux_workflow,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
             self.uefi_shell_preparer,
@@ -3339,6 +3476,8 @@ class Window(QMainWindow):
                 self.raw_confirmation_dialog.reject()
             if self.fast_zero_confirmation_dialog is not None:
                 self.fast_zero_confirmation_dialog.reject()
+            if self.syslinux_confirmation_dialog is not None:
+                self.syslinux_confirmation_dialog.reject()
         elif was_inspecting:
             self.status.setText("Image inspection cancelled")
             self.image_detail.setText("Image inspection cancelled")
@@ -5021,7 +5160,9 @@ class Window(QMainWindow):
                 if matching_bundle is not None:
                     detail_lines.append(
                         "A hash-pinned matching payload bundle is cataloged; "
-                        "BIOS installation remains disabled until its media executor is audited"
+                        "the default-off developer preview includes a SeaBIOS-certified "
+                        "6.03 path that can add legacy BIOS while retaining UEFI "
+                        "(6.04, native-helper, and physical-media certification remain)"
                     )
             elif self.inspection.bootloader_identity_ambiguous:
                 detail_lines.append(
@@ -5836,6 +5977,69 @@ class Window(QMainWindow):
             )
             if warning != QMessageBox.StandardButton.Yes:
                 return
+        syslinux_dependency_key = self.eligible_syslinux_dependency(
+            inspection,
+            write_plan,
+            device,
+        )
+        if not self.experimental_syslinux_gui_enabled():
+            syslinux_dependency_key = None
+        if syslinux_dependency_key is not None:
+            version = syslinux_dependency_key.split(":", 1)[1]
+            try:
+                catalog_details = self.syslinux_catalog_details(
+                    syslinux_dependency_key
+                )
+            except CatalogError:
+                catalog_details = None
+            if catalog_details is None:
+                QMessageBox.warning(
+                    self,
+                    "BIOS compatibility unavailable",
+                    "The complete matching Syslinux bundle is not present in "
+                    "ISOpropyl's validated catalog. No target was changed.",
+                )
+                return
+            bundle_bytes, artifact_names, licenses, provenance_urls = catalog_details
+            answer = QMessageBox.question(
+                self,
+                "Experimental legacy BIOS compatibility",
+                f"This ISO contains an exact Syslinux/Isolinux {version} build. "
+                "ISOpropyl can add a separately verified legacy-BIOS boot path "
+                "while retaining the image's UEFI files.\n\n"
+                f"Artifacts: {', '.join(artifact_names)} "
+                f"({self.display_size(bundle_bytes)} total)\n"
+                f"License: {', '.join(licenses)}\n"
+                "Pinned provenance:\n• "
+                + "\n• ".join(provenance_urls)
+                + "\n\nISOpropyl may contact only the catalog-pinned HTTPS sources "
+                "if a verified cache entry is absent. Cached files are reverified; "
+                "exact size and SHA-256 are mandatory. No downloaded code runs on "
+                "Linux and no system Syslinux fallback is used. The final "
+                "target write uses the installed PolicyKit helper, a typed "
+                "target-bound confirmation, and mandatory full SHA-256 read-back.\n\n"
+                "This first profile is limited to kernel-removable media no larger "
+                "than 128 GiB with 512-byte logical sectors. It requires temporary "
+                "space for all extracted files plus a fully allocated image as large "
+                "as the target. Secure Boot does not apply to legacy BIOS boot, and "
+                "physical hardware certification is still outstanding.\n\n"
+                "Prepare experimental BIOS + retained UEFI media?",
+                QMessageBox.StandardButton.No | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                try:
+                    resolve_syslinux_helper_installation()
+                except SyslinuxDeviceHelperUnavailable as error:
+                    QMessageBox.warning(
+                        self,
+                        "BIOS host integration unavailable",
+                        f"{error}\n\nInstall the native ISOpropyl package with its "
+                        "fixed PolicyKit helper, then try again. No target was changed.",
+                    )
+                    return
+            else:
+                syslinux_dependency_key = None
         runtime_validation_requested = self.runtime_validation.isChecked()
         if runtime_validation_requested:
             runtime_reason = self.runtime_validation_exclusion_reason()
@@ -5946,6 +6150,7 @@ class Window(QMainWindow):
             persistence_profile=persistence_profile,
             persistence_bytes=persistence_bytes,
             runtime_validation_requested=runtime_validation_requested,
+            syslinux_dependency_key=syslinux_dependency_key,
         )
         self.iso_staging_preparation_generation += 1
         operation = BackgroundPreparation()
@@ -5964,6 +6169,45 @@ class Window(QMainWindow):
                     raise IsoStagingCancelled("ISO staging-plan preparation was cancelled")
 
             try:
+                syslinux_c32_bundle: BoundBootBundle | None = None
+                syslinux_payload_bundle: BoundBootBundle | None = None
+                if request.syslinux_dependency_key is not None:
+                    family, version = request.syslinux_dependency_key.split(":", 1)
+                    if family != "syslinux" or not version:
+                        raise IsoStagingCancelled(
+                            "The selected Syslinux dependency is invalid"
+                        )
+                    syslinux_c32_bundle = prepare_bundle(
+                        family,
+                        version,
+                        "blank-bios-module",
+                        cancel_event=operation.cancel_event,
+                        progress=lambda done, total: self.bridge.progress.emit(
+                            done,
+                            total,
+                            f"Obtaining verified Syslinux {version} module",
+                        ),
+                    )
+                    syslinux_payload_bundle = prepare_bundle(
+                        family,
+                        version,
+                        "matched-bios-payloads",
+                        cancel_event=operation.cancel_event,
+                        progress=lambda done, total: self.bridge.progress.emit(
+                            done,
+                            total,
+                            f"Obtaining verified Syslinux {version} BIOS payloads",
+                        ),
+                    )
+                syslinux_arguments = (
+                    {
+                        "syslinux_c32_bundle": syslinux_c32_bundle,
+                        "syslinux_payload_bundle": syslinux_payload_bundle,
+                    }
+                    if syslinux_c32_bundle is not None
+                    and syslinux_payload_bundle is not None
+                    else {}
+                )
                 staging_plan = build_iso_staging_plan(
                     request.image,
                     Path(request.workspace.name) / "ready-media",
@@ -5974,6 +6218,7 @@ class Window(QMainWindow):
                     cancel_check=check_cancelled,
                     windows_customization=request.windows_customization,
                     windows_architecture=request.windows_architecture,
+                    **syslinux_arguments,
                 )
                 if request.runtime_validation_requested:
                     prepared = prepare_runtime_validation(
@@ -6045,6 +6290,17 @@ class Window(QMainWindow):
                     not request.runtime_validation_requested
                     or not self.runtime_validation_exclusion_reason()
                 )
+                and (
+                    request.syslinux_dependency_key is None
+                    or (
+                        self.experimental_syslinux_gui_enabled()
+                        and self.eligible_syslinux_dependency(
+                            request.inspection,
+                            request.write_plan,
+                            request.device,
+                        ) == request.syslinux_dependency_key
+                    )
+                )
             )
         except OSError:
             current = False
@@ -6093,6 +6349,24 @@ class Window(QMainWindow):
                 if request.windows_customization.enabled else None
             )
             or result.wim_selection != request.windows_customization.install_image
+            or (
+                request.syslinux_dependency_key is None
+                and any((
+                    result.syslinux_staging,
+                    result.syslinux_c32_bundle,
+                    result.syslinux_payload_bundle,
+                ))
+            )
+            or (
+                request.syslinux_dependency_key is not None
+                and (
+                    result.syslinux_staging is None
+                    or result.syslinux_c32_bundle is None
+                    or result.syslinux_payload_bundle is None
+                    or result.syslinux_staging.dependency_key
+                    != request.syslinux_dependency_key
+                )
+            )
         ):
             try:
                 request.workspace.cleanup()
@@ -6116,6 +6390,7 @@ class Window(QMainWindow):
             persistence_profile=request.persistence_profile,
             persistence_bytes=request.persistence_bytes,
             runtime_validation=prepared_runtime_validation,
+            syslinux_enabled=request.syslinux_dependency_key is not None,
         )
         self.set_busy(False)
         self._continue_prepared_iso_write(pending)
@@ -6127,6 +6402,9 @@ class Window(QMainWindow):
         assert write_plan.layout is not None
         strategy = write_plan.layout.boot_strategy
         persistence_profile = pending.persistence_profile
+        if pending.syslinux_enabled:
+            self.start_syslinux_preparation(pending)
+            return
         if persistence_profile is not None:
             self.start_casper_preparation(pending)
             return
@@ -6175,6 +6453,305 @@ class Window(QMainWindow):
             self.start_uefi_preparation(pending)
             return
         self.confirm_and_start_iso_write(pending, None, None)
+
+    def start_syslinux_preparation(self, pending: PendingIsoWrite) -> None:
+        """Transfer the narrow dual-firmware write to its one-shot workflow."""
+
+        if (
+            not pending.syslinux_enabled
+            or pending.staging_plan.syslinux_staging is None
+            or pending.staging_plan.syslinux_c32_bundle is None
+            or pending.staging_plan.syslinux_payload_bundle is None
+            or self.syslinux_workflow is not None
+        ):
+            try:
+                pending.workspace.cleanup()
+            except OSError as error:
+                self.logger.warning(
+                    "Could not remove rejected Syslinux workspace: %s", error,
+                )
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "BIOS compatibility unavailable",
+                "The verified Syslinux staging inputs are incomplete.",
+            )
+            return
+        try:
+            workflow = SyslinuxWriteWorkflow(SyslinuxWorkflowInputs(
+                pending.write_plan,
+                pending.staging_plan,
+                pending.device,
+                pending.workspace,
+                persistence_profile=pending.persistence_profile,
+                runtime_validation=pending.runtime_validation,
+            ))
+        except SyslinuxWorkflowError as error:
+            try:
+                pending.workspace.cleanup()
+            except OSError as cleanup_error:
+                self.logger.warning(
+                    "Could not remove rejected Syslinux workspace: %s",
+                    cleanup_error,
+                )
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "BIOS compatibility unavailable",
+                f"{error} No target was changed.",
+            )
+            return
+
+        self.iso_workspace = None
+        self.pending_iso_write = pending
+        self.syslinux_workflow = workflow
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Preparing verified Syslinux staging…")
+
+        def work() -> None:
+            try:
+                plan = workflow.prepare(
+                    lambda stage, done, total: self.bridge.progress.emit(
+                        done, total, stage,
+                    )
+                )
+                result: object = PreparedSyslinuxWrite(
+                    pending, workflow, plan,
+                )
+            except BaseException as error:
+                result = error
+            self.bridge.syslinux_preparation_finished.emit(workflow, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_syslinux_preparation_finished(
+        self,
+        workflow: object,
+        result: object,
+    ) -> None:
+        if not isinstance(workflow, SyslinuxWriteWorkflow):
+            return
+        if workflow is not self.syslinux_workflow:
+            workflow.close()
+            return
+        pending = self.pending_iso_write
+        if (
+            not isinstance(result, PreparedSyslinuxWrite)
+            or pending is None
+            or result.pending is not pending
+            or result.workflow is not workflow
+            or result.plan is not workflow.plan
+        ):
+            message = (
+                str(result) if isinstance(result, BaseException)
+                else "The Syslinux preparation result did not match the selected write."
+            )
+            self.logger.warning("Syslinux preparation failed safely: %s", message)
+            self.bridge.finished.emit(False, message)
+            return
+        try:
+            resolve_syslinux_helper_installation()
+        except SyslinuxDeviceHelperUnavailable as error:
+            self.bridge.finished.emit(
+                False,
+                f"{error} No target was changed.",
+            )
+            return
+        self.prompt_syslinux_confirmation(result)
+
+    def prompt_syslinux_confirmation(
+        self,
+        prepared: PreparedSyslinuxWrite,
+    ) -> None:
+        plan = prepared.plan
+        dialog = QDialog(self)
+        self.syslinux_confirmation_dialog = dialog
+        dialog.setWindowTitle("Confirm BIOS + UEFI USB write")
+        dialog.setMinimumWidth(620)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel("This is the final destructive confirmation")
+        heading.setObjectName("dialogHeading")
+        layout.addWidget(heading)
+        composite = plan.composite_plan
+        staged = composite.staging_result
+        iso_plan = composite.iso_plan
+        bundles = (
+            iso_plan.syslinux_c32_bundle,
+            iso_plan.syslinux_payload_bundle,
+        )
+        bundle_lines = []
+        for bundle in bundles:
+            if bundle is not None:
+                bundle_lines.append(
+                    f"  {bundle.purpose}: {bundle.total_size} bytes · "
+                    f"{bundle.license} · {bundle.provenance_url}"
+                )
+        warnings = "\n".join(f"  • {warning}" for warning in plan.warnings)
+        model = " ".join(
+            part.strip() for part in (plan.device.vendor, plan.device.model)
+            if part.strip()
+        ) or "not reported"
+        serial = plan.device.serial or plan.device.wwn or "not reported"
+        certification = (
+            "The exact Syslinux 6.03 production pipeline passed a sealed, "
+            "networkless QEMU TCG/SeaBIOS bootstrap and configuration-prompt "
+            "certificate."
+            if composite.version == "6.03-2014-10-06"
+            else
+            "This Syslinux build has not yet passed the QEMU/SeaBIOS certificate."
+        )
+        details = QPlainTextEdit()
+        details.setObjectName("syslinuxConfirmationDetails")
+        details.setReadOnly(True)
+        details.setPlainText(
+            f"EVERYTHING ON THIS DEVICE WILL BE PERMANENTLY ERASED\n\n"
+            f"Firmware result: BIOS + retained UEFI\n"
+            f"Syslinux: {composite.version}\n"
+            f"Configuration directory: {composite.config_directory or '/'}\n"
+            f"Published tree: {staged.files} files, {staged.directories} directories, "
+            f"{staged.bytes_staged} content bytes\n"
+            f"Source manifest SHA-256: {composite.source_manifest_sha256}\n"
+            f"C32 bundle SHA-256: {composite.c32_bundle_sha256}\n"
+            f"BIOS payload bundle SHA-256: {composite.payload_bundle_sha256}\n"
+            + "Bundles:\n" + "\n".join(bundle_lines)
+            + f"\n\nTarget path: {plan.device.path}\n"
+            f"Target model: {model}\n"
+            f"Target serial/WWN: {serial}\n"
+            f"Kernel identity: {plan.device.major_minor}\n"
+            f"Kernel disk sequence: {plan.disk_sequence}\n"
+            f"Capacity / private scratch image: {self.display_size(plan.image_size)} "
+            f"({plan.image_size} bytes)\n"
+            f"Logical sector: {plan.logical_sector_size} bytes\n\n"
+            f"Warnings:\n{warnings}\n\n"
+            "ISOpropyl will build and re-attest a fully allocated anonymous FAT32 "
+            "image before unmounting or mutating the target. The fixed PolicyKit "
+            "helper retains one exclusive descriptor through write, cache flush, "
+            "inactive-sector proof, MBR-last activation, and mandatory complete "
+            f"SHA-256 read-back. There is no fallback writer. {certification} "
+            "Emulator certification does not imply physical firmware or media "
+            "certification."
+        )
+        details.setMinimumHeight(390)
+        layout.addWidget(details)
+        phrase_label = QLabel(
+            "Type this exact phrase to authorize the selected target:\n"
+            f"{plan.confirmation_phrase}"
+        )
+        phrase_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(phrase_label)
+        phrase = QLineEdit()
+        phrase.setObjectName("syslinuxConfirmationPhrase")
+        phrase.setPlaceholderText(plan.confirmation_phrase)
+        layout.addWidget(phrase)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        write_button = buttons.addButton(
+            "Erase and write",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        write_button.setObjectName("syslinuxWriteButton")
+        write_button.setEnabled(False)
+        phrase.textChanged.connect(
+            lambda value: write_button.setEnabled(
+                value == plan.confirmation_phrase
+            )
+        )
+        write_button.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self.syslinux_confirmation_dialog = None
+        if not accepted:
+            prepared.workflow.close()
+            if self.syslinux_workflow is prepared.workflow:
+                self.syslinux_workflow = None
+            self.pending_iso_write = None
+            self.iso_workspace = None
+            self.set_busy(False)
+            self.status.setText("BIOS-compatible ISO write cancelled")
+            return
+        try:
+            prepared.workflow.confirm(phrase.text())
+        except SyslinuxWorkflowError as error:
+            self.bridge.finished.emit(False, str(error))
+            return
+        self.start_syslinux_device_write(prepared)
+
+    def start_syslinux_device_write(
+        self,
+        prepared: PreparedSyslinuxWrite,
+    ) -> None:
+        plan = prepared.plan
+        workflow = prepared.workflow
+        if workflow is not self.syslinux_workflow:
+            workflow.close()
+            return
+        self.status.setText("Building the verified Syslinux image…")
+        self.logger.info(
+            "Confirmed Syslinux device write: image=%s target=%s identity=%s "
+            "plan_sha256=%s",
+            prepared.pending.image,
+            plan.device.path,
+            plan.device.identity,
+            plan.plan_sha256,
+        )
+
+        def work() -> None:
+            try:
+                result: object = workflow.execute(
+                    lambda stage, done, total: self.bridge.progress.emit(
+                        done, total, stage,
+                    )
+                )
+            except BaseException as error:
+                result = error
+            self.bridge.syslinux_execution_finished.emit(workflow, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_syslinux_execution_finished(
+        self,
+        workflow: object,
+        outcome: object,
+    ) -> None:
+        if not isinstance(workflow, SyslinuxWriteWorkflow):
+            return
+        if workflow is not self.syslinux_workflow:
+            workflow.close()
+            return
+        if (
+            type(outcome) is SyslinuxDeviceWriteResult
+            and outcome is workflow.result
+        ):
+            message = (
+                "Your BIOS + UEFI bootable USB is ready. The complete image "
+                "passed mandatory SHA-256 read-back. Eject it with your desktop "
+                "before removing it."
+            )
+            if outcome.cancellation_deferred:
+                message += (
+                    " A late cancellation was safely deferred after COMMIT so "
+                    "durability and verification could finish."
+                )
+            self.bridge.finished.emit(True, message)
+            return
+        message = (
+            str(outcome) if isinstance(outcome, BaseException)
+            else "The Syslinux workflow returned an invalid result."
+        )
+        if workflow.committed:
+            message += (
+                " The helper had already accepted COMMIT, so target state is "
+                "unknown or incomplete. Keep the drive connected, then rewrite "
+                "or restore it before attempting to boot."
+            )
+        else:
+            message += " No target mutation was committed."
+        self.logger.error("Syslinux device write failed: %s", message)
+        self.bridge.finished.emit(False, message)
 
     def start_uefi_preparation(self, pending: PendingIsoWrite) -> None:
         preparer = BackgroundPreparation()

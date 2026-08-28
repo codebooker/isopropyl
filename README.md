@@ -53,6 +53,7 @@ identity, and require an explicit confirmation.
 | **Authenticated raw writing** | Expands every supported raw input into a private anonymous snapshot, shows its SHA-256 and exact target in a typed confirmation, then uses a guarded PolicyKit transaction with mandatory pre-activation read-back and optional full verification. |
 | **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and a second typed warning for fixed USB disks or risky image profiles. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
+| **Syslinux BIOS developer preview** | For exact supported Syslinux 6.03/6.04 images, an explicit environment-gated preview can add a legacy-BIOS path while retaining the source UEFI files. It uses hash-pinned payloads, a target-bound typed confirmation, MBR-last activation, and mandatory full-device SHA-256 read-back. The normal GUI keeps it hidden pending a native hardened helper and physical-media certification. |
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, and can generate a reviewed `autounattend.xml` for setup, privacy, account, quality-of-life, and Windows 11 Secure Boot policy options. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
@@ -125,6 +126,23 @@ sudo make install-host-helper PREFIX=/usr
 
 Re-run that command after changing the helper or its PolicyKit policy. Ordinary
 image inspection and non-raw UI exploration do not require it.
+
+The narrow Syslinux BIOS + retained UEFI workflow is intentionally a developer
+preview, not a normal alpha feature. After installing the exact host helper, an
+experienced tester with expendable media can opt in for one process:
+
+```bash
+ISOPROPYL_EXPERIMENTAL_SYSLINUX=1 ./isopropyl-gui
+```
+
+Only exact cataloged Syslinux/Isolinux 6.03 or 6.04-pre1 media, a native
+single-partition UEFI/FAT32 plan, and kernel-removable USB/SD targets with
+512-byte logical sectors and no more than 128 GiB capacity are eligible. The
+workflow needs temporary space for the extracted tree plus a fully allocated
+image equal to the target capacity. Do not treat the successful SeaBIOS
+certificate as physical-device or firmware certification; a native hardened
+replacement for the provisional Python helper and installed
+VM/OVMF/physical-media coverage remain release gates.
 
 For development, replace `python -m pip install .` with
 `python -m pip install -e .`. A checkout can also be launched directly:
@@ -376,8 +394,9 @@ optional tools disable the relevant path instead of weakening validation.
 The GUI and CLI raw/DD paths transfer only a fully allocated, re-attested
 anonymous snapshot to a fixed root-owned helper. They support images shorter
 than the target, mandatory pre-activation verification, optional complete final
-verification, and stale physical-tail sanitation. The same helper also contains
-a separate backend-only path for a narrowly supported Syslinux FAT32 image.
+verification, and stale physical-tail sanitation. The same provisional helper
+also contains a separate, default-off developer preview for a narrowly
+supported Syslinux FAT32 image.
 These privileged paths are:
 
 - not installed by `pip install` or the ordinary `make install` target;
@@ -386,8 +405,9 @@ These privileged paths are:
 - limited to eligible removable or explicitly revealed external USB media and
   512-byte logical sectors (the Syslinux profile additionally requires exact
   matched 6.03/6.04 payloads); and
-- still gated on native-helper hardening, an installed PolicyKit integration
-  test, QEMU SeaBIOS/OVMF results, and representative physical media.
+- now covered by a device-free QEMU/SeaBIOS boot certificate, while still gated
+  on native-helper hardening, an installed PolicyKit integration test, OVMF,
+  hot-swap/failure coverage, and representative physical media.
 
 Distribution integrators can stage the isolated launcher, helper, and three
 exact PolicyKit actions with `make install-host-helper PREFIX=/usr`. Source testers
@@ -421,7 +441,9 @@ secrets, private installer answer files, or unredacted drive data.
 ISOpropyl is an ambitious alpha. Automated tests cover the non-destructive logic
 and mocked destructive boundaries, but CI does not write physical media. Broad
 distribution, desktop, Wayland/X11, firmware, Secure Boot, card-reader, and
-hardware testing is still required. BIOS controls remain intentionally hidden.
+hardware testing is still required. BIOS controls remain hidden in ordinary
+launches; the narrowly scoped Syslinux developer preview requires an explicit
+per-process environment opt-in and expendable media.
 
 The honest capability audit lives in [FEATURE_MATRIX.md](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md);
 planned work and release gates live in [ROADMAP.md](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md).
@@ -448,6 +470,30 @@ bounded QEMU TCG boot; it passes only a sealed, read-only in-memory snapshot,
 uses QEMU's seccomp sandbox and snapshot mode, rejects root or set-ID execution,
 disables networking and KVM, and never opens a host block device. This is
 emulator evidence, not physical firmware or USB-media certification.
+
+Maintainers can reproduce the Syslinux 6.03 ISO-mode certificate from the exact
+official source archive as well:
+
+```bash
+python3 tools/certify_syslinux_boot.py --run /path/to/syslinux-6.03.tar.xz
+```
+
+The run requires Linux memfd sealing, `qemu-system-x86_64`, `xorriso`, and 7-Zip
+(`7zz` or `7z`). Preparation may contact only the catalog-pinned HTTPS sources
+for missing Syslinux bundle data; populate the verified cache first for a fully
+offline run. The QEMU boot phase itself has networking disabled.
+
+The harness independently pins the official archive and four source members,
+requires ISOpropyl's prepared bundles to byte-match the official build outputs,
+exercises the production inspection/staging/private-FAT32/patch pipeline, and
+boots only the resulting sealed read-only memfd under QEMU TCG and SeaBIOS. It
+records the selected QEMU executable's version and SHA-256; the certificate
+therefore depends on trusting that recorded emulator binary. It certifies the
+BIOS bootstrap and configuration prompt—not UEFI, an operating system, the
+privileged device transaction, or physical media. The real integration test is
+explicitly opt-in rather than part of the device-free default suite. A locally
+reproduced observation is retained as
+[`certifications/syslinux-6.03-seabios-2026-08-28.json`](https://github.com/codebooker/isopropyl/blob/main/certifications/syslinux-6.03-seabios-2026-08-28.json).
 
 Read [CONTRIBUTING.md](https://github.com/codebooker/isopropyl/blob/main/CONTRIBUTING.md) before changing a destructive path.
 Brand assets and usage guidance are in [BRANDING.md](https://github.com/codebooker/isopropyl/blob/main/BRANDING.md).

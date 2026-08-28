@@ -277,6 +277,12 @@ class SafeIsoExtractor:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
             with self._lock:
                 if self._process is process:
                     self._process = None

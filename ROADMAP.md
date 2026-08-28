@@ -65,8 +65,8 @@ evidence.
   provenance-bound 440-byte MBR bootstrap merge are implemented. A pure,
   exact-version config/C32/root staging policy is also implemented, including
   collision rejection and independent pins for `ldlinux.c32` and the complete
-  unpatched root `ldlinux.sys` plus blank ADV output. Its opt-in backend-only ISO
-  transform requires both exact bundle roles, revalidates descriptor-bound
+  unpatched root `ldlinux.sys` plus blank ADV output. Its environment-gated
+  developer ISO transform requires both exact bundle roles, revalidates descriptor-bound
   source and extracted-tree bytes, creates missing files exclusively, reads
   them back, and binds its Syslinux-adjusted planned catalog/accounting before
   the existing final-tree validation. It currently accepts Syslinux evidence
@@ -93,11 +93,20 @@ evidence.
   source-residency, and `BLKGETDISKSEQ` checks; uses an in-band PREPARED →
   COMMIT/CANCEL boundary; retains one block descriptor through writes, cache
   flushes, and mandatory full SHA-256 read-back; clears stale GPT boundary
-  metadata before streaming; and activates the new MBR last. It is backend-only
-  and installed only through the explicit host-integration target. Remaining
-  gates are a native hardened helper, an installed PolicyKit/SCM_RIGHTS VM test,
-  QEMU/SeaBIOS plus OVMF, hot-swap/failure tests, and physical certification.
-  Do not expose payloads or remove a BIOS blocker before those gates pass. GRUB
+  metadata before streaming; proves sector zero remains inactive immediately
+  before activation; and activates the new MBR last. An authoritative one-shot
+  app workflow now owns exact preparation, confirmation, execution, cancellation,
+  and cleanup, but ordinary launches keep it hidden; experienced testers must set
+  `ISOPROPYL_EXPERIMENTAL_SYSLINUX=1` and use expendable media. A retained,
+  locally reproduced 2026-08-28 device-free observation pins the official
+  Syslinux 6.03 archive and source members, requires the project bundles to
+  byte-match them, exercises the production pipeline, and reaches the Syslinux
+  prompt under sealed, networkless QEMU TCG/SeaBIOS while recording the trusted
+  emulator's version and SHA-256. Remaining gates are a native hardened helper,
+  an installed PolicyKit/SCM_RIGHTS VM test,
+  OVMF retained-UEFI coverage, hot-swap/failure tests, and physical certification.
+  Keep the general BIOS planner blocker and normal GUI exposure intact until those
+  gates pass. GRUB
   BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced
   and verified without executing downloaded code.

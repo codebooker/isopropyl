@@ -1,2 +1,4 @@
 include tests/windows-profile-observations-v1.json
 include tools/certify_freedos_boot.py
+include tools/certify_syslinux_boot.py
+include certifications/syslinux-6.03-seabios-2026-08-28.json

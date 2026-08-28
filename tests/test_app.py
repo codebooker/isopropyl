@@ -26,6 +26,7 @@ from isopropyl.app import (
     FreeDosDownloadToken,
     IsoStagingPreparationRequest,
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
+    PreparedSyslinuxWrite,
     StagedDbxConfirmation,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
     WindowsDownloadToken, ZipOverlayPlanningToken,
@@ -76,6 +77,7 @@ from isopropyl.runtime_validation import (
 from isopropyl.raw_device import RawDeviceWritePlan
 from isopropyl.raw_device_runner import RawDeviceWriteResult
 from isopropyl.raw_workflow import RawWorkflowCancelled, RawWorkflowError
+from isopropyl.syslinux_workflow import SyslinuxWorkflowState
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
 from isopropyl.wim import WimEdition, WimInfo, WimSelection
@@ -119,6 +121,19 @@ def optical_windows_inspection(*, hybrid: bool = False) -> ImageInspection:
             ImageMember("sources", 0, "directory"),
             ImageMember("sources/install.esd", 16, "file"),
         ),
+    )
+
+
+def syslinux_uefi_inspection() -> ImageInspection:
+    return replace(
+        optical_windows_inspection(),
+        volume_label="SYSLINUX",
+        looks_windows=False,
+        has_windows_installer=False,
+        bootloader="Syslinux/Isolinux",
+        bootloader_version="6.04",
+        bootloader_build="6.04-pre1",
+        bootloader_dependency="syslinux:6.04-pre1",
     )
 
 
@@ -925,6 +940,404 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.window.deleteLater()
         self.application.processEvents()
         self.settings_home.cleanup()
+
+    def syslinux_write_plan(self, inspection: ImageInspection):
+        self.window.inspection = inspection
+        entries = self.window.archive_entries()
+        plan = build_write_plan(
+            inspection,
+            entries,
+            firmware_target=FirmwareTarget.UEFI_ONLY,
+            target_size=self.window.devices[0].size,
+            target_logical_sector_size=512,
+        )
+        self.assertTrue(plan.executable)
+        return plan
+
+    def configure_syslinux_write(self):
+        inspection = syslinux_uefi_inspection()
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        self.window.inspection = inspection
+        self.window.inspection_identity = identity
+        self.window.rebuild_write_recommendation(preserve_selection=False)
+        recommendation = self.window.write_recommendation
+        assert recommendation is not None and recommendation.iso_plan is not None
+        self.assertTrue(recommendation.iso_plan.executable)
+        return identity, recommendation.iso_plan
+
+    def test_syslinux_dual_firmware_eligibility_is_exact_and_catalog_bound(self):
+        inspection = syslinux_uefi_inspection()
+        plan = self.syslinux_write_plan(inspection)
+
+        self.assertEqual(
+            self.window.eligible_syslinux_dependency(
+                inspection, plan, self.window.devices[0],
+            ),
+            "syslinux:6.04-pre1",
+        )
+        details = self.window.syslinux_catalog_details(
+            "syslinux:6.04-pre1"
+        )
+        self.assertIsNotNone(details)
+        assert details is not None
+        self.assertEqual(details[0], 512 + 68_121 + 122_656)
+        self.assertEqual(
+            set(details[1]), {"ldlinux.bss", "ldlinux.sys", "ldlinux.c32"},
+        )
+        self.assertEqual(details[2], ("GPL-2.0-or-later",))
+        self.assertEqual(len(details[3]), 2)
+
+    def test_syslinux_dual_firmware_eligibility_rejects_unsafe_targets(self):
+        inspection = syslinux_uefi_inspection()
+        plan = self.syslinux_write_plan(inspection)
+        candidates = (
+            replace(device(), removable=False),
+            replace(device(), read_only=True),
+            replace(device(), transport="scsi"),
+            replace(device(), logical_sector_size=4096),
+            replace(device(), size=129 * 1024**3),
+            replace(device(), size=device().size + 1),
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                self.assertIsNone(
+                    self.window.eligible_syslinux_dependency(
+                        inspection, plan, candidate,
+                    )
+                )
+
+    def test_syslinux_dual_firmware_eligibility_rejects_compositions(self):
+        inspection = syslinux_uefi_inspection()
+        plan = self.syslinux_write_plan(inspection)
+        self.window.windows_options = WindowsCustomization(
+            bypass_hardware_requirements=True,
+        )
+        self.assertIsNone(
+            self.window.eligible_syslinux_dependency(
+                inspection, plan, self.window.devices[0],
+            )
+        )
+        self.window.windows_options = WindowsCustomization()
+        self.window.runtime_validation.setChecked(True)
+        self.assertIsNone(
+            self.window.eligible_syslinux_dependency(
+                inspection, plan, self.window.devices[0],
+            )
+        )
+
+    def test_declining_syslinux_consent_touches_no_cache_or_workspace(self):
+        identity, plan = self.configure_syslinux_write()
+        with (
+            patch.dict(
+                os.environ, {"ISOPROPYL_EXPERIMENTAL_SYSLINUX": "1"},
+            ),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=identity),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ) as question,
+            patch("isopropyl.app.resolve_syslinux_helper_installation") as helper,
+            patch("isopropyl.app.prepare_bundle") as prepare,
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value="",
+            ) as chooser,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        consent = question.call_args
+        self.assertEqual(consent.args[1], "Experimental legacy BIOS compatibility")
+        self.assertIn("ldlinux.bss", consent.args[2])
+        self.assertIn("GPL-2.0-or-later", consent.args[2])
+        self.assertIn("Pinned provenance", consent.args[2])
+        self.assertIn("fully allocated image as large as the target", consent.args[2])
+        self.assertIn("physical hardware certification", consent.args[2])
+        self.assertEqual(consent.args[4], QMessageBox.StandardButton.No)
+        helper.assert_not_called()
+        prepare.assert_not_called()
+        chooser.assert_called_once()
+
+    def test_syslinux_gui_path_is_default_off_without_developer_opt_in(self):
+        identity, plan = self.configure_syslinux_write()
+        with (
+            patch.dict(
+                os.environ, {"ISOPROPYL_EXPERIMENTAL_SYSLINUX": ""},
+            ),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=identity),
+            patch("isopropyl.app.QMessageBox.question") as question,
+            patch("isopropyl.app.prepare_bundle") as prepare,
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value="",
+            ) as chooser,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        question.assert_not_called()
+        prepare.assert_not_called()
+        chooser.assert_called_once()
+
+    def test_missing_syslinux_helper_fails_before_download_or_workspace(self):
+        identity, plan = self.configure_syslinux_write()
+        with (
+            patch.dict(
+                os.environ, {"ISOPROPYL_EXPERIMENTAL_SYSLINUX": "1"},
+            ),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=identity),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "isopropyl.app.resolve_syslinux_helper_installation",
+                side_effect=app_module.SyslinuxDeviceHelperUnavailable(
+                    "installed helper missing"
+                ),
+            ),
+            patch("isopropyl.app.prepare_bundle") as prepare,
+            patch("isopropyl.app.QFileDialog.getExistingDirectory") as chooser,
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        prepare.assert_not_called()
+        chooser.assert_not_called()
+        self.assertIn("installed helper missing", warning.call_args.args[2])
+        self.assertIn("No target was changed", warning.call_args.args[2])
+
+    def test_syslinux_consent_binds_both_exact_bundles_to_pending_write(self):
+        identity, plan = self.configure_syslinux_write()
+        c32_bundle = Mock()
+        payload_bundle = Mock()
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+
+        def builder(*args, **kwargs):
+            staging = fake_iso_staging_plan(*args, **kwargs)
+            return replace(
+                staging,
+                syslinux_c32_bundle=kwargs["syslinux_c32_bundle"],
+                syslinux_payload_bundle=kwargs["syslinux_payload_bundle"],
+                syslinux_staging=SimpleNamespace(
+                    dependency_key="syslinux:6.04-pre1"
+                ),
+            )
+
+        with (
+            patch.dict(
+                os.environ, {"ISOPROPYL_EXPERIMENTAL_SYSLINUX": "1"},
+            ),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=identity),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.resolve_syslinux_helper_installation"),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch(
+                "isopropyl.app.prepare_bundle",
+                side_effect=(c32_bundle, payload_bundle),
+            ) as prepare,
+            patch("isopropyl.app.build_iso_staging_plan", side_effect=builder),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        self.assertEqual(prepare.call_count, 2)
+        self.assertEqual(
+            tuple(call.args[:3] for call in prepare.call_args_list),
+            (
+                ("syslinux", "6.04-pre1", "blank-bios-module"),
+                ("syslinux", "6.04-pre1", "matched-bios-payloads"),
+            ),
+        )
+        pending = continuation.call_args.args[0]
+        self.assertTrue(pending.syslinux_enabled)
+        self.assertIs(pending.staging_plan.syslinux_c32_bundle, c32_bundle)
+        self.assertIs(pending.staging_plan.syslinux_payload_bundle, payload_bundle)
+        pending.workspace.cleanup()
+
+    def test_syslinux_bundle_failure_cannot_publish_partial_preparation(self):
+        identity, plan = self.configure_syslinux_write()
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+        with (
+            patch.dict(
+                os.environ, {"ISOPROPYL_EXPERIMENTAL_SYSLINUX": "1"},
+            ),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=identity),
+            patch(
+                "isopropyl.app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.resolve_syslinux_helper_installation"),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch(
+                "isopropyl.app.prepare_bundle",
+                side_effect=(Mock(), RuntimeError("second bundle failed")),
+            ),
+            patch("isopropyl.app.build_iso_staging_plan") as builder,
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.warning") as warning,
+        ):
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), plan,
+            )
+
+        builder.assert_not_called()
+        continuation.assert_not_called()
+        self.assertIn("second bundle failed", warning.call_args.args[2])
+        self.assertFalse(self.window.operation_active)
+
+    def test_syslinux_pending_write_transfers_to_authoritative_workflow(self):
+        _identity, plan = self.configure_syslinux_write()
+        workspace = tempfile.TemporaryDirectory(
+            prefix="isopropyl-app-workflow-", dir=self.settings_home.name,
+        )
+        staging = replace(
+            fake_iso_staging_plan(
+                self.window.image,
+                Path(workspace.name) / "ready-media",
+                self.window.archive_entries(),
+                plan,
+            ),
+            syslinux_analysis=object(),
+            syslinux_c32_bundle=object(),
+            syslinux_payload_bundle=object(),
+            syslinux_staging=object(),
+        )
+        pending = PendingIsoWrite(
+            self.window.image,
+            self.window.inspection,
+            self.window.devices[0],
+            plan,
+            workspace,
+            staging,
+            syslinux_enabled=True,
+        )
+        target_plan = object()
+
+        def prepare(workflow, progress):
+            progress("Binding the private dual-firmware image", 1, 1)
+            workflow._plan = target_plan
+            workflow._state = SyslinuxWorkflowState.PREPARED
+            return target_plan
+
+        with (
+            patch.object(
+                app_module.SyslinuxWriteWorkflow,
+                "prepare",
+                new=prepare,
+            ),
+            patch("isopropyl.app.resolve_syslinux_helper_installation"),
+            patch.object(self.window, "prompt_syslinux_confirmation") as prompt,
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.start_syslinux_preparation(pending)
+
+        prompt.assert_called_once()
+        prepared = prompt.call_args.args[0]
+        self.assertIs(prepared.pending, pending)
+        self.assertIs(prepared.plan, target_plan)
+        self.assertIs(prepared.workflow, self.window.syslinux_workflow)
+        self.assertIs(prepared.workflow.inputs.write_plan, plan)
+        self.assertIs(prepared.workflow.inputs.staging_plan, staging)
+        self.assertIs(prepared.workflow.inputs.device, self.window.devices[0])
+        self.assertIsNone(self.window.iso_workspace)
+        prepared.workflow.close()
+        self.window.syslinux_workflow = None
+        self.window.pending_iso_write = None
+
+    def test_final_syslinux_dialog_discloses_receipts_and_requires_exact_phrase(self):
+        bundle = SimpleNamespace(
+            purpose="matched-bios-payloads",
+            total_size=68_633,
+            license="GPL-2.0-or-later",
+            provenance_url="https://example.invalid/pinned",
+        )
+        staged = SimpleNamespace(files=6, directories=3, bytes_staged=238_157)
+        composite = SimpleNamespace(
+            version="6.03-2014-10-06",
+            config_directory="isolinux",
+            staging_result=staged,
+            iso_plan=SimpleNamespace(
+                syslinux_c32_bundle=bundle,
+                syslinux_payload_bundle=bundle,
+            ),
+            source_manifest_sha256="a" * 64,
+            c32_bundle_sha256="b" * 64,
+            payload_bundle_sha256="c" * 64,
+        )
+        plan = SimpleNamespace(
+            composite_plan=composite,
+            device=self.window.devices[0],
+            image_size=self.window.devices[0].size,
+            disk_sequence=42,
+            logical_sector_size=512,
+            warnings=("Physical media is not certified.",),
+            confirmation_phrase="WRITE DUAL /dev/sdz 65:144",
+        )
+        workflow = Mock()
+        prepared = PreparedSyslinuxWrite(Mock(), workflow, plan)
+        observed: dict[str, object] = {}
+
+        def inspect(dialog: QDialog) -> int:
+            details = dialog.findChild(
+                QPlainTextEdit, "syslinuxConfirmationDetails",
+            )
+            phrase = dialog.findChild(QLineEdit, "syslinuxConfirmationPhrase")
+            button = dialog.findChild(QPushButton, "syslinuxWriteButton")
+            observed["details"] = details.toPlainText()
+            observed["initially_enabled"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase.lower())
+            observed["wrong_enabled"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase)
+            observed["exact_enabled"] = button.isEnabled()
+            return QDialog.DialogCode.Accepted
+
+        with (
+            patch("isopropyl.app.QDialog.exec", new=inspect),
+            patch.object(self.window, "start_syslinux_device_write") as start,
+        ):
+            self.window.prompt_syslinux_confirmation(prepared)
+
+        workflow.confirm.assert_called_once_with(plan.confirmation_phrase)
+        start.assert_called_once_with(prepared)
+        self.assertFalse(observed["initially_enabled"])
+        self.assertFalse(observed["wrong_enabled"])
+        self.assertTrue(observed["exact_enabled"])
+        details = str(observed["details"])
+        self.assertIn("BIOS + retained UEFI", details)
+        self.assertIn("a" * 64, details)
+        self.assertIn("Kernel disk sequence: 42", details)
+        self.assertIn("private scratch image", details)
+        self.assertIn("inactive-sector proof", details)
+        self.assertIn("mandatory complete SHA-256 read-back", details)
 
     def test_windows_iso_is_recommended_and_verification_is_mandatory(self):
         self.window.verify.setChecked(False)
@@ -1757,7 +2170,8 @@ class WindowWriteMethodTests(unittest.TestCase):
         tooltip = self.window.image_detail.toolTip()
         self.assertIn("Exact boot payload: 6.04-pre1", tooltip)
         self.assertIn("hash-pinned matching payload bundle is cataloged", tooltip)
-        self.assertIn("BIOS installation remains disabled", tooltip)
+        self.assertIn("default-off developer preview includes a SeaBIOS-certified", tooltip)
+        self.assertIn("native-helper", tooltip)
 
     def test_multi_source_windows_iso_requires_an_explicit_source_choice(self):
         inspection = replace(

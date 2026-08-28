@@ -1,12 +1,15 @@
 # Third-party notices
 
 ISOpropyl's application code is licensed under AGPL-3.0-or-later. The optional
-boot artifacts below are not part of the Python package. The package contains
-only pinned catalog metadata. UEFI:NTFS and the optional boot-time corruption
-validator are obtained only after explicit user consent. GRUB entries remain
-dormant preparation inputs. Syslinux bundles have a backend-only private-tree
-data consumer, but normal writes do not download them and no GUI or BIOS executor
-consumes them yet.
+version-specific boot payload bundles below are not part of the Python package;
+the package contains their pinned catalog metadata. The exception is the small
+MIT-licensed Syslinux 6.02 MBR bootstrap embedded in `isopropyl/syslinux.py` and
+documented in its own section below. UEFI:NTFS and the optional boot-time
+corruption validator are obtained only after explicit user consent. GRUB entries
+remain dormant preparation inputs. Syslinux bundles have a private-tree/device
+consumer, but ordinary writes do not download them; only the explicitly
+environment-gated developer preview can request both exact bundle roles after
+separate consent.
 
 ## Rufus Windows experience command manifest
 
@@ -261,8 +264,18 @@ validates the C32 module and unpatched root file as data only after source and
 extracted-tree validation; neither component executes a downloaded payload on
 the Linux host.
 The private-tree root alone is not a boot claim. The separate anonymous
-regular-file transaction performs the FAT location patch and VBR/MBR writes,
-but no named image, block device, GUI, or device-facing BIOS path is enabled.
+regular-file transaction performs the FAT location patch and VBR/MBR writes.
+Its block-device path is default-off and available only through the warned
+`ISOPROPYL_EXPERIMENTAL_SYSLINUX=1` developer workflow.
+
+The device-free Syslinux 6.03 certificate additionally pins the official
+`syslinux-6.03.tar.xz` archive at SHA-256
+`26d3986d2bea109d5dc0e4f8c4822a459276cf021125e8c9f23c3cca5d8c850e`
+and independently pins `isolinux.bin`, `ldlinux.bss`, `ldlinux.sys`, and
+`ldlinux.c32` inside it. The certification harness requires the three prepared
+catalog artifacts to byte-match those official source-release members before it
+builds and boots a sealed private image. The source archive is evidence input
+only and is not shipped in the Python package.
 
 The backend implementation in `isopropyl/syslinux.py` adapts the on-disk
 ADV, extent, patch-area checksum, first-sector-pointer, and FAT VBR merge formats
@@ -295,7 +308,7 @@ is. The full GPL-2.0 text and source-release archives are available from the
 [official Syslinux distribution](https://www.kernel.org/pub/linux/utils/boot/syslinux/),
 while the exact acquired binary provenance remains pinned to the immutable Rufus
 web snapshot above. No downloaded payload is executed on Linux, and no
-device-facing BIOS path is enabled yet. The GPL-2.0-or-later payloads may be used
+ordinary device-facing BIOS path is enabled. The GPL-2.0-or-later payloads may be used
 under their GPL-3.0-or-later option, which is compatible with
 AGPL-3.0-or-later through GPLv3/AGPLv3 section 13. Each covered component retains
 its license, and the AGPL network-source requirements apply to the combination.

@@ -491,6 +491,61 @@ class HelperTransactionTests(unittest.TestCase):
         self.assertEqual(os.pread(self.harness.target.fileno(), 512, 0), b"\0" * 512)
         self.assertEqual(self.harness.mutation_calls, 1)
 
+    def test_stale_sector_zero_after_cache_invalidation_fails_closed(self):
+        flushes = 0
+
+        def expose_stale_mbr(fd: int, operation: int) -> None:
+            nonlocal flushes
+            self.harness.ioctl_void(fd, operation)
+            flushes += 1
+            if flushes == 1:
+                self.assertEqual(os.pread(fd, 512, 0), b"\0" * 512)
+                os.pwrite(fd, b"\xa5" * 512, 0)
+
+        with self.assertRaisesRegex(
+            HelperVerificationError,
+            "sector zero is not inactive before MBR activation",
+        ):
+            self.harness.execute(
+                operations=self.harness.operations(ioctl_void=expose_stale_mbr),
+            )
+        self.assertEqual(flushes, 2)
+        self.assertFalse(any(
+            offset == 0 and data == self.image[:512]
+            for _, data, offset in self.harness.write_calls
+        ))
+        self.assertEqual(
+            os.pread(self.harness.target.fileno(), 512, 0),
+            b"\0" * 512,
+        )
+
+    def test_inactive_sector_zero_short_read_fails_closed(self):
+        target_zero_reads = 0
+
+        def empty_inactive_read(fd: int, count: int, offset: int) -> bytes:
+            nonlocal target_zero_reads
+            if fd in self.harness.target_fds and offset == 0 and count == 512:
+                target_zero_reads += 1
+                return b""
+            return os.pread(fd, count, offset)
+
+        with self.assertRaisesRegex(
+            HelperVerificationError,
+            "inactive target MBR read-back made invalid progress",
+        ):
+            self.harness.execute(
+                operations=self.harness.operations(pread=empty_inactive_read),
+            )
+        self.assertEqual(target_zero_reads, 1)
+        self.assertFalse(any(
+            offset == 0 and data == self.image[:512]
+            for _, data, offset in self.harness.write_calls
+        ))
+        self.assertEqual(
+            os.pread(self.harness.target.fileno(), 512, 0),
+            b"\0" * 512,
+        )
+
     def test_backup_header_failure_follows_durable_primary_deactivation(self):
         def fail_tail(fd: int, data: bytes, offset: int) -> int:
             if offset >= 512 and data and not any(data):
