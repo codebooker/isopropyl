@@ -2925,6 +2925,7 @@ class WindowZipOverlayTests(unittest.TestCase):
         self.assertIs(kwargs["overlay"], self.overlay)
         self.assertTrue(callable(kwargs["cancel_check"]))
         self.assertNotIn("syslinux_c32_bundle", kwargs)
+        self.assertNotIn("syslinux_payload_bundle", kwargs)
         continuation.assert_called_once()
         pending = continuation.call_args.args[0]
         self.assertIs(pending.staging_plan.overlay, self.overlay)

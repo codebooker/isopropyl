@@ -6,6 +6,7 @@ import hashlib
 import os
 import struct
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -325,6 +326,49 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(bound.ldlinux_sys, b"sys")
         self.assertEqual(bound.ldlinux_bss, b"bss")
 
+    def test_consumer_rejects_subclasses_and_malformed_bundle_fields(self):
+        fixture = {"ldlinux.bss": b"bss", "ldlinux.sys": b"sys"}
+        pins = {
+            name: (len(data), hashlib.sha256(data).hexdigest())
+            for name, data in fixture.items()
+        }
+        artifacts = tuple(
+            BoundBootArtifact(name, fixture[name], pins[name][1]) for name in pins
+        )
+        bundle = BoundBootBundle(
+            "syslinux", "fixture", "matched-bios-payloads", artifacts,
+            "GPL-2.0-or-later", "https://example.invalid/source",
+        )
+
+        class ForgedBundle(BoundBootBundle):
+            pass
+
+        class ForgedArtifact(BoundBootArtifact):
+            pass
+
+        forged_bundle = ForgedBundle(**bundle.__dict__)
+        forged_artifact = replace(
+            bundle,
+            artifacts=(
+                ForgedArtifact(**artifacts[0].__dict__),
+                artifacts[1],
+            ),
+        )
+        malformed = replace(bundle)
+        object.__setattr__(malformed, "version", [])
+        with (
+            patch("isopropyl.syslinux.PINNED_SYSLINUX_PAYLOADS", {"fixture": pins}),
+            patch(
+                "isopropyl.syslinux.PINNED_SYSLINUX_PROVENANCE",
+                {"fixture": "https://example.invalid/source"},
+            ),
+        ):
+            for candidate in (forged_bundle, forged_artifact, malformed, object()):
+                with self.subTest(candidate=candidate), self.assertRaises(
+                    SyslinuxPatchError,
+                ):
+                    bind_syslinux_bundle(candidate)  # type: ignore[arg-type]
+
 
 _REAL_FIXTURE_DIRECTORY = os.environ.get("ISOPROPYL_SYSLINUX_FIXTURES", "")
 
@@ -352,12 +396,27 @@ class RealPayloadGoldenTests(unittest.TestCase):
                 "a714a4a8f70ffa59fb82019884ae85c06a2df952670ec60d19d880cbee3278b5",
             ),
         }
+        expected_roots = {
+            "6.03-2014-10-06": (
+                69_623,
+                "b073e94a47a2eedc93367d75956c83a82b05d4c778eb78685af3f484917f484c",
+            ),
+            "6.04-pre1": (
+                69_145,
+                "7d50190c5f9c7f3e7f4f3ca98da03ec294cf10aa2b45adbdddee53f422b283a5",
+            ),
+        }
         root = Path(_REAL_FIXTURE_DIRECTORY)
         for version, expected in expected_outputs.items():
             with self.subTest(version=version):
                 directory = root / version
                 bss = (directory / "ldlinux.bss").read_bytes()
                 system = (directory / "ldlinux.sys").read_bytes()
+                staged_root = system + make_empty_adv()
+                self.assertEqual(
+                    (len(staged_root), hashlib.sha256(staged_root).hexdigest()),
+                    expected_roots[version],
+                )
                 bundle = BoundBootBundle(
                     "syslinux", version, "matched-bios-payloads",
                     (

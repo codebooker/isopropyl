@@ -180,7 +180,8 @@ issue requesting a private contact channel without disclosing the vulnerability.
   and every stable singly linked regular file is rehashed and frozen as immutable
   bytes. GRUB entries never satisfy a detected-image dependency. A pure,
   non-destructive Syslinux consumer independently re-pins the two enabled
-  payload pairs; no production BIOS executor or GUI path consumes them. The
+  payload pairs. A backend-only private-tree planner consumes caller-bound bytes
+  as inert data, but no production BIOS executor or GUI path consumes them. The
   UEFI Shell backend independently
   rechecks the five exact hashes and sizes, PE architecture, EFI application
   subsystem, and unchanged unsigned state before it can create a new mode-0700
@@ -361,18 +362,23 @@ uses shortest-path, tie-breaking, or distribution-name heuristics. Root
 paths, and every foreign or misplaced C32 module fail closed. The policy either
 reuses byte-for-byte matching `ldlinux.c32` evidence or plans exclusive creation
 from an independently size/hash/provenance-pinned bundle; it never overwrites a
-source file. Generated redirects and every input-derived field are digest-bound
-and rebuilt during plan validation. The caller must supply immutable bytes for
+source file. It separately binds the exact matched `ldlinux.bss`/`ldlinux.sys`
+pair and always plans a new root `ldlinux.sys` consisting of the pinned raw file
+plus the exact two-sector blank ADV. The complete root output has its own frozen
+size/SHA-256 pin and can never be reused from source media. Generated files and
+every input-derived field are digest-bound and rebuilt during plan validation.
+The caller must supply immutable bytes for
 every identity source and the selected config: each loader is size-bound and
 re-identified, while the config is size/hash-bound, ASCII/control-checked, and
 rejected if it can load direct or transitive modules through `UI`, `COM32`,
 `CONFIG`, `INCLUDE`, `MENU INCLUDE`, or a `.c32` reference. Supporting those
 directives later requires parsing and pinning their full dependency closure.
 The policy itself still performs no filesystem mutation. An optional ISO
-staging consumer accepts only an already prepared immutable C32 bundle, reopens
-the identity-bound ISO, rebuilds the analysis and policy from exact member
-bytes, and repeats validation against the extractor's actual files before any
-addition. It creates only policy-authorized files through exclusive no-follow
+staging consumer accepts only an already prepared immutable C32 bundle together
+with its same-version matched BIOS payload bundle, reopens the identity-bound
+ISO, rebuilds the analysis and policy from exact member bytes, and repeats
+validation against the extractor's actual files before any addition. It creates
+only policy-authorized files through exclusive no-follow
 descriptors in the unpublished private tree, fsyncs and reads them back, then
 requires the Syslinux-adjusted planned namespace, sizes, digest, and free-space
 accounting to match. A second exact-byte pass immediately precedes publication;
@@ -380,10 +386,11 @@ the existing final-tree scan separately covers later WIM and answer-file
 transformations. The initial profile requires every Syslinux identity, config,
 and reused C32 byte to originate in the base ISO; overlay/embedded-origin
 evidence fails closed. It never downloads a bundle, replaces media content, or
-authorizes a device write; the normal GUI caller supplies no Syslinux C32 bundle.
+authorizes a device write; the normal GUI caller supplies neither Syslinux bundle.
 
-This is not authorization to write a device. Root `ldlinux.sys` materialization,
-a bounded privileged executor, exact post-write sector verification,
+This is not authorization to write a device. Integration with the existing
+bounded FAT mapper and pure location/boot-sector patch plans in one verified
+regular-file target transaction, a privileged executor, exact post-write verification,
 QEMU/SeaBIOS and OVMF gates, and physical BIOS testing remain mandatory before
 the GUI can offer BIOS construction. Until then, hybrid media should use
 verified DD mode to preserve its existing boot layout.

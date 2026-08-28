@@ -53,15 +53,17 @@ evidence.
   extent, checksum, FAT32 VBR merge, descriptor-only FAT mapping, partition
   offset binding, regular-file before/after read-back harness, and exact
   provenance-bound 440-byte MBR bootstrap merge are implemented. A pure,
-  exact-version config/C32 staging policy is also implemented, including
-  collision rejection and independently pinned `ldlinux.c32`. Its opt-in
-  backend-only ISO transform now revalidates descriptor-bound source and
-  extracted-tree bytes, creates missing config/C32 files exclusively, reads
+  exact-version config/C32/root staging policy is also implemented, including
+  collision rejection and independent pins for `ldlinux.c32` and the complete
+  unpatched root `ldlinux.sys` plus blank ADV output. Its opt-in backend-only ISO
+  transform requires both exact bundle roles, revalidates descriptor-bound
+  source and extracted-tree bytes, creates missing files exclusively, reads
   them back, and binds its Syslinux-adjusted planned catalog/accounting before
   the existing final-tree validation. It currently accepts Syslinux evidence
-  only from the base ISO. Remaining gates are root
-  `ldlinux.sys` materialization, bounded privileged writes, exact sector-diff
-  validation, QEMU/SeaBIOS plus OVMF, and physical certification. Do not expose
+  only from the base ISO. Remaining gates are integration with the existing FAT
+  mapper and pure location/VBR patch plans in one verified regular-file target
+  transaction, privileged writes, exact sector-diff validation, QEMU/SeaBIOS
+  plus OVMF, and physical certification. Do not expose
   payloads or remove a BIOS blocker before those gates pass. GRUB BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced
   and verified without executing downloaded code.

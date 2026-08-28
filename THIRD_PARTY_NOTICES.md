@@ -3,9 +3,10 @@
 ISOpropyl's application code is licensed under AGPL-3.0-or-later. The optional
 boot artifacts below are not part of the Python package. The package contains
 only pinned catalog metadata. UEFI:NTFS and the optional boot-time corruption
-validator are obtained only after explicit user consent. The GRUB and Syslinux
-entries are dormant preparation inputs: normal writes do not download them and
-no BIOS executor consumes them yet.
+validator are obtained only after explicit user consent. GRUB entries remain
+dormant preparation inputs. Syslinux bundles have a backend-only private-tree
+data consumer, but normal writes do not download them and no GUI or BIOS executor
+consumes them yet.
 
 ## Rufus Windows experience command manifest
 
@@ -20,9 +21,10 @@ and opaque `VisiblePlaces` payload in `isopropyl/windows.py` are adapted
 effect-for-effect from that source. ISOpropyl represents the manifest in Python,
 adds descriptions and noninteractive PowerShell switches, and surrounds it with
 independent WIM/ESD gating, disclosure, XML generation, staging identity checks,
-and no-wipe validation. Under GPLv3 section 13, the combined work is distributed
-under ISOpropyl's AGPL-3.0-or-later terms. Rufus and ISOpropyl provide these
-commands without warranty.
+and no-wipe validation. The GPL-3.0-or-later option is compatible with
+AGPL-3.0-or-later through GPLv3/AGPLv3 section 13. Each covered component retains
+its license, and the AGPL network-source requirements apply to the combination.
+Rufus and ISOpropyl provide these commands without warranty.
 
 ## Ubuntu CD Image signing key
 
@@ -190,10 +192,15 @@ Each file has its own exact size and SHA-256 in `bootloaders-v2.json`. A matched
 bundle is accepted only when every named artifact resolves at the same exact
 version. ISOpropyl does not use Rufus's version-suffix or prefix fallback.
 The pure staging policy in `isopropyl/syslinux_staging.py` independently
-re-pins each exact `ldlinux.c32` size, SHA-256, license, and provenance before
-it may appear in a plan. The optional private-tree consumer copies those exact
-bytes as data only after source and extracted-tree validation; neither component
-executes the module on the Linux host.
+re-pins each exact `ldlinux.c32` size, SHA-256, license, and provenance. It also
+re-pins both matched BIOS artifacts and the final unpatched root `ldlinux.sys`
+size/SHA-256 after the two exact blank ADV sectors are appended. The optional
+private-tree consumer requires both same-version bundle roles and materializes or
+validates the C32 module and unpatched root file as data only after source and
+extracted-tree validation; neither component executes a downloaded payload on
+the Linux host.
+The root file is not a boot claim: no FAT location patch, VBR/MBR write, or
+device-facing BIOS transaction is enabled.
 
 The non-destructive implementation in `isopropyl/syslinux.py` adapts the on-disk
 ADV, extent, patch-area checksum, first-sector-pointer, and FAT VBR merge formats
@@ -220,10 +227,15 @@ metadata tail.
 ISOpropyl reimplements those formats in Python with stricter consumer-local
 hash/provenance pins, overlap and width checks, a descriptor-only FAT32 mapper,
 and complete regular-file read-back tests. No version-specific `ldlinux` payload
-is included in the Python package; the small MIT-licensed MBR bootstrap is. No
-downloaded payload is executed on Linux, and no device-facing BIOS path is
-enabled yet. Under GPLv3 section 13, the combined work is distributed under
-ISOpropyl's AGPL-3.0-or-later terms.
+is included in the Python package or wheel; the small MIT-licensed MBR bootstrap
+is. The full GPL-2.0 text and source-release archives are available from the
+[official Syslinux distribution](https://www.kernel.org/pub/linux/utils/boot/syslinux/),
+while the exact acquired binary provenance remains pinned to the immutable Rufus
+web snapshot above. No downloaded payload is executed on Linux, and no
+device-facing BIOS path is enabled yet. The GPL-2.0-or-later payloads may be used
+under their GPL-3.0-or-later option, which is compatible with
+AGPL-3.0-or-later through GPLv3/AGPLv3 section 13. Each covered component retains
+its license, and the AGPL network-source requirements apply to the combination.
 
 ## GRUB BIOS core-image bundles
 

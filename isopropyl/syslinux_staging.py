@@ -7,16 +7,19 @@ from __future__ import annotations
 This module opens no path and writes no byte.  It accepts a complete portable
 ISO catalog, the immutable result of boot-payload analysis, descriptor-caller-
 supplied immutable bytes for every source member on which the decision relies,
-and one already downloaded catalog bundle.  Its output describes the only two
-files the later private-tree executor may need to create or reuse:
+and two already downloaded catalog bundles.  Its output describes the only
+three files the later private-tree executor may need to create or reuse:
 
 * a root ``syslinux.cfg`` redirect; and
-* the exact ``ldlinux.c32`` matching the selected Syslinux build.
+* the exact ``ldlinux.c32`` matching the selected Syslinux build; and
+* the exact unpatched root ``ldlinux.sys`` with two empty ADV sectors.
 
 The initial policy is deliberately narrow.  It supports only the two builds
 whose installer payloads are independently pinned by :mod:`isopropyl.syslinux`,
-never replaces a file, and rejects every other C32 module.  A future expansion
-must first bind the complete C32 dependency closure for the selected image.
+never replaces a file, and rejects every other C32 module.  In addition to the
+configuration files, it creates the exact unpatched root ``ldlinux.sys`` plus
+two empty ADV sectors.  This is still only a private-tree placeholder: sector
+mapping and boot-sector patching happen at a later, separately validated gate.
 """
 
 import hashlib
@@ -40,6 +43,11 @@ from .iso import (
     EntryKind,
     UnsafeArchiveError,
     validate_portable_fat_entries,
+)
+from .syslinux import (
+    SyslinuxPatchError,
+    bind_syslinux_bundle,
+    make_empty_adv,
 )
 
 
@@ -69,6 +77,21 @@ PINNED_SYSLINUX_C32 = MappingProxyType({
         "d3472c02263acf9cd1da5db51e263c5484bad13ea68618c403d9cb01ca070aee",
         "https://github.com/pbatard/rufus-web/tree/"
         "e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/syslinux-6.04",
+    ),
+})
+
+# A second consumer pin covers the exact transient root file, including the
+# two blank ADV sectors appended to the independently pinned raw payload.  This
+# prevents a future ADV implementation change from silently altering the
+# private-tree contract.
+PINNED_SYSLINUX_ROOTS = MappingProxyType({
+    "6.03-2014-10-06": (
+        69_623,
+        "b073e94a47a2eedc93367d75956c83a82b05d4c778eb78685af3f484917f484c",
+    ),
+    "6.04-pre1": (
+        69_145,
+        "7d50190c5f9c7f3e7f4f3ca98da03ec294cf10aa2b45adbdddee53f422b283a5",
     ),
 })
 
@@ -112,6 +135,7 @@ class SyslinuxStagingPlan:
     config_directory: str
     root_redirect: SyslinuxStageFile | None
     ldlinux_c32: SyslinuxStageFile
+    root_ldlinux_sys: SyslinuxStageFile
     source_catalog_sha256: str
     analysis_sha256: str
     source_members_sha256: str
@@ -122,7 +146,11 @@ class SyslinuxStagingPlan:
     def additions(self) -> tuple[SyslinuxStageFile, ...]:
         """Return only files that a later executor must create exclusively."""
 
-        candidates = (self.root_redirect, self.ldlinux_c32)
+        candidates = (
+            self.root_redirect,
+            self.ldlinux_c32,
+            self.root_ldlinux_sys,
+        )
         return tuple(
             item for item in candidates
             if item is not None and item.disposition is StageDisposition.CREATE
@@ -697,6 +725,7 @@ def _build_plan(
     entries: Sequence[ArchiveEntry],
     analysis: BootloaderAnalysis,
     module_bundle: BoundBootBundle,
+    payload_bundle: BoundBootBundle,
     source_files: Mapping[str, bytes] | None,
     existing_files: Mapping[str, bytes] | None,
 ) -> SyslinuxStagingPlan:
@@ -707,6 +736,14 @@ def _build_plan(
     module = bind_syslinux_c32_bundle(module_bundle)
     if module.version != build:
         raise SyslinuxStagingError("the C32 bundle does not match the image's Isolinux build")
+    try:
+        payloads = bind_syslinux_bundle(payload_bundle)
+    except SyslinuxPatchError as error:
+        raise SyslinuxStagingError(str(error)) from error
+    if payloads.version != build or payloads.version != module.version:
+        raise SyslinuxStagingError(
+            "the BIOS payload bundle does not match the image and C32 build",
+        )
 
     if ("ldlinux.sys",) in occupied:
         raise SyslinuxStagingError("the ISO already contains a root ldlinux.sys")
@@ -722,7 +759,22 @@ def _build_plan(
     config_sha256 = _validate_config_bytes(config, supplied_sources[config.path])
     redirect = _root_redirect(config.path)
     c32 = _bind_c32_target(catalog, parent, module, existing_files)
-    additions = tuple(item for item in (redirect, c32) if item is not None)
+    root_data = payloads.ldlinux_sys + make_empty_adv()
+    expected_root = PINNED_SYSLINUX_ROOTS.get(build)
+    root_sha256 = hashlib.sha256(root_data).hexdigest()
+    if expected_root != (len(root_data), root_sha256):
+        raise SyslinuxStagingError(
+            "the generated root ldlinux.sys does not match its independent pin",
+        )
+    root_ldlinux_sys = SyslinuxStageFile(
+        "ldlinux.sys",
+        root_data,
+        root_sha256,
+        StageDisposition.CREATE,
+    )
+    additions = tuple(
+        item for item in (redirect, c32, root_ldlinux_sys) if item is not None
+    )
     if any(
         item.disposition is StageDisposition.CREATE
         and _case_key(item.path) in occupied
@@ -739,6 +791,7 @@ def _build_plan(
         config_directory=directory,
         root_redirect=redirect,
         ldlinux_c32=c32,
+        root_ldlinux_sys=root_ldlinux_sys,
         source_catalog_sha256=_catalog_digest(catalog),
         analysis_sha256=_analysis_digest(identities),
         source_members_sha256=_source_members_digest(identities, supplied_sources),
@@ -751,6 +804,7 @@ def plan_syslinux_staging(
     entries: Sequence[ArchiveEntry],
     analysis: BootloaderAnalysis,
     module_bundle: BoundBootBundle,
+    payload_bundle: BoundBootBundle,
     *,
     source_files: Mapping[str, bytes] | None = None,
     existing_files: Mapping[str, bytes] | None = None,
@@ -758,7 +812,8 @@ def plan_syslinux_staging(
     """Return an immutable, non-writing Syslinux staging policy decision."""
 
     return _build_plan(
-        entries, analysis, module_bundle, source_files, existing_files,
+        entries, analysis, module_bundle, payload_bundle, source_files,
+        existing_files,
     )
 
 
@@ -767,6 +822,7 @@ def validate_syslinux_staging_plan(
     entries: Sequence[ArchiveEntry],
     analysis: BootloaderAnalysis,
     module_bundle: BoundBootBundle,
+    payload_bundle: BoundBootBundle,
     *,
     source_files: Mapping[str, bytes] | None = None,
     existing_files: Mapping[str, bytes] | None = None,
@@ -786,14 +842,17 @@ def validate_syslinux_staging_plan(
         plan.source_members_sha256,
         plan.config_sha256,
     )
-    stage_files = tuple(
-        item for item in (plan.root_redirect, plan.ldlinux_c32) if item is not None
-    )
+    stage_files = tuple(item for item in (
+        plan.root_redirect,
+        plan.ldlinux_c32,
+        plan.root_ldlinux_sys,
+    ) if item is not None)
     if (
         any(type(value) is not str for value in scalar_fields)
         or plan.root_redirect is not None
         and type(plan.root_redirect) is not SyslinuxStageFile
         or type(plan.ldlinux_c32) is not SyslinuxStageFile
+        or type(plan.root_ldlinux_sys) is not SyslinuxStageFile
         or any(
             type(item.path) is not str
             or type(item.data) is not bytes
@@ -816,7 +875,8 @@ def validate_syslinux_staging_plan(
     ):
         raise SyslinuxStagingError("the Syslinux staging plan digests are invalid")
     rebuilt = _build_plan(
-        entries, analysis, module_bundle, source_files, existing_files,
+        entries, analysis, module_bundle, payload_bundle, source_files,
+        existing_files,
     )
     if plan != rebuilt:
         raise SyslinuxStagingError("the Syslinux staging plan is forged or stale")

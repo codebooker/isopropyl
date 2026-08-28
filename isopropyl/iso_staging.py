@@ -218,6 +218,7 @@ class IsoStagingPlan:
     embedded_content_bytes: int = 0
     syslinux_analysis: BootloaderAnalysis | None = None
     syslinux_c32_bundle: BoundBootBundle | None = None
+    syslinux_payload_bundle: BoundBootBundle | None = None
     syslinux_staging: SyslinuxStagingPlan | None = None
     syslinux_content_bytes: int = 0
     staged_entries: tuple[ArchiveEntry, ...] = ()
@@ -820,6 +821,7 @@ def _read_bound_syslinux_inputs(
     image_identity: FileIdentity,
     entries: tuple[ArchiveEntry, ...],
     module_bundle: BoundBootBundle,
+    payload_bundle: BoundBootBundle,
     *,
     analysis_entries: tuple[ArchiveEntry, ...] | None = None,
     cancel_check: Callable[[], None] | None = None,
@@ -939,6 +941,7 @@ def _read_bound_syslinux_inputs(
             entries,
             analysis,
             module_bundle,
+            payload_bundle,
             source_files=source_files,
             existing_files=existing_files,
         )
@@ -990,15 +993,21 @@ def build_iso_staging_plan(
     windows_architecture: str = "amd64",
     wimlib_resolver: Callable[[], str] = resolve_wimlib,
     syslinux_c32_bundle: BoundBootBundle | None = None,
+    syslinux_payload_bundle: BoundBootBundle | None = None,
 ) -> IsoStagingPlan:
     """Bind validated ISO/overlay catalogs and a write plan to a new output path.
 
-    ``syslinux_c32_bundle`` is a backend-only, already-bound data input.  This
-    function never downloads it, authorizes BIOS mode, or touches a device.
+    The two Syslinux bundles are backend-only, already-bound data inputs.  They
+    must be supplied together.  This function never downloads them, authorizes
+    BIOS mode, maps sectors, patches boot code, or touches a device.
     """
 
     if cancel_check is not None:
         cancel_check()
+    if (syslinux_c32_bundle is None) != (syslinux_payload_bundle is None):
+        raise IsoStagingSafetyError(
+            "The Syslinux C32 and BIOS payload bundles must be supplied together"
+        )
     try:
         safe_entries = validate_extraction_entries(entries)
     except (UnsafeArchiveError, ValueError) as error:
@@ -1111,6 +1120,7 @@ def build_iso_staging_plan(
     syslinux_analysis: BootloaderAnalysis | None = None
     syslinux_staging: SyslinuxStagingPlan | None = None
     if syslinux_c32_bundle is not None:
+        assert syslinux_payload_bundle is not None
         (
             syslinux_analysis,
             _syslinux_sources,
@@ -1121,6 +1131,7 @@ def build_iso_staging_plan(
             extraction.image_identity,
             effective_entries,
             syslinux_c32_bundle,
+            syslinux_payload_bundle,
             analysis_entries=safe_entries,
             cancel_check=cancel_check,
         )
@@ -1202,6 +1213,7 @@ def build_iso_staging_plan(
         embedded_content_bytes=embedded_content_bytes,
         syslinux_analysis=syslinux_analysis,
         syslinux_c32_bundle=syslinux_c32_bundle,
+        syslinux_payload_bundle=syslinux_payload_bundle,
         syslinux_staging=syslinux_staging,
         syslinux_content_bytes=syslinux_content_bytes,
         staged_entries=staged_entries,
@@ -1269,6 +1281,7 @@ def validate_iso_staging_plan(
     syslinux_fields = (
         plan.syslinux_analysis,
         plan.syslinux_c32_bundle,
+        plan.syslinux_payload_bundle,
         plan.syslinux_staging,
     )
     if all(value is None for value in syslinux_fields):
@@ -1285,6 +1298,7 @@ def validate_iso_staging_plan(
         if (
             type(plan.syslinux_analysis) is not BootloaderAnalysis
             or type(plan.syslinux_c32_bundle) is not BoundBootBundle
+            or type(plan.syslinux_payload_bundle) is not BoundBootBundle
             or type(plan.syslinux_staging) is not SyslinuxStagingPlan
         ):
             raise IsoStagingSafetyError(
@@ -1292,6 +1306,7 @@ def validate_iso_staging_plan(
             )
         assert plan.syslinux_analysis is not None
         assert plan.syslinux_c32_bundle is not None
+        assert plan.syslinux_payload_bundle is not None
         assert plan.syslinux_staging is not None
         (
             fresh_analysis,
@@ -1303,6 +1318,7 @@ def validate_iso_staging_plan(
             plan.image_identity,
             effective_entries,
             plan.syslinux_c32_bundle,
+            plan.syslinux_payload_bundle,
             analysis_entries=entries,
             cancel_check=cancel_check,
         )
@@ -1316,6 +1332,7 @@ def validate_iso_staging_plan(
                 effective_entries,
                 fresh_analysis,
                 plan.syslinux_c32_bundle,
+                plan.syslinux_payload_bundle,
                 source_files=fresh_sources,
                 existing_files=fresh_existing,
             )
@@ -1910,6 +1927,7 @@ def _validate_staged_syslinux_sources(
     assert plan.syslinux_staging is not None
     assert plan.syslinux_analysis is not None
     assert plan.syslinux_c32_bundle is not None
+    assert plan.syslinux_payload_bundle is not None
     paths = syslinux_staging_read_paths(
         plan.effective_entries,
         plan.syslinux_analysis,
@@ -1944,6 +1962,7 @@ def _validate_staged_syslinux_sources(
             plan.effective_entries,
             plan.syslinux_analysis,
             plan.syslinux_c32_bundle,
+            plan.syslinux_payload_bundle,
             source_files=source_files,
             existing_files=existing_files,
         )

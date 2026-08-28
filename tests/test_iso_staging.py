@@ -14,6 +14,7 @@ from types import MappingProxyType
 from unittest.mock import patch
 
 import isopropyl.iso_staging as iso_staging
+import isopropyl.syslinux as syslinux
 import isopropyl.syslinux_staging as syslinux_staging
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.bootloaders import BoundBootArtifact, BoundBootBundle
@@ -79,11 +80,33 @@ SYSLINUX_CONFIG = b"DEFAULT linux\n\nLABEL linux\n  LINUX /vmlinuz\n"
 SYSLINUX_C32 = b"integration fixture ldlinux.c32"
 SYSLINUX_BUILD = "6.03-2014-10-06"
 SYSLINUX_PROVENANCE = "fixture://syslinux-6.03"
+SYSLINUX_PAYLOAD_PROVENANCE = "fixture://syslinux-bios-6.03"
+SYSLINUX_BSS = b"integration fixture ldlinux.bss"
+SYSLINUX_SYS = b"integration fixture ldlinux.sys"
 SYSLINUX_TEST_PINS = MappingProxyType({
     SYSLINUX_BUILD: (
         len(SYSLINUX_C32),
         hashlib.sha256(SYSLINUX_C32).hexdigest(),
         SYSLINUX_PROVENANCE,
+    ),
+})
+SYSLINUX_PAYLOAD_PINS = MappingProxyType({
+    SYSLINUX_BUILD: MappingProxyType({
+        "ldlinux.bss": (
+            len(SYSLINUX_BSS), hashlib.sha256(SYSLINUX_BSS).hexdigest(),
+        ),
+        "ldlinux.sys": (
+            len(SYSLINUX_SYS), hashlib.sha256(SYSLINUX_SYS).hexdigest(),
+        ),
+    }),
+})
+SYSLINUX_PAYLOAD_PROVENANCE_PINS = MappingProxyType({
+    SYSLINUX_BUILD: SYSLINUX_PAYLOAD_PROVENANCE,
+})
+SYSLINUX_ROOT = SYSLINUX_SYS + syslinux.make_empty_adv()
+SYSLINUX_ROOT_PINS = MappingProxyType({
+    SYSLINUX_BUILD: (
+        len(SYSLINUX_ROOT), hashlib.sha256(SYSLINUX_ROOT).hexdigest(),
     ),
 })
 
@@ -114,6 +137,24 @@ def syslinux_c32_bundle() -> BoundBootBundle:
         (BoundBootArtifact("ldlinux.c32", SYSLINUX_C32, digest),),
         "GPL-2.0-or-later",
         SYSLINUX_PROVENANCE,
+    )
+
+
+def syslinux_payload_bundle() -> BoundBootBundle:
+    artifacts = tuple(
+        BoundBootArtifact(name, data, hashlib.sha256(data).hexdigest())
+        for name, data in (
+            ("ldlinux.bss", SYSLINUX_BSS),
+            ("ldlinux.sys", SYSLINUX_SYS),
+        )
+    )
+    return BoundBootBundle(
+        "syslinux",
+        SYSLINUX_BUILD,
+        "matched-bios-payloads",
+        artifacts,
+        "GPL-2.0-or-later",
+        SYSLINUX_PAYLOAD_PROVENANCE,
     )
 
 
@@ -375,8 +416,34 @@ class BlockingSplitter(FakeSplitter):
 
 
 class IsoStagingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patches = (
+            patch.object(
+                syslinux_staging, "PINNED_SYSLINUX_C32", SYSLINUX_TEST_PINS,
+            ),
+            patch.object(
+                syslinux_staging, "PINNED_SYSLINUX_ROOTS", SYSLINUX_ROOT_PINS,
+            ),
+            patch.object(
+                syslinux, "PINNED_SYSLINUX_PAYLOADS", SYSLINUX_PAYLOAD_PINS,
+            ),
+            patch.object(
+                syslinux,
+                "PINNED_SYSLINUX_PROVENANCE",
+                SYSLINUX_PAYLOAD_PROVENANCE_PINS,
+            ),
+        )
+        for active_patch in patches:
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+
     def make_plan(self, root: Path, entries=None, **kwargs):
         selected = entries or basic_entries()
+        if (
+            kwargs.get("syslinux_c32_bundle") is not None
+            and "syslinux_payload_bundle" not in kwargs
+        ):
+            kwargs["syslinux_payload_bundle"] = syslinux_payload_bundle()
         image = root / "source.iso"
         image.write_bytes(b"ISO placeholder")
         scanner = kwargs.pop("catalog_scanner", fake_catalog_scanner(selected))
@@ -403,6 +470,12 @@ class IsoStagingTests(unittest.TestCase):
                 plan.effective_catalog_digest,
             )
             self.assertIsNone(plan.syslinux_staging)
+            self.assertIsNone(plan.syslinux_c32_bundle)
+            self.assertIsNone(plan.syslinux_payload_bundle)
+            self.assertNotIn(
+                "ldlinux.sys",
+                {entry.path.casefold() for entry in plan.staged_entries},
+            )
             self.assertEqual(plan.syslinux_content_bytes, 0)
             self.assertFalse(plan.needs_wim_split)
             self.assertIsNone(plan.autounattend_xml)
@@ -786,8 +859,23 @@ class IsoStagingTests(unittest.TestCase):
                 SYSLINUX_C32,
             )
             self.assertEqual(
+                (result.destination / "ldlinux.sys").read_bytes(),
+                SYSLINUX_ROOT,
+            )
+            root_status = (result.destination / "ldlinux.sys").stat()
+            self.assertEqual(root_status.st_nlink, 1)
+            self.assertTrue((result.destination / "ldlinux.sys").is_file())
+            self.assertEqual(
+                tuple(
+                    (entry.path, entry.size)
+                    for entry in plan.staged_entries
+                    if entry.path == "ldlinux.sys"
+                ),
+                (("ldlinux.sys", len(SYSLINUX_ROOT)),),
+            )
+            self.assertEqual(
                 plan.syslinux_content_bytes,
-                len(redirect.data) + len(SYSLINUX_C32),
+                len(redirect.data) + len(SYSLINUX_C32) + len(SYSLINUX_ROOT),
             )
             self.assertEqual(
                 plan.content_bytes,
@@ -796,10 +884,38 @@ class IsoStagingTests(unittest.TestCase):
                     if entry.kind is EntryKind.FILE
                 ),
             )
+            self.assertEqual(
+                plan.required_free_bytes,
+                plan.content_bytes + iso_staging.OUTPUT_SPACE_RESERVE,
+            )
             self.assertEqual(result.catalog_digest, plan.staged_catalog_digest)
-            self.assertEqual(result.files, 6)
+            self.assertEqual(result.files, 7)
             self.assertTrue(descriptor_reads)
             self.assertTrue(all(descriptor is not None for _, descriptor in descriptor_reads))
+
+    def test_syslinux_private_staging_requires_both_exact_bundle_roles(self):
+        entries = syslinux_entries()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for kwargs in (
+                {
+                    "syslinux_c32_bundle": syslinux_c32_bundle(),
+                    "syslinux_payload_bundle": None,
+                },
+                {
+                    "syslinux_payload_bundle": syslinux_payload_bundle(),
+                },
+            ):
+                with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "must be supplied together",
+                ):
+                    self.make_plan(
+                        root,
+                        entries,
+                        write_plan=write_plan(entries),
+                        **kwargs,
+                    )
 
     def test_syslinux_private_staging_reuses_exact_existing_c32(self):
         entries = syslinux_entries(existing_c32=True)
@@ -845,7 +961,12 @@ class IsoStagingTests(unittest.TestCase):
             assert plan.syslinux_staging is not None
             self.assertEqual(
                 tuple(item.path for item in plan.syslinux_staging.additions),
-                ("syslinux.cfg",),
+                ("syslinux.cfg", "ldlinux.sys"),
+            )
+            assert plan.syslinux_staging.root_redirect is not None
+            self.assertEqual(
+                plan.syslinux_content_bytes,
+                len(plan.syslinux_staging.root_redirect.data) + len(SYSLINUX_ROOT),
             )
             self.assertEqual(
                 (result.destination / "isolinux/ldlinux.c32").read_bytes(),
@@ -911,6 +1032,7 @@ class IsoStagingTests(unittest.TestCase):
             (True, "isolinux/ldlinux.c32"),
             (False, "syslinux.cfg"),
             (False, "isolinux/ldlinux.c32"),
+            (False, "ldlinux.sys"),
         ):
             with self.subTest(
                 existing_c32=existing_c32,
@@ -964,7 +1086,15 @@ class IsoStagingTests(unittest.TestCase):
                         windows_architecture="amd64",
                         wimlib_resolver=lambda: WIMLIB,
                     )
-                    with self.assertRaises(IsoStagingSafetyError):
+                    failure = (
+                        self.assertRaisesRegex(
+                            IsoStagingSafetyError,
+                            "Generated Syslinux file 'ldlinux.sys' changed before publication",
+                        )
+                        if mutation_path == "ldlinux.sys"
+                        else self.assertRaises(IsoStagingSafetyError)
+                    )
+                    with failure:
                         IsoStagingExecutor(
                             extractor=FakeExtractor(mutate=populate_sources),
                             wim_inspector=mutating_inspector,
@@ -1007,6 +1137,14 @@ class IsoStagingTests(unittest.TestCase):
                 candidates = (
                     replace(plan, syslinux_analysis=None),
                     replace(plan, syslinux_c32_bundle=None),
+                    replace(plan, syslinux_payload_bundle=None),
+                    replace(
+                        plan,
+                        syslinux_payload_bundle=replace(
+                            plan.syslinux_payload_bundle,
+                            purpose="blank-bios-module",
+                        ),
+                    ),
                     replace(plan, syslinux_staging=None),
                     replace(
                         plan,

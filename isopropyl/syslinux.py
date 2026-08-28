@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
 
-from .bootloaders import BoundBootBundle
+from .bootloaders import BoundBootArtifact, BoundBootBundle
 
 
 SECTOR_SIZE: Final = 512
@@ -215,10 +215,16 @@ def prepare_syslinux_mbr(
 def bind_syslinux_bundle(bundle: BoundBootBundle) -> SyslinuxPayloads:
     """Accept only one independently pinned, complete Syslinux payload pair."""
 
-    if not isinstance(bundle, BoundBootBundle):
-        raise SyslinuxPatchError("a bound Syslinux bundle is required")
+    if type(bundle) is not BoundBootBundle:
+        raise SyslinuxPatchError("an exact bound Syslinux bundle is required")
     if (
-        bundle.family != "syslinux"
+        type(bundle.family) is not str
+        or type(bundle.version) is not str
+        or type(bundle.purpose) is not str
+        or type(bundle.artifacts) is not tuple
+        or type(bundle.license) is not str
+        or type(bundle.provenance_url) is not str
+        or bundle.family != "syslinux"
         or bundle.purpose != "matched-bios-payloads"
         or bundle.license != "GPL-2.0-or-later"
         or bundle.provenance_url != PINNED_SYSLINUX_PROVENANCE.get(bundle.version)
@@ -227,20 +233,28 @@ def bind_syslinux_bundle(bundle: BoundBootBundle) -> SyslinuxPayloads:
     expected = PINNED_SYSLINUX_PAYLOADS.get(bundle.version)
     if expected is None:
         raise SyslinuxPatchError("the Syslinux version is not enabled for patching")
+    if len(bundle.artifacts) != len(expected):
+        raise SyslinuxPatchError("the Syslinux bundle is incomplete or out of order")
+    if any(
+        type(artifact) is not BoundBootArtifact
+        or type(artifact.name) is not str
+        or type(artifact.data) is not bytes
+        or type(artifact.sha256) is not str
+        for artifact in bundle.artifacts
+    ):
+        raise SyslinuxPatchError("the Syslinux bundle fields are invalid")
     if tuple(item.name for item in bundle.artifacts) != tuple(expected):
         raise SyslinuxPatchError("the Syslinux bundle is incomplete or out of order")
 
     accepted: dict[str, bytes] = {}
     for artifact in bundle.artifacts:
         size, digest = expected[artifact.name]
-        if type(artifact.data) is not bytes:
-            raise SyslinuxPatchError(f"{artifact.name} is not immutable bytes")
+        if len(artifact.data) != size or artifact.sha256 != digest:
+            raise SyslinuxPatchError(
+                f"{artifact.name} does not match ISOpropyl's pinned payload",
+            )
         actual = hashlib.sha256(artifact.data).hexdigest()
-        if (
-            len(artifact.data) != size
-            or artifact.sha256 != digest
-            or actual != digest
-        ):
+        if actual != digest:
             raise SyslinuxPatchError(
                 f"{artifact.name} does not match ISOpropyl's pinned payload",
             )

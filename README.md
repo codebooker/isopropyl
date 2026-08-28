@@ -185,16 +185,19 @@ confirmations and expanded drive visibility are never persisted.
   rejects recursive/module-loading directives and foreign C32 modules,
   preserves an authoritative root config or generates a canonical redirect,
   and binds the matching hash-pinned `ldlinux.c32`. An opt-in backend-only
-  transform now reopens the identity-bound ISO, rebuilds that decision, checks
-  the extractor's actual loader/config/module bytes, creates additions
-  exclusively in the private tree, reads them back, and binds the
-  Syslinux-adjusted planned catalog and byte accounting. A final exact-byte pass
-  runs just before publication, while the existing final-tree validator still
-  covers later WIM and answer-file transformations. Syslinux evidence must come
-  from the base ISO; overlay/embedded-origin evidence fails closed. The GUI never
-  supplies this C32 bundle and normal writes never download it. Root
-  `ldlinux.sys` materialization, privileged device writes, QEMU, and physical
-  boot certification still gate BIOS support.
+  transform now requires both that C32 bundle and the separately pinned matched
+  `ldlinux.bss`/`ldlinux.sys` pair. It reopens the identity-bound ISO, rebuilds
+  the decision, checks the extractor's actual loader/config/module bytes, and
+  exclusively creates the exact unpatched root `ldlinux.sys` plus its two blank
+  ADV sectors in the private tree. Every addition is read back and included in
+  the planned catalog, byte count, and free-space requirement. A final exact-byte
+  pass runs just before publication, while the existing final-tree validator
+  still covers later WIM and answer-file transformations. Syslinux evidence must
+  come from the base ISO; overlay/embedded-origin evidence fails closed. The GUI
+  supplies neither bundle and normal writes never download them. Integration
+  with the existing descriptor-only FAT mapper and pure patch plans, followed by
+  privileged device writes, QEMU, and physical boot certification, still gates
+  BIOS support.
 - Parse El Torito BIOS/UEFI entries, including the bounded embedded-FAT subset,
   and inspect EFI PE architecture, certificate framing, and SBAT. A sealed,
   resource-limited worker can report embedded
@@ -347,9 +350,10 @@ CI currently exercises the non-destructive suite on an Ubuntu x86-64 runner with
 Python 3.12; device-facing tests mock block devices and privileged commands and
 never write a real drive. Broad distro, desktop, Wayland/X11, firmware, Secure
 Boot, card-reader, and physical-media testing is still required. BIOS options
-remain intentionally hidden until the backend-only Syslinux staging work is
-joined to bounded root `ldlinux.sys` and device transactions, QEMU/SeaBIOS
-results, and physical evidence.
+remain intentionally hidden until the backend-only unpatched root `ldlinux.sys`
+tree is joined to the existing bounded FAT mapper and pure boot-code patch plans
+inside a verified regular-file target transaction, then to device transactions,
+QEMU/SeaBIOS results, and physical evidence.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
 and [ROADMAP.md](ROADMAP.md).

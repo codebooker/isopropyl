@@ -9,6 +9,7 @@ from types import MappingProxyType
 from unittest.mock import patch
 
 import isopropyl.syslinux_staging as staging
+import isopropyl.syslinux as syslinux
 from isopropyl.boot_identity import BootloaderAnalysis, BootloaderIdentity
 from isopropyl.bootloaders import BoundBootArtifact, BoundBootBundle, load_catalog
 from isopropyl.iso import ArchiveEntry, EntryKind
@@ -16,14 +17,13 @@ from isopropyl.syslinux_staging import (
     StageDisposition,
     SyslinuxStagingError,
     bind_syslinux_c32_bundle,
-    plan_syslinux_staging,
     syslinux_staging_analysis_paths,
     syslinux_staging_read_paths,
-    validate_syslinux_staging_plan,
 )
 
 
 PRODUCTION_PINS = staging.PINNED_SYSLINUX_C32
+PRODUCTION_ROOT_PINS = staging.PINNED_SYSLINUX_ROOTS
 VERSIONS = {
     "6.03-2014-10-06": ("6.03", b"fixture c32 for 6.03", "fixture://6.03"),
     "6.04-pre1": ("6.04", b"fixture c32 for 6.04-pre1", "fixture://6.04"),
@@ -33,6 +33,32 @@ TEST_PINS = MappingProxyType({
     for version, (_base, data, provenance) in VERSIONS.items()
 })
 CONFIG_DATA = b"DEFAULT linux\n\nLABEL linux\n  LINUX /vmlinuz\n"
+BIOS_PAYLOADS = {
+    version: {
+        "ldlinux.bss": f"fixture bss for {version}".encode(),
+        "ldlinux.sys": f"fixture sys for {version}".encode(),
+    }
+    for version in VERSIONS
+}
+BIOS_TEST_PINS = MappingProxyType({
+    version: MappingProxyType({
+        name: (len(data), hashlib.sha256(data).hexdigest())
+        for name, data in payloads.items()
+    })
+    for version, payloads in BIOS_PAYLOADS.items()
+})
+BIOS_TEST_PROVENANCE = MappingProxyType({
+    version: f"fixture://bios/{version}" for version in VERSIONS
+})
+BIOS_TEST_ROOTS = MappingProxyType({
+    version: (
+        len(payloads["ldlinux.sys"] + syslinux.make_empty_adv()),
+        hashlib.sha256(
+            payloads["ldlinux.sys"] + syslinux.make_empty_adv(),
+        ).hexdigest(),
+    )
+    for version, payloads in BIOS_PAYLOADS.items()
+})
 
 
 def bootloader_blob(version: str) -> bytes:
@@ -66,6 +92,39 @@ def module_bundle(version: str = "6.03-2014-10-06") -> BoundBootBundle:
         "syslinux", version, "blank-bios-module",
         (BoundBootArtifact("ldlinux.c32", data, digest),),
         "GPL-2.0-or-later", VERSIONS[version][2],
+    )
+
+
+def payload_bundle(version: str = "6.03-2014-10-06") -> BoundBootBundle:
+    payloads = BIOS_PAYLOADS[version]
+    artifacts = tuple(
+        BoundBootArtifact(name, data, hashlib.sha256(data).hexdigest())
+        for name, data in payloads.items()
+    )
+    return BoundBootBundle(
+        "syslinux", version, "matched-bios-payloads", artifacts,
+        "GPL-2.0-or-later", BIOS_TEST_PROVENANCE[version],
+    )
+
+
+def _payload_for_module(module: object) -> BoundBootBundle:
+    version = getattr(module, "version", "6.03-2014-10-06")
+    if type(version) is not str or version not in BIOS_PAYLOADS:
+        version = "6.03-2014-10-06"
+    return payload_bundle(version)
+
+
+def plan_syslinux_staging(entries, boot_analysis, module, **kwargs):
+    payload = kwargs.pop("payload_bundle", _payload_for_module(module))
+    return staging.plan_syslinux_staging(
+        entries, boot_analysis, module, payload, **kwargs,
+    )
+
+
+def validate_syslinux_staging_plan(plan, entries, boot_analysis, module, **kwargs):
+    payload = kwargs.pop("payload_bundle", _payload_for_module(module))
+    return staging.validate_syslinux_staging_plan(
+        plan, entries, boot_analysis, module, payload, **kwargs,
     )
 
 
@@ -103,6 +162,21 @@ class SyslinuxStagingTests(unittest.TestCase):
         self.pin_patch = patch.object(staging, "PINNED_SYSLINUX_C32", TEST_PINS)
         self.pin_patch.start()
         self.addCleanup(self.pin_patch.stop)
+        self.payload_pin_patch = patch.object(
+            syslinux, "PINNED_SYSLINUX_PAYLOADS", BIOS_TEST_PINS,
+        )
+        self.payload_pin_patch.start()
+        self.addCleanup(self.payload_pin_patch.stop)
+        self.payload_provenance_patch = patch.object(
+            syslinux, "PINNED_SYSLINUX_PROVENANCE", BIOS_TEST_PROVENANCE,
+        )
+        self.payload_provenance_patch.start()
+        self.addCleanup(self.payload_provenance_patch.stop)
+        self.root_pin_patch = patch.object(
+            staging, "PINNED_SYSLINUX_ROOTS", BIOS_TEST_ROOTS,
+        )
+        self.root_pin_patch.start()
+        self.addCleanup(self.root_pin_patch.stop)
 
     def test_nested_603_config_creates_canonical_redirect_and_module(self):
         catalog = entries()
@@ -128,11 +202,91 @@ class SyslinuxStagingTests(unittest.TestCase):
         self.assertIs(result.root_redirect.disposition, StageDisposition.CREATE)
         self.assertEqual(result.ldlinux_c32.path, "isolinux/ldlinux.c32")
         self.assertIs(result.ldlinux_c32.disposition, StageDisposition.CREATE)
-        self.assertEqual(result.additions, (result.root_redirect, result.ldlinux_c32))
+        self.assertEqual(
+            result.additions,
+            (result.root_redirect, result.ldlinux_c32, result.root_ldlinux_sys),
+        )
+        self.assertEqual(result.root_ldlinux_sys.path, "ldlinux.sys")
+        self.assertEqual(
+            result.root_ldlinux_sys.data,
+            BIOS_PAYLOADS[result.version]["ldlinux.sys"] + syslinux.make_empty_adv(),
+        )
         validate_syslinux_staging_plan(
             result, catalog, analysis(), module_bundle(), source_files=sources,
         )
 
+    def test_production_root_and_adv_pins_are_frozen_independently(self):
+        self.assertEqual(
+            hashlib.sha256(syslinux.make_empty_adv()).hexdigest(),
+            "32a7611ef0a2a3ecb19b45aea0d85b5da493874e42a671ad6283658ba383527e",
+        )
+
+    def test_generated_root_must_match_its_second_consumer_pin(self):
+        size, digest = BIOS_TEST_ROOTS["6.03-2014-10-06"]
+        for pin in ((size, "0" * 64), (size + 1, digest)):
+            with (
+                self.subTest(pin=pin),
+                patch.object(
+                    staging,
+                    "PINNED_SYSLINUX_ROOTS",
+                    {"6.03-2014-10-06": pin},
+                ),
+                self.assertRaisesRegex(SyslinuxStagingError, "independent pin"),
+            ):
+                plan_syslinux_staging(
+                    entries(),
+                    analysis(),
+                    module_bundle(),
+                    source_files=source_member_bytes(),
+                )
+        self.assertEqual(
+            PRODUCTION_ROOT_PINS,
+            {
+                "6.03-2014-10-06": (
+                    69_623,
+                    "b073e94a47a2eedc93367d75956c83a82b05d4c778eb78685af3f484917f484c",
+                ),
+                "6.04-pre1": (
+                    69_145,
+                    "7d50190c5f9c7f3e7f4f3ca98da03ec294cf10aa2b45adbdddee53f422b283a5",
+                ),
+            },
+        )
+
+    def test_bios_payload_bundle_must_match_image_and_c32_build(self):
+        with self.assertRaisesRegex(SyslinuxStagingError, "BIOS payload bundle"):
+            plan_syslinux_staging(
+                entries(),
+                analysis(),
+                module_bundle(),
+                payload_bundle=payload_bundle("6.04-pre1"),
+                source_files=source_member_bytes(),
+            )
+
+        bundle = payload_bundle()
+        for forged in (
+            replace(bundle, purpose="blank-bios-module"),
+            replace(bundle, license="MIT"),
+            replace(bundle, provenance_url="fixture://wrong"),
+            replace(bundle, artifacts=tuple(reversed(bundle.artifacts))),
+            replace(
+                bundle,
+                artifacts=(
+                    bundle.artifacts[0],
+                    replace(bundle.artifacts[1], data=b"changed"),
+                ),
+            ),
+        ):
+            with self.subTest(forged=forged), self.assertRaises(
+                SyslinuxStagingError,
+            ):
+                plan_syslinux_staging(
+                    entries(),
+                    analysis(),
+                    module_bundle(),
+                    payload_bundle=forged,
+                    source_files=source_member_bytes(),
+                )
     def test_read_paths_return_exact_required_iso_members(self):
         catalog = entries()
         self.assertEqual(
@@ -426,7 +580,10 @@ class SyslinuxStagingTests(unittest.TestCase):
         self.assertEqual(result.config_directory, "")
         self.assertIsNone(result.root_redirect)
         self.assertEqual(result.ldlinux_c32.path, "ldlinux.c32")
-        self.assertEqual(result.additions, (result.ldlinux_c32,))
+        self.assertEqual(
+            result.additions,
+            (result.ldlinux_c32, result.root_ldlinux_sys),
+        )
 
     def test_root_isolinux_config_redirect_has_no_append(self):
         catalog = entries("isolinux.cfg", bootloader="isolinux.bin")
@@ -472,7 +629,10 @@ class SyslinuxStagingTests(unittest.TestCase):
             existing_files={"isolinux/ldlinux.c32": data},
         )
         self.assertIs(result.ldlinux_c32.disposition, StageDisposition.REUSE)
-        self.assertEqual(result.additions, (result.root_redirect,))
+        self.assertEqual(
+            result.additions,
+            (result.root_redirect, result.root_ldlinux_sys),
+        )
         validate_syslinux_staging_plan(
             result, catalog, analysis(), module_bundle(),
             source_files=source_member_bytes(),
@@ -770,6 +930,25 @@ class SyslinuxStagingTests(unittest.TestCase):
             replace(
                 result,
                 ldlinux_c32=replace(result.ldlinux_c32, disposition=StageDisposition.REUSE),
+            ),
+            replace(
+                result,
+                root_ldlinux_sys=replace(result.root_ldlinux_sys, path="other.sys"),
+            ),
+            replace(
+                result,
+                root_ldlinux_sys=replace(
+                    result.root_ldlinux_sys,
+                    disposition=StageDisposition.REUSE,
+                ),
+            ),
+            replace(
+                result,
+                root_ldlinux_sys=replace(
+                    result.root_ldlinux_sys,
+                    data=b"changed",
+                    sha256=hashlib.sha256(b"changed").hexdigest(),
+                ),
             ),
         ):
             with self.subTest(forged=forged):
