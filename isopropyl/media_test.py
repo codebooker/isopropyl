@@ -29,7 +29,7 @@ from enum import Enum
 from typing import BinaryIO
 
 from .devices import Device, SizeUnitMode, format_size, list_devices
-from .conflicts import conflict_diagnostic_suffix
+from .conflicts import conflict_diagnostic_suffix, unmount_response_is_inactive
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -477,7 +477,7 @@ class MediaTestRunner:
         if self.cancelled:
             raise MediaTestCancelled("Media validation was cancelled")
 
-    def _verify_target(self, plan: MediaTestPlan) -> None:
+    def _verify_target(self, plan: MediaTestPlan) -> Device:
         try:
             matching = [
                 candidate for candidate in self._device_lister()
@@ -501,8 +501,10 @@ class MediaTestRunner:
                 raise MediaTestSafetyError(
                     "The target device number changed; rescan and confirm again"
                 )
+        return matching[0]
 
-    def _unmount(self, plan: MediaTestPlan) -> None:
+    def _unmount(self, plan: MediaTestPlan) -> bool:
+        normalized_nonzero = False
         targets = plan.device.partitions or (
             (plan.device.path,) if plan.device.mountpoints else ()
         )
@@ -521,11 +523,14 @@ class MediaTestRunner:
                     message + conflict_diagnostic_suffix(target)
                 ) from error
             combined = f"{result.stdout or ''}{result.stderr or ''}".lower()
-            if result.returncode and "not mounted" not in combined:
-                message = combined.strip() or f"Could not unmount {target}"
-                raise MediaTestSafetyError(
-                    message + conflict_diagnostic_suffix(target)
-                )
+            if result.returncode:
+                if not unmount_response_is_inactive(combined):
+                    message = combined.strip() or f"Could not unmount {target}"
+                    raise MediaTestSafetyError(
+                        message + conflict_diagnostic_suffix(target)
+                    )
+                normalized_nonzero = True
+        return normalized_nonzero
 
     @staticmethod
     def _pipe_reader(
@@ -651,9 +656,14 @@ class MediaTestRunner:
         # device path both before authorization work and immediately before the
         # first destructive command.
         self._verify_target(plan)
-        self._unmount(plan)
+        normalized_unmount = self._unmount(plan)
         self._check_cancelled()
-        self._verify_target(plan)
+        current = self._verify_target(plan)
+        if normalized_unmount:
+            if current.mountpoints:
+                raise MediaTestSafetyError(
+                    "The target still reports mounted filesystems after unmounting"
+                )
 
         bad_blocks: set[int] = set()
         capacity_status = CapacityStatus.NOT_TESTED

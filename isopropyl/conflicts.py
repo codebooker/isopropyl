@@ -2,12 +2,13 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Best-effort, read-only diagnostics for a busy block device.
+"""Best-effort, read-only diagnostics and UDisks response normalization.
 
-The probe never kills a process and never weakens an unmount failure. It uses
-the trusted system ``fuser`` with a fixed argument vector, then reads only the
-owning process name and numeric UID from a descriptor-bound ``/proc/<pid>``
-directory.
+The probe never kills a process.  An inactive UDisks response is only a hint;
+destructive callers must pair any normalized nonzero response with a fresh
+empty-mountpoint witness.  Conflict diagnostics use the trusted system
+``fuser`` with a fixed argument vector, then read only the owning process name
+and numeric UID from a descriptor-bound ``/proc/<pid>`` directory.
 """
 
 import os
@@ -30,6 +31,21 @@ TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 TRUSTED_TOOL_DIRECTORIES = frozenset(TRUSTED_TOOL_PATH.split(":"))
 _BLOCK_PATH = re.compile(r"/dev/[A-Za-z0-9._+:-]+")
 _PID = re.compile(r"[1-9][0-9]*")
+_INACTIVE_UNMOUNT_MARKERS = (
+    "not mounted",
+    "not a mounted filesystem",
+    "not a mountable filesystem",
+)
+
+
+def unmount_response_is_inactive(message: object) -> bool:
+    """Recognize a trusted UDisks reply that indicates no active mount."""
+
+    if not isinstance(message, str):
+        return False
+    normalized = " ".join(message.casefold().split())
+    normalized = normalized.rstrip(".")
+    return any(normalized.endswith(marker) for marker in _INACTIVE_UNMOUNT_MARKERS)
 
 
 @dataclass(frozen=True)

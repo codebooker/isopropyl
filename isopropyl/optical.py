@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from .conflicts import conflict_diagnostic_suffix
+from .conflicts import conflict_diagnostic_suffix, unmount_response_is_inactive
 
 OPTICAL_SECTOR_BYTES = 2048
 OUTPUT_SPACE_RESERVE_BYTES = 16 * 1024 * 1024
@@ -560,9 +560,9 @@ class OpticalCaptureRunner:
                     f"The destination needs {required} free bytes, but only {free} are available"
                 )
 
-    def _unmount(self, plan: OpticalCapturePlan, current: OpticalDevice) -> None:
+    def _unmount(self, plan: OpticalCapturePlan, current: OpticalDevice) -> bool:
         if not current.mountpoints:
-            return
+            return False
         try:
             result = self._run_command(
                 [
@@ -580,14 +580,14 @@ class OpticalCaptureRunner:
                 message + conflict_diagnostic_suffix(current.path)
             ) from error
         combined = (result.stdout or "") + (result.stderr or "")
-        if result.returncode and not any(
-            item in combined.casefold()
-            for item in ("not mounted", "not a mounted filesystem")
-        ):
-            message = _bounded_message(combined, f"Could not unmount {current.path}")
-            raise OpticalSafetyError(
-                message + conflict_diagnostic_suffix(current.path)
-            )
+        if result.returncode:
+            if not unmount_response_is_inactive(combined):
+                message = _bounded_message(combined, f"Could not unmount {current.path}")
+                raise OpticalSafetyError(
+                    message + conflict_diagnostic_suffix(current.path)
+                )
+            return True
+        return False
 
     @staticmethod
     def _stderr_reader(
@@ -719,10 +719,14 @@ class OpticalCaptureRunner:
         validate_optical_capture_plan(plan)
         self._verify_destination(plan, check_space=True)
         current = self._verify_source(plan)
-        self._unmount(plan, current)
+        normalized_unmount = self._unmount(plan, current)
         # Revalidate the source and destination after unmount, immediately
         # before opening a temporary output and starting the privileged reader.
-        self._verify_source(plan)
+        current = self._verify_source(plan)
+        if normalized_unmount and current.mountpoints:
+            raise OpticalSafetyError(
+                "The optical source still reports mounted filesystems after unmounting"
+            )
         self._verify_destination(plan, check_space=True)
 
         descriptor = -1

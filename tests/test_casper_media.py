@@ -487,6 +487,46 @@ class LayoutExecutorTests(unittest.TestCase):
             popen.assert_not_called()
             boundary.assert_not_called()
 
+    def test_normalized_unmount_requires_empty_witness_before_partitioning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _profile, _staging, plan = media_plan(root)
+            mounted = device(
+                mountpoints=("/media/usb",),
+                partitions=("/dev/sdz1", "/dev/sdz2"),
+            )
+            partitioner = Mock()
+
+            def runner(argv, **_kwargs):
+                if argv[0] == "/usr/bin/lsblk" and "--nodeps" in argv:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "blockdevices": [{
+                            "path": "/dev/sdz", "type": "disk", "log-sec": 512,
+                        }],
+                    }), "")
+                if argv[0] == "/usr/bin/udisksctl":
+                    return subprocess.CompletedProcess(
+                        argv,
+                        1,
+                        "",
+                        "Object /org/freedesktop/UDisks2/block_devices/sdz1 "
+                        "is not a mountable filesystem.",
+                    )
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            executor = CasperLayoutExecutor(
+                boundary_validator=Mock(),
+                device_lookup=lambda _path: mounted,
+                which=finder,
+                runner=runner,
+                lstat_func=block_stat,
+                popen=partitioner,
+            )
+
+            with self.assertRaisesRegex(FormattingError, "still reports mounted"):
+                executor.execute_multi(mounted, plan.layout)
+            partitioner.assert_not_called()
+
     def test_revalidates_exact_geometry_and_nodes_before_each_mkfs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

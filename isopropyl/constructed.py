@@ -27,7 +27,7 @@ from pathlib import Path, PurePosixPath
 from typing import TypeVar
 
 from .devices import Device, parse_lsblk, path_is_on_device
-from .conflicts import conflict_diagnostic_suffix
+from .conflicts import conflict_diagnostic_suffix, unmount_response_is_inactive
 from .formatting import (
     Filesystem,
     FormatCancelled,
@@ -1107,17 +1107,35 @@ class ConstructedMediaExecutor:
                     capture_output=True, text=True, timeout=30, shell=False,
                 )
                 combined = (result.stdout or "") + (result.stderr or "")
-                unmounted = result.returncode == 0 or any(
-                    item in combined.casefold()
-                    for item in ("not mounted", "not a mounted filesystem")
+                normalized_nonzero = (
+                    result.returncode != 0
+                    and unmount_response_is_inactive(combined)
                 )
-                if not unmounted:
-                    cleanup_diagnostic = (
-                        _bounded_message(
-                            combined, f"Could not unmount {partition}",
+                unmounted = result.returncode == 0
+                if normalized_nonzero:
+                    try:
+                        current = self._verify_device(plan)
+                    except (ConstructedMediaError, OSError, ValueError) as error:
+                        cleanup_diagnostic = _bounded_message(
+                            error,
+                            "Could not verify the target mount state after unmounting",
                         )
-                        + conflict_diagnostic_suffix(partition)
-                    )
+                    else:
+                        unmounted = not current.mountpoints
+                        if not unmounted:
+                            cleanup_diagnostic = (
+                                "The target still reports mounted filesystems after "
+                                "unmounting"
+                                + conflict_diagnostic_suffix(partition)
+                            )
+                if not unmounted:
+                    if not cleanup_diagnostic:
+                        cleanup_diagnostic = (
+                            _bounded_message(
+                                combined, f"Could not unmount {partition}",
+                            )
+                            + conflict_diagnostic_suffix(partition)
+                        )
             except (OSError, subprocess.SubprocessError) as error:
                 unmounted = False
                 cleanup_diagnostic = (

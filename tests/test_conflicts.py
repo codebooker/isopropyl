@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from isopropyl.conflicts import (
     ConflictReport, ConflictingProcess, conflict_diagnostic_suffix,
-    probe_conflicting_processes,
+    probe_conflicting_processes, unmount_response_is_inactive,
 )
 
 
@@ -48,6 +48,26 @@ class ConflictDiagnosticTests(unittest.TestCase):
         (process / "stat").write_text(
             f"{pid} (fixture process) " + " ".join(fields) + "\n"
         )
+
+    def test_unmount_inactive_responses_are_narrow_and_normalized(self):
+        for message in (
+            "not mounted",
+            "Object is not a mounted filesystem.",
+            "Object /org/freedesktop/UDisks2/block_devices/sda1 is not a "
+            "mountable filesystem.",
+            "  NOT   A MOUNTABLE\nFILESYSTEM  ",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(unmount_response_is_inactive(message))
+        for message in (
+            "device is busy",
+            "not mounted; device is busy",
+            "not a mountable filesystem; permission denied",
+            "",
+            None,
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(unmount_response_is_inactive(message))
 
     def test_fixed_fuser_probe_reports_descriptor_bound_process_names(self):
         with tempfile.TemporaryDirectory() as directory:

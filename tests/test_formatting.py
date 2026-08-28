@@ -1840,6 +1840,89 @@ class FormatExecutorTests(unittest.TestCase):
             executor.execute(self.device, self.plan)
         diagnose.assert_called_once_with("/dev/sdz1")
 
+    def test_unformatted_partition_response_allows_safe_recovery_format(self):
+        processes = []
+        unmount_seen = False
+
+        def popen(argv, **kwargs):
+            process = FakeProcess(argv, **kwargs)
+            processes.append(process)
+            return process
+
+        def runner(argv, **_kwargs):
+            nonlocal unmount_seen
+            if argv[0].endswith("/udisksctl"):
+                unmount_seen = True
+                return completed(
+                    stderr=(
+                        "Object /org/freedesktop/UDisks2/block_devices/sdz1 "
+                        "is not a mountable filesystem."
+                    ),
+                    code=1,
+                )
+            if "--json" in argv and any(
+                argument.endswith("/sfdisk") for argument in argv
+            ):
+                return completed(single_metadata_payload(self.plan))
+            if "lsblk" in argv[0] and "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
+            if "lsblk" in argv[0]:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "children": [{
+                        "path": "/dev/sdz1", "type": "part",
+                        "pkname": self.device.path, "maj:min": "65:145",
+                    }],
+                }]}))
+            return completed()
+
+        executor = FormatExecutor(
+            device_lookup=lambda _path: (
+                test_device(mountpoints=()) if unmount_seen else self.device
+            ),
+            which=lambda name: f"/usr/bin/{name}",
+            popen=popen,
+            runner=runner,
+            lstat_func=partition_lstat,
+            sleep=lambda _seconds: None,
+        )
+
+        self.assertEqual(executor.execute(self.device, self.plan), "/dev/sdz1")
+        self.assertTrue(any(
+            any(argument.endswith("/mkfs.vfat") for argument in process.argv)
+            for process in processes
+        ))
+
+    def test_normalized_unmount_response_requires_empty_mountpoint_witness(self):
+        partitioner = Mock()
+
+        def runner(argv, **_kwargs):
+            if "PATH,TYPE,LOG-SEC" in argv:
+                return completed(json.dumps({"blockdevices": [{
+                    "path": self.device.path, "type": "disk", "log-sec": 512,
+                }]}))
+            if argv[0].endswith("/udisksctl"):
+                return completed(
+                    stderr=(
+                        "Object /org/freedesktop/UDisks2/block_devices/sdz1 "
+                        "is not a mountable filesystem."
+                    ),
+                    code=1,
+                )
+            return completed()
+
+        executor = FormatExecutor(
+            device_lookup=lambda _path: self.device,
+            which=lambda name: f"/usr/bin/{name}",
+            runner=runner,
+            popen=partitioner,
+        )
+
+        with self.assertRaisesRegex(FormattingError, "still reports mounted"):
+            executor.execute(self.device, self.plan)
+        partitioner.assert_not_called()
+
     def test_unmount_timeout_is_bounded_before_partitioning(self):
         calls = []
 

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .devices import Device, parse_lsblk
-from .conflicts import conflict_diagnostic_suffix
+from .conflicts import conflict_diagnostic_suffix, unmount_response_is_inactive
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -280,6 +280,7 @@ def unmount_device(
         stat_func=stat_func, device_lookup=device_lookup,
     )
     targets = current.partitions or ((current.path,) if current.mountpoints else ())
+    normalized_nonzero = False
     for target in targets:
         cancel_check()
         try:
@@ -293,16 +294,19 @@ def unmount_device(
                 str(error) + conflict_diagnostic_suffix(target)
             ) from error
         combined = (result.stdout or "") + (result.stderr or "")
-        if result.returncode and not any(
-            marker in combined.casefold()
-            for marker in ("not mounted", "not a mounted filesystem")
-        ):
-            message = _bounded_message(combined, f"Could not unmount {target}")
-            raise WriterError(message + conflict_diagnostic_suffix(target))
-    revalidate_device(
+        if result.returncode:
+            if not unmount_response_is_inactive(combined):
+                message = _bounded_message(combined, f"Could not unmount {target}")
+                raise WriterError(message + conflict_diagnostic_suffix(target))
+            normalized_nonzero = True
+    current = revalidate_device(
         expected, writable=writable, tools=tools, runner=runner,
         stat_func=stat_func, device_lookup=device_lookup,
     )
+    if normalized_nonzero and current.mountpoints:
+        raise WriterSafetyError(
+            "The target still reports mounted filesystems after unmounting"
+        )
 
 
 class ImageWriter:

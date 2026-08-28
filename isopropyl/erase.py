@@ -34,7 +34,7 @@ from enum import Enum
 from typing import BinaryIO
 
 from .devices import Device, SizeUnitMode, format_size, parse_lsblk
-from .conflicts import conflict_diagnostic_suffix
+from .conflicts import conflict_diagnostic_suffix, unmount_response_is_inactive
 from .locking import (
     CooperativeLockError,
     cooperative_lock_command,
@@ -496,7 +496,8 @@ class EraseRunner:
             )
         return current
 
-    def _unmount(self, plan: ErasePlan, current: Device) -> None:
+    def _unmount(self, plan: ErasePlan, current: Device) -> bool:
+        normalized_nonzero = False
         targets = current.partitions or ((current.path,) if current.mountpoints else ())
         for target in targets:
             self._check_cancelled()
@@ -514,14 +515,14 @@ class EraseRunner:
                     message + conflict_diagnostic_suffix(target)
                 ) from error
             combined = (result.stdout or "") + (result.stderr or "")
-            if result.returncode and not any(
-                item in combined.casefold()
-                for item in ("not mounted", "not a mounted filesystem")
-            ):
-                message = _bounded_message(combined, f"Could not unmount {target}")
-                raise EraseSafetyError(
-                    message + conflict_diagnostic_suffix(target)
-                )
+            if result.returncode:
+                if not unmount_response_is_inactive(combined):
+                    message = _bounded_message(combined, f"Could not unmount {target}")
+                    raise EraseSafetyError(
+                        message + conflict_diagnostic_suffix(target)
+                    )
+                normalized_nonzero = True
+        return normalized_nonzero
 
     @staticmethod
     def _pipe_reader(
@@ -674,8 +675,12 @@ class EraseRunner:
         # every destructive command.  A path reuse or device replacement fails
         # closed before the next byte range can start.
         current = self._verify_target(plan)
-        self._unmount(plan, current)
-        self._verify_target(plan)
+        normalized_unmount = self._unmount(plan, current)
+        current = self._verify_target(plan)
+        if normalized_unmount and current.mountpoints:
+            raise EraseSafetyError(
+                "The target still reports mounted filesystems after unmounting"
+            )
 
         completed = 0
         for index, byte_range in enumerate(plan.ranges):

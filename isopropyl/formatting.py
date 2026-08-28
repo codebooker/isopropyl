@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .devices import Device, parse_lsblk
-from .conflicts import conflict_diagnostic_suffix
+from .conflicts import conflict_diagnostic_suffix, unmount_response_is_inactive
 from .locking import (
     CooperativeLockError,
     add_native_sfdisk_lock,
@@ -2055,7 +2055,8 @@ class FormatExecutor:
             plan, result.stdout, partition, expected_logical_sector_size,
         )
 
-    def _unmount(self, device: Device, tools: FormatTools) -> None:
+    def _unmount(self, device: Device, tools: FormatTools) -> bool:
+        normalized_nonzero = False
         targets = device.partitions or ((device.path,) if device.mountpoints else ())
         for target in targets:
             self._check_cancelled()
@@ -2073,14 +2074,14 @@ class FormatExecutor:
                     + conflict_diagnostic_suffix(target)
                 ) from error
             combined = ((result.stdout or "") + (result.stderr or "")).strip()
-            if result.returncode and not any(
-                text in combined.casefold()
-                for text in ("not mounted", "not a mounted filesystem")
-            ):
-                message = combined or f"Could not unmount {target}"
-                raise FormattingError(
-                    message + conflict_diagnostic_suffix(target)
-                )
+            if result.returncode:
+                if not unmount_response_is_inactive(combined):
+                    message = combined or f"Could not unmount {target}"
+                    raise FormattingError(
+                        message + conflict_diagnostic_suffix(target)
+                    )
+                normalized_nonzero = True
+        return normalized_nonzero
 
     def _discover_partition(self, plan: FormatPlan, tools: FormatTools) -> str:
         for attempt in range(self._discovery_attempts):
@@ -2127,8 +2128,12 @@ class FormatExecutor:
         current = self._assert_identity(plan, tools)
         logical_sector_size = self._assert_restore_filesystem_geometry(plan, tools)
         report("Unmounting")
-        self._unmount(current, tools)
-        self._assert_identity(plan, tools)
+        normalized_unmount = self._unmount(current, tools)
+        current = self._assert_identity(plan, tools)
+        if normalized_unmount and current.mountpoints:
+            raise FormattingError(
+                "The target still reports mounted filesystems after unmounting"
+            )
         self._assert_restore_filesystem_geometry(
             plan, tools, logical_sector_size,
         )
@@ -2281,8 +2286,12 @@ class MultiFormatExecutor(FormatExecutor):
         # differs from the kernel device. Observe and bind it before unmounting.
         self._assert_logical_sector_size(plan, tools)
         report("Unmounting")
-        self._unmount(current, tools)  # type: ignore[arg-type]
-        self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        normalized_unmount = self._unmount(current, tools)  # type: ignore[arg-type]
+        current = self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        if normalized_unmount and current.mountpoints:
+            raise FormattingError(
+                "The target still reports mounted filesystems after unmounting"
+            )
         self._assert_logical_sector_size(plan, tools)
 
         report("Creating partition table")

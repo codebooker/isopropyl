@@ -35,7 +35,7 @@ from .constructed import (
     build_constructed_media_plan,
     validate_constructed_media_plan,
 )
-from .conflicts import conflict_diagnostic_suffix
+from .conflicts import conflict_diagnostic_suffix, unmount_response_is_inactive
 from .devices import Device, parse_lsblk, path_is_on_device
 from .formatting import (
     DeviceChangedError,
@@ -900,8 +900,12 @@ class CasperLayoutExecutor(MultiFormatExecutor):
         self._assert_logical_sector_size(plan, tools)
         report("Unmounting")
         self._check_cancelled()
-        self._unmount(current, tools)  # type: ignore[arg-type]
-        self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        normalized_unmount = self._unmount(current, tools)  # type: ignore[arg-type]
+        current = self._assert_identity(plan, tools)  # type: ignore[arg-type]
+        if normalized_unmount and current.mountpoints:
+            raise FormattingError(
+                "The target still reports mounted filesystems after unmounting"
+            )
         self._assert_logical_sector_size(plan, tools)
 
         self._check_cancelled()
@@ -1154,9 +1158,7 @@ class CasperMediaExecutor:
                     + conflict_diagnostic_suffix(partition)
                 ) from error
             combined = ((result.stdout or "") + (result.stderr or "")).casefold()
-            if result.returncode and not any(
-                text in combined for text in ("not mounted", "not a mounted filesystem")
-            ):
+            if result.returncode and not unmount_response_is_inactive(combined):
                 raise CasperMediaError(
                     _bounded(combined, f"Could not unmount {partition}")
                     + conflict_diagnostic_suffix(partition)
