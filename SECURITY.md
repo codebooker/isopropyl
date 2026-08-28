@@ -184,6 +184,15 @@ issue requesting a private contact channel without disclosing the vulnerability.
   external tool. None of this authorizes physical media: privileged topology,
   mount, GPT/NTFS, PREPARED → COMMIT, cancellation-recovery, and physical-boot
   gates remain unimplemented.
+- The Windows BCD oracle module is a non-authorizing evidence contract, not a
+  hive parser, editor, or trust decision. It accepts only canonical, bounded
+  JSON; models BCD values with their actual registry kinds; derives references,
+  boot paths, devices, inheritance, and recovery-disabled byte `00` from typed
+  elements; binds a disposable fresh-store GPT layout and hash-verified Microsoft
+  tool transcripts; and requires a four-run one-GUID-at-a-time differential
+  cohort. Its tests are synthetic and cannot remove the native BCD authoring,
+  read-back, QEMU/OVMF, or physical-media execution blockers. No application,
+  helper, PolicyKit, or device-writing path imports this module yet.
 - The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
   dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
   2.06/2.12/2.14 blank-media research bundles, plus the exact upstream UEFI

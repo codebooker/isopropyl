@@ -145,8 +145,13 @@ evidence.
   512-byte-sector GPT geometry (260 MiB ESP, 128 MiB MSR, remaining NTFS).
   A candidate serializer/parser records the 88-byte qualified-partition hive
   layout used by two independent open-source implementations, but Microsoft's
-  public WMI style values conflict with that internal mapping. Windows-generated
-  fixtures and QEMU therefore gate any hive use. A candidate non-executable
+  public WMI style values conflict with that internal mapping. A separate strict
+  typed evidence envelope now models actual BCD registry kinds, derives graph and
+  boot semantics from captured values, binds the complete frozen GPT geometry and
+  Microsoft command provenance, and requires a four-run one-GUID-at-a-time
+  differential set. Its unit fixtures are explicitly synthetic: Windows-generated
+  captures, native hivex construction/read-back, and QEMU still gate any hive use.
+  A candidate non-executable
   WIM-apply request contract now carries strictly validated claims for the
   parent, exact child geometry, WIM snapshot, edition index/expanded size, and
   plan receipts. A device-free backend now certifies the exact inherited-fd

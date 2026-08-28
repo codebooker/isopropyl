@@ -289,11 +289,14 @@ expanded drive visibility are never persisted.
 | Additive `.zip` overlay | ISO mode option | One stored/deflated archive; additions only, no overwrites or links. |
 
 Unsupported or ambiguous formats fail closed. Direct FFU/WIM/ESD device apply,
-executable Windows To Go (an internal fail-closed layout/capacity preview and a
-device-free anonymous-NTFS-image WIM backend certification now exist), and general
+executable Windows To Go (an internal fail-closed layout/capacity preview, a
+device-free anonymous-NTFS-image WIM backend certificate, and a non-authorizing
+typed Windows BCD differential-evidence contract now exist), and general
 device-facing BIOS/dual-firmware construction from arbitrary payloads remain
 roadmap work. The certification backend explicitly rejects block devices and is
 not a claim about hostile same-UID processes, Windows boot, or physical media.
+The BCD contract currently has synthetic tests only; it cannot create, modify,
+publish, or trust a boot hive.
 
 ## Windows customization
 

@@ -96,6 +96,7 @@ wim_apply_backend.py
 wim_apply_protocol.py
 windows.py
 windows_bcd.py
+windows_bcd_oracle.py
 windows_bootex.py
 windows_downloads.py
 windows_paths.py
