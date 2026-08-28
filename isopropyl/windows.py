@@ -30,6 +30,7 @@ LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
 KEYBOARD_LAYOUT = re.compile(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}")
 CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 ONLINE_ACCOUNT_BYPASS_BUILDS = frozenset({22000, 22621, 22631, 26100})
+SECURE_BOOT_REVOCATION_POLICY_BUILDS = frozenset({26200, 28000})
 ONLINE_ACCOUNT_BYPASS_EDITIONS = frozenset({
     "education",
     "educationn",
@@ -95,6 +96,45 @@ _FAST_STARTUP_COMMAND = (
     "Disable Windows Fast Startup",
     'reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Power" '
     "/v HiberbootEnabled /t REG_DWORD /d 0 /f",
+)
+
+# Rufus 4.14 introduced the same installed-system policy deployment, but uses a
+# fixed drive letter. ISOpropyl deliberately uses a new private mount directory
+# and a PowerShell try/finally block so an existing drive mapping cannot collide
+# and the EFI System Partition is unmounted even when the copy fails. No value
+# in this command is derived from a username, path, ISO member, or other user
+# input.
+_SECURE_BOOT_REVOCATION_POLICY_COMMAND = (
+    "Apply the installed Windows Secure Boot revocation policy",
+    "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+    '-Command "$ErrorActionPreference=\'Stop\';'
+    "$m=Join-Path $env:SystemRoot "
+    "('Temp\\ISOpropyl-ESP-'+[guid]::NewGuid().ToString('N'));"
+    "New-Item -ItemType Directory -Path $m | Out-Null;"
+    "$mounted=$false;"
+    "try { "
+    "$source=Join-Path $env:WINDIR "
+    "'System32\\SecureBootUpdates\\SkuSiPolicy.p7b';"
+    "if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { "
+    "throw 'SkuSiPolicy.p7b is unavailable' };"
+    "& mountvol.exe $m /S;"
+    "if ($LASTEXITCODE -ne 0) { "
+    "throw 'Could not mount the EFI System Partition' };"
+    "$mounted=$true;"
+    "$destination=Join-Path $m 'EFI\\Microsoft\\Boot';"
+    "New-Item -ItemType Directory -Force -Path $destination | Out-Null;"
+    "Copy-Item -LiteralPath $source -Destination "
+    "(Join-Path $destination 'SkuSiPolicy.p7b') -Force;"
+    "} finally { "
+    "$unmountExit=0;"
+    "if ($mounted) { "
+    "& mountvol.exe $m /D | Out-Null;$unmountExit=$LASTEXITCODE };"
+    "Remove-Item -LiteralPath $m -Force -ErrorAction SilentlyContinue;"
+    "if ($unmountExit -ne 0) { "
+    "throw 'Could not unmount the EFI System Partition' };"
+    "if (Test-Path -LiteralPath $m) { "
+    "throw 'Could not remove the EFI mount directory' }"
+    '}"',
 )
 
 _QOL_FIRST_LOGON_COMMANDS = (
@@ -215,6 +255,8 @@ class WindowsCustomization:
     disable_fast_startup: bool = False
     quality_of_life: bool = False
     acknowledge_quality_of_life_limitations: bool = False
+    apply_secure_boot_revocation_policy: bool = False
+    acknowledge_secure_boot_revocation_risk: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -223,7 +265,7 @@ class WindowsCustomization:
             self.bypass_online_account_requirement,
             bool(self.local_username), self.reduce_data_collection,
             self.disable_automatic_bitlocker, self.disable_fast_startup,
-            self.quality_of_life,
+            self.quality_of_life, self.apply_secure_boot_revocation_policy,
             bool(self.input_locale),
             bool(self.system_locale), bool(self.ui_language),
             bool(self.user_locale), bool(self.timezone), self.install_image is not None,
@@ -394,6 +436,54 @@ def quality_of_life_compatibility(
     )
 
 
+def secure_boot_revocation_policy_compatibility(
+    selection: WimSelection | None,
+) -> tuple[bool, str]:
+    """Gate installed-system SkuSiPolicy deployment on conclusive metadata."""
+
+    if selection is None:
+        return False, (
+            "Inspect and select a Windows 11 25H2 or later edition before "
+            "enabling this option"
+        )
+    try:
+        validate_wim_selection(selection)
+    except WimValidationError:
+        return False, "The selected Windows edition metadata is not valid"
+    edition = selection.edition
+    if (
+        edition.major_version != 10
+        or edition.minor_version != 0
+        or edition.build not in SECURE_BOOT_REVOCATION_POLICY_BUILDS
+    ):
+        return False, (
+            "The installed-system Secure Boot policy option requires Windows 11 "
+            "25H2 or 26H1 build 26200 or 28000"
+        )
+    if edition.architecture not in {"amd64", "arm64"}:
+        return False, (
+            "The installed-system Secure Boot policy option requires x64 or ARM64 "
+            "Windows 11"
+        )
+    edition_text = unicodedata.normalize("NFKC", " ".join((
+        edition.name, edition.description, edition.edition_id,
+    ))).casefold()
+    compact_edition_text = "".join(
+        character for character in edition_text if character.isalnum()
+    )
+    if "smode" in compact_edition_text or "cloud" in compact_edition_text:
+        return False, (
+            "The installed-system Secure Boot policy option is disabled because "
+            "first-logon commands are not reliable for S-mode or cloud editions"
+        )
+    return True, (
+        "At first logon, copies the selected Windows 11 installation's own "
+        "SkuSiPolicy.p7b to its EFI System Partition. This can block older boot, "
+        "installation, and recovery media. The image must already include the "
+        "latest applicable updates, which ISOpropyl cannot verify."
+    )
+
+
 def _settings(root: ET.Element, passes: dict[str, ET.Element], name: str) -> ET.Element:
     settings = passes.get(name)
     if settings is None:
@@ -481,6 +571,18 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
         compatible, reason = quality_of_life_compatibility(options.install_image)
         if not compatible:
             raise ValueError(reason)
+    if options.apply_secure_boot_revocation_policy:
+        if not options.acknowledge_secure_boot_revocation_risk:
+            raise ValueError(
+                "Acknowledge that applying SkuSiPolicy.p7b can block older boot "
+                "or recovery media, that the image must include the latest "
+                "applicable updates, and that first-logon success cannot be verified"
+            )
+        compatible, reason = secure_boot_revocation_policy_compatibility(
+            options.install_image,
+        )
+        if not compatible:
+            raise ValueError(reason)
 
     root = ET.Element(f"{{{UNATTEND_NS}}}unattend")
     passes: dict[str, ET.Element] = {}
@@ -557,7 +659,8 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
 
     needs_shell = any((
         options.hide_online_account, options.bypass_online_account_requirement,
-        username, options.reduce_data_collection, options.quality_of_life, timezone,
+        username, options.reduce_data_collection, options.quality_of_life,
+        options.apply_secure_boot_revocation_policy, timezone,
     ))
     if needs_shell:
         shell = component("oobeSystem", "Microsoft-Windows-Shell-Setup")
@@ -617,6 +720,10 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
                     "powershell.exe -NoLogo -NoProfile -NonInteractive -Command "
                     + account_policy,
                 ))
+        if options.apply_secure_boot_revocation_policy:
+            first_logon_commands.append(
+                _SECURE_BOOT_REVOCATION_POLICY_COMMAND
+            )
         if options.quality_of_life:
             first_logon_commands.extend(
                 _QOL_FIRST_LOGON_COMMANDS[

@@ -249,6 +249,20 @@ issue requesting a private contact channel without disclosing the vulnerability.
   duplicate `HiberbootEnabled`. Tests assert one ordered component, one ordered
   first-logon sequence, exact regeneration from the frozen staging model, and
   the absence of `DiskConfiguration`, `InstallTo`, and `WillWipeDisk`.
+  The installed-system Secure Boot revocation-policy option is separately
+  default-off and requires an explicitly selected, validated x64/ARM64 Windows
+  11 build 26200 or 28000. Unknown future builds and obvious S-mode/cloud
+  editions fail closed. The
+  generated first-logon command contains no user text, host path, downloaded
+  payload, or network action: it creates a unique private mount directory,
+  mounts the installed system's EFI System Partition, copies only that installed
+  Windows image's own `System32\SecureBootUpdates\SkuSiPolicy.p7b`, and uses a
+  `try/finally` cleanup to unmount the partition and remove the directory. The
+  GUI requires confirmation that the image already contains the latest
+  applicable updates and acknowledgment that older boot/recovery media may be
+  blocked, current recovery media and any BitLocker recovery key should be
+  available, and ISOpropyl cannot attest the image's servicing level or that the
+  later first-logon step succeeds.
   This is an ISOpropyl construction invariant, not a claim that every unusual
   booted Windows Setup launch context has been physically certified. ISOpropyl
   never emits an automatic target-disk wipe instruction for Windows Setup.

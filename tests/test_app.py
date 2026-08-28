@@ -1926,6 +1926,100 @@ class WindowWriteMethodTests(unittest.TestCase):
         with patch("isopropyl.app.QDialog.exec", new=verify_reopened):
             self.window.configure_windows()
 
+    def test_secure_boot_policy_requires_known_build_and_acknowledgment(self):
+        source = ArchiveEntry("sources/install.wim", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26200, 0,
+        )
+        self.window.windows_wim_candidates = (source,)
+        self.window.windows_install_source_count = 1
+        self.window.windows_wim_member = source
+        self.window.windows_wim_editions = (edition,)
+
+        def enable_and_save(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsSecureBootRevocationPolicyCheckBox",
+            )
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsSecureBootRevocationPolicyAcknowledgment",
+            )
+            combo = dialog.findChild(QComboBox, "windowsEditionCombo")
+            assert checkbox is not None and acknowledgment is not None
+            assert combo is not None
+            self.assertFalse(checkbox.isEnabled())
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(acknowledgment.isEnabled())
+            self.assertIn("latest applicable updates", acknowledgment.text())
+            combo.setCurrentIndex(combo.findData(edition.index))
+            self.assertTrue(checkbox.isEnabled())
+            self.assertIn("SkuSiPolicy.p7b", checkbox.toolTip())
+            checkbox.setChecked(True)
+            self.assertTrue(acknowledgment.isEnabled())
+            acknowledgment.setChecked(True)
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=enable_and_save):
+            self.window.configure_windows()
+
+        self.assertTrue(
+            self.window.windows_options.apply_secure_boot_revocation_policy,
+        )
+        self.assertTrue(
+            self.window.windows_options.acknowledge_secure_boot_revocation_risk,
+        )
+        self.assertEqual(self.window.windows_options.install_image.edition, edition)
+
+        def verify_reopened(dialog) -> int:
+            checkbox = dialog.findChild(
+                QCheckBox, "windowsSecureBootRevocationPolicyCheckBox",
+            )
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsSecureBootRevocationPolicyAcknowledgment",
+            )
+            assert checkbox is not None and acknowledgment is not None
+            self.assertTrue(checkbox.isEnabled())
+            self.assertTrue(checkbox.isChecked())
+            self.assertTrue(acknowledgment.isEnabled())
+            self.assertTrue(acknowledgment.isChecked())
+            checkbox.setChecked(False)
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=verify_reopened):
+            self.window.configure_windows()
+        self.assertTrue(
+            self.window.windows_options.apply_secure_boot_revocation_policy,
+        )
+
+    def test_iso_plan_preview_discloses_secure_boot_policy(self):
+        source = ArchiveEntry("sources/install.wim", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26200, 0,
+        )
+        self.window.windows_options = WindowsCustomization(
+            install_image=WimSelection(source.path, source.size, (edition,), 1),
+            apply_secure_boot_revocation_policy=True,
+            acknowledge_secure_boot_revocation_risk=True,
+        )
+        observed = {}
+
+        def inspect(dialog: QDialog) -> int:
+            text = dialog.findChild(QPlainTextEdit)
+            assert text is not None
+            observed["text"] = text.toPlainText()
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            self.window.preview_iso_plan()
+
+        preview = observed["text"]
+        self.assertIn("SkuSiPolicy.p7b", preview)
+        self.assertIn("at first logon", preview)
+        self.assertIn("current updates and recovery readiness", preview)
+
     def test_online_account_bypass_disables_unknown_later_build(self):
         source = ArchiveEntry("sources/install.wim", 16)
         edition = WimEdition(
@@ -1974,6 +2068,8 @@ class WindowWriteMethodTests(unittest.TestCase):
             acknowledge_online_account_limitations=True,
             quality_of_life=True,
             acknowledge_quality_of_life_limitations=True,
+            apply_secure_boot_revocation_policy=True,
+            acknowledge_secure_boot_revocation_risk=True,
         )
 
         self.window.select_windows_wim_source(second)
@@ -1989,6 +2085,12 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.windows_options.quality_of_life)
         self.assertFalse(
             self.window.windows_options.acknowledge_quality_of_life_limitations,
+        )
+        self.assertFalse(
+            self.window.windows_options.apply_secure_boot_revocation_policy,
+        )
+        self.assertFalse(
+            self.window.windows_options.acknowledge_secure_boot_revocation_risk,
         )
 
     def test_nested_wim_edition_records_its_exact_source_path(self):
@@ -2074,6 +2176,8 @@ class WindowWriteMethodTests(unittest.TestCase):
             acknowledge_online_account_limitations=True,
             quality_of_life=True,
             acknowledge_quality_of_life_limitations=True,
+            apply_secure_boot_revocation_policy=True,
+            acknowledge_secure_boot_revocation_risk=True,
         )
         info = WimInfo("/tmp/install.wim", 17, (edition,), (1, 2, 17, 4, 5, 1))
 
@@ -2093,6 +2197,12 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.windows_options.quality_of_life)
         self.assertFalse(
             self.window.windows_options.acknowledge_quality_of_life_limitations,
+        )
+        self.assertFalse(
+            self.window.windows_options.apply_secure_boot_revocation_policy,
+        )
+        self.assertFalse(
+            self.window.windows_options.acknowledge_secure_boot_revocation_risk,
         )
 
     def test_settings_persist_binary_units_and_refresh_device_label(self):
@@ -4220,6 +4330,51 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         self.assertIn("disable OneDrive synchronization", confirmation)
         self.assertIn("Outlook and Teams packages", confirmation)
         self.assertIn("Package or policy steps may partially fail", confirmation)
+        workspace.cleanup.assert_called_once_with()
+
+    def test_final_confirmation_discloses_secure_boot_policy_recovery_risk(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        source = ArchiveEntry("sources/install.esd", 16)
+        edition = WimEdition(
+            1, "Windows 11 Pro", "", "Professional", "amd64",
+            10, 0, 26200, 0,
+        )
+        customization = WindowsCustomization(
+            install_image=WimSelection(source.path, source.size, (edition,), 1),
+            apply_secure_boot_revocation_policy=True,
+            acknowledge_secure_boot_revocation_risk=True,
+        )
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        staging = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            plan,
+            windows_customization=customization,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging,
+        )
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        confirmation = warning.call_args.args[2]
+        self.assertIn("Secure Boot revocation policy", confirmation)
+        self.assertIn("SkuSiPolicy.p7b", confirmation)
+        self.assertIn("older Windows, installer, or recovery media", confirmation)
+        self.assertIn("BitLocker recovery key", confirmation)
+        self.assertIn("latest applicable updates", confirmation)
+        self.assertIn("cannot verify the image's update level", confirmation)
+        self.assertIn("cannot verify", confirmation)
         workspace.cleanup.assert_called_once_with()
 
     def test_malformed_prepared_payload_is_rejected_before_confirmation(self):

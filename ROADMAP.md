@@ -41,8 +41,13 @@ evidence.
 - Add BIOS and dual BIOS+UEFI construction with exact, provenance-bound boot code.
 - Expand the implemented UEFI:NTFS path beyond 512-byte logical sectors only
   after upstream payload and firmware evidence supports it.
-- Track Windows CA 2023, `SkuSiPolicy.p7b`, S Mode, and post-24H2 online-account
-  behavior without silently extending the current exact-build `BypassNRO` policy.
+- Physically validate the implemented, separately acknowledged installed-system
+  `SkuSiPolicy.p7b` workflow on supported Windows 11 25H2/26H1 x64/ARM64 systems,
+  including missing-policy, copy-failure, recovery, and BitLocker scenarios.
+  Add CA 2023-signed installer bootloader replacement only after versioned
+  extraction, signature/architecture validation, and firmware fixtures. Track
+  S Mode and post-24H2 online-account behavior without silently extending the
+  current exact-build `BypassNRO` policy.
 - Keep the standalone Fast Startup switch and the implemented Windows 11
   quality-of-life bundle separate, default-off, and explicitly disclosed. Track
   package/policy drift through release fixtures without adding downloaded or
@@ -96,11 +101,14 @@ evidence.
   BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced
   and verified without executing downloaded code.
-- Integrate the implemented bounded El Torito FAT tree with persistence-profile
-  discovery and safe mutation of the embedded UEFI GRUB configuration used by
-  current official Ubuntu media. Then hardware-certify the immutable Casper
-  workflow across 512- and 4096-byte logical-sector media and expand profiles
-  only through release-specific fixtures and hardware results.
+- Do not treat the implemented bounded El Torito FAT parser as an Ubuntu
+  persistence solution: official Ubuntu 20.04.6, 22.04.5, and 24.04.4 embedded
+  EFI images contain EFI binaries but no recognized text `grub.cfg`, and the
+  older images duplicate those files in the base ISO. Research an evidence-backed
+  configuration path for current official media without replacing embedded
+  binaries, then hardware-certify the immutable Casper workflow across 512- and
+  4096-byte logical-sector media. Expand profiles only through release-specific
+  fixtures and hardware results.
 - Expand the shipped distro-specific ISO-mode exclusion catalog only through
   unique structural evidence and representative fixtures, and add tested
   BIOS/UEFI construction profiles. Nobara and openSUSE remain deferred because

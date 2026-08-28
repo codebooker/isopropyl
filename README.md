@@ -39,7 +39,7 @@ a feature-for-feature replacement.
 |---|---|
 | **Authenticated raw writing** | Expands every supported raw input into a private anonymous snapshot, shows its SHA-256 and exact target in a typed confirmation, then uses a guarded PolicyKit transaction with mandatory pre-activation read-back and optional full verification. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
-| **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, and can generate a reviewed `autounattend.xml` for setup, privacy, account, and quality-of-life options. |
+| **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, and can generate a reviewed `autounattend.xml` for setup, privacy, account, quality-of-life, and Windows 11 Secure Boot policy options. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
 | **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, performs full or scan-and-skip logical zeroing, and runs bad-block or fake-capacity tests in separate warned workflows. |
@@ -160,16 +160,22 @@ For recognized Windows installer media, ISOpropyl can generate a transparent
 - Windows 11 setup-check bypasses;
 - locale, time zone, privacy, and OOBE preferences;
 - BitLocker device-encryption prevention and optional Fast Startup suppression;
-- carefully gated local/offline account setup; and
+- carefully gated local/offline account setup;
 - an opt-in Windows 11 quality-of-life profile covering OneDrive, Outlook,
   Teams, Copilot, recommendations, search, news, Start, Edge, and the classic
-  context menu.
+  context menu;
+- for a selected Windows 11 25H2 or 26H1 edition, an opt-in first-logon step
+  that copies the installed system's own `SkuSiPolicy.p7b` revocation policy to
+  its EFI System Partition.
 
 These options are best-effort and deliberately conservative. Existing answer
 files are never replaced or silently merged. Unsupported editions,
-architectures, S-mode media, future releases, and ambiguous layouts disable the
-stronger paths. Review the generated file before writing; Windows policy and
-package names can change.
+architectures, S-mode media, unrecognized releases, and ambiguous layouts
+disable the stronger paths. Review the generated file before writing; Windows
+policy and package names can change. The revocation-policy option can stop older
+Windows, installer, and recovery media from booting, so it requires a separate
+recovery and BitLocker-risk acknowledgment—including confirmation that the image
+already contains the latest applicable updates—and is never enabled by default.
 
 ## Safety by design
 

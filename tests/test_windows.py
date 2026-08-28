@@ -10,6 +10,7 @@ from isopropyl.windows import (
     UNATTEND_NS, WCM_NS, WindowsCustomization, add_autounattend_to_staging,
     answer_file_install_index, answer_file_install_path, generate_autounattend,
     online_account_bypass_compatibility, quality_of_life_compatibility,
+    secure_boot_revocation_policy_compatibility,
     validate_input_locale, validate_install_wim_path, validate_language_tag,
     validate_timezone,
     validate_username, windows_architecture,
@@ -38,6 +39,125 @@ def install_selection(
 
 
 class WindowsCustomizationTests(unittest.TestCase):
+    def test_secure_boot_policy_requires_windows_11_25h2_or_26h1_metadata(self):
+        for architecture in ("amd64", "arm64"):
+            for build in (26200, 28000):
+                with self.subTest(architecture=architecture, build=build):
+                    selection = install_selection(architecture, build=build)
+                    supported, reason = (
+                        secure_boot_revocation_policy_compatibility(selection)
+                    )
+                    self.assertTrue(supported, reason)
+                    generate_autounattend(WindowsCustomization(
+                        install_image=selection,
+                        apply_secure_boot_revocation_policy=True,
+                        acknowledge_secure_boot_revocation_risk=True,
+                    ), architecture)
+
+        invalid = (
+            None,
+            install_selection(build=26199),
+            install_selection(build=30000),
+            install_selection(build=19045, name="Windows 10 Pro"),
+            install_selection("x86", build=26200),
+            install_selection(
+                build=26200, edition_id="ProfessionalSMode",
+                name="Windows 11 Pro S Mode",
+            ),
+            install_selection(
+                build=26200, edition_id="CloudEdition",
+                name="Windows 11 SE Cloud",
+            ),
+            install_selection(build=26200, major_version=11),
+            install_selection(build=26200, minor_version=1),
+        )
+        for selection in invalid:
+            with self.subTest(selection=selection):
+                supported, reason = (
+                    secure_boot_revocation_policy_compatibility(selection)
+                )
+                self.assertFalse(supported)
+                self.assertTrue(reason)
+                with self.assertRaises(ValueError):
+                    generate_autounattend(WindowsCustomization(
+                        install_image=selection,
+                        apply_secure_boot_revocation_policy=True,
+                        acknowledge_secure_boot_revocation_risk=True,
+                    ))
+
+    def test_secure_boot_revocation_policy_requires_risk_acknowledgment(self):
+        with self.assertRaisesRegex(ValueError, "Acknowledge"):
+            generate_autounattend(WindowsCustomization(
+                install_image=install_selection(build=26200),
+                apply_secure_boot_revocation_policy=True,
+            ))
+
+    def test_secure_boot_revocation_policy_uses_fixed_cleanup_safe_command(self):
+        options = WindowsCustomization(
+            install_image=install_selection(build=26200),
+            apply_secure_boot_revocation_policy=True,
+            acknowledge_secure_boot_revocation_risk=True,
+        )
+        self.assertTrue(options.enabled)
+        root = ET.fromstring(generate_autounattend(options, "amd64"))
+        containers = root.findall(".//u:FirstLogonCommands", NS)
+        self.assertEqual(len(containers), 1)
+        commands = containers[0].findall("u:SynchronousCommand", NS)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0].findtext("u:Order", namespaces=NS), "1")
+        self.assertEqual(
+            commands[0].findtext("u:Description", namespaces=NS),
+            "Apply the installed Windows Secure Boot revocation policy",
+        )
+        command = commands[0].findtext("u:CommandLine", namespaces=NS) or ""
+        self.assertTrue(command.startswith("powershell.exe -NoLogo -NoProfile"))
+        self.assertIn("System32\\SecureBootUpdates\\SkuSiPolicy.p7b", command)
+        self.assertIn("EFI\\Microsoft\\Boot", command)
+        self.assertIn("[guid]::NewGuid()", command)
+        self.assertIn("try {", command)
+        self.assertIn("} finally {", command)
+        self.assertIn("mountvol.exe $m /S", command)
+        self.assertIn("mountvol.exe $m /D", command)
+        self.assertIn("$mounted=$false", command)
+        self.assertIn("$mounted=$true", command)
+        self.assertIn("$unmountExit=$LASTEXITCODE", command)
+        self.assertIn("Could not unmount the EFI System Partition", command)
+        self.assertIn("Could not remove the EFI mount directory", command)
+        self.assertLess(command.index(" /S"), command.index("Copy-Item"))
+        self.assertLess(command.index("Copy-Item"), command.index(" /D"))
+        self.assertNotIn("S:", command)
+        self.assertNotIn("http", command.casefold())
+        self.assertNotIn("WillWipeDisk", command)
+        self.assertIsNone(root.find(".//u:DiskConfiguration", NS))
+        self.assertIsNone(root.find(".//u:InstallTo", NS))
+        self.assertIsNone(root.find(".//u:WillWipeDisk", NS))
+
+    def test_secure_boot_policy_is_ordered_between_account_and_qol_commands(self):
+        options = WindowsCustomization(
+            install_image=install_selection(build=26200),
+            local_username="Policy User",
+            apply_secure_boot_revocation_policy=True,
+            acknowledge_secure_boot_revocation_risk=True,
+            quality_of_life=True,
+            acknowledge_quality_of_life_limitations=True,
+        )
+        root = ET.fromstring(generate_autounattend(options, "amd64"))
+        self.assertEqual(len(root.findall(".//u:FirstLogonCommands", NS)), 1)
+        commands = root.findall(
+            ".//u:FirstLogonCommands/u:SynchronousCommand", NS,
+        )
+        paths = [
+            item.findtext("u:CommandLine", namespaces=NS) or ""
+            for item in commands
+        ]
+        self.assertIn("PasswordExpired", paths[0])
+        self.assertIn("SkuSiPolicy.p7b", paths[1])
+        self.assertIn("HiberbootEnabled", paths[2])
+        self.assertEqual(
+            [item.findtext("u:Order", namespaces=NS) for item in commands],
+            [str(index) for index in range(1, len(commands) + 1)],
+        )
+
     def test_emits_fixed_fast_startup_command_in_specialize(self):
         options = WindowsCustomization(disable_fast_startup=True)
         self.assertTrue(options.enabled)

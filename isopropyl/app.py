@@ -137,7 +137,7 @@ from .wim import (
 from .windows import (
     WindowsCustomization, generate_autounattend,
     online_account_bypass_compatibility, quality_of_life_compatibility,
-    windows_architecture,
+    secure_boot_revocation_policy_compatibility, windows_architecture,
 )
 from .zip_overlay import (
     ZipOverlayPlan, build_zip_overlay_plan,
@@ -4427,6 +4427,8 @@ class Window(QMainWindow):
             or self.windows_options.acknowledge_online_account_limitations
             or self.windows_options.quality_of_life
             or self.windows_options.acknowledge_quality_of_life_limitations
+            or self.windows_options.apply_secure_boot_revocation_policy
+            or self.windows_options.acknowledge_secure_boot_revocation_risk
         ):
             self.windows_options = replace(
                 self.windows_options, install_image=None, install_image_path="",
@@ -4434,6 +4436,8 @@ class Window(QMainWindow):
                 acknowledge_online_account_limitations=False,
                 quality_of_life=False,
                 acknowledge_quality_of_life_limitations=False,
+                apply_secure_boot_revocation_policy=False,
+                acknowledge_secure_boot_revocation_risk=False,
             )
 
     def start_windows_wim_inspection(self) -> None:
@@ -4541,6 +4545,8 @@ class Window(QMainWindow):
                 or self.windows_options.acknowledge_online_account_limitations
                 or self.windows_options.quality_of_life
                 or self.windows_options.acknowledge_quality_of_life_limitations
+                or self.windows_options.apply_secure_boot_revocation_policy
+                or self.windows_options.acknowledge_secure_boot_revocation_risk
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
@@ -4548,6 +4554,8 @@ class Window(QMainWindow):
                     acknowledge_online_account_limitations=False,
                     quality_of_life=False,
                     acknowledge_quality_of_life_limitations=False,
+                    apply_secure_boot_revocation_policy=False,
+                    acknowledge_secure_boot_revocation_risk=False,
                 )
             self.windows_wim_error = (
                 str(result) if isinstance(result, Exception)
@@ -4572,6 +4580,8 @@ class Window(QMainWindow):
                 or self.windows_options.acknowledge_online_account_limitations
                 or self.windows_options.quality_of_life
                 or self.windows_options.acknowledge_quality_of_life_limitations
+                or self.windows_options.apply_secure_boot_revocation_policy
+                or self.windows_options.acknowledge_secure_boot_revocation_risk
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
@@ -4579,6 +4589,8 @@ class Window(QMainWindow):
                     acknowledge_online_account_limitations=False,
                     quality_of_life=False,
                     acknowledge_quality_of_life_limitations=False,
+                    apply_secure_boot_revocation_policy=False,
+                    acknowledge_secure_boot_revocation_risk=False,
                 )
             self.windows_wim_error = str(error)
             self.windows_button.setToolTip(
@@ -4594,6 +4606,8 @@ class Window(QMainWindow):
                 or self.windows_options.acknowledge_online_account_limitations
                 or self.windows_options.quality_of_life
                 or self.windows_options.acknowledge_quality_of_life_limitations
+                or self.windows_options.apply_secure_boot_revocation_policy
+                or self.windows_options.acknowledge_secure_boot_revocation_risk
             ):
                 self.windows_options = replace(
                     self.windows_options, install_image=None, install_image_path="",
@@ -4601,6 +4615,8 @@ class Window(QMainWindow):
                     acknowledge_online_account_limitations=False,
                     quality_of_life=False,
                     acknowledge_quality_of_life_limitations=False,
+                    apply_secure_boot_revocation_policy=False,
+                    acknowledge_secure_boot_revocation_risk=False,
                 )
             self.windows_wim_error = (
                 "The WIM inspector returned metadata for a different catalog size"
@@ -4623,6 +4639,8 @@ class Window(QMainWindow):
             or self.windows_options.acknowledge_online_account_limitations
             or self.windows_options.quality_of_life
             or self.windows_options.acknowledge_quality_of_life_limitations
+            or self.windows_options.apply_secure_boot_revocation_policy
+            or self.windows_options.acknowledge_secure_boot_revocation_risk
         )
         if selection_is_stale or selection_is_missing:
             self.windows_options = replace(
@@ -4631,6 +4649,8 @@ class Window(QMainWindow):
                 acknowledge_online_account_limitations=False,
                 quality_of_life=False,
                 acknowledge_quality_of_life_limitations=False,
+                apply_secure_boot_revocation_policy=False,
+                acknowledge_secure_boot_revocation_risk=False,
             )
         labels = "\n".join(edition.display_label for edition in info.editions)
         self.windows_button.setToolTip(labels)
@@ -4862,6 +4882,13 @@ class Window(QMainWindow):
                 "Windows option: quality-of-life bundle disables OneDrive, "
                 "removes Outlook/Teams packages, and applies fixed first-logon "
                 "policy/UI defaults"
+            )
+        if self.windows_options.apply_secure_boot_revocation_policy:
+            lines.append(
+                "Windows option: at first logon, copy the installed system's "
+                "SkuSiPolicy.p7b Secure Boot revocation policy to its EFI "
+                "System Partition; current updates and recovery readiness are "
+                "required"
             )
         lines.extend(("", "Dependencies:"))
         lines.extend(
@@ -5738,6 +5765,20 @@ class Window(QMainWindow):
                 "disclosed Copilot, recommendations, search, news, Start, Edge, "
                 "Fast Startup, and context-menu defaults. Package or policy steps "
                 "may partially fail."
+            )
+        if (
+            staging_plan.windows_customization is not None
+            and staging_plan.windows_customization.apply_secure_boot_revocation_policy
+        ):
+            customization += (
+                "\nSecure Boot revocation policy: after Windows first logon, "
+                "copy that installed system's own SkuSiPolicy.p7b to its EFI "
+                "System Partition. This may stop older Windows, installer, or "
+                "recovery media from booting. The selected image must already "
+                "include the latest applicable updates. Have current recovery "
+                "media and any BitLocker recovery key available; ISOpropyl "
+                "cannot verify the image's update level or that the first-logon "
+                "command succeeds."
             )
         if staging_plan.wim_selection is not None:
             customization += (
@@ -6706,6 +6747,21 @@ class Window(QMainWindow):
         )
         privacy = QCheckBox("Reduce setup data collection (skip Express privacy settings)")
         bitlocker = QCheckBox("Prevent automatic BitLocker device encryption")
+        secure_boot_policy = QCheckBox(
+            "Apply the installed Windows Secure Boot revocation policy "
+            "(25H2/26H1)"
+        )
+        secure_boot_policy.setObjectName(
+            "windowsSecureBootRevocationPolicyCheckBox",
+        )
+        secure_boot_policy_acknowledgment = QCheckBox(
+            "I confirm this image includes the latest applicable updates, have "
+            "current recovery media and any BitLocker recovery key, and understand "
+            "older boot media may stop working"
+        )
+        secure_boot_policy_acknowledgment.setObjectName(
+            "windowsSecureBootRevocationPolicyAcknowledgment",
+        )
         fast_startup = QCheckBox(
             "Disable Windows Fast Startup (use full shutdowns; startup may be slower)"
         )
@@ -6740,16 +6796,23 @@ class Window(QMainWindow):
             password_never_expires.setEnabled(enabled)
 
         local.toggled.connect(set_local_controls)
-        for checkbox in (
-            bypass, online, offline_account, privacy, bitlocker, fast_startup,
-            quality_of_life,
-        ):
+        for checkbox in (bypass, online, offline_account):
             setup_layout.addWidget(checkbox)
         offline_account_note = QLabel()
         offline_account_note.setWordWrap(True)
         offline_account_note.setObjectName("muted")
         setup_layout.addWidget(offline_account_note)
         setup_layout.addWidget(offline_account_acknowledgment)
+        setup_layout.addWidget(privacy)
+        setup_layout.addWidget(bitlocker)
+        setup_layout.addWidget(secure_boot_policy)
+        secure_boot_policy_note = QLabel()
+        secure_boot_policy_note.setWordWrap(True)
+        secure_boot_policy_note.setObjectName("muted")
+        setup_layout.addWidget(secure_boot_policy_note)
+        setup_layout.addWidget(secure_boot_policy_acknowledgment)
+        setup_layout.addWidget(fast_startup)
+        setup_layout.addWidget(quality_of_life)
         quality_of_life_note = QLabel()
         quality_of_life_note.setWordWrap(True)
         quality_of_life_note.setObjectName("muted")
@@ -6800,6 +6863,12 @@ class Window(QMainWindow):
         )
         privacy.setChecked(current.reduce_data_collection)
         bitlocker.setChecked(current.disable_automatic_bitlocker)
+        secure_boot_policy.setChecked(
+            current.apply_secure_boot_revocation_policy,
+        )
+        secure_boot_policy_acknowledgment.setChecked(
+            current.acknowledge_secure_boot_revocation_risk,
+        )
         fast_startup.setChecked(current.disable_fast_startup)
         quality_of_life.setChecked(current.quality_of_life)
         quality_of_life_acknowledgment.setChecked(
@@ -6857,18 +6926,44 @@ class Window(QMainWindow):
             if not enabled:
                 quality_of_life_acknowledgment.setChecked(False)
 
+        def update_secure_boot_policy_control() -> None:
+            supported, reason = secure_boot_revocation_policy_compatibility(
+                selected_bypass_image(),
+            )
+            secure_boot_policy.setEnabled(supported)
+            secure_boot_policy.setToolTip(reason)
+            secure_boot_policy_note.setText(reason)
+            if not supported:
+                secure_boot_policy.setChecked(False)
+
+        def update_secure_boot_policy_acknowledgment() -> None:
+            enabled = (
+                secure_boot_policy.isEnabled()
+                and secure_boot_policy.isChecked()
+            )
+            secure_boot_policy_acknowledgment.setEnabled(enabled)
+            if not enabled:
+                secure_boot_policy_acknowledgment.setChecked(False)
+
         source_combo.currentIndexChanged.connect(update_offline_account_control)
         image_combo.currentIndexChanged.connect(update_offline_account_control)
         source_combo.currentIndexChanged.connect(update_quality_of_life_control)
         image_combo.currentIndexChanged.connect(update_quality_of_life_control)
+        source_combo.currentIndexChanged.connect(update_secure_boot_policy_control)
+        image_combo.currentIndexChanged.connect(update_secure_boot_policy_control)
         offline_account.toggled.connect(update_offline_account_acknowledgment)
         quality_of_life.toggled.connect(
             update_quality_of_life_acknowledgment,
+        )
+        secure_boot_policy.toggled.connect(
+            update_secure_boot_policy_acknowledgment,
         )
         update_offline_account_control()
         update_offline_account_acknowledgment()
         update_quality_of_life_control()
         update_quality_of_life_acknowledgment()
+        update_secure_boot_policy_control()
+        update_secure_boot_policy_acknowledgment()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel
@@ -6912,6 +7007,12 @@ class Window(QMainWindow):
                 quality_of_life=quality_of_life.isChecked(),
                 acknowledge_quality_of_life_limitations=(
                     quality_of_life_acknowledgment.isChecked()
+                ),
+                apply_secure_boot_revocation_policy=(
+                    secure_boot_policy.isChecked()
+                ),
+                acknowledge_secure_boot_revocation_risk=(
+                    secure_boot_policy_acknowledgment.isChecked()
                 ),
                 input_locale=input_locale.text(),
                 system_locale=system_locale.text(),

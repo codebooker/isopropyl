@@ -1882,6 +1882,43 @@ class IsoStagingTests(unittest.TestCase):
                     ),
                 ))
 
+    def test_secure_boot_policy_profile_is_frozen_and_regenerated_exactly(self):
+        customization = WindowsCustomization(
+            install_image=selected_esd(build=26200),
+            apply_secure_boot_revocation_policy=True,
+            acknowledge_secure_boot_revocation_risk=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), selected_esd_entries(),
+                windows_customization=customization,
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            validate_iso_staging_plan(plan)
+            xml = plan.autounattend_xml or ""
+            self.assertIn("SkuSiPolicy.p7b", xml)
+            self.assertIn("finally", xml)
+            self.assertNotIn("WillWipeDisk", xml)
+
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "bound customization",
+            ):
+                validate_iso_staging_plan(replace(
+                    plan,
+                    autounattend_xml=xml.replace(
+                        "SkuSiPolicy.p7b", "ForgedPolicy.p7b", 1,
+                    ),
+                ))
+            with self.assertRaises(IsoStagingSafetyError):
+                validate_iso_staging_plan(replace(
+                    plan,
+                    windows_customization=replace(
+                        customization,
+                        apply_secure_boot_revocation_policy=False,
+                        acknowledge_secure_boot_revocation_risk=False,
+                    ),
+                ))
     def test_answer_file_requires_consistent_bound_generation_inputs(self):
         customization = WindowsCustomization(hide_online_account=True)
         with tempfile.TemporaryDirectory() as directory:

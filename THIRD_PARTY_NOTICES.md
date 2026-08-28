@@ -17,11 +17,13 @@ consumes them yet.
   [`LICENSE.txt`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/LICENSE.txt)
 
 The fixed Windows 11 quality-of-life command selection, order, registry values,
-and opaque `VisiblePlaces` payload in `isopropyl/windows.py` are adapted
-effect-for-effect from that source. ISOpropyl represents the manifest in Python,
-adds descriptions and noninteractive PowerShell switches, and surrounds it with
-independent WIM/ESD gating, disclosure, XML generation, staging identity checks,
-and no-wipe validation. The GPL-3.0-or-later option is compatible with
+opaque `VisiblePlaces` payload, and installed-system `SkuSiPolicy.p7b` deployment
+effect in `isopropyl/windows.py` are adapted from that source. For the policy
+deployment, ISOpropyl replaces Rufus's fixed `S:` mount with a unique directory
+and a `try/finally` cleanup sequence. ISOpropyl represents the manifest in
+Python, adds descriptions and noninteractive PowerShell switches, and surrounds
+it with independent WIM/ESD gating, disclosure, XML generation, staging identity
+checks, and no-wipe validation. The GPL-3.0-or-later option is compatible with
 AGPL-3.0-or-later through GPLv3/AGPLv3 section 13. Each covered component retains
 its license, and the AGPL network-source requirements apply to the combination.
 Rufus and ISOpropyl provide these commands without warranty.
