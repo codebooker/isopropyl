@@ -14,7 +14,10 @@ formatter, mount, or privileged writer backend.
 import hashlib
 import hmac
 import json
+import array
+import os
 import re
+import socket
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -529,6 +532,62 @@ class PreparedSyslinuxIsoFat32:
         if self._witness is not _OWNER_WITNESS or self._image is None:
             raise SyslinuxIsoFat32Error("The prepared image is closed")
         return self._image.chunks(chunk_bytes)
+
+    def _send_to_privileged_helper(
+        self,
+        channel: socket.socket,
+        request_packet: bytes,
+        *,
+        cancel_check: CancelCheck | None = None,
+    ) -> None:
+        """Transfer the re-attested anonymous descriptor in one local packet.
+
+        This internal bridge never returns a descriptor or path to the GUI-side
+        coordinator.  The privileged helper still treats both the packet and
+        received descriptor as untrusted and independently validates them.
+        """
+
+        if self._witness is not _OWNER_WITNESS or self._image is None:
+            raise SyslinuxIsoFat32Error("The prepared image is closed")
+        if (
+            type(channel) is not socket.socket
+            or channel.family != socket.AF_UNIX
+            or channel.type & 0xF != socket.SOCK_SEQPACKET
+            or type(request_packet) is not bytes
+            or not request_packet
+            or len(request_packet) > 4_096
+        ):
+            raise SyslinuxIsoFat32Error("The privileged helper channel is invalid")
+        try:
+            descriptor, image_size = self._image._duplicate_attested_descriptor(
+                cancel_check,
+            )
+        except PrivateFat32Error as error:
+            raise SyslinuxIsoFat32Error(str(error)) from error
+        try:
+            if image_size != self._result.image_size:
+                raise SyslinuxIsoFat32Error(
+                    "The prepared image size changed before helper transfer",
+                )
+            rights = array.array("i", [descriptor])
+            try:
+                sent = channel.sendmsg(
+                    [request_packet],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                )
+            except OSError as error:
+                raise SyslinuxIsoFat32Error(
+                    "Could not transfer the anonymous image to the privileged helper",
+                ) from error
+            if sent != len(request_packet):
+                raise SyslinuxIsoFat32Error(
+                    "The privileged helper request was not transferred atomically",
+                )
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
     def close(self) -> None:
         image = self._image

@@ -49,8 +49,9 @@ the active extractor, WIM splitter, formatter, or constructed-media executor.
 
 ## Current limits
 
-- No device-facing BIOS or dual BIOS+UEFI construction; the witnessed Syslinux
-  backend and target receipt remain non-executable.
+- No GUI-facing BIOS or dual BIOS+UEFI construction. The witnessed Syslinux
+  backend has a separately installed helper-backed transaction, but it remains
+  hidden pending installed PolicyKit, VM, and physical certification.
 - No arbitrary symlink or hardlink materialization.
 - Embedded El Torito extraction is limited to one strictly validated FAT12/16/32
   filesystem, either direct or in an otherwise empty active-first-partition MBR
@@ -77,13 +78,15 @@ provenance. Resolver code enforces HTTPS origin/redirect hosts, purpose-specific
 bundle membership, no-follow descriptor-bound atomic caching, parent-path
 revalidation, and pre-use verification under one caller-visible deadline. The
 UEFI:NTFS GUI obtains explicit consent before acquisition, and its privileged
-writer consumes verified in-memory bytes instead of the cache path. No GUI or
-device-facing BIOS executor consumes the GRUB/Syslinux bundles. A backend-only,
-device-unreachable Syslinux composite can consume the exact two supported bundle
-roles only after authenticated ISO staging. A non-executable target authorization
-layer can bind that composite to an exact 512-byte-sector, equal-capacity removable
-disk and typed phrase, but no privileged BIOS executor consumes it; GRUB bundles
-deliberately do not satisfy detected-image dependency keys.
+writer consumes verified in-memory bytes instead of the cache path. No GUI-facing
+BIOS executor consumes the GRUB/Syslinux bundles. A backend-only Syslinux
+composite can consume the exact two supported bundle roles only after
+authenticated ISO staging. Target authorization binds an exact 512-byte-sector,
+equal-capacity, kernel-removable disk, its kernel generation, and a typed phrase.
+The optional fixed host integration can execute that narrow profile through an
+authenticated descriptor protocol and mandatory read-back, but ordinary Python
+packaging does not install it and the application does not expose it. GRUB
+bundles deliberately do not satisfy detected-image dependency keys.
 
 Every additional catalog entry requires documented upstream provenance, license
 review, exact version/custom-build compatibility, size and digest review,

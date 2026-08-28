@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# This launcher and the standalone stdlib-only helper script are installed by
+# the native host package, never selected from a virtual environment or PATH.
+exec /usr/bin/python3 -I -S /usr/libexec/isopropyl/syslinux_device_helper.py "$@"

@@ -4,14 +4,11 @@ from __future__ import annotations
 
 """Witnessed target authorization for the private Syslinux image pipeline.
 
-This module deliberately stops before privileged device I/O.  It binds one
-authentic :class:`SyslinuxIsoFat32Plan` to one exact removable whole disk and an
-exact typed confirmation.  The process-local receipt prevents accidental or
-forged in-process substitutions; it is not cross-process privilege authority.
-A future installed, root-owned helper must treat every serialized expectation as
-untrusted and independently verify it while keeping one descriptor and one lock
-across writing, ``fsync``, and exact read-back.  Separate privileged ``dd``
-invocations are not an acceptable substitute for that transaction boundary.
+This module stops before privileged device I/O. It binds one authentic
+:class:`SyslinuxIsoFat32Plan` to one exact removable whole disk, the kernel disk
+generation, and an exact typed confirmation. Process-local receipts prevent
+in-process substitutions; the separately installed helper still treats every
+serialized expectation as untrusted and establishes its own kernel evidence.
 """
 
 import hashlib
@@ -24,6 +21,7 @@ import stat
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .devices import Device, parse_lsblk
 from .syslinux_iso_fat32 import (
@@ -41,11 +39,13 @@ REQUIRED_EXECUTOR_PROFILE = (
 )
 _PLAN_TOKEN = object()
 _CONFIRMATION_TOKEN = object()
+_READY_TOKEN = object()
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAJOR_MINOR = re.compile(r"\d+:\d+\Z")
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _TRUSTED_TOOL_DIRECTORIES = frozenset(_TRUSTED_TOOL_PATH.split(":"))
 _MAX_LSBLK_OUTPUT = 2 * 1024 * 1024
+_SYSFS_ROOT = Path("/sys")
 _LSBLK_FIELDS = (
     "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,"
     "MAJ:MIN,MOUNTPOINTS,RO,LOG-SEC"
@@ -84,6 +84,16 @@ class _ConfirmationReceipt:
 
 
 @dataclass(frozen=True)
+class _ReadyReceipt:
+    token: object
+    ready: object
+    plan: object
+    confirmation: object
+    device: object
+    snapshot: tuple[object, ...]
+
+
+@dataclass(frozen=True)
 class _LiveTargetObservation:
     device: Device
     related_device_numbers: frozenset[int]
@@ -93,13 +103,14 @@ class _LiveTargetObservation:
 class SyslinuxDeviceWritePlan:
     """One exact composite image plan authorized for one exact whole disk.
 
-    The plan is intentionally not executable in this milestone.  Its receipt
-    prevents an ordinary dataclass clone or refreshed equivalent from acquiring
-    authority, while its digest makes every public relationship auditable.
+    The plan is executable only through the separately installed, backend-only
+    coordinator/helper transaction. Its receipt prevents an ordinary dataclass
+    clone or refreshed equivalent from acquiring authority.
     """
 
     composite_plan: SyslinuxIsoFat32Plan = field(repr=False, compare=False)
     device: Device
+    disk_sequence: int
     composite_plan_sha256: str
     private_plan_sha256: str
     source_manifest_sha256: str
@@ -131,6 +142,24 @@ class ConfirmedSyslinuxDeviceWrite:
     logical_sector_size: int
     confirmation_phrase: str
     _authorization: _ConfirmationReceipt | None = field(
+        init=False,
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True)
+class ReadySyslinuxDeviceWrite:
+    """Post-unmount, freshly witnessed target state for helper invocation."""
+
+    plan: SyslinuxDeviceWritePlan = field(repr=False, compare=False)
+    confirmation: ConfirmedSyslinuxDeviceWrite = field(repr=False, compare=False)
+    device: Device
+    disk_sequence: int
+    plan_sha256: str
+    ready_sha256: str
+    _authorization: _ReadyReceipt | None = field(
         init=False,
         default=None,
         repr=False,
@@ -327,6 +356,7 @@ def _plan_digest(plan: SyslinuxDeviceWritePlan) -> str:
                     "volume_id": plan.volume_id,
                 },
                 "target": _device_payload(plan.device),
+                "disk_sequence": plan.disk_sequence,
                 "logical_sector_size": plan.logical_sector_size,
                 "firmware_profile": plan.firmware_profile,
                 "mandatory_readback": plan.mandatory_readback,
@@ -348,6 +378,7 @@ def _plan_snapshot(plan: SyslinuxDeviceWritePlan) -> tuple[object, ...]:
         plan.composite_plan_sha256,
         plan.private_plan_sha256,
         plan.source_manifest_sha256,
+        plan.disk_sequence,
         plan.image_size,
         plan.disk_signature,
         plan.volume_id,
@@ -431,7 +462,7 @@ def _validate_live_target(
     return observation
 
 
-def _validate_relationships(
+def _validate_static_relationships(
     plan: SyslinuxDeviceWritePlan,
     *,
     cancel_check: CancelCheck | None = None,
@@ -487,6 +518,10 @@ def _validate_relationships(
         or plan.volume_id != private.volume_id
         or plan.device.size != plan.image_size
         or plan.device.size % SECTOR_SIZE
+        or not plan.device.removable
+        or type(plan.disk_sequence) is not int
+        or isinstance(plan.disk_sequence, bool)
+        or not 0 < plan.disk_sequence <= 0xFFFFFFFFFFFFFFFF
         or plan.logical_sector_size != SECTOR_SIZE
         or plan.device.logical_sector_size != SECTOR_SIZE
         or plan.firmware_profile != expected_profile
@@ -499,9 +534,22 @@ def _validate_relationships(
         raise SyslinuxDevicePlanError(
             "The Syslinux image, target geometry, and authorization bindings disagree",
         )
+    _check_cancelled(cancel_check)
+
+
+def _validate_relationships(
+    plan: SyslinuxDeviceWritePlan,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> None:
+    _validate_static_relationships(plan, cancel_check=cancel_check)
     target_status = _validate_target_node(plan.device)
     observation = _validate_live_target(plan.device, target_status)
     _validate_source_residency(plan, target_status, observation)
+    if _read_disk_sequence(plan.device.major_minor) != plan.disk_sequence:
+        raise SyslinuxDevicePlanError(
+            "The selected target is a different disk generation; refresh and confirm it again",
+        )
     _check_cancelled(cancel_check)
 
 
@@ -533,6 +581,10 @@ def build_syslinux_device_write_plan(
         raise SyslinuxDevicePlanError(
             "The initial Syslinux target profile requires 512-byte logical sectors",
         )
+    if not device.removable:
+        raise SyslinuxDevicePlanError(
+            "The initial Syslinux target profile requires kernel-removable media",
+        )
     if device.size != private.geometry.image_size:
         raise SyslinuxDevicePlanError(
             "The target capacity must exactly match the witnessed Syslinux image size",
@@ -541,10 +593,12 @@ def build_syslinux_device_write_plan(
         raise SyslinuxDevicePlanError("The target capacity is not sector aligned")
     target_status = _validate_target_node(device)
     observation = _validate_live_target(device, target_status)
+    disk_sequence = _read_disk_sequence(device.major_minor)
     firmware_profile = _firmware_profile(composite_plan)
     candidate = SyslinuxDeviceWritePlan(
         composite_plan,
         device,
+        disk_sequence,
         composite_plan.plan_sha256,
         private.plan_sha256,
         composite_plan.source_manifest_sha256,
@@ -562,6 +616,7 @@ def build_syslinux_device_write_plan(
     plan = SyslinuxDeviceWritePlan(
         candidate.composite_plan,
         candidate.device,
+        candidate.disk_sequence,
         candidate.composite_plan_sha256,
         candidate.private_plan_sha256,
         candidate.source_manifest_sha256,
@@ -645,6 +700,14 @@ def validate_confirmed_syslinux_device_write(
     """Validate that a confirmation belongs to this exact authoritative plan."""
 
     _validate_relationships(plan, cancel_check=cancel_check)
+    _validate_confirmation_receipt(plan, confirmation)
+    _check_cancelled(cancel_check)
+
+
+def _validate_confirmation_receipt(
+    plan: SyslinuxDeviceWritePlan,
+    confirmation: ConfirmedSyslinuxDeviceWrite,
+) -> None:
     if type(confirmation) is not ConfirmedSyslinuxDeviceWrite:
         raise SyslinuxDevicePlanError("An exact Syslinux target confirmation is required")
     receipt = confirmation._authorization
@@ -665,5 +728,187 @@ def validate_confirmed_syslinux_device_write(
     ):
         raise SyslinuxDevicePlanError(
             "The Syslinux target confirmation is forged, cloned, or belongs to another plan",
+        )
+
+
+def _post_unmount_device_matches(original: Device, current: Device) -> bool:
+    return (
+        current.mountpoints == ()
+        and current.path == original.path
+        and current.size == original.size
+        and current.model == original.model
+        and current.vendor == original.vendor
+        and current.transport == original.transport
+        and current.serial == original.serial
+        and current.wwn == original.wwn
+        and current.major_minor == original.major_minor
+        and current.removable == original.removable
+        and current.hotplug == original.hotplug
+        and current.read_only == original.read_only
+        and current.partitions == original.partitions
+        and current.logical_sector_size == original.logical_sector_size
+    )
+
+
+def _read_disk_sequence(major_minor: str) -> int:
+    """Read the kernel generation number for one current whole-disk identity."""
+
+    if type(major_minor) is not str or _MAJOR_MINOR.fullmatch(major_minor) is None:
+        raise SyslinuxDevicePlanError("The target has no valid kernel identity")
+    path = _SYSFS_ROOT / "dev" / "block" / major_minor / "diskseq"
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise SyslinuxDevicePlanError(
+            "The kernel cannot provide a disk generation for this target",
+        ) from error
+    if not data or len(data) > 32 or b"\x00" in data:
+        raise SyslinuxDevicePlanError("The kernel disk generation is malformed")
+    try:
+        rendered = data.decode("ascii").strip()
+    except UnicodeError as error:
+        raise SyslinuxDevicePlanError("The kernel disk generation is malformed") from error
+    if not rendered.isdecimal():
+        raise SyslinuxDevicePlanError("The kernel disk generation is malformed")
+    value = int(rendered, 10)
+    if not 0 < value <= 0xFFFFFFFFFFFFFFFF:
+        raise SyslinuxDevicePlanError("The kernel disk generation is outside the supported range")
+    return value
+
+
+def _ready_digest(ready: ReadySyslinuxDeviceWrite) -> str:
+    try:
+        encoded = json.dumps(
+            {
+                "profile": "io.github.codebooker.isopropyl/syslinux-ready-target/v1",
+                "plan_sha256": ready.plan_sha256,
+                "disk_sequence": ready.disk_sequence,
+                "original_target": _device_payload(ready.plan.device),
+                "unmounted_target": _device_payload(ready.device),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (AttributeError, TypeError, UnicodeError, ValueError):
+        return ""
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _ready_snapshot(ready: ReadySyslinuxDeviceWrite) -> tuple[object, ...]:
+    return (
+        ready.plan_sha256,
+        ready.disk_sequence,
+        ready.ready_sha256,
+        ready.device,
+    )
+
+
+def authorize_unmounted_syslinux_device_write(
+    plan: SyslinuxDeviceWritePlan,
+    confirmation: ConfirmedSyslinuxDeviceWrite,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> ReadySyslinuxDeviceWrite:
+    """Witness the sole allowed transition from confirmed mounts to none."""
+
+    _validate_static_relationships(plan, cancel_check=cancel_check)
+    _validate_confirmation_receipt(plan, confirmation)
+    target_status = _validate_target_node(plan.device)
+    observation = _probe_live_target(plan.device.path)
+    if type(observation) is not _LiveTargetObservation:
+        raise SyslinuxDevicePlanError("Live post-unmount inspection returned invalid evidence")
+    current = observation.device
+    if not _post_unmount_device_matches(plan.device, current):
+        raise SyslinuxDevicePlanError(
+            "The target changed during unmounting or still has a mounted filesystem",
+        )
+    try:
+        validate_device_selection(current, writable=True)
+    except WriterSafetyError as error:
+        raise SyslinuxDevicePlanError(str(error)) from error
+    if target_status.st_rdev not in observation.related_device_numbers:
+        raise SyslinuxDevicePlanError(
+            "The post-unmount block node is absent from its live topology",
+        )
+    _validate_source_residency(plan, target_status, observation)
+    disk_sequence = _read_disk_sequence(current.major_minor)
+    if disk_sequence != plan.disk_sequence:
+        raise SyslinuxDevicePlanError(
+            "The target is a different disk generation than the confirmed plan",
+        )
+    candidate = ReadySyslinuxDeviceWrite(
+        plan,
+        confirmation,
+        current,
+        disk_sequence,
+        plan.plan_sha256,
+        "",
+    )
+    ready = ReadySyslinuxDeviceWrite(
+        candidate.plan,
+        candidate.confirmation,
+        candidate.device,
+        candidate.disk_sequence,
+        candidate.plan_sha256,
+        _ready_digest(candidate),
+    )
+    _check_cancelled(cancel_check)
+    object.__setattr__(
+        ready,
+        "_authorization",
+        _ReadyReceipt(
+            _READY_TOKEN,
+            ready,
+            plan,
+            confirmation,
+            current,
+            _ready_snapshot(ready),
+        ),
+    )
+    return ready
+
+
+def validate_ready_syslinux_device_write(
+    plan: SyslinuxDeviceWritePlan,
+    confirmation: ConfirmedSyslinuxDeviceWrite,
+    ready: ReadySyslinuxDeviceWrite,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> None:
+    """Re-probe the exact unmounted target immediately before helper launch."""
+
+    _validate_static_relationships(plan, cancel_check=cancel_check)
+    _validate_confirmation_receipt(plan, confirmation)
+    if type(ready) is not ReadySyslinuxDeviceWrite:
+        raise SyslinuxDevicePlanError("An exact post-unmount target receipt is required")
+    receipt = ready._authorization
+    if (
+        type(receipt) is not _ReadyReceipt
+        or receipt.token is not _READY_TOKEN
+        or receipt.ready is not ready
+        or receipt.plan is not plan
+        or receipt.confirmation is not confirmation
+        or receipt.device is not ready.device
+        or receipt.snapshot != _ready_snapshot(ready)
+        or ready.plan is not plan
+        or ready.confirmation is not confirmation
+        or ready.plan_sha256 != plan.plan_sha256
+        or ready.disk_sequence != plan.disk_sequence
+        or type(ready.disk_sequence) is not int
+        or isinstance(ready.disk_sequence, bool)
+        or not 0 < ready.disk_sequence <= 0xFFFFFFFFFFFFFFFF
+        or not _post_unmount_device_matches(plan.device, ready.device)
+        or not hmac.compare_digest(_ready_digest(ready), ready.ready_sha256)
+    ):
+        raise SyslinuxDevicePlanError(
+            "The post-unmount target receipt is forged, cloned, or stale",
+        )
+    target_status = _validate_target_node(ready.device)
+    observation = _validate_live_target(ready.device, target_status)
+    _validate_source_residency(plan, target_status, observation)
+    if _read_disk_sequence(ready.device.major_minor) != ready.disk_sequence:
+        raise SyslinuxDevicePlanError(
+            "The target disk generation changed after unmount authorization",
         )
     _check_cancelled(cancel_check)

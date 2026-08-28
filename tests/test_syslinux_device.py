@@ -16,13 +16,16 @@ import isopropyl.syslinux_device as syslinux_device
 from isopropyl.devices import Device
 from isopropyl.syslinux_device import (
     ConfirmedSyslinuxDeviceWrite,
+    ReadySyslinuxDeviceWrite,
     REQUIRED_EXECUTOR_PROFILE,
     SyslinuxDevicePlanCancelled,
     SyslinuxDevicePlanError,
     SyslinuxDeviceWritePlan,
+    authorize_unmounted_syslinux_device_write,
     build_syslinux_device_write_plan,
     confirm_syslinux_device_write,
     validate_confirmed_syslinux_device_write,
+    validate_ready_syslinux_device_write,
     validate_syslinux_device_write_plan,
 )
 
@@ -99,6 +102,7 @@ class SyslinuxDevicePlanTests(unittest.TestCase):
         _iso_plan, _staging_result, self.composite = self.fixture.composite_plan()
         self.target = _device()
         self.live_device = self.target
+        self.disk_sequence = 982_451_653
         self.related_device_numbers = frozenset({_block_status().st_rdev})
         self.real_probe = syslinux_device._probe_live_target
         self.status_patch = patch(
@@ -116,6 +120,12 @@ class SyslinuxDevicePlanTests(unittest.TestCase):
         )
         self.probe_patch.start()
         self.addCleanup(self.probe_patch.stop)
+        self.disk_sequence_patch = patch(
+            "isopropyl.syslinux_device._read_disk_sequence",
+            return_value=self.disk_sequence,
+        )
+        self.disk_sequence_probe = self.disk_sequence_patch.start()
+        self.addCleanup(self.disk_sequence_patch.stop)
 
     def plan(self, device: Device | None = None) -> SyslinuxDeviceWritePlan:
         return build_syslinux_device_write_plan(
@@ -130,6 +140,7 @@ class SyslinuxDevicePlanTests(unittest.TestCase):
         self.assertIs(plan.device, self.target)
         self.assertEqual(plan.image_size, composite_fixtures.IMAGE_SIZE)
         self.assertEqual(plan.image_size, plan.device.size)
+        self.assertEqual(plan.disk_sequence, self.disk_sequence)
         self.assertEqual(plan.logical_sector_size, 512)
         self.assertEqual(plan.firmware_profile, "bios-and-uefi")
         self.assertTrue(plan.mandatory_readback)
@@ -738,6 +749,129 @@ class SyslinuxDevicePlanTests(unittest.TestCase):
                 finally:
                     object.__setattr__(confirmation, name, original)
                 validate_confirmed_syslinux_device_write(plan, confirmation)
+
+    def test_post_unmount_receipt_allows_only_mountpoints_to_become_empty(self):
+        plan = self.plan()
+        confirmation = confirm_syslinux_device_write(plan, plan.confirmation_phrase)
+        self.live_device = replace(self.target, mountpoints=())
+        ready = authorize_unmounted_syslinux_device_write(plan, confirmation)
+        self.assertIs(type(ready), ReadySyslinuxDeviceWrite)
+        self.assertIs(ready.plan, plan)
+        self.assertIs(ready.confirmation, confirmation)
+        self.assertEqual(ready.device, self.live_device)
+        self.assertEqual(ready.device.mountpoints, ())
+        self.assertEqual(ready.disk_sequence, self.disk_sequence)
+        self.assertEqual(len(ready.ready_sha256), 64)
+        validate_ready_syslinux_device_write(plan, confirmation, ready)
+
+        for name, value in {
+            "model": "replacement",
+            "vendor": "replacement",
+            "serial": "replacement",
+            "wwn": "replacement",
+            "size": self.target.size + 512,
+            "major_minor": "65:145",
+            "partitions": (),
+            "logical_sector_size": 4096,
+            "read_only": True,
+            "transport": "mmc",
+        }.items():
+            self.live_device = replace(self.target, mountpoints=(), **{name: value})
+            with self.subTest(field=name), self.assertRaisesRegex(
+                SyslinuxDevicePlanError,
+                "changed during unmounting",
+            ):
+                authorize_unmounted_syslinux_device_write(plan, confirmation)
+
+        self.live_device = self.target
+        with self.assertRaisesRegex(SyslinuxDevicePlanError, "still has a mounted"):
+            authorize_unmounted_syslinux_device_write(plan, confirmation)
+
+    def test_disk_generation_is_bound_before_confirmation_and_survives_unmount(self):
+        plan = self.plan()
+        self.disk_sequence_probe.return_value = self.disk_sequence + 1
+        with self.assertRaisesRegex(SyslinuxDevicePlanError, "different disk generation"):
+            confirm_syslinux_device_write(plan, plan.confirmation_phrase)
+
+        self.disk_sequence_probe.return_value = self.disk_sequence
+        confirmation = confirm_syslinux_device_write(plan, plan.confirmation_phrase)
+        self.live_device = replace(self.target, mountpoints=())
+        self.disk_sequence_probe.return_value = self.disk_sequence + 1
+        with self.assertRaisesRegex(SyslinuxDevicePlanError, "confirmed plan"):
+            authorize_unmounted_syslinux_device_write(plan, confirmation)
+
+    def test_ready_receipts_are_self_bound_and_reprobed(self):
+        plan = self.plan()
+        confirmation = confirm_syslinux_device_write(plan, plan.confirmation_phrase)
+        self.live_device = replace(self.target, mountpoints=())
+        ready = authorize_unmounted_syslinux_device_write(plan, confirmation)
+        values = {
+            item.name: getattr(ready, item.name)
+            for item in fields(ready)
+            if item.init
+        }
+
+        class ForgedReady(ReadySyslinuxDeviceWrite):
+            pass
+
+        for forged in (
+            replace(ready),
+            replace(ready, ready_sha256="0" * 64),
+            replace(ready, device=replace(ready.device)),
+            ReadySyslinuxDeviceWrite(**values),
+            ForgedReady(**values),
+        ):
+            with self.subTest(forged=type(forged).__name__), self.assertRaises(
+                SyslinuxDevicePlanError,
+            ):
+                validate_ready_syslinux_device_write(plan, confirmation, forged)
+
+        transplanted = replace(ready)
+        object.__setattr__(transplanted, "_authorization", ready._authorization)
+        with self.assertRaisesRegex(SyslinuxDevicePlanError, "forged, cloned"):
+            validate_ready_syslinux_device_write(plan, confirmation, transplanted)
+
+        self.live_device = replace(ready.device, serial="replacement")
+        with self.assertRaisesRegex(SyslinuxDevicePlanError, "changed after discovery"):
+            validate_ready_syslinux_device_write(plan, confirmation, ready)
+
+        self.live_device = ready.device
+        self.disk_sequence_probe.return_value = self.disk_sequence + 1
+        with self.assertRaisesRegex(SyslinuxDevicePlanError, "disk generation changed"):
+            validate_ready_syslinux_device_write(plan, confirmation, ready)
+
+    def test_post_unmount_cancellation_precedes_ready_receipt_mint(self):
+        plan = self.plan()
+        confirmation = confirm_syslinux_device_write(plan, plan.confirmation_phrase)
+        self.live_device = replace(self.target, mountpoints=())
+        probed = False
+
+        def probe(_path: str):
+            nonlocal probed
+            probed = True
+            return syslinux_device._LiveTargetObservation(
+                self.live_device,
+                self.related_device_numbers,
+            )
+
+        def cancel() -> None:
+            if probed:
+                raise SyslinuxDevicePlanCancelled("cancelled after unmount probe")
+
+        with (
+            patch("isopropyl.syslinux_device._probe_live_target", side_effect=probe),
+            patch(
+                "isopropyl.syslinux_device._ReadyReceipt",
+                side_effect=AssertionError("ready receipt minted after cancellation"),
+            ) as receipt,
+            self.assertRaisesRegex(SyslinuxDevicePlanCancelled, "after unmount probe"),
+        ):
+            authorize_unmounted_syslinux_device_write(
+                plan,
+                confirmation,
+                cancel_check=cancel,
+            )
+        receipt.assert_not_called()
 
     def test_planning_and_confirmation_never_prepare_or_touch_a_target(self):
         self.assertFalse(hasattr(__import__(

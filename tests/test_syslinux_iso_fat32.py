@@ -3,10 +3,12 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import ast
+import array
 import hashlib
 import inspect
 import os
 import stat
+import socket
 import subprocess
 import sys
 import tempfile
@@ -403,6 +405,50 @@ class SyslinuxIsoFat32Tests(unittest.TestCase):
                 IMAGE_SIZE,
             )
         self.assertEqual(patch_call["config_directory"], "")
+
+    def test_prepared_owner_transfers_one_re_attested_anonymous_descriptor(self):
+        _iso_plan, _staging_result, plan = self.composite_plan()
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        received_descriptor = -1
+        try:
+            with prepare_syslinux_iso_fat32(plan) as prepared:
+                expected = prepared.result.final_image_sha256
+                prepared._send_to_privileged_helper(parent, b"fixed-request")
+                packet, ancillary, flags, _address = child.recvmsg(
+                    4_096,
+                    socket.CMSG_SPACE(array.array("i").itemsize),
+                )
+                self.assertEqual(packet, b"fixed-request")
+                self.assertFalse(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
+                rights = []
+                for level, kind, value in ancillary:
+                    self.assertEqual((level, kind), (socket.SOL_SOCKET, socket.SCM_RIGHTS))
+                    descriptors = array.array("i")
+                    descriptors.frombytes(value)
+                    rights.extend(descriptors)
+                self.assertEqual(len(rights), 1)
+                received_descriptor = rights[0]
+                status = os.fstat(received_descriptor)
+                self.assertTrue(stat.S_ISREG(status.st_mode))
+                self.assertEqual(status.st_nlink, 0)
+                self.assertEqual(status.st_size, IMAGE_SIZE)
+            digest = hashlib.sha256()
+            offset = 0
+            while offset < IMAGE_SIZE:
+                block = os.pread(
+                    received_descriptor,
+                    min(4 * 1024 * 1024, IMAGE_SIZE - offset),
+                    offset,
+                )
+                self.assertTrue(block)
+                digest.update(block)
+                offset += len(block)
+            self.assertEqual(digest.hexdigest(), expected)
+        finally:
+            if received_descriptor >= 0:
+                os.close(received_descriptor)
+            parent.close()
+            child.close()
 
     def test_same_size_live_mutation_fails_before_anonymous_creation(self):
         _iso_plan, staging_result, plan = self.composite_plan()

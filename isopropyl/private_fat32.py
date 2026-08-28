@@ -1402,42 +1402,7 @@ class AnonymousFat32Image:
             raise PrivateFat32Error("The private image chunk size is invalid")
 
         def iterate() -> Iterator[bytes]:
-            with self._lifecycle:
-                if self._state is not PrivateFat32State.PATCHED_ATTESTED:
-                    raise PrivateFat32Error(
-                        "Only a patched, attested image can be streamed",
-                    )
-                descriptor = os.dup(self._owned_descriptor())
-                image_size = self._plan.geometry.image_size
-                try:
-                    before_stream = _private_status(descriptor, image_size)
-                    stream_sha256 = _image_digest(descriptor, image_size)
-                    after_stream = _private_status(descriptor, image_size)
-                    transaction_result = self._transaction_result
-                    if (
-                        transaction_result is None
-                        or _source_identity(before_stream)
-                        != _source_identity(after_stream)
-                        or _source_identity(after_stream)
-                        != (
-                            transaction_result.final_identity.device,
-                            transaction_result.final_identity.inode,
-                            transaction_result.final_identity.size,
-                            transaction_result.final_identity.modified_ns,
-                            transaction_result.final_identity.changed_ns,
-                        )
-                        or not hmac.compare_digest(
-                            stream_sha256,
-                            transaction_result.final_image_sha256,
-                        )
-                    ):
-                        self._poison()
-                        raise PrivateFat32Error(
-                            "The patched FAT32 image changed before streaming",
-                        )
-                except BaseException:
-                    os.close(descriptor)
-                    raise
+            descriptor, image_size = self._duplicate_attested_descriptor()
             try:
                 consumed = 0
                 while consumed < image_size:
@@ -1453,6 +1418,55 @@ class AnonymousFat32Image:
                 os.close(descriptor)
 
         return iterate()
+
+    def _duplicate_attested_descriptor(
+        self,
+        cancel_check: CancelCheck | None = None,
+    ) -> tuple[int, int]:
+        """Duplicate only a still-attested image for the owned helper bridge."""
+
+        with self._lifecycle:
+            if self._state is not PrivateFat32State.PATCHED_ATTESTED:
+                raise PrivateFat32Error(
+                    "Only a patched, attested image can cross the helper boundary",
+                )
+            descriptor = os.dup(self._owned_descriptor())
+            image_size = self._plan.geometry.image_size
+            try:
+                os.set_inheritable(descriptor, False)
+                before_stream = _private_status(descriptor, image_size)
+                stream_sha256 = _image_digest(
+                    descriptor,
+                    image_size,
+                    cancel_check,
+                )
+                after_stream = _private_status(descriptor, image_size)
+                transaction_result = self._transaction_result
+                if (
+                    transaction_result is None
+                    or _source_identity(before_stream)
+                    != _source_identity(after_stream)
+                    or _source_identity(after_stream)
+                    != (
+                        transaction_result.final_identity.device,
+                        transaction_result.final_identity.inode,
+                        transaction_result.final_identity.size,
+                        transaction_result.final_identity.modified_ns,
+                        transaction_result.final_identity.changed_ns,
+                    )
+                    or not hmac.compare_digest(
+                        stream_sha256,
+                        transaction_result.final_image_sha256,
+                    )
+                ):
+                    self._poison()
+                    raise PrivateFat32Error(
+                        "The patched FAT32 image changed before streaming or helper transfer",
+                    )
+            except BaseException:
+                os.close(descriptor)
+                raise
+            return descriptor, image_size
 
     def __enter__(self) -> AnonymousFat32Image:
         with self._lifecycle:

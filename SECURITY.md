@@ -323,9 +323,9 @@ issue requesting a private contact channel without disclosing the vulnerability.
 - Diagnostics omit drive identifiers, mount paths, ISO member lists, and logs by
   default. ISOpropyl contains no telemetry.
 
-## Dormant Syslinux BIOS boundary
+## Experimental backend-only Syslinux BIOS boundary
 
-The device-facing BIOS path remains disabled. Its implemented groundwork accepts
+The GUI-facing BIOS path remains disabled. Its implemented groundwork accepts
 only exact Syslinux `6.03-2014-10-06` or `6.04-pre1` immutable bundles whose
 family, purpose, license, provenance, artifact order, size, catalog digest, and
 fresh SHA-256 all match a second consumer-local pin set. It reproduces upstream's
@@ -457,29 +457,64 @@ attestation without exposing an unpatched owner. Its public entry point accepts
 no injectable builder or transaction capable of retaining the anonymous
 descriptor, and it returns only the patched-attested stream owner.
 
-The next non-executable boundary joins that authentic composite to one exact
-removable target. Its non-init receipt binds the exact composite and `Device`
+The target-authorization boundary joins that authentic composite to one exact
+kernel-removable target. Its non-init receipt binds the exact composite and `Device`
 objects, all public digests and media IDs, complete discovery fields, live block
-major:minor, equal image/target capacity, fixed 512-byte logical sectors,
+major:minor, the kernel disk-generation sequence, equal image/target capacity,
+fixed 512-byte logical sectors,
 source/workspace non-residency, mandatory read-back, warnings, and a case-sensitive
 typed phrase. Manual construction, `dataclasses.replace()`, refreshed equivalent
 objects, and cross-plan confirmations lose authority. A bounded, trusted-path,
 read-only `lsblk` probe must reproduce the complete discovery record and supplies
 the descendant/stacked-device identities used for fail-closed source/workspace
-residency checks at planning, validation, and confirmation. These process-local
+residency checks at planning, validation, confirmation, and after unmounting.
+The kernel disk generation is captured before typed confirmation and rechecked
+before helper launch. These process-local
 receipts prevent in-process substitution; they are not serialized privilege
 credentials. Planning and confirmation do not prepare an image, unmount, or open
 the target for I/O.
 
-This is still not authorization to write a device. The required executor is an
-installed, root-owned helper that opens the target once, independently verifies
-all bounded serialized input as untrusted, verifies descriptor identity and
-geometry, retains the same descriptor and lock across
-bounded streaming, durability, and exact SHA-256 read-back, and rejects every
-short, extra, or mismatched byte. No separate-command or pathname fallback is
-permitted. QEMU/SeaBIOS and OVMF gates plus physical BIOS testing remain mandatory
-before the GUI can offer BIOS construction. Until then, hybrid media should use
-verified DD mode to preserve its existing boot layout.
+A separately installed root-owned executor now implements that boundary without
+making it GUI-reachable. The unprivileged coordinator verifies fixed root-owned
+paths and one exact PolicyKit action, prepares and re-attests the anonymous image,
+unmounts, mints a fresh target receipt, and transfers the source descriptor over
+an authenticated `AF_UNIX/SOCK_SEQPACKET` channel. No target pathname crosses the
+protocol; the helper derives it from the requested major:minor through sysfs. The
+PolicyKit description and authentication message explicitly identify the media
+bytes as caller-supplied; authentication does not imply content trust.
+
+The helper accepts only 64-bit Linux, kernel-removable USB/MMC disks, 512-byte
+logical sectors, and exact-capacity targets. It independently verifies initial
+host namespaces, peer and message credentials, source ownership/mode/link count,
+the canonical Syslinux MBR/FAT32 image, exact private-builder FAT geometry and
+FSInfo mirrors, and the immutable code of the two pinned Syslinux VBR profiles.
+It also verifies current mount and swap topology (including swapfiles), holders,
+source residency, read-only state, and the sysfs disk generation. It opens the
+block node once with `O_EXCL`, takes an advisory `flock`,
+and checks `BLKGETSIZE64`, `BLKSSZGET`, `BLKROGET`, and `BLKGETDISKSEQ` on that
+same descriptor. A bounded, authenticated PREPARED → COMMIT/CANCEL exchange is
+the mutation boundary; GUI cancellation is in-band because an unprivileged parent
+cannot reliably signal a root process after `pkexec` authorization.
+
+After COMMIT, the helper repeats source, path, topology, and opened-descriptor
+identity checks. It durably blanks only the legacy MBR/primary GPT header, then
+durably blanks the standard backup GPT header at the final LBA; it does not wipe
+a broad live-data tail. An interruption between those metadata steps occurs
+before source streaming and can leave the old GPT recoverable from its backup.
+It then writes all non-activation bytes, flushes and invalidates caches, verifies them,
+rechecks the disk generation, and writes sector zero last. A second flush/cache
+invalidation and full SHA-256 read-back are mandatory. Post-activation failures
+attempt same-descriptor MBR deactivation only after the disk generation and
+geometry are re-established; cleanup is skipped and reported if media identity
+changed. Cancellation after COMMIT is deferred through recovery and verification.
+
+Linux block `O_EXCL` excludes competing exclusive holders, and `flock` coordinates
+lock-aware peers; neither is absolute ownership against an uncooperative raw
+`O_RDWR` writer. The Python helper is therefore provisional. A native hardened
+implementation, installed pkexec/PolicyKit+SCM_RIGHTS testing in a root-owned VM,
+QEMU/SeaBIOS and OVMF results, hot-swap/unplug races, and representative physical
+media remain mandatory before the GUI can offer BIOS construction. Until then,
+hybrid media should use verified DD mode to preserve their existing layout.
 
 ## Boot-time corruption-check boundary
 

@@ -49,7 +49,7 @@ evidence.
 - Move the reviewed GRUB/Syslinux bundle metadata to project-owned signed
   release manifests and a corresponding-source-compliant artifact service;
   keep exact-match-only immutable preparation.
-- Complete the narrowly scoped Syslinux MBR/FAT installer. The exact ADV,
+- Certify and package the narrowly scoped Syslinux MBR/FAT installer. The exact ADV,
   extent, checksum, FAT32 VBR merge, descriptor-only FAT mapping, partition
   offset binding, regular-file before/after read-back harness, and exact
   provenance-bound 440-byte MBR bootstrap merge are implemented. A pure,
@@ -72,15 +72,23 @@ evidence.
   pre/post-publication manifests now authenticate the published ISO tree, and a
   witnessed composite binds that receipt, exact bundles/config/root loader, and
   private plan before returning only a patched-attested image owner. A separate
-  clone-resistant process-local receipt now binds that exact composite to a
+  clone-resistant process-local receipt binds that exact composite to a
   freshly reproduced complete removable-device observation and descendant
   topology, live block identity, exact capacity, 512-byte sector geometry,
   fail-closed source/workspace non-residency, mandatory read-back, warnings, and
-  typed confirmation without preparing or opening the target for I/O. Remaining
-  gates are the installed root-owned executor that retains one descriptor and
-  lock across streaming/durability/read-back, QEMU/SeaBIOS plus OVMF, and physical
-  certification. Do not expose payloads or remove a BIOS blocker before those
-  gates pass. GRUB BIOS follows only after
+  typed confirmation and the kernel disk generation before preparation. A
+  separately installed, fixed PolicyKit coordinator now transfers only the
+  re-attested anonymous descriptor over an authenticated local packet socket.
+  The root helper repeats sysfs, mount/swap, geometry, removability, topology,
+  source-residency, and `BLKGETDISKSEQ` checks; uses an in-band PREPARED →
+  COMMIT/CANCEL boundary; retains one block descriptor through writes, cache
+  flushes, and mandatory full SHA-256 read-back; clears stale GPT boundary
+  metadata before streaming; and activates the new MBR last. It is backend-only
+  and installed only through the explicit host-integration target. Remaining
+  gates are a native hardened helper, an installed PolicyKit/SCM_RIGHTS VM test,
+  QEMU/SeaBIOS plus OVMF, hot-swap/failure tests, and physical certification.
+  Do not expose payloads or remove a BIOS blocker before those gates pass. GRUB
+  BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced
   and verified without executing downloaded code.
 - Integrate the implemented bounded El Torito FAT tree with persistence-profile
