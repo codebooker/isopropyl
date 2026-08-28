@@ -1,27 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
-  <title id="title">ISOpropyl — Bootable media, made simple.</title>
+  <title id="title">ISOpropyl — Bootable media, without the guesswork.</title>
   <desc id="desc">Project banner for the ISOpropyl Linux USB image writer.</desc>
   <defs>
     <linearGradient id="hero-bg" x1="60" y1="20" x2="1130" y2="350" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#1B2331"/>
+      <stop stop-color="#1B2433"/>
       <stop offset="0.58" stop-color="#111720"/>
       <stop offset="1" stop-color="#0B0F15"/>
     </linearGradient>
     <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(225 168) rotate(25) scale(310 245)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F58A26" stop-opacity="0.22"/>
-      <stop offset="1" stop-color="#F58A26" stop-opacity="0"/>
+      <stop stop-color="#F6922E" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#F6922E" stop-opacity="0"/>
     </radialGradient>
-    <linearGradient id="drop" x1="200" y1="115" x2="235" y2="250" gradientUnits="userSpaceOnUse">
+    <radialGradient id="disc" cx="0" cy="0" r="1" gradientTransform="translate(131 104) rotate(48) scale(148)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.66" stop-color="#EEF2F7"/>
+      <stop offset="1" stop-color="#C6CEDA"/>
+    </radialGradient>
+    <linearGradient id="amber" x1="215" y1="115" x2="260" y2="269" gradientUnits="userSpaceOnUse">
       <stop stop-color="#FFB34F"/>
       <stop offset="1" stop-color="#F47D20"/>
     </linearGradient>
-    <radialGradient id="disc" cx="0" cy="0" r="1" gradientTransform="translate(148 121) rotate(48) scale(128)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFFFF"/>
-      <stop offset="0.7" stop-color="#E7ECF3"/>
-      <stop offset="1" stop-color="#BFC8D5"/>
-    </radialGradient>
-    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%" color-interpolation-filters="sRGB">
+    <filter id="shadow" x="-25%" y="-25%" width="150%" height="165%" color-interpolation-filters="sRGB">
       <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#020409" flood-opacity="0.45"/>
     </filter>
   </defs>
@@ -30,22 +30,21 @@
   <rect width="1200" height="360" rx="34" fill="url(#glow)"/>
   <rect x="1" y="1" width="1198" height="358" rx="33" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="2"/>
 
-  <g transform="translate(70 38)" filter="url(#shadow)">
-    <circle cx="140" cy="140" r="98" fill="url(#disc)"/>
-    <circle cx="140" cy="140" r="73" fill="none" stroke="#AAB5C5" stroke-opacity="0.58" stroke-width="3"/>
-    <path d="M72 177a98 98 0 0 0 88 59" fill="none" stroke="#F58A26" stroke-width="13" stroke-linecap="round"/>
-    <path d="M96 62a98 98 0 0 1 106 15" fill="none" stroke="#FFFFFF" stroke-opacity="0.72" stroke-width="7" stroke-linecap="round"/>
-    <circle cx="140" cy="140" r="27" fill="#171D27"/>
-    <circle cx="140" cy="140" r="10" fill="#F6922E"/>
-    <path d="M232 84s-48 59-48 100c0 31 21 54 48 54s48-23 48-54c0-41-48-100-48-100Z" fill="url(#drop)" stroke="#FFD291" stroke-width="4" stroke-linejoin="round"/>
-    <path d="M222 120c-12 18-23 40-23 59 0 10 3 19 9 27" fill="none" stroke="#FFF4DF" stroke-opacity="0.72" stroke-width="8" stroke-linecap="round"/>
+  <g transform="translate(62 31) scale(1.25)" filter="url(#shadow)">
+    <circle cx="105" cy="121" r="71" fill="url(#disc)"/>
+    <circle cx="105" cy="121" r="52" fill="none" stroke="#AAB5C5" stroke-opacity="0.5" stroke-width="2.5"/>
+    <circle cx="105" cy="121" r="19" fill="#161D28"/>
+    <circle cx="105" cy="121" r="7.5" fill="#F6922E"/>
+    <path d="M58 149C70 178 98 196 132 198C151 199 168 195 182 187" fill="none" stroke="#F6922E" stroke-width="11" stroke-linecap="round"/>
+    <path d="M182 79C182 79 145 126 145 160C145 188 161 207 182 207C204 207 220 188 220 160C220 126 182 79 182 79Z" fill="url(#amber)" stroke="#FFD291" stroke-width="3.5" stroke-linejoin="round"/>
+    <path d="M174 111C165 125 158 143 158 157C158 166 160 174 165 180" fill="none" stroke="#FFF4DF" stroke-opacity="0.78" stroke-width="6" stroke-linecap="round"/>
   </g>
 
-  <text x="440" y="143" fill="#F8FAFD" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="76" font-weight="700" letter-spacing="-2">ISO<tspan fill="#F6922E">propyl</tspan></text>
-  <text x="444" y="202" fill="#D0D7E2" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="27" font-weight="500">Bootable media, made simple.</text>
-  <text x="444" y="249" fill="#929EAF" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="19">A capable, safety-first USB image writer for Linux.</text>
+  <text x="425" y="137" fill="#F8FAFD" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="76" font-weight="700" letter-spacing="-2">ISO<tspan fill="#F6922E">propyl</tspan></text>
+  <text x="429" y="198" fill="#D0D7E2" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="27" font-weight="500">Bootable media, without the guesswork.</text>
+  <text x="429" y="244" fill="#929EAF" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="18">Linux-native. Guarded device writes. Verified end to end.</text>
 
-  <g transform="translate(444 281)" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="14" font-weight="650" letter-spacing="1.2">
+  <g transform="translate(429 278)" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="650" letter-spacing="1.2">
     <rect width="70" height="32" rx="16" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.1"/>
     <text x="35" y="21" text-anchor="middle" fill="#C9D1DD">ISO</text>
     <rect x="82" width="74" height="32" rx="16" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.1"/>
