@@ -21,10 +21,10 @@ import shutil
 import stat
 import subprocess
 import threading
-import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import TypeVar
 
 from .devices import Device, parse_lsblk, path_is_on_device
 from .conflicts import conflict_diagnostic_suffix
@@ -39,6 +39,19 @@ from .formatting import (
     resolve_tools as resolve_format_tools,
     validate_device,
 )
+from .staging_tree import (
+    FAT32_MAX_FILE_BYTES,
+    MAX_TREE_DEPTH,
+    MAX_TREE_ENTRIES,
+    StagedDirectory,
+    StagedFile,
+    StagingTreeSafetyError,
+    scan_staging_tree as _scan_staging_tree,
+    staged_case_key as _case_key,
+    staged_directory_from_stat as _staged_directory_from_stat,
+    staged_file_from_stat as _staged_file_from_stat,
+    validate_staged_component as _validate_staged_component,
+)
 from .timestamps import (
     FAT_MTIME_TOLERANCE_NS,
     MAX_PORTABLE_ARCHIVE_MTIME_NS,
@@ -49,21 +62,13 @@ from .timestamps import (
 )
 
 COPY_BLOCK_BYTES = 4 * 1024 * 1024
-FAT32_MAX_FILE_BYTES = (4 * 1024 * 1024 * 1024) - 1
 MINIMUM_CAPACITY_RESERVE_BYTES = 64 * 1024 * 1024
 PARTITION_RESERVE_BYTES = 2 * 1024 * 1024
-MAX_TREE_ENTRIES = 1_000_000
-MAX_TREE_DEPTH = 128
 MAX_ERROR_CHARACTERS = 2048
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _TRUSTED_TOOL_DIRECTORIES = tuple(_TRUSTED_TOOL_PATH.split(":"))
 _BLOCK_PATH = re.compile(r"/dev/[A-Za-z0-9._+:-]+")
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
-_WINDOWS_DEVICE = re.compile(
-    r"^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$",
-    re.IGNORECASE,
-)
-_FAT_FORBIDDEN = frozenset('<>:"/\\|?*')
 _DIR_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
@@ -72,6 +77,7 @@ _WRITE_FLAGS = (
     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     | getattr(os, "O_CLOEXEC", 0)
 )
+_T = TypeVar("_T")
 
 
 class ConstructedMediaError(RuntimeError):
@@ -82,7 +88,7 @@ class ConstructedMediaUnavailable(ConstructedMediaError):
     pass
 
 
-class ConstructedMediaSafetyError(ConstructedMediaError):
+class ConstructedMediaSafetyError(ConstructedMediaError, StagingTreeSafetyError):
     pass
 
 
@@ -90,32 +96,41 @@ class ConstructedMediaCancelled(ConstructedMediaError):
     pass
 
 
-@dataclass(frozen=True)
-class StagedDirectory:
-    parts: tuple[str, ...]
-    device: int
-    inode: int
-    modified_ns: int
-    changed_ns: int
-
-    @property
-    def path(self) -> str:
-        return PurePosixPath(*self.parts).as_posix() if self.parts else "."
+def _translate_staging_error(operation: Callable[[], _T]) -> _T:
+    try:
+        return operation()
+    except StagingTreeSafetyError as error:
+        raise ConstructedMediaSafetyError(str(error)) from error
 
 
-@dataclass(frozen=True)
-class StagedFile:
-    parts: tuple[str, ...]
-    device: int
-    inode: int
-    size: int
-    modified_ns: int
-    changed_ns: int
-    link_count: int
+def _validate_component(component: str, rendered_path: str) -> None:
+    _translate_staging_error(
+        lambda: _validate_staged_component(component, rendered_path),
+    )
 
-    @property
-    def path(self) -> str:
-        return PurePosixPath(*self.parts).as_posix()
+
+def _directory_from_stat(
+    parts: tuple[str, ...], info: os.stat_result,
+) -> StagedDirectory:
+    return _translate_staging_error(
+        lambda: _staged_directory_from_stat(parts, info),
+    )
+
+
+def _file_from_stat(parts: tuple[str, ...], info: os.stat_result) -> StagedFile:
+    return _translate_staging_error(
+        lambda: _staged_file_from_stat(parts, info),
+    )
+
+
+def scan_staging_tree(
+    root: Path | str,
+    *,
+    max_file_bytes: int | None = FAT32_MAX_FILE_BYTES,
+) -> tuple[Path, tuple[StagedDirectory, ...], tuple[StagedFile, ...]]:
+    return _translate_staging_error(
+        lambda: _scan_staging_tree(root, max_file_bytes=max_file_bytes),
+    )
 
 
 @dataclass(frozen=True)
@@ -210,193 +225,6 @@ def resolve_constructed_tools(
         findmnt=_trusted_tool("findmnt", finder),
         lsblk=_trusted_tool("lsblk", finder),
     )
-
-
-def _validate_component(component: str, rendered_path: str) -> None:
-    if not component or component in {".", ".."} or "\x00" in component:
-        raise ConstructedMediaSafetyError(f"Unsafe staged path: {rendered_path!r}")
-    if any(ord(character) < 32 or ord(character) == 127 for character in component):
-        raise ConstructedMediaSafetyError(
-            f"Control character in staged path: {rendered_path!r}"
-        )
-    if any(character in _FAT_FORBIDDEN for character in component):
-        raise ConstructedMediaSafetyError(
-            f"FAT32-incompatible character in staged path: {rendered_path!r}"
-        )
-    if component.endswith((" ", ".")):
-        raise ConstructedMediaSafetyError(
-            f"Trailing dot or space in staged path: {rendered_path!r}"
-        )
-    if _WINDOWS_DEVICE.fullmatch(unicodedata.normalize("NFC", component)):
-        raise ConstructedMediaSafetyError(
-            f"Reserved FAT32 device name in staged path: {rendered_path!r}"
-        )
-    try:
-        utf16_units = len(component.encode("utf-16-le")) // 2
-    except UnicodeEncodeError as error:
-        raise ConstructedMediaSafetyError(
-            f"Staged path is not valid Unicode: {rendered_path!r}"
-        ) from error
-    if utf16_units > 255:
-        raise ConstructedMediaSafetyError(
-            f"Staged path component exceeds the FAT32 name limit: {rendered_path!r}"
-        )
-
-
-def _case_key(parts: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(unicodedata.normalize("NFC", item).casefold() for item in parts)
-
-
-def _directory_from_stat(parts: tuple[str, ...], info: os.stat_result) -> StagedDirectory:
-    path = PurePosixPath(*parts).as_posix() if parts else "."
-    if not (
-        MIN_PORTABLE_ARCHIVE_MTIME_NS
-        <= info.st_mtime_ns
-        <= MAX_PORTABLE_ARCHIVE_MTIME_NS
-    ):
-        raise ConstructedMediaSafetyError(
-            f"Staged directory has a modification time outside the portable range: {path!r}"
-        )
-    return StagedDirectory(
-        parts, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns,
-    )
-
-
-def _file_from_stat(parts: tuple[str, ...], info: os.stat_result) -> StagedFile:
-    path = PurePosixPath(*parts).as_posix()
-    if not (
-        MIN_PORTABLE_ARCHIVE_MTIME_NS
-        <= info.st_mtime_ns
-        <= MAX_PORTABLE_ARCHIVE_MTIME_NS
-    ):
-        raise ConstructedMediaSafetyError(
-            f"Staged file has a modification time outside the portable range: {path!r}"
-        )
-    return StagedFile(
-        parts, info.st_dev, info.st_ino, info.st_size,
-        info.st_mtime_ns, info.st_ctime_ns, info.st_nlink,
-    )
-
-
-def _scan_directory_fd(
-    directory_fd: int,
-    parts: tuple[str, ...],
-    root_device: int,
-    directories: list[StagedDirectory],
-    files: list[StagedFile],
-    occupied: dict[tuple[str, ...], str],
-    max_file_bytes: int | None,
-) -> None:
-    if len(parts) >= MAX_TREE_DEPTH:
-        raise ConstructedMediaSafetyError("The staged tree exceeds the directory-depth limit")
-    try:
-        names = sorted(os.listdir(directory_fd), key=lambda item: item.casefold())
-    except OSError as error:
-        raise ConstructedMediaSafetyError(
-            _bounded_message(error, "Could not enumerate the staged tree")
-        ) from error
-    for name in names:
-        child_parts = parts + (name,)
-        rendered = PurePosixPath(*child_parts).as_posix()
-        _validate_component(name, rendered)
-        key = _case_key(child_parts)
-        if key in occupied:
-            raise ConstructedMediaSafetyError(
-                f"Case or Unicode-normalization collision: {occupied[key]!r} and {rendered!r}"
-            )
-        occupied[key] = rendered
-        if len(directories) + len(files) >= MAX_TREE_ENTRIES:
-            raise ConstructedMediaSafetyError("The staged tree contains too many entries")
-        try:
-            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except OSError as error:
-            raise ConstructedMediaSafetyError(
-                _bounded_message(error, f"Could not inspect staged entry {rendered!r}")
-            ) from error
-        if before.st_dev != root_device:
-            raise ConstructedMediaSafetyError(
-                f"Cross-filesystem staged entries are forbidden: {rendered!r}"
-            )
-        if stat.S_ISLNK(before.st_mode):
-            raise ConstructedMediaSafetyError(f"Symbolic links are forbidden: {rendered!r}")
-        if stat.S_ISDIR(before.st_mode):
-            try:
-                child_fd = os.open(name, _DIR_FLAGS, dir_fd=directory_fd)
-            except OSError as error:
-                raise ConstructedMediaSafetyError(
-                    _bounded_message(error, f"Could not safely open directory {rendered!r}")
-                ) from error
-            try:
-                opened = os.fstat(child_fd)
-                if (
-                    not stat.S_ISDIR(opened.st_mode)
-                    or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-                ):
-                    raise ConstructedMediaSafetyError(
-                        f"Staged directory changed while scanning: {rendered!r}"
-                    )
-                directories.append(_directory_from_stat(child_parts, opened))
-                _scan_directory_fd(
-                    child_fd, child_parts, root_device,
-                    directories, files, occupied, max_file_bytes,
-                )
-            finally:
-                os.close(child_fd)
-        elif stat.S_ISREG(before.st_mode):
-            if before.st_nlink != 1:
-                raise ConstructedMediaSafetyError(
-                    f"Hard-linked staged files are forbidden: {rendered!r}"
-                )
-            if max_file_bytes is not None and before.st_size > max_file_bytes:
-                raise ConstructedMediaSafetyError(
-                    f"Staged file exceeds the selected filesystem's single-file limit: {rendered!r}"
-                )
-            files.append(_file_from_stat(child_parts, before))
-        else:
-            raise ConstructedMediaSafetyError(
-                f"Only regular files and directories are allowed: {rendered!r}"
-            )
-
-
-def scan_staging_tree(
-    root: Path | str,
-    *,
-    max_file_bytes: int | None = FAT32_MAX_FILE_BYTES,
-) -> tuple[Path, tuple[StagedDirectory, ...], tuple[StagedFile, ...]]:
-    staging = Path(root)
-    if not staging.is_absolute():
-        raise ConstructedMediaSafetyError("The staging tree must use an absolute path")
-    staging = Path(os.path.normpath(staging))
-    try:
-        initial = os.lstat(staging)
-    except OSError as error:
-        raise ConstructedMediaSafetyError(
-            _bounded_message(error, "The staging tree is unavailable")
-        ) from error
-    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISDIR(initial.st_mode):
-        raise ConstructedMediaSafetyError(
-            "The staging root must be a real directory, not a link or special file"
-        )
-    try:
-        root_fd = os.open(staging, _DIR_FLAGS)
-    except OSError as error:
-        raise ConstructedMediaSafetyError(
-            _bounded_message(error, "Could not safely open the staging root")
-        ) from error
-    try:
-        opened = os.fstat(root_fd)
-        if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
-            raise ConstructedMediaSafetyError("The staging root changed while opening it")
-        directories = [_directory_from_stat((), opened)]
-        files: list[StagedFile] = []
-        _scan_directory_fd(
-            root_fd, (), opened.st_dev, directories, files, {}, max_file_bytes,
-        )
-    finally:
-        os.close(root_fd)
-    directories.sort(key=lambda item: (len(item.parts), _case_key(item.parts)))
-    files.sort(key=lambda item: _case_key(item.parts))
-    return staging, tuple(directories), tuple(files)
 
 
 def _fallback_loaders(files: Sequence[StagedFile]) -> tuple[str, ...]:

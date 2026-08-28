@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 
-from .constructed import (
+from .staging_tree import (
     StagedDirectory,
     StagedFile,
     scan_staging_tree,

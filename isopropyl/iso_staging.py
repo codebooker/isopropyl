@@ -28,8 +28,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from .constructed import (
-    ConstructedMediaSafetyError,
+from .staging_tree import (
+    StagingTreeSafetyError,
     scan_staging_tree,
 )
 from .boot_identity import (
@@ -2183,7 +2183,7 @@ def _validate_split_result(
         raise IsoStagingSafetyError("The WIM splitter published to an unexpected directory")
     try:
         scanned_root, directories, files = scan_staging_tree(split_directory)
-    except ConstructedMediaSafetyError as error:
+    except StagingTreeSafetyError as error:
         raise IsoStagingSafetyError(str(error)) from error
     if scanned_root != split_directory or len(directories) != 1:
         raise IsoStagingSafetyError("The WIM splitter created unexpected directories")
@@ -2654,7 +2654,7 @@ class IsoStagingExecutor:
                         else None
                     ),
                 )
-            except ConstructedMediaSafetyError as error:
+            except StagingTreeSafetyError as error:
                 raise IsoStagingSafetyError(str(error)) from error
             if scanned_root != tree:
                 raise IsoStagingSafetyError("The final staging root changed during validation")
