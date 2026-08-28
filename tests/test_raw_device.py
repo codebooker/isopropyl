@@ -162,6 +162,8 @@ class RawDevicePlanTests(unittest.TestCase):
             "original_modified_ns": evidence.original_modified_ns + 1,
             "original_changed_ns": evidence.original_changed_ns + 1,
             "workspace_device": evidence.workspace_device + 1,
+            "requires_exact_target_size": True,
+            "required_logical_sector_size": 512,
         }
         for field_name, value in changes.items():
             with self.subTest(field=field_name):
@@ -185,6 +187,12 @@ class RawDevicePlanTests(unittest.TestCase):
             {"original_modified_ns": -1},
             {"original_changed_ns": -1},
             {"workspace_device": -1},
+            {"requires_exact_target_size": None},
+            {"requires_exact_target_size": 1},
+            {"required_logical_sector_size": 0},
+            {"required_logical_sector_size": -512},
+            {"required_logical_sector_size": True},
+            {"required_logical_sector_size": "512"},
         )
         for changes in invalid:
             with self.subTest(changes=changes), self.assertRaises(
@@ -240,6 +248,74 @@ class RawDevicePlanTests(unittest.TestCase):
             evidence.workspace_device,
             result.workspace_identity.device,
         )
+        self.assertFalse(evidence.requires_exact_target_size)
+        self.assertIsNone(evidence.required_logical_sector_size)
+
+        explicit_generic = raw_source_evidence_from_snapshot(
+            prepared,
+            requires_exact_target_size=False,
+            required_logical_sector_size=None,
+        )
+        self.assertEqual(explicit_generic, evidence)
+        with self.assertRaisesRegex(RawDevicePlanError, "disagree"):
+            raw_source_evidence_from_snapshot(
+                prepared,
+                requires_exact_target_size=True,
+            )
+
+        constrained_result = replace(
+            result,
+            requires_exact_target_size=True,
+            required_logical_sector_size=512,
+        )
+        constrained_prepared = PreparedRawSnapshot(
+            os.dup(source.fileno()),
+            constrained_result,
+            raw_snapshot._OWNER_WITNESS,
+        )
+        self.addCleanup(constrained_prepared.close)
+        constrained = raw_source_evidence_from_snapshot(
+            constrained_prepared,
+            requires_exact_target_size=True,
+            required_logical_sector_size=512,
+        )
+        self.assertTrue(constrained.requires_exact_target_size)
+        self.assertEqual(constrained.required_logical_sector_size, 512)
+        self.assertNotEqual(
+            constrained.snapshot_plan_sha256,
+            evidence.snapshot_plan_sha256,
+        )
+        for invalid_keywords in (
+            {"requires_exact_target_size": 1},
+            {"requires_exact_target_size": None},
+            {"required_logical_sector_size": True},
+            {"required_logical_sector_size": 0},
+        ):
+            with self.subTest(invalid_keywords=invalid_keywords), self.assertRaises(
+                RawDevicePlanError,
+            ):
+                raw_source_evidence_from_snapshot(
+                    prepared,
+                    **invalid_keywords,
+                )
+
+        derived = raw_source_evidence_from_snapshot(constrained_prepared)
+        self.assertTrue(derived.requires_exact_target_size)
+        self.assertEqual(derived.required_logical_sector_size, 512)
+        with self.assertRaisesRegex(RawDevicePlanError, "disagree"):
+            raw_source_evidence_from_snapshot(
+                constrained_prepared,
+                requires_exact_target_size=False,
+            )
+        with self.assertRaisesRegex(RawDevicePlanError, "disagree"):
+            raw_source_evidence_from_snapshot(
+                constrained_prepared,
+                required_logical_sector_size=None,
+            )
+        object.__setattr__(constrained_result, "requires_exact_target_size", "yes")
+        with self.assertRaisesRegex(RawDevicePlanError, "constraint"):
+            raw_source_evidence_from_snapshot(constrained_prepared)
+        object.__setattr__(constrained_result, "requires_exact_target_size", True)
         with self.assertRaises(RawDevicePlanError):
             raw_source_evidence_from_snapshot(result)  # type: ignore[arg-type]
         prepared.close()
@@ -337,6 +413,59 @@ class RawDevicePlanTests(unittest.TestCase):
             ):
                 self.plan(source=_source(source_size=size))
 
+    def test_authoritative_source_geometry_constraints_are_enforced(self):
+        exact = _source(
+            source_size=TARGET_SIZE,
+            original_size=TARGET_SIZE,
+            requires_exact_target_size=True,
+            required_logical_sector_size=512,
+        )
+        plan = self.plan(source=exact)
+        self.assertTrue(plan.requires_exact_target_size)
+        self.assertEqual(plan.required_logical_sector_size, 512)
+        confirmation = confirm_raw_device_write(plan, plan.confirmation_phrase)
+        self.assertTrue(confirmation.requires_exact_target_size)
+        self.assertEqual(confirmation.required_logical_sector_size, 512)
+        validate_confirmed_raw_device_write(plan, confirmation)
+
+        generic = replace(
+            exact,
+            requires_exact_target_size=False,
+            required_logical_sector_size=None,
+        )
+        generic_plan = self.plan(source=generic)
+        self.assertNotEqual(plan.snapshot_plan_sha256, generic_plan.snapshot_plan_sha256)
+        self.assertNotEqual(plan.plan_sha256, generic_plan.plan_sha256)
+        with self.assertRaisesRegex(RawDevicePlanError, "another plan"):
+            validate_confirmed_raw_device_write(generic_plan, confirmation)
+
+        for size in (TARGET_SIZE - 512, TARGET_SIZE + 512):
+            with self.subTest(size=size), self.assertRaisesRegex(
+                RawDevicePlanError,
+                "exactly matches",
+            ):
+                self.plan(
+                    source=_source(
+                        source_size=size,
+                        requires_exact_target_size=True,
+                    ),
+                )
+
+        with self.assertRaisesRegex(RawDevicePlanError, "requires.*4096-byte"):
+            self.plan(
+                source=_source(required_logical_sector_size=4096),
+            )
+        with self.assertRaisesRegex(RawDevicePlanError, "profile requires 512-byte"):
+            self.plan(
+                source=_source(required_logical_sector_size=4096),
+                device=_device(logical_sector_size=4096),
+            )
+        with self.assertRaisesRegex(RawDevicePlanError, "profile requires 512-byte"):
+            self.plan(
+                source=_source(required_logical_sector_size=None),
+                device=_device(logical_sector_size=4096),
+            )
+
     def test_target_policy_binds_capacity_sector_and_complete_device(self):
         invalid = (
             (_device(logical_sector_size=4096), "512-byte"),
@@ -359,6 +488,8 @@ class RawDevicePlanTests(unittest.TestCase):
                 self.plan(device=device)
 
         plan = self.plan()
+        self.assertFalse(plan.requires_exact_target_size)
+        self.assertIsNone(plan.required_logical_sector_size)
         changes = {
             "path": "/dev/sdy",
             "size": plan.device.size + 512,
@@ -416,6 +547,8 @@ class RawDevicePlanTests(unittest.TestCase):
             validate_raw_device_write_plan(transplanted)
 
         confirmation = confirm_raw_device_write(plan, plan.confirmation_phrase)
+        self.assertFalse(confirmation.requires_exact_target_size)
+        self.assertIsNone(confirmation.required_logical_sector_size)
         confirmation_values = {
             item.name: getattr(confirmation, item.name)
             for item in fields(confirmation)
@@ -440,6 +573,32 @@ class RawDevicePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(RawDevicePlanError, "another plan"):
             validate_confirmed_raw_device_write(other, confirmation)
 
+        confirmation_mutations = {
+            "plan": replace(plan),
+            "plan_sha256": "0" * 64,
+            "source_sha256": "1" * 64,
+            "source_size": confirmation.source_size + 512,
+            "requires_exact_target_size": True,
+            "required_logical_sector_size": 512,
+            "device_identity": confirmation.device_identity[:-1] + ("other",),
+            "target_capacity": confirmation.target_capacity + 512,
+            "logical_sector_size": 4096,
+            "final_verification_requested": (
+                not confirmation.final_verification_requested
+            ),
+            "confirmation_phrase": confirmation.confirmation_phrase + " ",
+        }
+        for name, mutation in confirmation_mutations.items():
+            original = getattr(confirmation, name)
+            with self.subTest(confirmation_field=name):
+                object.__setattr__(confirmation, name, mutation)
+                try:
+                    with self.assertRaises(RawDevicePlanError):
+                        validate_confirmed_raw_device_write(plan, confirmation)
+                finally:
+                    object.__setattr__(confirmation, name, original)
+                validate_confirmed_raw_device_write(plan, confirmation)
+
     def test_every_public_plan_field_is_receipt_and_digest_bound(self):
         plan = self.plan()
         mutations = {
@@ -452,6 +611,8 @@ class RawDevicePlanTests(unittest.TestCase):
             "source_size": plan.source_size + 1,
             "original_source_identity": plan.original_source_identity[:-1] + (0,),
             "workspace_device": plan.workspace_device + 1,
+            "requires_exact_target_size": True,
+            "required_logical_sector_size": 512,
             "target_capacity": plan.target_capacity + 512,
             "logical_sector_size": 4096,
             "mandatory_preactivation_readback": False,
@@ -476,16 +637,23 @@ class RawDevicePlanTests(unittest.TestCase):
 
     def test_source_evidence_mutation_after_plan_is_detected(self):
         plan = self.plan()
-        original = self.source.original_changed_ns
-        object.__setattr__(self.source, "original_changed_ns", original + 1)
-        try:
-            with self.assertRaises(RawDevicePlanError):
+        mutations = {
+            "original_changed_ns": self.source.original_changed_ns + 1,
+            "requires_exact_target_size": True,
+            "required_logical_sector_size": 512,
+        }
+        for name, mutation in mutations.items():
+            original = getattr(self.source, name)
+            with self.subTest(source_evidence_field=name):
+                object.__setattr__(self.source, name, mutation)
+                try:
+                    with self.assertRaises(RawDevicePlanError):
+                        validate_raw_device_write_plan(plan)
+                    with self.assertRaises(RawDevicePlanError):
+                        confirm_raw_device_write(plan, plan.confirmation_phrase)
+                finally:
+                    object.__setattr__(self.source, name, original)
                 validate_raw_device_write_plan(plan)
-            with self.assertRaises(RawDevicePlanError):
-                confirm_raw_device_write(plan, plan.confirmation_phrase)
-        finally:
-            object.__setattr__(self.source, "original_changed_ns", original)
-        validate_raw_device_write_plan(plan)
 
     def test_source_and_workspace_residency_are_rejected_at_every_boundary(self):
         for field_name in ("original_device", "workspace_device"):

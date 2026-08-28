@@ -2,14 +2,15 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Witnessed regular-file source -> anonymous raw-image snapshot.
+"""Witnessed image source -> anonymous raw-image snapshot.
 
 The raw writer must not ask a privileged process to reopen a user pathname or
-consume a mutable decoder pipe.  This module implements the narrow first
-profile: one already selected, uncompressed regular file is copied into a
+consume a mutable decoder pipe.  This module keeps the narrow first profile
+available unchanged, while descriptor-bound ``ImageSource``
+objects and virtual-disk callbacks can also materialize expanded bytes into a
 fully allocated, unlinked ``O_TMPFILE``.  Both the source and the private
-workspace are independently rebound before creation, source identity includes
-ctime, and the resulting descriptor can cross a helper boundary exactly once.
+workspace are independently rebound before creation, the outer source identity
+includes ctime, and the resulting descriptor can cross a helper boundary once.
 
 Target topology is deliberately supplied as input evidence.  This module does
 not discover block devices; it only proves that neither the selected source
@@ -32,6 +33,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from .sources import ImageSource, ImageSourceError
+
 
 COPY_BYTES = 4 * 1024 * 1024
 MAX_RAW_SNAPSHOT_BYTES = 64 * 1024 * 1024 * 1024 * 1024
@@ -40,6 +43,33 @@ _PLAN_PROFILE = "io.github.codebooker.isopropyl/raw-snapshot-plan/v1"
 _PLAN_WITNESS = object()
 _OWNER_WITNESS = object()
 _SHA256_LENGTH = 64
+_STREAM_MATERIALIZATION_PROFILES = frozenset({"plain", "compressed", "vtsi"})
+_CALLBACK_MATERIALIZATION_PROFILES = frozenset({
+    "virtual",
+    "compressed-virtual",
+})
+_MATERIALIZATION_PROFILES = (
+    _STREAM_MATERIALIZATION_PROFILES | _CALLBACK_MATERIALIZATION_PROFILES
+)
+_VIRTUAL_SUFFIXES = frozenset({".qcow", ".qcow2", ".vhd", ".vhdx"})
+_NON_RAW_MATERIALIZED_SUFFIXES = frozenset({
+    ".esd",
+    ".ffu",
+    ".vtsi",
+    ".wim",
+})
+_COMPRESSION_SUFFIXES = frozenset({
+    ".bz2",
+    ".bzip2",
+    ".gz",
+    ".gzip",
+    ".lzma",
+    ".xz",
+    ".z",
+    ".zip",
+    ".zst",
+    ".zstd",
+})
 _SOURCE_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -113,6 +143,7 @@ class RawSnapshotIdentity:
 class _PlanReceipt:
     token: object
     plan: object
+    bound_source: object
     snapshot: tuple[object, ...]
 
 
@@ -125,6 +156,14 @@ class RawSnapshotPlan:
     target_device_numbers: frozenset[int]
     image_size: int
     plan_sha256: str
+    materialization_profile: str = "plain"
+    requires_exact_target_size: bool = False
+    required_logical_sector_size: int | None = None
+    _bound_source: ImageSource | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _authorization: _PlanReceipt | None = field(
         init=False,
         default=None,
@@ -142,10 +181,14 @@ class RawSnapshotResult:
     image_size: int
     image_sha256: str
     fully_preallocated: bool
+    materialization_profile: str = "plain"
+    requires_exact_target_size: bool = False
+    required_logical_sector_size: int | None = None
 
 
 CancelCheck = Callable[[], None]
 Progress = Callable[[int, int], None]
+Materializer = Callable[[int, CancelCheck], None]
 
 
 def _bounded(value: object, fallback: str) -> str:
@@ -173,6 +216,140 @@ def _canonical_absolute(value: Path | str, label: str) -> str:
     if resolved != rendered:
         raise RawSnapshotError(f"The {label} path must not contain symbolic links")
     return rendered
+
+
+def _canonical_bound_path(value: Path | str, label: str) -> str:
+    """Validate descriptor metadata without reopening its caller-visible path."""
+
+    try:
+        rendered = os.fspath(value)
+    except TypeError as error:
+        raise RawSnapshotError(f"The {label} path is invalid") from error
+    if (
+        type(rendered) is not str
+        or not os.path.isabs(rendered)
+        or os.path.normpath(rendered) != rendered
+        or "\x00" in rendered
+    ):
+        raise RawSnapshotError(f"The {label} path must be absolute and canonical")
+    return rendered
+
+
+def _bound_source_identity(source: ImageSource) -> tuple[int, RawSourceIdentity]:
+    if type(source) is not ImageSource:
+        raise RawSnapshotError("An exact descriptor-bound ImageSource is required")
+    try:
+        descriptor = source.fileno()
+        status = os.fstat(descriptor)
+    except (ImageSourceError, OSError) as error:
+        raise RawSnapshotError(
+            _bounded(error, "The descriptor-bound image source is unavailable"),
+        ) from error
+    if (
+        type(descriptor) is not int
+        or descriptor < 0
+        or not stat.S_ISREG(status.st_mode)
+        or type(status.st_size) is not int
+        or status.st_size <= 0
+    ):
+        raise RawSnapshotError("The descriptor-bound outer source is invalid")
+    identity = RawSourceIdentity(
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+    try:
+        declared = (
+            source.identity.device,
+            source.identity.inode,
+            source.identity.size,
+            source.identity.modified_ns,
+            source.identity.changed_ns,
+        )
+    except AttributeError as error:
+        raise RawSnapshotError("The descriptor-bound outer identity is malformed") from error
+    if identity.selection_tuple != declared:
+        raise RawSnapshotError("The descriptor-bound outer source identity changed")
+    return descriptor, identity
+
+
+def _validate_materialization_binding(
+    source: ImageSource,
+    profile: str,
+    requires_exact_target_size: bool,
+    required_logical_sector_size: int | None,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> None:
+    if (
+        type(profile) is not str
+        or profile not in _MATERIALIZATION_PROFILES
+        or type(requires_exact_target_size) is not bool
+        or (
+            required_logical_sector_size is not None
+            and (
+                type(required_logical_sector_size) is not int
+                or isinstance(required_logical_sector_size, bool)
+                or required_logical_sector_size <= 0
+            )
+        )
+    ):
+        raise RawSnapshotError("The raw materialization profile is invalid")
+    if cancel_check is not None:
+        cancel_check()
+    try:
+        logical_name = source.decoded_name(cancel_check=cancel_check)
+        suffix = Path(logical_name).suffix.casefold()
+        actual_profile = "vtsi" if source.sparse_format == "vtsi" else (
+            ("compressed-virtual" if source.compressed else "virtual")
+            if suffix in _VIRTUAL_SUFFIXES
+            else ("compressed" if source.compressed else "plain")
+        )
+        if (
+            source.sparse_format not in {"", "vtsi"}
+            or profile != actual_profile
+            or requires_exact_target_size is not source.requires_exact_target_size
+            or required_logical_sector_size
+            != (source.required_logical_sector_size or None)
+        ):
+            raise RawSnapshotError(
+                "The ImageSource does not match its materialization constraints",
+            )
+    except ImageSourceError as error:
+        raise RawSnapshotError(
+            _bounded(error, "The descriptor-bound image source is invalid"),
+        ) from error
+    suffix = Path(logical_name).suffix.casefold()
+    if profile in _CALLBACK_MATERIALIZATION_PROFILES:
+        if (
+            suffix not in _VIRTUAL_SUFFIXES
+            or requires_exact_target_size
+            or required_logical_sector_size is not None
+        ):
+            raise RawSnapshotError(
+                "The virtual materialization constraints are invalid",
+            )
+    elif profile == "vtsi":
+        if (
+            suffix != ".vtsi"
+            or not requires_exact_target_size
+            or required_logical_sector_size != 512
+        ):
+            raise RawSnapshotError("The VTSI materialization constraints are invalid")
+    elif (
+        suffix in _NON_RAW_MATERIALIZED_SUFFIXES
+        or suffix in _COMPRESSION_SUFFIXES
+        or requires_exact_target_size
+        or required_logical_sector_size is not None
+    ):
+        raise RawSnapshotError(
+            "Virtual, nested, or apply-only images cannot be raw-materialized",
+        )
+    _bound_source_identity(source)
+    if cancel_check is not None:
+        cancel_check()
 
 
 def _source_identity(info: os.stat_result) -> RawSourceIdentity:
@@ -290,6 +467,57 @@ def _open_workspace(
     return descriptor, identity
 
 
+def _require_bound_inputs_unchanged(
+    plan: RawSnapshotPlan,
+    source: ImageSource,
+    workspace_descriptor: int,
+    *,
+    snapshot_descriptor: int = -1,
+) -> tuple[RawSourceIdentity, RawWorkspaceIdentity]:
+    _source_descriptor, source_identity = _bound_source_identity(source)
+    try:
+        workspace_status = os.fstat(workspace_descriptor)
+        workspace_path_status = os.lstat(plan.workspace_path)
+        workspace_identity = _workspace_identity(workspace_status)
+    except OSError as error:
+        raise RawSnapshotError("The private raw snapshot workspace changed") from error
+    if (
+        source is not plan._bound_source
+        or _canonical_bound_path(source.path, "bound image") != plan.source_path
+        or source_identity != plan.source_identity
+        or workspace_identity != plan.workspace_identity
+        or not stat.S_ISDIR(workspace_path_status.st_mode)
+        or (
+            workspace_path_status.st_dev,
+            workspace_path_status.st_ino,
+        ) != (workspace_status.st_dev, workspace_status.st_ino)
+        or source.sparse_format
+        != ("vtsi" if plan.materialization_profile == "vtsi" else "")
+        or source.compressed
+        is not plan.materialization_profile.startswith("compressed")
+        or source.requires_exact_target_size
+        is not plan.requires_exact_target_size
+        or (source.required_logical_sector_size or None)
+        != plan.required_logical_sector_size
+    ):
+        raise RawSnapshotError("The bound source or workspace changed")
+    _require_nonresident(
+        source_identity,
+        workspace_identity,
+        plan.target_device_numbers,
+    )
+    if snapshot_descriptor >= 0:
+        try:
+            snapshot_device = os.fstat(snapshot_descriptor).st_dev
+        except OSError as error:
+            raise RawSnapshotError("The anonymous raw snapshot disappeared") from error
+        if snapshot_device in plan.target_device_numbers:
+            raise RawSnapshotError(
+                "The anonymous snapshot resides on the target topology",
+            )
+    return source_identity, workspace_identity
+
+
 def _available_bytes(workspace_descriptor: int) -> int:
     try:
         info = os.fstatvfs(workspace_descriptor)
@@ -358,6 +586,9 @@ def _plan_snapshot(plan: RawSnapshotPlan) -> tuple[object, ...]:
         plan.target_device_numbers,
         plan.image_size,
         plan.plan_sha256,
+        plan.materialization_profile,
+        plan.requires_exact_target_size,
+        plan.required_logical_sector_size,
     )
 
 
@@ -378,6 +609,11 @@ def _plan_digest(plan: RawSnapshotPlan) -> str:
                 ),
                 "target_device_numbers": sorted(plan.target_device_numbers),
                 "image_size": plan.image_size,
+                "materialization_profile": plan.materialization_profile,
+                "requires_exact_target_size": plan.requires_exact_target_size,
+                "required_logical_sector_size": (
+                    plan.required_logical_sector_size
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -441,9 +677,139 @@ def build_raw_snapshot_plan(
         source_identity.size,
         _plan_digest(candidate),
     )
-    receipt = _PlanReceipt(_PLAN_WITNESS, plan, _plan_snapshot(plan))
+    receipt = _PlanReceipt(_PLAN_WITNESS, plan, None, _plan_snapshot(plan))
     object.__setattr__(plan, "_authorization", receipt)
     return plan
+
+
+def _build_bound_snapshot_plan(
+    source: ImageSource,
+    workspace: Path | str,
+    *,
+    expected_expanded_size: int,
+    materialization_profile: str,
+    requires_exact_target_size: bool,
+    required_logical_sector_size: int | None,
+    target_device_numbers: frozenset[int],
+    cancel_check: CancelCheck | None = None,
+) -> RawSnapshotPlan:
+    """Bind one already-open ImageSource to an exact expanded snapshot plan."""
+
+    if (
+        type(expected_expanded_size) is not int
+        or isinstance(expected_expanded_size, bool)
+        or not 0 < expected_expanded_size <= MAX_RAW_SNAPSHOT_BYTES
+    ):
+        raise RawSnapshotError("The exact expanded raw image size is invalid")
+    topology = _validate_target_device_numbers(target_device_numbers)
+    if type(source) is not ImageSource:
+        raise RawSnapshotError("An exact descriptor-bound ImageSource is required")
+    source_path = _canonical_bound_path(source.path, "bound image")
+    workspace_path = _canonical_absolute(workspace, "raw snapshot workspace")
+    _validate_materialization_binding(
+        source,
+        materialization_profile,
+        requires_exact_target_size,
+        required_logical_sector_size,
+        cancel_check=cancel_check,
+    )
+    _source_descriptor, source_identity = _bound_source_identity(source)
+    workspace_descriptor = -1
+    try:
+        workspace_descriptor, workspace_identity = _open_workspace(workspace_path)
+        _require_nonresident(source_identity, workspace_identity, topology)
+        _require_capacity(workspace_descriptor, expected_expanded_size)
+    finally:
+        if workspace_descriptor >= 0:
+            os.close(workspace_descriptor)
+    candidate = RawSnapshotPlan(
+        source_path,
+        source_identity,
+        workspace_path,
+        workspace_identity,
+        topology,
+        expected_expanded_size,
+        "",
+        materialization_profile,
+        requires_exact_target_size,
+        required_logical_sector_size,
+        source,
+    )
+    plan = RawSnapshotPlan(
+        candidate.source_path,
+        candidate.source_identity,
+        candidate.workspace_path,
+        candidate.workspace_identity,
+        candidate.target_device_numbers,
+        candidate.image_size,
+        _plan_digest(candidate),
+        candidate.materialization_profile,
+        candidate.requires_exact_target_size,
+        candidate.required_logical_sector_size,
+        source,
+    )
+    object.__setattr__(
+        plan,
+        "_authorization",
+        _PlanReceipt(_PLAN_WITNESS, plan, source, _plan_snapshot(plan)),
+    )
+    return plan
+
+
+def build_image_source_snapshot_plan(
+    source: ImageSource,
+    workspace: Path | str,
+    *,
+    expected_expanded_size: int,
+    materialization_profile: str,
+    requires_exact_target_size: bool,
+    required_logical_sector_size: int | None,
+    target_device_numbers: frozenset[int],
+    cancel_check: CancelCheck | None = None,
+) -> RawSnapshotPlan:
+    """Bind a plain, compressed, or VTSI stream to an expanded snapshot."""
+
+    if materialization_profile not in _STREAM_MATERIALIZATION_PROFILES:
+        raise RawSnapshotError(
+            "The stream materialization profile must be plain, compressed, or VTSI",
+        )
+    return _build_bound_snapshot_plan(
+        source,
+        workspace,
+        expected_expanded_size=expected_expanded_size,
+        materialization_profile=materialization_profile,
+        requires_exact_target_size=requires_exact_target_size,
+        required_logical_sector_size=required_logical_sector_size,
+        target_device_numbers=target_device_numbers,
+        cancel_check=cancel_check,
+    )
+
+
+def build_materialized_snapshot_plan(
+    source: ImageSource,
+    workspace: Path | str,
+    *,
+    expected_expanded_size: int,
+    materialization_profile: str,
+    target_device_numbers: frozenset[int],
+    cancel_check: CancelCheck | None = None,
+) -> RawSnapshotPlan:
+    """Bind a virtual source to one caller-materialized expanded snapshot."""
+
+    if materialization_profile not in _CALLBACK_MATERIALIZATION_PROFILES:
+        raise RawSnapshotError(
+            "The callback materialization profile must be virtual or compressed-virtual",
+        )
+    return _build_bound_snapshot_plan(
+        source,
+        workspace,
+        expected_expanded_size=expected_expanded_size,
+        materialization_profile=materialization_profile,
+        requires_exact_target_size=False,
+        required_logical_sector_size=None,
+        target_device_numbers=target_device_numbers,
+        cancel_check=cancel_check,
+    )
 
 
 def _validate_plan_shape(plan: RawSnapshotPlan) -> None:
@@ -454,12 +820,39 @@ def _validate_plan_shape(plan: RawSnapshotPlan) -> None:
         type(receipt) is not _PlanReceipt
         or receipt.token is not _PLAN_WITNESS
         or receipt.plan is not plan
+        or receipt.bound_source is not plan._bound_source
         or receipt.snapshot != _plan_snapshot(plan)
         or type(plan.source_identity) is not RawSourceIdentity
         or type(plan.workspace_identity) is not RawWorkspaceIdentity
         or type(plan.image_size) is not int
-        or plan.image_size != plan.source_identity.size
+        or (
+            plan._bound_source is None
+            and plan.image_size != plan.source_identity.size
+        )
         or not 0 < plan.image_size <= MAX_RAW_SNAPSHOT_BYTES
+        or type(plan.materialization_profile) is not str
+        or plan.materialization_profile not in _MATERIALIZATION_PROFILES
+        or type(plan.requires_exact_target_size) is not bool
+        or (
+            plan.required_logical_sector_size is not None
+            and (
+                type(plan.required_logical_sector_size) is not int
+                or isinstance(plan.required_logical_sector_size, bool)
+                or plan.required_logical_sector_size <= 0
+            )
+        )
+        or (
+            plan._bound_source is None
+            and (
+                plan.materialization_profile != "plain"
+                or plan.requires_exact_target_size
+                or plan.required_logical_sector_size is not None
+            )
+        )
+        or (
+            plan._bound_source is not None
+            and type(plan._bound_source) is not ImageSource
+        )
         or type(plan.plan_sha256) is not str
         or len(plan.plan_sha256) != _SHA256_LENGTH
         or any(character not in "0123456789abcdef" for character in plan.plan_sha256)
@@ -467,8 +860,13 @@ def _validate_plan_shape(plan: RawSnapshotPlan) -> None:
     ):
         raise RawSnapshotError("The raw snapshot plan is forged or inconsistent")
     _validate_target_device_numbers(plan.target_device_numbers)
+    source_path = (
+        _canonical_absolute(plan.source_path, "raw image")
+        if plan._bound_source is None
+        else _canonical_bound_path(plan.source_path, "bound image")
+    )
     if (
-        _canonical_absolute(plan.source_path, "raw image") != plan.source_path
+        source_path != plan.source_path
         or _canonical_absolute(plan.workspace_path, "raw snapshot workspace")
         != plan.workspace_path
     ):
@@ -481,21 +879,40 @@ def validate_raw_snapshot_plan(plan: RawSnapshotPlan) -> None:
     _validate_plan_shape(plan)
     source_descriptor = workspace_descriptor = -1
     try:
-        source_descriptor, source_identity = _open_source(
-            plan.source_path,
-            plan.source_identity,
-        )
         workspace_descriptor, workspace_identity = _open_workspace(
             plan.workspace_path,
             plan.workspace_identity,
         )
-        _require_nonresident(
-            source_identity,
-            workspace_identity,
-            plan.target_device_numbers,
-        )
+        if plan._bound_source is None:
+            source_descriptor, source_identity = _open_source(
+                plan.source_path,
+                plan.source_identity,
+            )
+            _require_nonresident(
+                source_identity,
+                workspace_identity,
+                plan.target_device_numbers,
+            )
+        else:
+            _validate_materialization_binding(
+                plan._bound_source,
+                plan.materialization_profile,
+                plan.requires_exact_target_size,
+                plan.required_logical_sector_size,
+            )
+            _require_bound_inputs_unchanged(
+                plan,
+                plan._bound_source,
+                workspace_descriptor,
+            )
         _require_capacity(workspace_descriptor, plan.image_size)
-        if not _source_status_matches(os.fstat(source_descriptor), source_identity):
+        if (
+            source_descriptor >= 0
+            and not _source_status_matches(
+                os.fstat(source_descriptor),
+                plan.source_identity,
+            )
+        ):
             raise RawSnapshotError("The selected raw image changed during validation")
     finally:
         if source_descriptor >= 0:
@@ -530,6 +947,116 @@ def _snapshot_identity(
         mode,
         info.st_blocks,
     )
+
+
+@dataclass(frozen=True)
+class _SnapshotObjectIdentity:
+    device: int
+    inode: int
+    owner: int
+    mode: int
+
+
+def _snapshot_object_identity(
+    descriptor: int,
+    *,
+    expected_size: int | None,
+) -> _SnapshotObjectIdentity:
+    """Attest an unlinked O_RDWR destination without requiring allocation."""
+
+    try:
+        info = os.fstat(descriptor)
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    except OSError as error:
+        raise RawSnapshotError(
+            "The anonymous materialization descriptor is unavailable",
+        ) from error
+    mode = stat.S_IMODE(info.st_mode)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 0
+        or info.st_uid != os.geteuid()
+        or mode != 0o600
+        or (expected_size is not None and info.st_size != expected_size)
+        or flags & os.O_ACCMODE != os.O_RDWR
+        or flags & os.O_APPEND
+    ):
+        raise RawSnapshotError(
+            "The materialization destination must be an exact private, unlinked, "
+            "read/write regular file",
+        )
+    return _SnapshotObjectIdentity(
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        mode,
+    )
+
+
+def _require_snapshot_object(
+    descriptor: int,
+    expected: _SnapshotObjectIdentity,
+    *,
+    expected_size: int | None,
+) -> None:
+    if _snapshot_object_identity(
+        descriptor,
+        expected_size=expected_size,
+    ) != expected:
+        raise RawSnapshotError(
+            "The anonymous materialization destination was substituted",
+        )
+
+
+def _require_exclusive_snapshot_lock(descriptor: int) -> None:
+    """Prove a distinct open-file description cannot acquire the lock."""
+
+    probe = -1
+    acquired = False
+    try:
+        probe = os.open(
+            f"/proc/self/fd/{descriptor}",
+            os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            return
+    except OSError as error:
+        raise RawSnapshotError(
+            "The anonymous materialization lock could not be attested",
+        ) from error
+    finally:
+        if acquired and probe >= 0:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if probe >= 0:
+            os.close(probe)
+    raise RawSnapshotError("The anonymous materialization lock was released")
+
+
+def _close_if_snapshot_descriptor(
+    descriptor: int,
+    expected: _SnapshotObjectIdentity,
+) -> bool:
+    """Close our duplicate only if a callback did not reuse its fd number."""
+
+    if descriptor < 0:
+        return False
+    try:
+        info = os.fstat(descriptor)
+    except OSError:
+        return False
+    if (info.st_dev, info.st_ino) != (expected.device, expected.inode):
+        return False
+    try:
+        os.close(descriptor)
+    except OSError:
+        return False
+    return True
 
 
 def _read_exact(
@@ -829,6 +1356,15 @@ class RawSnapshotBuilder:
                 continue
 
     @staticmethod
+    def _truncate_exact(descriptor: int, size: int) -> None:
+        while True:
+            try:
+                os.ftruncate(descriptor, size)
+                return
+            except InterruptedError:
+                continue
+
+    @staticmethod
     def _open_anonymous(workspace_descriptor: int) -> int:
         if not hasattr(os, "O_TMPFILE"):
             raise RawSnapshotError("This Linux filesystem runtime lacks O_TMPFILE")
@@ -850,6 +1386,346 @@ class RawSnapshotBuilder:
                 _bounded(error, "The workspace cannot create a strict anonymous file"),
             ) from error
 
+    def _execute_materializer(
+        self,
+        plan: RawSnapshotPlan,
+        source: ImageSource,
+        materializer: Materializer,
+        *,
+        cancel_check: CancelCheck | None,
+        progress: Progress,
+    ) -> PreparedRawSnapshot:
+        workspace_descriptor = snapshot_descriptor = callback_descriptor = -1
+        initial_object: _SnapshotObjectIdentity | None = None
+        continuity_failure: BaseException | None = None
+
+        def check_continuity() -> None:
+            nonlocal continuity_failure
+            try:
+                self._check_cancelled(cancel_check)
+                _require_bound_inputs_unchanged(
+                    plan,
+                    source,
+                    workspace_descriptor,
+                    snapshot_descriptor=snapshot_descriptor,
+                )
+                if initial_object is not None:
+                    _require_snapshot_object(
+                        snapshot_descriptor,
+                        initial_object,
+                        expected_size=None,
+                    )
+                    _require_exclusive_snapshot_lock(snapshot_descriptor)
+            except BaseException as error:
+                continuity_failure = error
+                raise
+
+        try:
+            workspace_descriptor, _workspace_identity_value = _open_workspace(
+                plan.workspace_path,
+                plan.workspace_identity,
+            )
+            _require_bound_inputs_unchanged(
+                plan,
+                source,
+                workspace_descriptor,
+            )
+            _require_capacity(workspace_descriptor, plan.image_size)
+
+            snapshot_descriptor = self._open_anonymous(workspace_descriptor)
+            os.fchmod(snapshot_descriptor, 0o600)
+            fcntl.flock(snapshot_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            initial_object = _snapshot_object_identity(
+                snapshot_descriptor,
+                expected_size=0,
+            )
+            _require_exclusive_snapshot_lock(snapshot_descriptor)
+            check_continuity()
+            progress(0, plan.image_size)
+            check_continuity()
+
+            try:
+                callback_descriptor = os.dup(snapshot_descriptor)
+                os.set_inheritable(callback_descriptor, False)
+            except OSError as error:
+                raise RawSnapshotError(
+                    "The anonymous materialization descriptor could not be duplicated",
+                ) from error
+            _require_snapshot_object(
+                callback_descriptor,
+                initial_object,
+                expected_size=0,
+            )
+            callback_intact = False
+            try:
+                outcome = materializer(callback_descriptor, check_continuity)
+            finally:
+                callback_intact = _close_if_snapshot_descriptor(
+                    callback_descriptor,
+                    initial_object,
+                )
+                callback_descriptor = -1
+            if not callback_intact:
+                raise RawSnapshotError(
+                    "The materializer closed or substituted its destination descriptor",
+                )
+            if outcome is not None:
+                raise RawSnapshotError(
+                    "The materializer returned an unexpected result",
+                )
+
+            check_continuity()
+            _require_snapshot_object(
+                snapshot_descriptor,
+                initial_object,
+                expected_size=plan.image_size,
+            )
+
+            # qemu-img intentionally emits sparse raw output.  Preserve the
+            # exact guest-visible length, then force every logical byte to have
+            # backing storage before this descriptor can reach a disk helper.
+            self._truncate_exact(snapshot_descriptor, plan.image_size)
+            self._preallocate_exact(snapshot_descriptor, plan.image_size)
+            self._truncate_exact(snapshot_descriptor, plan.image_size)
+            check_continuity()
+            self._sync_exact(snapshot_descriptor)
+            snapshot_before = _snapshot_identity(
+                os.fstat(snapshot_descriptor),
+                plan.image_size,
+            )
+            _require_snapshot_object(
+                snapshot_descriptor,
+                initial_object,
+                expected_size=plan.image_size,
+            )
+
+            first_sha256 = _hash_descriptor(
+                snapshot_descriptor,
+                plan.image_size,
+                cancel_check=check_continuity,
+                read_at=self._operations.pread,
+            )
+            snapshot_middle = _snapshot_identity(
+                os.fstat(snapshot_descriptor),
+                plan.image_size,
+            )
+            check_continuity()
+            second_sha256 = _hash_descriptor(
+                snapshot_descriptor,
+                plan.image_size,
+                cancel_check=check_continuity,
+                read_at=self._operations.pread,
+            )
+            snapshot_after = _snapshot_identity(
+                os.fstat(snapshot_descriptor),
+                plan.image_size,
+            )
+            check_continuity()
+            if (
+                snapshot_before != snapshot_middle
+                or snapshot_middle != snapshot_after
+                or not hmac.compare_digest(first_sha256, second_sha256)
+            ):
+                raise RawSnapshotError(
+                    "The materialized anonymous snapshot failed complete read-back attestation",
+                )
+            progress(plan.image_size, plan.image_size)
+            check_continuity()
+            result = RawSnapshotResult(
+                plan.plan_sha256,
+                plan.source_identity,
+                plan.workspace_identity,
+                snapshot_after,
+                plan.image_size,
+                second_sha256,
+                True,
+                plan.materialization_profile,
+                False,
+                None,
+            )
+            prepared = PreparedRawSnapshot(
+                snapshot_descriptor,
+                result,
+                _OWNER_WITNESS,
+            )
+            snapshot_descriptor = -1
+            return prepared
+        except RawSnapshotCancelled:
+            raise
+        except BaseException as error:
+            if error is continuity_failure:
+                raise
+            if isinstance(error, RawSnapshotError):
+                raise
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RawSnapshotError(
+                _bounded(error, "The caller-supplied image materializer failed"),
+            ) from error
+        finally:
+            if callback_descriptor >= 0:
+                if initial_object is None:
+                    try:
+                        os.close(callback_descriptor)
+                    except OSError:
+                        pass
+                else:
+                    _close_if_snapshot_descriptor(
+                        callback_descriptor,
+                        initial_object,
+                    )
+            if snapshot_descriptor >= 0:
+                os.close(snapshot_descriptor)
+            if workspace_descriptor >= 0:
+                os.close(workspace_descriptor)
+
+    def _execute_image_source(
+        self,
+        plan: RawSnapshotPlan,
+        source: ImageSource,
+        *,
+        cancel_check: CancelCheck | None,
+        progress: Progress,
+    ) -> PreparedRawSnapshot:
+        workspace_descriptor = snapshot_descriptor = -1
+        try:
+            workspace_descriptor, _workspace_identity_value = _open_workspace(
+                plan.workspace_path,
+                plan.workspace_identity,
+            )
+            _require_bound_inputs_unchanged(
+                plan,
+                source,
+                workspace_descriptor,
+            )
+            _require_capacity(workspace_descriptor, plan.image_size)
+
+            snapshot_descriptor = self._open_anonymous(workspace_descriptor)
+            os.fchmod(snapshot_descriptor, 0o600)
+            fcntl.flock(snapshot_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._preallocate_exact(snapshot_descriptor, plan.image_size)
+            os.ftruncate(snapshot_descriptor, plan.image_size)
+            _snapshot_identity(os.fstat(snapshot_descriptor), plan.image_size)
+            _require_bound_inputs_unchanged(
+                plan,
+                source,
+                workspace_descriptor,
+                snapshot_descriptor=snapshot_descriptor,
+            )
+            self._check_cancelled(cancel_check)
+
+            copied = 0
+            digest = hashlib.sha256()
+            progress(0, plan.image_size)
+            try:
+                chunks = source.chunks(
+                    expected_size=plan.image_size,
+                    cancel_check=lambda: self._check_cancelled(cancel_check),
+                )
+                for block in chunks:
+                    self._check_cancelled(cancel_check)
+                    if type(block) is not bytes or not block:
+                        raise RawSnapshotError(
+                            "The materialized image made invalid stream progress",
+                        )
+                    if len(block) > plan.image_size - copied:
+                        raise RawSnapshotError(
+                            "The materialized image produced more than its exact size",
+                        )
+                    # ImageSource checks its descriptor before yielding; repeat
+                    # the outer five-field and workspace/topology checks after
+                    # each decode step and before those bytes reach the snapshot.
+                    _require_bound_inputs_unchanged(
+                        plan,
+                        source,
+                        workspace_descriptor,
+                        snapshot_descriptor=snapshot_descriptor,
+                    )
+                    self._write_exact(snapshot_descriptor, block, copied)
+                    digest.update(block)
+                    copied += len(block)
+                    progress(copied, plan.image_size)
+            except ImageSourceError as error:
+                raise RawSnapshotError(
+                    _bounded(error, "The descriptor-bound image could not be materialized"),
+                ) from error
+            if copied != plan.image_size:
+                raise RawSnapshotError(
+                    f"The materialized image ended at {copied} bytes; "
+                    f"expected {plan.image_size}",
+                )
+            _require_bound_inputs_unchanged(
+                plan,
+                source,
+                workspace_descriptor,
+                snapshot_descriptor=snapshot_descriptor,
+            )
+
+            self._sync_exact(snapshot_descriptor)
+            snapshot_before = _snapshot_identity(
+                os.fstat(snapshot_descriptor),
+                plan.image_size,
+            )
+            copied_sha256 = digest.hexdigest()
+            snapshot_sha256 = _hash_descriptor(
+                snapshot_descriptor,
+                plan.image_size,
+                cancel_check=lambda: self._check_cancelled(cancel_check),
+                read_at=self._operations.pread,
+            )
+            snapshot_after = _snapshot_identity(
+                os.fstat(snapshot_descriptor),
+                plan.image_size,
+            )
+            _require_bound_inputs_unchanged(
+                plan,
+                source,
+                workspace_descriptor,
+                snapshot_descriptor=snapshot_descriptor,
+            )
+            self._check_cancelled(cancel_check)
+            if (
+                snapshot_before != snapshot_after
+                or not hmac.compare_digest(copied_sha256, snapshot_sha256)
+            ):
+                raise RawSnapshotError(
+                    "The anonymous raw snapshot failed complete read-back attestation",
+                )
+            result = RawSnapshotResult(
+                plan.plan_sha256,
+                plan.source_identity,
+                plan.workspace_identity,
+                snapshot_after,
+                plan.image_size,
+                snapshot_sha256,
+                True,
+                plan.materialization_profile,
+                plan.requires_exact_target_size,
+                plan.required_logical_sector_size,
+            )
+            prepared = PreparedRawSnapshot(
+                snapshot_descriptor,
+                result,
+                _OWNER_WITNESS,
+            )
+            snapshot_descriptor = -1
+            return prepared
+        except RawSnapshotCancelled:
+            raise
+        except BaseException as error:
+            if isinstance(error, RawSnapshotError):
+                raise
+            if isinstance(error, OSError):
+                raise RawSnapshotError(
+                    _bounded(error, "Raw image materialization failed"),
+                ) from error
+            raise
+        finally:
+            if snapshot_descriptor >= 0:
+                os.close(snapshot_descriptor)
+            if workspace_descriptor >= 0:
+                os.close(workspace_descriptor)
+
     def execute(
         self,
         plan: RawSnapshotPlan,
@@ -862,6 +1738,17 @@ class RawSnapshotBuilder:
         self._used = True
         validate_raw_snapshot_plan(plan)
         self._check_cancelled(cancel_check)
+        if plan._bound_source is not None:
+            if plan.materialization_profile in _CALLBACK_MATERIALIZATION_PROFILES:
+                raise RawSnapshotError(
+                    "This snapshot plan requires execute_materialized()",
+                )
+            return self._execute_image_source(
+                plan,
+                plan._bound_source,
+                cancel_check=cancel_check,
+                progress=progress,
+            )
         source_descriptor = workspace_descriptor = snapshot_descriptor = -1
         try:
             source_descriptor, source_identity = _open_source(
@@ -966,6 +1853,9 @@ class RawSnapshotBuilder:
                 plan.image_size,
                 snapshot_sha256,
                 True,
+                plan.materialization_profile,
+                plan.requires_exact_target_size,
+                plan.required_logical_sector_size,
             )
             prepared = PreparedRawSnapshot(
                 snapshot_descriptor,
@@ -992,6 +1882,48 @@ class RawSnapshotBuilder:
             if workspace_descriptor >= 0:
                 os.close(workspace_descriptor)
 
+    def execute_materialized(
+        self,
+        plan: RawSnapshotPlan,
+        materializer: Materializer,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: Progress = lambda _done, _total: None,
+    ) -> PreparedRawSnapshot:
+        """Run one caller materializer into a builder-owned anonymous file.
+
+        The callback borrows its destination descriptor for the duration of
+        the call and must neither close nor substitute it.  Long-running
+        callbacks must invoke the supplied check function while working; it
+        combines cancellation with source, workspace, topology, descriptor,
+        and lock continuity checks.
+        """
+
+        if self._used:
+            raise RawSnapshotError("A raw snapshot builder can only be used once")
+        self._used = True
+        if not callable(materializer):
+            raise RawSnapshotError("A callable raw image materializer is required")
+        validate_raw_snapshot_plan(plan)
+        self._check_cancelled(cancel_check)
+        if (
+            plan._bound_source is None
+            or plan.materialization_profile
+            not in _CALLBACK_MATERIALIZATION_PROFILES
+            or plan.requires_exact_target_size
+            or plan.required_logical_sector_size is not None
+        ):
+            raise RawSnapshotError(
+                "An authentic virtual materialization snapshot plan is required",
+            )
+        return self._execute_materializer(
+            plan,
+            plan._bound_source,
+            materializer,
+            cancel_check=cancel_check,
+            progress=progress,
+        )
+
 
 def prepare_raw_snapshot(
     plan: RawSnapshotPlan,
@@ -1003,6 +1935,42 @@ def prepare_raw_snapshot(
 
     return RawSnapshotBuilder().execute(
         plan,
+        cancel_check=cancel_check,
+        progress=progress,
+    )
+
+
+def prepare_image_source_snapshot(
+    plan: RawSnapshotPlan,
+    *,
+    cancel_check: CancelCheck | None = None,
+    progress: Progress = lambda _done, _total: None,
+) -> PreparedRawSnapshot:
+    """Materialize one witnessed ImageSource plan into an anonymous snapshot."""
+
+    if type(plan) is not RawSnapshotPlan or plan._bound_source is None:
+        raise RawSnapshotError(
+            "An authentic descriptor-bound ImageSource snapshot plan is required",
+        )
+    return RawSnapshotBuilder().execute(
+        plan,
+        cancel_check=cancel_check,
+        progress=progress,
+    )
+
+
+def prepare_materialized_snapshot(
+    plan: RawSnapshotPlan,
+    materializer: Materializer,
+    *,
+    cancel_check: CancelCheck | None = None,
+    progress: Progress = lambda _done, _total: None,
+) -> PreparedRawSnapshot:
+    """Convenience wrapper for one caller-supplied virtual materializer."""
+
+    return RawSnapshotBuilder().execute_materialized(
+        plan,
+        materializer,
         cancel_check=cancel_check,
         progress=progress,
     )

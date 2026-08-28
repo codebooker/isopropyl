@@ -516,19 +516,26 @@ QEMU/SeaBIOS and OVMF results, hot-swap/unplug races, and representative physica
 media remain mandatory before the GUI can offer BIOS construction. Until then,
 hybrid media should use verified DD mode to preserve their existing layout.
 
-## Experimental backend-only raw/DD broker boundary
+## GUI raw/DD broker boundary
 
-The generic raw profile is separate from the Syslinux profile and is not yet
-GUI-reachable. It accepts one canonical, singly linked, nonempty regular source
-and one stable private `0700` workspace. Planning binds source device, inode,
-size, mtime, ctime, workspace identity, and a fresh complete target-topology
-device-number set. Neither source nor workspace may reside on the target. The
-builder requires enough available space, creates an unlinked
+The generic raw profile is separate from the backend-only Syslinux profile and
+is the GUI's sole DD/raw executor. It has no legacy writer fallback. Every
+plain, compressed, VTSI, virtual, or compressed-virtual input is bound through
+one already-open outer-source descriptor and expanded into one stable private
+`0700` snapshot workspace. Planning binds source device, inode, size, mtime,
+ctime, materialization profile, format-specific target constraints, workspace
+identity, and a fresh complete target-topology device-number set. Neither source,
+temporary root, nor workspace may reside on the target. The builder requires
+enough available space, creates an unlinked
 `O_TMPFILE | O_EXCL` with mode `0600`, takes a nonblocking exclusive lock,
-preallocates every byte, copies through bounded positional I/O, fsyncs, and
-independently reads and hashes the entire snapshot. The opaque one-shot owner
-exposes no descriptor; transfer duplicates, re-attests, and sends the source
-exactly once through `SCM_RIGHTS`, then consumes the unprivileged owner.
+preallocates every byte, fsyncs, and independently reads and hashes the entire
+expanded snapshot. Stream formats have exact-length decoding. Virtual formats
+are freshly reinspected and converted directly into a borrowed anonymous
+descriptor; backing files, encryption, corruption metadata, and QCOW2 external
+data files are rejected. Compressed virtual decode staging is isolated from the
+immutable snapshot directory. The opaque one-shot owner exposes no descriptor;
+transfer duplicates, re-attests, and sends the source exactly once through
+`SCM_RIGHTS`, then consumes the unprivileged owner.
 
 Target authorization binds the authentic snapshot-plan digest, expanded size
 and SHA-256, original source identity, workspace filesystem, complete `Device`
@@ -570,9 +577,9 @@ new media; it is not power-loss atomicity and it does not erase unused bytes
 between a shorter source and the physical target tail. `O_EXCL` and `flock` do
 not stop a hostile or uncooperative nonexclusive block writer. Native-helper,
 installed PolicyKit/SCM_RIGHTS VM, cache/power-loss, hot-unplug, replacement,
-large-media, and physical boot tests remain mandatory before all GUI raw,
-compressed, virtual, and VTSI inputs may migrate to this broker. There is no
-automatic fallback from a failed broker transaction to the legacy DD path.
+large-media, and physical boot tests remain mandatory for release confidence.
+All GUI raw, compressed, virtual, and VTSI inputs now use this broker, and a
+failed or unavailable broker transaction never falls back to the legacy DD path.
 
 ## Boot-time corruption-check boundary
 

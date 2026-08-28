@@ -6,6 +6,7 @@ import gzip
 import json
 import lzma
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -36,14 +37,27 @@ def json_result(payload: object, returncode: int = 0) -> subprocess.CompletedPro
 
 
 class FinishedProcess:
-    def __init__(self, command: list[str], size: int, *, wrong_size: bool = False) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        size: int,
+        *,
+        wrong_size: bool = False,
+        returncode: int = 0,
+        stdout: bytes | None = None,
+        stderr: bytes = b"",
+    ) -> None:
         self.command = command
         destination = Path(command[-1])
         with destination.open("wb") as stream:
             stream.truncate(size - 512 if wrong_size else size)
-        self.stdout = io.BytesIO(b"    (0.00/100%)\r    (50.00/100%)\r    (100.00/100%)\r")
-        self.stderr = io.BytesIO()
-        self.returncode: int | None = 0
+        self.stdout = io.BytesIO(
+            stdout
+            if stdout is not None
+            else b"    (0.00/100%)\r    (50.00/100%)\r    (100.00/100%)\r"
+        )
+        self.stderr = io.BytesIO(stderr)
+        self.returncode: int | None = returncode
 
     def poll(self) -> int | None:
         return self.returncode
@@ -110,6 +124,41 @@ class VirtualDiskTests(unittest.TestCase):
         result = inspect_virtual_disk(self.source, qemu_img=self.tool, runner=runner)
         return result, calls
 
+    @contextmanager
+    def anonymous_output(self):
+        if not hasattr(os, "O_TMPFILE"):
+            self.skipTest("O_TMPFILE is unavailable")
+        directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(
+                    ".",
+                    os.O_TMPFILE | os.O_EXCL | os.O_RDWR,
+                    0o600,
+                    dir_fd=directory,
+                )
+            except OSError as error:
+                self.skipTest(f"The test filesystem lacks O_TMPFILE: {error}")
+            os.fchmod(descriptor, 0o600)
+            yield descriptor
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            os.close(directory)
+
+    @staticmethod
+    def matching_info_result(info):
+        return json_result({
+            "format": info.format,
+            "virtual-size": info.virtual_size,
+            "actual-size": info.actual_size,
+            "format-specific": {"type": info.format, "data": {}},
+        })
+
     def test_info_parsing_uses_absolute_shell_free_qemu_img(self):
         info, calls = self.inspect()
         self.assertEqual(info.format, "vhdx")
@@ -153,6 +202,116 @@ class VirtualDiskTests(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(VirtualDiskError, message):
                     self.inspect(payload)
+
+    def test_external_qcow_data_file_metadata_is_rejected_with_normalized_keys(self):
+        cases = (
+            {"data-file": "/tmp/external.raw"},
+            {"data_file": "/tmp/external.raw"},
+            {"data-file-raw": True},
+            {"data_file_raw": 1},
+        )
+        for metadata in cases:
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(
+                VirtualDiskError,
+                "external data-file",
+            ):
+                self.inspect({
+                    "format": "qcow2",
+                    "virtual-size": 4096,
+                    "format-specific": {
+                        "type": "qcow2",
+                        "data": metadata,
+                    },
+                })
+
+        info, _ = self.inspect({
+            "format": "qcow2",
+            "virtual-size": 4096,
+            "format-specific": {"type": "qcow2", "data": {}},
+        })
+        process_calls = []
+
+        def must_not_convert(*args: object, **kwargs: object):
+            process_calls.append((args, kwargs))
+            raise AssertionError("conversion reached external data-file input")
+
+        with self.anonymous_output() as output:
+            with self.assertRaisesRegex(VirtualDiskError, "external data-file"):
+                VirtualDiskStager(
+                    must_not_convert,
+                    info_runner=lambda *_args, **_kwargs: json_result({
+                        "format": "qcow2",
+                        "virtual-size": 4096,
+                        "format-specific": {
+                            "type": "qcow2",
+                            "data": {
+                                "data-file": "/tmp/external.raw",
+                                "data-file-raw": True,
+                            },
+                        },
+                    }),
+                ).convert_into_descriptor(info, output)
+            self.assertEqual(os.fstat(output).st_size, 0)
+        self.assertEqual(process_calls, [])
+
+    def test_real_qemu_external_qcow_data_file_is_rejected_on_inspect_and_convert(self):
+        qemu_command = shutil.which("qemu-img")
+        if qemu_command is None:
+            self.skipTest("qemu-img is unavailable")
+        qemu_img = Path(qemu_command).resolve(strict=True)
+        image = self.root / "external-data.qcow2"
+        data_file = self.root / "external-data.raw"
+        created = subprocess.run(
+            [
+                str(qemu_img),
+                "create",
+                "-f",
+                "qcow2",
+                "-o",
+                f"data_file={data_file},data_file_raw=on",
+                str(image),
+                "4096",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+            shell=False,
+        )
+        if created.returncode:
+            diagnostic = created.stderr.decode(errors="replace").strip()
+            self.skipTest(
+                "qemu-img cannot create external-data QCOW2 fixtures: "
+                f"{diagnostic[-300:]}"
+            )
+
+        with self.assertRaisesRegex(VirtualDiskError, "external data-file"):
+            inspect_virtual_disk(image, qemu_img=qemu_img)
+
+        safe_info = inspect_virtual_disk(
+            image,
+            qemu_img=qemu_img,
+            runner=lambda *_args, **_kwargs: json_result({
+                "format": "qcow2",
+                "virtual-size": 4096,
+                "format-specific": {"type": "qcow2", "data": {}},
+            }),
+        )
+        process_calls = []
+
+        def must_not_convert(*args: object, **kwargs: object):
+            process_calls.append((args, kwargs))
+            raise AssertionError("conversion reached external data-file input")
+
+        with self.anonymous_output() as output:
+            with self.assertRaisesRegex(VirtualDiskError, "external data-file"):
+                VirtualDiskStager(must_not_convert).convert_into_descriptor(
+                    safe_info,
+                    output,
+                )
+            self.assertEqual(os.fstat(output).st_size, 0)
+        self.assertEqual(process_calls, [])
 
     def test_malformed_json_types_sizes_and_unsupported_formats_fail_closed(self):
         def run(stdout: bytes):
@@ -506,6 +665,262 @@ class VirtualDiskTests(unittest.TestCase):
         resolve.assert_not_called()
         self.assertTrue(fake.closed)
         self.assertEqual(set(self.root.iterdir()), before)
+
+    def test_descriptor_conversion_uses_only_bound_proc_fds_and_keeps_ownership(self):
+        info, _ = self.inspect()
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        updates: list[tuple[int, int]] = []
+
+        def factory(command: list[str], **kwargs: object):
+            calls.append((command, kwargs))
+            return FinishedProcess(command, info.virtual_size)
+
+        with self.anonymous_output() as output:
+            before = os.fstat(output)
+            VirtualDiskStager(
+                factory,
+                info_runner=lambda *_args, **_kwargs: self.matching_info_result(info),
+            ).convert_into_descriptor(
+                info,
+                output,
+                lambda done, total: updates.append((done, total)),
+            )
+            after = os.fstat(output)
+            self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+            self.assertEqual(after.st_nlink, 0)
+            self.assertEqual(after.st_mode & 0o777, 0o600)
+            self.assertEqual(after.st_size, info.virtual_size)
+            self.assertEqual(updates[-1], (info.virtual_size, info.virtual_size))
+
+        self.assertEqual(len(calls), 1)
+        command, kwargs = calls[0]
+        self.assertEqual(command[0], str(info.qemu_img.path))
+        self.assertEqual(command[1:3], ["convert", "--progress"])
+        self.assertEqual(command[command.index("--source-format") + 1], info.format)
+        self.assertEqual(command[command.index("--target-format") + 1], "raw")
+        self.assertRegex(command[-2], r"^/proc/self/fd/\d+$")
+        self.assertRegex(command[-1], r"^/proc/self/fd/\d+$")
+        self.assertNotEqual(command[-2], command[-1])
+        inherited = tuple(
+            int(item.rsplit("/", 1)[-1]) for item in command[-2:]
+        )
+        self.assertEqual(kwargs["pass_fds"], inherited)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(kwargs["stderr"], subprocess.PIPE)
+        self.assertIs(kwargs["shell"], False)
+        self.assertIs(kwargs["close_fds"], True)
+        self.assertNotIn(str(info.path), command)
+
+    def test_descriptor_conversion_revalidates_format_and_size_before_qemu(self):
+        info, _ = self.inspect()
+        cases = (
+            ({"format": "qcow2", "virtual-size": info.virtual_size}, "format"),
+            ({"format": info.format, "virtual-size": info.virtual_size * 2}, "size"),
+        )
+        for payload, _label in cases:
+            with self.subTest(payload=payload), self.anonymous_output() as output:
+                factory_calls = []
+
+                def factory(*args: object, **kwargs: object):
+                    factory_calls.append((args, kwargs))
+                    raise AssertionError("conversion reached stale metadata")
+
+                with self.assertRaisesRegex(
+                    VirtualDiskChanged,
+                    "format or guest-visible size changed",
+                ):
+                    VirtualDiskStager(
+                        factory,
+                        info_runner=lambda *_args, value=payload, **_kwargs: json_result(
+                            {
+                                **value,
+                                "format-specific": {
+                                    "type": value["format"],
+                                    "data": {},
+                                },
+                            }
+                        ),
+                    ).convert_into_descriptor(info, output)
+                self.assertEqual(factory_calls, [])
+                self.assertEqual(os.fstat(output).st_size, 0)
+
+    def test_descriptor_conversion_rejects_linked_readonly_and_nonempty_outputs(self):
+        info, _ = self.inspect()
+        runner = lambda *_args, **_kwargs: self.matching_info_result(info)
+        linked = self.root / "linked-output.raw"
+        linked.write_bytes(b"")
+        linked_descriptor = os.open(linked, os.O_RDWR)
+        try:
+            with self.assertRaisesRegex(VirtualDiskError, "unlinked"):
+                VirtualDiskStager(info_runner=runner).convert_into_descriptor(
+                    info,
+                    linked_descriptor,
+                )
+        finally:
+            os.close(linked_descriptor)
+
+        with self.anonymous_output() as output:
+            readonly = os.open(f"/proc/self/fd/{output}", os.O_RDONLY)
+            try:
+                with self.assertRaisesRegex(VirtualDiskError, "read/write"):
+                    VirtualDiskStager(info_runner=runner).convert_into_descriptor(
+                        info,
+                        readonly,
+                    )
+            finally:
+                os.close(readonly)
+        with self.anonymous_output() as output:
+            os.write(output, b"not empty")
+            with self.assertRaisesRegex(VirtualDiskError, "private 0600"):
+                VirtualDiskStager(info_runner=runner).convert_into_descriptor(
+                    info,
+                    output,
+                )
+
+    def test_descriptor_conversion_detects_caller_fd_substitution(self):
+        info, _ = self.inspect()
+        replacement = -1
+        with self.anonymous_output() as output:
+            original_number = output
+
+            def factory(command: list[str], **_kwargs: object):
+                nonlocal replacement
+                os.close(original_number)
+                replacement = os.open("/dev/null", os.O_RDONLY)
+                self.assertEqual(replacement, original_number)
+                return FinishedProcess(command, info.virtual_size)
+
+            with self.assertRaisesRegex(VirtualDiskChanged, "substituted"):
+                VirtualDiskStager(
+                    factory,
+                    info_runner=lambda *_args, **_kwargs: self.matching_info_result(info),
+                ).convert_into_descriptor(info, output)
+        replacement = -1
+
+    def test_descriptor_conversion_cancellation_reaps_qemu_and_preserves_empty_fd(self):
+        info, _ = self.inspect()
+        process = BlockingProcess()
+        started = threading.Event()
+
+        def factory(_command: list[str], **_kwargs: object):
+            started.set()
+            return process
+
+        stager = VirtualDiskStager(
+            factory,
+            info_runner=lambda *_args, **_kwargs: self.matching_info_result(info),
+        )
+        errors: list[BaseException] = []
+        with self.anonymous_output() as output:
+            def run() -> None:
+                try:
+                    stager.convert_into_descriptor(info, output)
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(started.wait(2))
+            stager.cancel()
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(
+                errors and isinstance(errors[0], VirtualConversionCancelled)
+            )
+            self.assertIsNotNone(process.returncode)
+            self.assertEqual(os.fstat(output).st_size, 0)
+
+    def test_descriptor_conversion_bounds_stall_errors_and_unexpected_output(self):
+        info, _ = self.inspect()
+        matching = lambda *_args, **_kwargs: self.matching_info_result(info)
+
+        process = BlockingProcess()
+        with (
+            self.anonymous_output() as output,
+            patch(
+                "isopropyl.virtual.VIRTUAL_CONVERSION_STALL_TIMEOUT_SECONDS",
+                0.0,
+            ),
+            self.assertRaisesRegex(VirtualDiskError, "stopped reporting progress"),
+        ):
+            VirtualDiskStager(
+                lambda *_args, **_kwargs: process,
+                info_runner=matching,
+            ).convert_into_descriptor(info, output)
+        self.assertIsNotNone(process.returncode)
+
+        cases = (
+            ({"returncode": 7, "stderr": b"bounded qemu failure"}, "bounded qemu failure"),
+            ({"stdout": b"unexpected success chatter"}, "unexpected conversion output"),
+            ({"stderr": b"unexpected success diagnostic"}, "unexpected diagnostics"),
+        )
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments), self.anonymous_output() as output:
+                with self.assertRaisesRegex(VirtualDiskError, message):
+                    VirtualDiskStager(
+                        lambda command, **_kwargs: FinishedProcess(
+                            command,
+                            info.virtual_size,
+                            **arguments,
+                        ),
+                        info_runner=matching,
+                    ).convert_into_descriptor(info, output)
+
+        with self.anonymous_output() as output, self.assertRaisesRegex(
+            VirtualDiskChanged,
+            "wrong size",
+        ):
+            VirtualDiskStager(
+                lambda command, **_kwargs: FinishedProcess(
+                    command,
+                    info.virtual_size,
+                    wrong_size=True,
+                ),
+                info_runner=matching,
+            ).convert_into_descriptor(info, output)
+
+    def test_descriptor_conversion_rechecks_source_identity_after_qemu(self):
+        info, _ = self.inspect()
+        before = self.source.stat()
+
+        def factory(command: list[str], **_kwargs: object):
+            process = FinishedProcess(command, info.virtual_size)
+            self.source.write_bytes(b"Z" * before.st_size)
+            os.utime(
+                self.source,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            return process
+
+        with self.anonymous_output() as output, self.assertRaises(VirtualDiskChanged):
+            VirtualDiskStager(
+                factory,
+                info_runner=lambda *_args, **_kwargs: self.matching_info_result(info),
+            ).convert_into_descriptor(info, output)
+
+    def test_descriptor_conversion_accepts_existing_compressed_container_stage(self):
+        compressed = self.root / "guest.vhdx.gz"
+        payload = b"decoded-container" * 257
+        compressed.write_bytes(gzip.compress(payload))
+        info_result = lambda *_args, **_kwargs: json_result({
+            "format": "vhdx",
+            "virtual-size": 4096,
+            "format-specific": {"type": "vhdx", "data": {}},
+        })
+        prepared = CompressedVirtualDiskPreparer(
+            qemu_img=self.tool,
+            info_runner=info_result,
+        ).prepare(compressed, temporary_root=self.root)
+        try:
+            with self.anonymous_output() as output:
+                VirtualDiskStager(
+                    lambda command, **_kwargs: FinishedProcess(command, 4096),
+                    info_runner=info_result,
+                ).convert_into_descriptor(prepared.info, output)
+                self.assertEqual(os.fstat(output).st_size, 4096)
+        finally:
+            prepared.close()
 
     def test_conversion_is_explicit_raw_sparse_private_and_exact(self):
         info, _ = self.inspect()

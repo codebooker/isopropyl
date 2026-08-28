@@ -105,15 +105,16 @@ from .runtime_validation import (
     apply_runtime_validation, prepare_runtime_validation,
     validate_prepared_runtime_validation, validate_runtime_validation_stage,
 )
+from .raw_device import RawDeviceWritePlan
+from .raw_device_runner import RawDeviceWriteResult
+from .raw_workflow import (
+    RawWorkflowCancelled, RawWorkflowError, RawWriteWorkflow,
+)
 from .settings import (
     SettingsStore, application_settings, parse_application_arguments,
     portable_settings_path, settings_sync_error, settings_sync_was_committed,
 )
-from .writer import ImageWriter, WriteCancelled
-from .virtual import (
-    CompressedVirtualDiskPreparer, VirtualConversionCancelled,
-    VirtualDiskStager, inspect_virtual_disk,
-)
+from .writer import WriteCancelled
 from .uefi import SignatureTableState
 from .uefi_ntfs import (
     UEFI_NTFS_SIZE, BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
@@ -266,6 +267,8 @@ class Bridge(QObject):
     casper_preparation_finished = pyqtSignal(object, object, object)
     device_refresh_finished = pyqtSignal(object, object)
     linux_download_finished = pyqtSignal(object, object, object)
+    raw_preparation_finished = pyqtSignal(object, object)
+    raw_execution_finished = pyqtSignal(object, object)
 
 
 class Window(QMainWindow):
@@ -300,15 +303,14 @@ class Window(QMainWindow):
         self.iso_staging_preparer: BackgroundPreparation | None = None
         self.iso_staging_token: IsoStagingPreparationToken | None = None
         self.devices: list[Device] = []
-        self.writer: ImageWriter | None = None
+        self.raw_workflow: RawWriteWorkflow | None = None
+        self.raw_confirmation_dialog: QDialog | None = None
         self.imager: DriveImager | VirtualDriveImager | None = None
         self.formatter: FormatExecutor | None = None
         self.media_runner: MediaTestRunner | None = None
         self.eraser: EraseRunner | None = None
         self.optical_runner: OpticalCaptureRunner | None = None
         self.extractor: SafeIsoExtractor | None = None
-        self.virtual_stager: VirtualDiskStager | None = None
-        self.compressed_virtual_preparer: CompressedVirtualDiskPreparer | None = None
         self.iso_stager: IsoStagingExecutor | None = None
         self.windows_wim_extractor: SafeIsoExtractor | None = None
         self.constructed_writer: ConstructedMediaExecutor | None = None
@@ -382,6 +384,12 @@ class Window(QMainWindow):
         self.bridge.device_refresh_finished.connect(self.on_devices_refreshed)
         self.bridge.linux_download_finished.connect(
             self.on_linux_download_finished
+        )
+        self.bridge.raw_preparation_finished.connect(
+            self.on_raw_preparation_finished
+        )
+        self.bridge.raw_execution_finished.connect(
+            self.on_raw_execution_finished
         )
         QShortcut(QKeySequence.StandardKey.Open, self, activated=self.choose_image)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_devices)
@@ -1875,11 +1883,10 @@ class Window(QMainWindow):
     @property
     def operation_active(self) -> bool:
         return any((
-            self.writer, self.imager, self.formatter, self.media_runner, self.eraser,
+            self.raw_workflow,
+            self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner,
             self.extractor,
-            self.virtual_stager,
-            self.compressed_virtual_preparer,
             self.iso_stager,
             self.windows_wim_extractor,
             self.constructed_writer,
@@ -2042,14 +2049,18 @@ class Window(QMainWindow):
                 f"Guest-visible disk: {self.display_size(self.inspection.size)}\n"
             )
         answer = QMessageBox.warning(
-            self, "Erase removable drive?",
-            f"Everything on {self.display_device(device)} will be permanently erased.\n\n"
+            self, "Prepare authenticated raw write?",
+            f"A final typed confirmation will be required before anything on "
+            f"{self.display_device(device)} can be erased.\n\n"
             f"Image: {self.image.name}\nMethod: {method_description}\n"
             f"{virtual_size_details}"
             f"Layout: {self.inspection.layout}\n"
             f"Secure Boot DBX advice: {self.dbx_review_text(self.inspection)}\n"
             f"Target: {device.path}\nSerial: {device.serial or device.wwn or 'not reported'}\n\n"
-            "Check the target carefully before continuing.",
+            "ISOpropyl will first expand the image into a private anonymous "
+            "snapshot and calculate its SHA-256. The target is not unmounted or "
+            "mutated during preparation. Check the target carefully before "
+            "continuing.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
         )
@@ -2067,7 +2078,13 @@ class Window(QMainWindow):
                     "before writing.",
                 )
                 return
-            self.logger.info("Confirmed write: image=%s target=%s identity=%s", self.image, device.path, device.identity)
+            self.logger.info(
+                "Consented to raw snapshot preparation: image=%s target=%s "
+                "identity=%s",
+                self.image,
+                device.path,
+                device.identity,
+            )
             self.start_write(
                 self.image, device, self.verify.isChecked(), confirmed_identity,
             )
@@ -2126,6 +2143,21 @@ class Window(QMainWindow):
         should_verify: bool,
         expected_source_identity: tuple[int, int, int, int, int],
     ) -> None:
+        if self.operation_active:
+            QMessageBox.warning(
+                self,
+                "Another operation is active",
+                "Wait for the current operation to finish before starting a raw write.",
+            )
+            return
+        inspection = self.inspection
+        if inspection is None:
+            QMessageBox.critical(
+                self,
+                "Raw write unavailable",
+                "A completed image inspection is required before writing.",
+            )
+            return
         try:
             source_identity = image_identity(image)
         except OSError as error:
@@ -2138,158 +2170,251 @@ class Window(QMainWindow):
                 "The image changed after confirmation. Select it again before writing.",
             )
             return
-        self.writer = ImageWriter()
-        inspection = self.inspection
-        virtual_format = inspection.virtual_format if inspection is not None else ""
-        compressed_virtual = bool(
-            virtual_format
-            and inspection is not None
-            and inspection.compression != "none"
-        )
-        self.virtual_stager = VirtualDiskStager() if virtual_format else None
-        self.compressed_virtual_preparer = (
-            CompressedVirtualDiskPreparer() if compressed_virtual else None
-        )
+        try:
+            workflow = RawWriteWorkflow(
+                image,
+                inspection,
+                device,
+                source_identity,
+                final_verification=should_verify,
+            )
+        except RawWorkflowError as error:
+            QMessageBox.critical(self, "Raw write unavailable", str(error))
+            return
+        self.raw_workflow = workflow
         self.set_busy(True)
+        self.progress.setRange(0, 1000)
         self.progress.setValue(0)
-        self.status.setText("Preparing drive…")
+        self.status.setText("Preparing a private authenticated image snapshot…")
+
+        def progress(stage: str, done: int, total: int) -> None:
+            self.bridge.progress.emit(
+                done,
+                total,
+                self.raw_progress_label(inspection, stage),
+            )
 
         def work() -> None:
             try:
-                assert self.writer is not None
-                matches = [
-                    d for d in list_devices(include_usb_hdds=not device.removable)
-                    if d.path == device.path
-                ]
-                if not matches or matches[0].identity != device.identity:
-                    raise RuntimeError("The selected drive changed or was disconnected. Refresh and select it again.")
-                if matches[0].logical_sector_size != device.logical_sector_size:
-                    raise RuntimeError(
-                        "The selected drive's logical sector size changed. "
-                        "Refresh and select it again."
-                    )
-                if image_is_on_device(str(image), device):
-                    raise RuntimeError(
-                        "The selected image is stored on the target drive. Move it to another disk before writing."
-                    )
-                if image_identity(image) != source_identity:
-                    raise RuntimeError("The selected image changed after confirmation. Choose it again before writing.")
-                if self.virtual_stager is not None:
-                    try:
-                        stage_root_on_target = path_is_on_device(
-                            tempfile.gettempdir(), device,
-                        )
-                    except OSError:
-                        stage_root_on_target = True
-                    if stage_root_on_target:
-                        raise RuntimeError(
-                            "ISOpropyl's temporary staging directory is on the "
-                            "selected target drive. Configure temporary storage "
-                            "on another disk before writing."
-                        )
-                staged = None
-                prepared_container = None
-                write_source = image
-                if self.virtual_stager is not None:
-                    if self.compressed_virtual_preparer is not None:
-                        expected_format = {
-                            "VHD": "vpc",
-                            "VHDX": "vhdx",
-                            "QCOW": "qcow",
-                            "QCOW2": "qcow2",
-                        }.get(virtual_format)
-                        if expected_format is None or inspection is None:
-                            raise RuntimeError(
-                                "The confirmed virtual disk format is unsupported"
-                            )
-                        self.bridge.status_changed.emit(
-                            "Decoding compressed virtual disk…"
-                        )
-                        prepared_container = self.compressed_virtual_preparer.prepare(
-                            image,
-                            expected_identity=expected_source_identity,
-                            expected_format=expected_format,
-                            expected_virtual_size=inspection.size,
-                        )
-                        info = prepared_container.info
-                    else:
-                        info = inspect_virtual_disk(image)
-                        virtual_identity = (
-                            info.identity.device, info.identity.inode,
-                            info.identity.size, info.identity.modified_ns,
-                            info.identity.changed_ns,
-                        )
-                        if virtual_identity != expected_source_identity:
-                            raise RuntimeError(
-                                "The selected virtual disk changed after confirmation. "
-                                "Choose it again before writing."
-                            )
-                    try:
-                        staged = self.virtual_stager.stage(
-                            info,
-                            lambda d, t: self.bridge.progress.emit(
-                                d, t, "Converting virtual disk",
-                            ),
-                        )
-                    except BaseException:
-                        if prepared_container is not None:
-                            prepared_container.close()
-                            prepared_container = None
-                        raise
-                    write_source = staged.path
-                    if image_is_on_device(str(write_source), device):
-                        staged.close()
-                        staged = None
-                        if prepared_container is not None:
-                            prepared_container.close()
-                            prepared_container = None
-                        raise RuntimeError(
-                            "The private virtual-disk stage was created on the "
-                            "target drive. Configure temporary storage on another "
-                            "disk before writing."
-                        )
-                try:
-                    self.writer.write(
-                        write_source, device,
-                        lambda d, t: self.bridge.progress.emit(d, t, "Writing"),
-                        expected_identity=(
-                            expected_source_identity if staged is None else None
-                        ),
-                    )
-                    if should_verify:
-                        self.bridge.progress.emit(0, write_source.stat().st_size * 2, "Verifying")
-                        if not self.writer.verify(
-                            write_source, device.path,
-                            lambda d, t: self.bridge.progress.emit(d, t, "Verifying"),
-                        ):
-                            raise RuntimeError(
-                                "Verification failed: the written data does not match the image"
-                            )
-                finally:
-                    if staged is not None:
-                        staged.close()
-                    if prepared_container is not None:
-                        prepared_container.close()
-                if self.writer.cancelled:
-                    raise WriteCancelled("Writing was cancelled")
-                if self.writer.power_off(device):
-                    message = "Your bootable USB is ready and safely powered off. You can remove it."
-                else:
-                    message = "Your bootable USB is ready. Eject it with your desktop before removing it."
-                self.bridge.finished.emit(True, message)
-            except WriteCancelled as error:
-                self.logger.info("Operation cancelled: %s", error)
-                self.bridge.finished.emit(False, str(error))
-            except VirtualConversionCancelled as error:
-                self.logger.info("Operation cancelled: %s", error)
-                self.bridge.finished.emit(False, str(error))
-            except Exception as error:
-                self.logger.exception("Write operation failed")
-                self.bridge.finished.emit(False, str(error))
+                plan = workflow.prepare(progress)
+            except BaseException as error:
+                self.bridge.raw_preparation_finished.emit(workflow, error)
+            else:
+                self.bridge.raw_preparation_finished.emit(workflow, plan)
 
         threading.Thread(target=work, daemon=True).start()
 
+    @staticmethod
+    def raw_progress_label(inspection: ImageInspection, stage: str) -> str:
+        labels = {
+            "decode-virtual": "Decompressing virtual disk",
+            "convert-virtual": "Converting virtual disk",
+            "source-validation": "Validating prepared image",
+            "writing": "Writing authenticated image",
+            "preactivation-readback": "Checking target activation boundary",
+            "readback": "Verifying written image",
+        }
+        if stage == "snapshot":
+            if inspection.sparse_format == "VTSI":
+                return "Expanding VTSI snapshot"
+            if inspection.compression != "none":
+                return "Decompressing image snapshot"
+            return "Creating authenticated image snapshot"
+        return labels.get(stage, stage.replace("-", " ").capitalize())
+
+    def on_raw_preparation_finished(
+        self,
+        workflow: RawWriteWorkflow,
+        outcome: object,
+    ) -> None:
+        if workflow is not self.raw_workflow:
+            workflow.close()
+            return
+        if isinstance(outcome, RawWorkflowCancelled):
+            self.release_raw_workflow(
+                "Raw image preparation cancelled; the target was not mutated.",
+                refresh=True,
+            )
+            return
+        if isinstance(outcome, BaseException):
+            self.logger.error("Raw image preparation failed: %s", outcome)
+            self.bridge.finished.emit(False, str(outcome))
+            return
+        if type(outcome) is not RawDeviceWritePlan or outcome is not workflow.plan:
+            self.bridge.finished.emit(
+                False,
+                "Raw preparation returned a non-authoritative target plan.",
+            )
+            return
+
+        phrase = self.confirm_raw_write_plan(outcome)
+        if phrase is None:
+            self.release_raw_workflow(
+                "Raw write cancelled before target mutation.",
+                refresh=False,
+            )
+            return
+        try:
+            workflow.confirm(phrase)
+        except RawWorkflowCancelled:
+            self.release_raw_workflow(
+                "Raw write cancelled before target mutation.",
+                refresh=True,
+            )
+            return
+        except RawWorkflowError as error:
+            self.bridge.finished.emit(False, str(error))
+            return
+
+        self.logger.info(
+            "Confirmed authenticated raw write: plan=%s source=%s target=%s",
+            outcome.plan_sha256,
+            outcome.source_sha256,
+            outcome.device.identity,
+        )
+        self.status.setText("Starting the authenticated privileged write…")
+
+        def progress(stage: str, done: int, total: int) -> None:
+            self.bridge.progress.emit(
+                done,
+                total,
+                self.raw_progress_label(workflow.inspection, stage),
+            )
+
+        def work() -> None:
+            try:
+                result = workflow.execute(progress)
+            except BaseException as error:
+                self.bridge.raw_execution_finished.emit(workflow, error)
+            else:
+                self.bridge.raw_execution_finished.emit(workflow, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def confirm_raw_write_plan(self, plan: RawDeviceWritePlan) -> str | None:
+        device = plan.device
+        model = " ".join(
+            part.strip() for part in (device.vendor, device.model) if part.strip()
+        ) or "not reported"
+        serial = device.serial or device.wwn or "not reported"
+        warnings = "\n".join(f"• {warning}" for warning in plan.warnings)
+        if not warnings:
+            warnings = "• No additional image-specific warnings."
+
+        dialog = QDialog(self)
+        dialog.setObjectName("rawWriteConfirmationDialog")
+        dialog.setWindowTitle("Final authenticated raw-write confirmation")
+        dialog.setMinimumWidth(720)
+        layout = QVBoxLayout(dialog)
+        warning = QLabel(
+            "ALL DATA ON THIS EXACT TARGET WILL BE ERASED AFTER CONFIRMATION"
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
+        layout.addWidget(warning)
+
+        details = QPlainTextEdit()
+        details.setObjectName("rawWriteConfirmationDetails")
+        details.setReadOnly(True)
+        details.setPlainText(
+            f"Expanded image: {self.display_size(plan.source_size)} "
+            f"({plan.source_size} bytes)\n"
+            f"SHA-256: {plan.source_sha256}\n\n"
+            f"Target path: {device.path}\n"
+            f"Target model: {model}\n"
+            f"Target serial/WWN: {serial}\n"
+            f"Target capacity: {self.display_size(plan.target_capacity)} "
+            f"({plan.target_capacity} bytes)\n"
+            f"Logical sector: {plan.logical_sector_size} bytes\n\n"
+            f"Warnings:\n{warnings}"
+        )
+        details.setMinimumHeight(260)
+        layout.addWidget(details)
+
+        instruction = QLabel(
+            "Type the exact phrase below to authorize this one target and image:\n"
+            f"{plan.confirmation_phrase}"
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+        phrase = QLineEdit()
+        phrase.setObjectName("rawWriteConfirmationPhrase")
+        phrase.setPlaceholderText(plan.confirmation_phrase)
+        layout.addWidget(phrase)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        start = buttons.addButton(
+            "Write authenticated image",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        start.setObjectName("rawWriteConfirmButton")
+        start.setEnabled(False)
+        phrase.textChanged.connect(
+            lambda value: start.setEnabled(value == plan.confirmation_phrase)
+        )
+        start.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        self.raw_confirmation_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return phrase.text()
+        finally:
+            if self.raw_confirmation_dialog is dialog:
+                self.raw_confirmation_dialog = None
+
+    def on_raw_execution_finished(
+        self,
+        workflow: RawWriteWorkflow,
+        outcome: object,
+    ) -> None:
+        if workflow is not self.raw_workflow:
+            workflow.close()
+            return
+        if isinstance(outcome, RawWorkflowCancelled):
+            self.release_raw_workflow(
+                "Raw write cancelled before completion.",
+                refresh=True,
+            )
+            return
+        if isinstance(outcome, BaseException):
+            self.logger.error("Raw image execution failed: %s", outcome)
+            self.bridge.finished.emit(False, str(outcome))
+            return
+        if type(outcome) is not RawDeviceWriteResult or outcome is not workflow.result:
+            self.bridge.finished.emit(
+                False,
+                "The raw helper returned a non-authoritative completion result.",
+            )
+            return
+        message = (
+            "Your bootable USB is ready and the expanded image was verified. "
+            "Eject it with your desktop before removing it."
+            if outcome.final_verification
+            else "Your bootable USB is ready. Eject it with your desktop before "
+            "removing it."
+        )
+        self.bridge.finished.emit(True, message)
+
+    def release_raw_workflow(self, message: str, *, refresh: bool) -> None:
+        workflow = self.raw_workflow
+        self.raw_workflow = None
+        if workflow is not None:
+            workflow.close()
+        self.raw_confirmation_dialog = None
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.set_busy(False)
+        self.status.setText(message)
+        if refresh:
+            self.refresh_devices()
+
     def on_progress(self, done: int, total: int, stage: str) -> None:
+        if total <= 0:
+            self.progress.setValue(0)
+            self.status.setText(f"{stage}…")
+            return
         snapshot = self.progress_estimator.update(done, total, stage)
         self.progress.setValue(round(snapshot.fraction * 1000))
         details = (
@@ -2303,15 +2428,17 @@ class Window(QMainWindow):
         self.status.setText(details)
 
     def on_finished(self, success: bool, message: str) -> None:
-        self.writer = None
+        raw_workflow = self.raw_workflow
+        self.raw_workflow = None
+        if raw_workflow is not None:
+            raw_workflow.close()
+        self.raw_confirmation_dialog = None
         self.imager = None
         self.formatter = None
         self.media_runner = None
         self.eraser = None
         self.optical_runner = None
         self.extractor = None
-        self.virtual_stager = None
-        self.compressed_virtual_preparer = None
         self.iso_stager = None
         self.iso_staging_preparer = None
         self.iso_staging_token = None
@@ -2399,9 +2526,9 @@ class Window(QMainWindow):
         self.runtime_validation_cancel_event.set()
         self.inspection_busy = False
         active = tuple(filter(None, (
-            self.writer, self.imager, self.formatter, self.media_runner, self.eraser,
-            self.optical_runner, self.extractor, self.virtual_stager,
-            self.compressed_virtual_preparer,
+            self.raw_workflow,
+            self.imager, self.formatter, self.media_runner, self.eraser,
+            self.optical_runner, self.extractor,
             self.iso_stager, self.constructed_writer,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
@@ -2417,6 +2544,8 @@ class Window(QMainWindow):
             self.cancel_button.setEnabled(False)
             for operation in active:
                 operation.cancel()
+            if self.raw_confirmation_dialog is not None:
+                self.raw_confirmation_dialog.reject()
         elif was_inspecting:
             self.status.setText("Image inspection cancelled")
             self.image_detail.setText("Image inspection cancelled")

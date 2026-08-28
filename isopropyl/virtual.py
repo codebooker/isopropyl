@@ -9,6 +9,7 @@ module first inspects them with a fixed, absolute ``qemu-img`` executable and
 then converts the bound container identity into a private raw regular file.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -34,6 +35,8 @@ MAX_VIRTUAL_SIZE = 64 * 1024**4
 MAX_COMPRESSED_VIRTUAL_BYTES = 64 * 1024**3
 COMPRESSED_VIRTUAL_FREE_RESERVE_BYTES = 64 * 1024**2
 VIRTUAL_STAGING_FREE_RESERVE_BYTES = 64 * 1024**2
+VIRTUAL_CONVERSION_MAX_OUTPUT = 1024 * 1024
+VIRTUAL_CONVERSION_STALL_TIMEOUT_SECONDS = 5 * 60.0
 DEFAULT_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 PROGRESS_PATTERN = re.compile(rb"\(([0-9]+(?:\.[0-9]+)?)/100%\)")
 VIRTUAL_SUFFIX_FORMATS = {
@@ -256,6 +259,11 @@ def _find_restricted_metadata(value: object) -> tuple[str, str] | None:
     if isinstance(value, dict):
         for raw_key, child in value.items():
             key = str(raw_key).casefold().replace("_", "-")
+            if (
+                (key == "data-file" or key.startswith("data-file-"))
+                and _nonempty_security_value(child)
+            ):
+                return "external data-file", str(raw_key)
             if (key == "backing" or key.startswith("backing-")) and _nonempty_security_value(child):
                 return "backing", str(raw_key)
             if ("encrypt" in key or key == "key-secret") and _nonempty_security_value(child):
@@ -360,6 +368,11 @@ def _run_info_limited(
             _stop_process(process)
         for thread in threads:
             thread.join(timeout=2)
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
     if any(thread.is_alive() for thread in threads):
         raise VirtualDiskError("qemu-img inspection output pipes did not close")
     if reader_errors:
@@ -527,6 +540,90 @@ def _append_bounded(buffer: bytearray, block: bytes) -> None:
     buffer.extend(block)
     if len(buffer) > MAX_DIAGNOSTIC:
         del buffer[:len(buffer) - MAX_DIAGNOSTIC]
+
+
+@dataclass(frozen=True)
+class _AnonymousOutputIdentity:
+    device: int
+    inode: int
+    owner: int
+    mode: int
+
+
+def _anonymous_output_identity(
+    descriptor: int,
+    *,
+    expected_size: int,
+) -> _AnonymousOutputIdentity:
+    """Attest one caller-owned, unlinked, read/write regular-file descriptor."""
+
+    if type(descriptor) is not int or descriptor < 0:
+        raise VirtualDiskError("The anonymous virtual-conversion output is invalid")
+    try:
+        status = os.fstat(descriptor)
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    except OSError as error:
+        raise VirtualDiskError(
+            "The anonymous virtual-conversion output is unavailable"
+        ) from error
+    mode = stat.S_IMODE(status.st_mode)
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_nlink != 0
+        or status.st_uid != os.geteuid()
+        or mode != 0o600
+        or status.st_size != expected_size
+        or flags & os.O_ACCMODE != os.O_RDWR
+        or flags & os.O_APPEND
+    ):
+        raise VirtualDiskError(
+            "The virtual-conversion output must be an exact private 0600, "
+            "unlinked, read/write regular file"
+        )
+    return _AnonymousOutputIdentity(
+        status.st_dev,
+        status.st_ino,
+        status.st_uid,
+        mode,
+    )
+
+
+def _require_anonymous_output(
+    descriptor: int,
+    expected: _AnonymousOutputIdentity,
+    *,
+    expected_size: int,
+    label: str,
+) -> None:
+    try:
+        observed = _anonymous_output_identity(
+            descriptor,
+            expected_size=expected_size,
+        )
+    except VirtualDiskError as error:
+        raise VirtualDiskChanged(label) from error
+    if observed != expected:
+        raise VirtualDiskChanged(label)
+
+
+def _validate_conversion_stdout(payload: bytes) -> None:
+    """Accept only qemu-img's documented parenthesized progress records."""
+
+    position = 0
+    for match in PROGRESS_PATTERN.finditer(payload):
+        if payload[position:match.start()].strip(b" \t\r\n"):
+            raise VirtualDiskError("qemu-img produced unexpected conversion output")
+        try:
+            percentage = float(match.group(1))
+        except ValueError as error:
+            raise VirtualDiskError(
+                "qemu-img produced malformed conversion progress"
+            ) from error
+        if not 0.0 <= percentage <= 100.0:
+            raise VirtualDiskError("qemu-img produced invalid conversion progress")
+        position = match.end()
+    if payload[position:].strip(b" \t\r\n"):
+        raise VirtualDiskError("qemu-img produced unexpected conversion output")
 
 
 def _cleanup_stage(directory: Path, output: Path) -> None:
@@ -866,8 +963,14 @@ class CompressedVirtualDiskPreparer:
 class VirtualDiskStager:
     """Convert a bound virtual container into a private raw regular file."""
 
-    def __init__(self, process_factory: ProcessFactory = subprocess.Popen) -> None:
+    def __init__(
+        self,
+        process_factory: ProcessFactory = subprocess.Popen,
+        *,
+        info_runner: RunCommand | None = None,
+    ) -> None:
         self._process_factory = process_factory
+        self._info_runner = info_runner
         self._process: ProcessLike | None = None
         self._cancelled = threading.Event()
 
@@ -884,6 +987,328 @@ class VirtualDiskStager:
     def _raise_if_cancelled(self) -> None:
         if self.cancelled:
             raise VirtualConversionCancelled("Virtual disk conversion was cancelled")
+
+    def convert_into_descriptor(
+        self,
+        info: VirtualDiskInfo,
+        output_descriptor: int,
+        progress: Progress = lambda _done, _total: None,
+    ) -> None:
+        """Convert into one caller-owned anonymous descriptor without staging.
+
+        The caller retains ownership of ``output_descriptor``.  This method
+        duplicates and independently attests the open file description before
+        exposing only that duplicate to qemu-img.  It deliberately does not
+        allocate holes, sync, lock, hash, or close the caller's descriptor;
+        those are responsibilities of the anonymous-snapshot owner.
+        """
+
+        if (
+            type(info) is not VirtualDiskInfo
+            or type(info.identity) is not FileIdentity
+            or type(info.qemu_img) is not ToolIdentity
+            or type(info.qemu_img.identity) is not FileIdentity
+        ):
+            raise VirtualDiskError("A validated virtual-disk description is required")
+        if type(output_descriptor) is not int or output_descriptor < 0:
+            raise VirtualDiskError("The anonymous virtual-conversion output is invalid")
+        self._raise_if_cancelled()
+        if resolve_qemu_img(info.qemu_img.path) != info.qemu_img:
+            raise VirtualDiskChanged("qemu-img changed after virtual-disk inspection")
+        _unchanged(info.path, info.identity, "The selected virtual disk")
+        _unchanged(info.qemu_img.path, info.qemu_img.identity, "qemu-img")
+
+        source_descriptor = destination_descriptor = -1
+        process: ProcessLike | None = None
+        stdout = bytearray()
+        stderr = bytearray()
+        reader_errors: list[BaseException] = []
+        oversized = threading.Event()
+        activity_lock = threading.Lock()
+        last_activity = [time.monotonic()]
+        latest_done = 0
+        progress_lock = threading.Lock()
+        stdout_thread: threading.Thread | None = None
+        stderr_thread: threading.Thread | None = None
+
+        def record_activity() -> None:
+            with activity_lock:
+                last_activity[0] = time.monotonic()
+
+        def append_output(buffer: bytearray, block: bytes) -> bool:
+            record_activity()
+            room = VIRTUAL_CONVERSION_MAX_OUTPUT + 1 - len(buffer)
+            if room > 0:
+                buffer.extend(block[:room])
+            if len(buffer) > VIRTUAL_CONVERSION_MAX_OUTPUT:
+                oversized.set()
+                active = process
+                if active is not None and active.poll() is None:
+                    try:
+                        active.terminate()
+                    except OSError:
+                        pass
+                return False
+            return True
+
+        def read_stdout(stream: Any) -> None:
+            nonlocal latest_done
+            scan_tail = b""
+            try:
+                while block := stream.read(4096):
+                    if not append_output(stdout, block):
+                        return
+                    searchable = scan_tail + block
+                    for match in PROGRESS_PATTERN.finditer(searchable):
+                        percentage = float(match.group(1))
+                        if not 0.0 <= percentage <= 100.0:
+                            continue
+                        done = min(
+                            info.virtual_size,
+                            int(info.virtual_size * percentage / 100.0),
+                        )
+                        with progress_lock:
+                            if done > latest_done:
+                                latest_done = done
+                                progress(done, info.virtual_size)
+                    scan_tail = searchable[-128:]
+            except BaseException as error:
+                reader_errors.append(error)
+
+        def read_stderr(stream: Any) -> None:
+            try:
+                while block := stream.read(4096):
+                    if not append_output(stderr, block):
+                        return
+            except BaseException as error:
+                reader_errors.append(error)
+
+        try:
+            bound_path, source_descriptor, current_identity = _open_bound_source(
+                info.path,
+                "The selected virtual disk",
+            )
+            if bound_path != info.path or current_identity != info.identity:
+                raise VirtualDiskChanged(
+                    "The selected virtual disk changed before conversion"
+                )
+            try:
+                destination_descriptor = os.dup(output_descriptor)
+                os.set_inheritable(destination_descriptor, False)
+            except OSError as error:
+                raise VirtualDiskError(
+                    "The anonymous virtual-conversion output could not be duplicated"
+                ) from error
+            initial_output = _anonymous_output_identity(
+                destination_descriptor,
+                expected_size=0,
+            )
+            _require_anonymous_output(
+                output_descriptor,
+                initial_output,
+                expected_size=0,
+                label=(
+                    "The caller's anonymous conversion descriptor was substituted"
+                ),
+            )
+            output_path = Path(f"/proc/self/fd/{destination_descriptor}")
+            try:
+                output_probe = os.open(
+                    output_path,
+                    os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                )
+            except OSError as error:
+                raise VirtualDiskError(
+                    "The inherited anonymous output descriptor is unavailable"
+                ) from error
+            try:
+                _require_anonymous_output(
+                    output_probe,
+                    initial_output,
+                    expected_size=0,
+                    label=(
+                        "The inherited anonymous output descriptor is inconsistent"
+                    ),
+                )
+            finally:
+                os.close(output_probe)
+
+            fresh = _inspect_virtual_disk_descriptor(
+                source_descriptor,
+                info.path,
+                info.identity,
+                info.qemu_img,
+                runner=self._info_runner,
+                maximum_virtual_size=MAX_VIRTUAL_SIZE,
+                cancel_check=self._raise_if_cancelled,
+            )
+            if (
+                fresh.format != info.format
+                or fresh.virtual_size != info.virtual_size
+            ):
+                raise VirtualDiskChanged(
+                    "The virtual-disk format or guest-visible size changed "
+                    "after inspection"
+                )
+            _require_anonymous_output(
+                output_descriptor,
+                initial_output,
+                expected_size=0,
+                label=(
+                    "The caller's anonymous conversion descriptor was substituted"
+                ),
+            )
+            _require_anonymous_output(
+                destination_descriptor,
+                initial_output,
+                expected_size=0,
+                label="The anonymous conversion descriptor was substituted",
+            )
+            self._raise_if_cancelled()
+            _require_descriptor_identity(
+                source_descriptor,
+                info.identity,
+                "The selected virtual disk",
+            )
+            _unchanged(info.path, info.identity, "The selected virtual disk")
+            _unchanged(info.qemu_img.path, info.qemu_img.identity, "qemu-img")
+            source = f"/proc/self/fd/{source_descriptor}"
+            destination = f"/proc/self/fd/{destination_descriptor}"
+            command = [
+                str(info.qemu_img.path),
+                "convert",
+                "--progress",
+                "--source-format",
+                info.format,
+                "--source-cache",
+                "none",
+                "--target-format",
+                "raw",
+                "--sparse-size",
+                "4k",
+                source,
+                destination,
+            ]
+            try:
+                process = self._process_factory(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    close_fds=True,
+                    pass_fds=(source_descriptor, destination_descriptor),
+                )
+            except OSError as error:
+                raise VirtualDiskError(
+                    f"Could not start qemu-img conversion: {error}"
+                ) from error
+            self._process = process
+            if process.stdout is None or process.stderr is None:
+                raise VirtualDiskError("qemu-img conversion pipes were not available")
+            stdout_thread = threading.Thread(
+                target=read_stdout,
+                args=(process.stdout,),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=read_stderr,
+                args=(process.stderr,),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            while process.poll() is None:
+                if self.cancelled:
+                    _stop_process(process)
+                    break
+                with activity_lock:
+                    stalled = (
+                        time.monotonic() - last_activity[0]
+                        >= VIRTUAL_CONVERSION_STALL_TIMEOUT_SECONDS
+                    )
+                if stalled:
+                    _stop_process(process)
+                    raise VirtualDiskError(
+                        "qemu-img conversion stopped reporting progress"
+                    )
+                time.sleep(0.05)
+            try:
+                code = process.wait()
+            except subprocess.TimeoutExpired as error:
+                _stop_process(process)
+                raise VirtualDiskError(
+                    "qemu-img conversion did not terminate"
+                ) from error
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            if stdout_thread.is_alive() or stderr_thread.is_alive():
+                raise VirtualDiskError("qemu-img conversion output pipes did not close")
+            self._raise_if_cancelled()
+            if reader_errors:
+                raise VirtualDiskError(
+                    f"Could not read qemu-img conversion output: {reader_errors[0]}"
+                )
+            if oversized.is_set():
+                raise VirtualDiskError("qemu-img produced too much conversion output")
+            if code:
+                message = bytes(stderr[-MAX_DIAGNOSTIC:]).decode(
+                    errors="replace"
+                ).strip()
+                raise VirtualDiskError(
+                    message or "qemu-img could not convert the virtual disk"
+                )
+            _validate_conversion_stdout(bytes(stdout))
+            if bytes(stderr).strip():
+                raise VirtualDiskError(
+                    "A successful qemu-img conversion produced unexpected diagnostics"
+                )
+            _require_descriptor_identity(
+                source_descriptor,
+                info.identity,
+                "The selected virtual disk",
+            )
+            _unchanged(info.path, info.identity, "The selected virtual disk")
+            _unchanged(info.qemu_img.path, info.qemu_img.identity, "qemu-img")
+            _require_anonymous_output(
+                destination_descriptor,
+                initial_output,
+                expected_size=info.virtual_size,
+                label=(
+                    "The anonymous conversion output has the wrong size, type, "
+                    "flags, or identity, or was substituted"
+                ),
+            )
+            _require_anonymous_output(
+                output_descriptor,
+                initial_output,
+                expected_size=info.virtual_size,
+                label=(
+                    "The caller's anonymous conversion output has the wrong size, "
+                    "type, flags, or identity, or was substituted"
+                ),
+            )
+            with progress_lock:
+                if latest_done < info.virtual_size:
+                    progress(info.virtual_size, info.virtual_size)
+        finally:
+            if process is not None and process.poll() is None:
+                _stop_process(process)
+            if stdout_thread is not None and stdout_thread.is_alive():
+                stdout_thread.join(timeout=2)
+            if stderr_thread is not None and stderr_thread.is_alive():
+                stderr_thread.join(timeout=2)
+            self._process = None
+            if source_descriptor >= 0:
+                try:
+                    os.close(source_descriptor)
+                except OSError:
+                    pass
+            if destination_descriptor >= 0:
+                try:
+                    os.close(destination_descriptor)
+                except OSError:
+                    pass
 
     def stage(
         self,

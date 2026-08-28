@@ -45,6 +45,7 @@ REQUIRED_EXECUTOR_PROFILE = (
 _PLAN_TOKEN = object()
 _CONFIRMATION_TOKEN = object()
 _READY_TOKEN = object()
+_UNSET = object()
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAJOR_MINOR = re.compile(r"\d+:\d+\Z")
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
@@ -93,6 +94,12 @@ def _source_evidence_digest(evidence: RawSourceEvidence) -> str:
                     "changed_ns": evidence.original_changed_ns,
                 },
                 "workspace_device": evidence.workspace_device,
+                "requires_exact_target_size": (
+                    evidence.requires_exact_target_size
+                ),
+                "required_logical_sector_size": (
+                    evidence.required_logical_sector_size
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -124,6 +131,8 @@ class RawSourceEvidence:
     original_changed_ns: int
     workspace_device: int
     raw_snapshot_plan_sha256: str
+    requires_exact_target_size: bool = False
+    required_logical_sector_size: int | None = None
     snapshot_plan_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -153,6 +162,10 @@ class RawSourceEvidence:
                 )
         if self.original_inode == 0:
             raise RawDevicePlanError("The selected source inode is invalid")
+        _validate_semantic_constraints(
+            self.requires_exact_target_size,
+            self.required_logical_sector_size,
+        )
         object.__setattr__(
             self,
             "snapshot_plan_sha256",
@@ -170,10 +183,56 @@ class RawSourceEvidence:
         )
 
 
+def _validate_semantic_constraints(
+    requires_exact_target_size: object,
+    required_logical_sector_size: object,
+) -> None:
+    if type(requires_exact_target_size) is not bool:
+        raise RawDevicePlanError(
+            "The exact-target-size source constraint is invalid",
+        )
+    if (
+        required_logical_sector_size is not None
+        and (
+            not _is_plain_int(required_logical_sector_size)
+            or required_logical_sector_size <= 0
+        )
+    ):
+        raise RawDevicePlanError(
+            "The required logical sector size is invalid",
+        )
+
+
+def _snapshot_constraint(
+    result: RawSnapshotResult,
+    name: str,
+    explicit: object,
+    default: object,
+) -> object:
+    observed = getattr(result, name, _UNSET)
+    if observed is not _UNSET:
+        if explicit is not _UNSET and explicit != observed:
+            raise RawDevicePlanError(
+                "The explicit source constraints disagree with the raw "
+                "snapshot result",
+            )
+        return observed
+    return default if explicit is _UNSET else explicit
+
+
 def raw_source_evidence_from_snapshot(
     prepared: PreparedRawSnapshot,
+    *,
+    requires_exact_target_size: bool | object = _UNSET,
+    required_logical_sector_size: int | None | object = _UNSET,
 ) -> RawSourceEvidence:
-    """Derive target-plan evidence from one completed anonymous snapshot."""
+    """Derive evidence with explicit or snapshot-owned geometry semantics.
+
+    Generalized snapshot results expose the identically named authoritative
+    fields.  The defaults preserve ordinary raw semantics for older result
+    shapes; explicit keyword arguments must agree whenever result fields are
+    present.
+    """
 
     if (
         type(prepared) is not PreparedRawSnapshot
@@ -182,6 +241,23 @@ def raw_source_evidence_from_snapshot(
     ):
         raise RawDevicePlanError("An exact ready raw snapshot is required")
     result = prepared.result
+    if requires_exact_target_size is not _UNSET:
+        _validate_semantic_constraints(requires_exact_target_size, None)
+    if required_logical_sector_size is not _UNSET:
+        _validate_semantic_constraints(False, required_logical_sector_size)
+    exact = _snapshot_constraint(
+        result,
+        "requires_exact_target_size",
+        requires_exact_target_size,
+        False,
+    )
+    sector = _snapshot_constraint(
+        result,
+        "required_logical_sector_size",
+        required_logical_sector_size,
+        None,
+    )
+    _validate_semantic_constraints(exact, sector)
     try:
         evidence = RawSourceEvidence(
             source_sha256=result.image_sha256,
@@ -193,6 +269,8 @@ def raw_source_evidence_from_snapshot(
             original_changed_ns=result.source_identity.changed_ns,
             workspace_device=result.workspace_identity.device,
             raw_snapshot_plan_sha256=result.plan_sha256,
+            requires_exact_target_size=exact,
+            required_logical_sector_size=sector,
         )
     except (AttributeError, TypeError, ValueError) as error:
         raise RawDevicePlanError(
@@ -247,6 +325,8 @@ class RawDeviceWritePlan:
     source_size: int
     original_source_identity: tuple[int, int, int, int, int]
     workspace_device: int
+    requires_exact_target_size: bool
+    required_logical_sector_size: int | None
     target_capacity: int
     logical_sector_size: int
     mandatory_preactivation_readback: bool
@@ -271,6 +351,8 @@ class ConfirmedRawDeviceWrite:
     plan_sha256: str
     source_sha256: str
     source_size: int
+    requires_exact_target_size: bool
+    required_logical_sector_size: int | None
     device_identity: tuple[str, int, str, str, str, str]
     target_capacity: int
     logical_sector_size: int
@@ -492,6 +574,12 @@ def _plan_digest(plan: RawDeviceWritePlan) -> str:
                     "source_size": plan.source_size,
                     "original_identity": list(plan.original_source_identity),
                     "workspace_device": plan.workspace_device,
+                    "requires_exact_target_size": (
+                        plan.requires_exact_target_size
+                    ),
+                    "required_logical_sector_size": (
+                        plan.required_logical_sector_size
+                    ),
                 },
                 "target": _device_payload(plan.device),
                 "disk_sequence": plan.disk_sequence,
@@ -524,6 +612,8 @@ def _plan_snapshot(plan: RawDeviceWritePlan) -> tuple[object, ...]:
         plan.source_size,
         plan.original_source_identity,
         plan.workspace_device,
+        plan.requires_exact_target_size,
+        plan.required_logical_sector_size,
         plan.disk_sequence,
         plan.target_capacity,
         plan.logical_sector_size,
@@ -543,6 +633,8 @@ def _confirmation_snapshot(
         confirmation.plan_sha256,
         confirmation.source_sha256,
         confirmation.source_size,
+        confirmation.requires_exact_target_size,
+        confirmation.required_logical_sector_size,
         confirmation.device_identity,
         confirmation.target_capacity,
         confirmation.logical_sector_size,
@@ -582,6 +674,10 @@ def _validate_source_evidence(evidence: RawSourceEvidence) -> None:
         or evidence.workspace_device < 0
     ):
         raise RawDevicePlanError("The raw source snapshot evidence is inconsistent")
+    _validate_semantic_constraints(
+        evidence.requires_exact_target_size,
+        evidence.required_logical_sector_size,
+    )
 
 
 def _validate_target_node(device: Device) -> os.stat_result:
@@ -688,8 +784,21 @@ def _validate_static_relationships(
         or plan.source_size != evidence.source_size
         or plan.original_source_identity != evidence.original_identity
         or plan.workspace_device != evidence.workspace_device
+        or plan.requires_exact_target_size
+        is not evidence.requires_exact_target_size
+        or plan.required_logical_sector_size
+        != evidence.required_logical_sector_size
         or plan.target_capacity != plan.device.size
         or plan.source_size > plan.target_capacity
+        or (
+            plan.requires_exact_target_size
+            and plan.source_size != plan.target_capacity
+        )
+        or (
+            plan.required_logical_sector_size is not None
+            and plan.device.logical_sector_size
+            != plan.required_logical_sector_size
+        )
         or plan.target_capacity % SECTOR_SIZE
         or not _is_plain_int(plan.disk_sequence)
         or not 0 < plan.disk_sequence <= 0xFFFFFFFFFFFFFFFF
@@ -743,6 +852,15 @@ def build_raw_device_write_plan(
         validate_device_selection(device, writable=True)
     except WriterSafetyError as error:
         raise RawDevicePlanError(str(error)) from error
+    if (
+        source_evidence.required_logical_sector_size is not None
+        and device.logical_sector_size
+        != source_evidence.required_logical_sector_size
+    ):
+        raise RawDevicePlanError(
+            "The raw source requires a target with "
+            f"{source_evidence.required_logical_sector_size}-byte logical sectors",
+        )
     if device.logical_sector_size != SECTOR_SIZE:
         raise RawDevicePlanError(
             "The initial raw target profile requires 512-byte logical sectors",
@@ -751,6 +869,14 @@ def build_raw_device_write_plan(
         raise RawDevicePlanError("The target capacity is not sector aligned")
     if device.size > MAX_RAW_DEVICE_BYTES:
         raise RawDevicePlanError("The target capacity exceeds the raw helper profile")
+    if (
+        source_evidence.requires_exact_target_size
+        and source_evidence.source_size != device.size
+    ):
+        raise RawDevicePlanError(
+            "The raw source requires a target whose capacity exactly matches "
+            "the expanded image size",
+        )
     if source_evidence.source_size > device.size:
         raise RawDevicePlanError(
             "The expanded raw source is larger than the selected target capacity",
@@ -781,6 +907,8 @@ def build_raw_device_write_plan(
         source_evidence.source_size,
         source_evidence.original_identity,
         source_evidence.workspace_device,
+        source_evidence.requires_exact_target_size,
+        source_evidence.required_logical_sector_size,
         device.size,
         device.logical_sector_size,
         True,
@@ -800,6 +928,8 @@ def build_raw_device_write_plan(
         candidate.source_size,
         candidate.original_source_identity,
         candidate.workspace_device,
+        candidate.requires_exact_target_size,
+        candidate.required_logical_sector_size,
         candidate.target_capacity,
         candidate.logical_sector_size,
         candidate.mandatory_preactivation_readback,
@@ -872,6 +1002,8 @@ def confirm_raw_device_write(
         plan.plan_sha256,
         plan.source_sha256,
         plan.source_size,
+        plan.requires_exact_target_size,
+        plan.required_logical_sector_size,
         plan.device.identity,
         plan.target_capacity,
         plan.logical_sector_size,
@@ -909,6 +1041,10 @@ def _validate_confirmation_receipt(
         or confirmation.plan_sha256 != plan.plan_sha256
         or confirmation.source_sha256 != plan.source_sha256
         or confirmation.source_size != plan.source_size
+        or confirmation.requires_exact_target_size
+        is not plan.requires_exact_target_size
+        or confirmation.required_logical_sector_size
+        != plan.required_logical_sector_size
         or confirmation.device_identity != plan.device.identity
         or confirmation.target_capacity != plan.target_capacity
         or confirmation.logical_sector_size != plan.logical_sector_size

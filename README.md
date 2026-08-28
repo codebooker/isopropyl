@@ -37,10 +37,10 @@ a feature-for-feature replacement.
 
 | Capability | What ISOpropyl does |
 |---|---|
-| **Raw DD writing** | Streams hybrid ISOs and raw images, with cancellation and optional full byte-for-byte read-back verification. |
+| **Authenticated raw writing** | Expands every supported raw input into a private anonymous snapshot, shows its SHA-256 and exact target in a typed confirmation, then uses a guarded PolicyKit transaction with mandatory pre-activation read-back and optional full verification. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, and can generate a reviewed `autounattend.xml` for setup, privacy, account, and quality-of-life options. |
-| **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-checked streaming or private conversion. |
+| **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
 | **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, securely erases media, and runs bad-block or fake-capacity tests in separate warned workflows. |
 | **Linux image download** | Downloads the pinned Ubuntu LTS profile from distribution-owned infrastructure and verifies its signed checksum manifest. |
@@ -65,6 +65,17 @@ python -m pip install .
 isopropyl
 ```
 
+Raw/DD writes use ISOpropyl's fixed privileged host integration; there is no
+fallback to a pathname-based `dd` writer. Install that integration explicitly
+from the same trusted checkout before testing raw writes:
+
+```bash
+sudo make install-host-helper PREFIX=/usr
+```
+
+Re-run that command after changing the helper or its PolicyKit policy. Ordinary
+image inspection and non-raw UI exploration do not require it.
+
 For development, replace `python -m pip install .` with
 `python -m pip install -e .`. A checkout can also be launched directly:
 
@@ -85,7 +96,9 @@ For development, replace `python -m pip install .` with
 2. Select a removable destination and inspect its model, capacity, path, and
    serial number.
 3. Choose the recommended raw, virtual-restore, or VTSI path.
-4. Keep **Verify after writing** enabled, review the erase warning, and confirm.
+4. Keep **Verify after writing** enabled, allow private snapshot preparation,
+   then check the expanded size, SHA-256, target identity, and warnings in the
+   final dialog before typing its exact authorization phrase.
 
 ### Rebuild an eligible ISO
 
@@ -115,9 +128,9 @@ expanded drive visibility are never persisted.
 | Eligible UEFI `.iso` | ISO mode | FAT32 or verified UEFI:NTFS; currently UEFI-only. |
 | `.img`, `.raw`, `.usb`, `.wic` | DD mode | Treated as raw disk images. |
 | SquashFS `.squashfs`, `.sqfs` | DD mode | Validates and reports the standalone SquashFS 4.0 superblock before raw writing. |
-| `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, `.Z`, single-file `.zip` | Streaming DD | The expanded stream is bounded by the selected target. |
-| VHD, VHDX, QCOW, QCOW2 | Convert, then DD | Requires `qemu-img`; backing files and encrypted containers are rejected. |
-| Compressed virtual disk | Decode, convert, then DD | Exactly one supported wrapper; nested compression is rejected. |
+| `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, `.Z`, single-file `.zip` | Authenticated raw snapshot | The exact expanded bytes are privately allocated, hashed, and confirmed before writing. |
+| VHD, VHDX, QCOW, QCOW2 | Convert to authenticated snapshot | Requires `qemu-img`; backing files, QCOW2 external data files, encryption, and corrupt metadata are rejected. |
+| Compressed virtual disk | Decode and convert to snapshot | Exactly one supported wrapper; nested compression is rejected. |
 | VTSI v1.0 | Sparse restore | Requires an exact-capacity target with 512-byte logical sectors. |
 | Additive `.zip` overlay | ISO mode option | One stored/deflated archive; additions only, no overwrites or links. |
 
@@ -163,8 +176,8 @@ ISOpropyl treats every target write as a destructive transaction:
 - backup, capture, extraction, and staging outputs are created without
   overwriting existing files.
 
-The experimental device broker goes further. Its separate Syslinux and raw/DD
-profiles bind the kernel's disk-generation sequence before typed confirmation,
+The raw-device broker goes further. Its separate Syslinux and raw/DD profiles
+bind the kernel's disk-generation sequence before typed confirmation,
 check that generation again through sysfs and `BLKGETDISKSEQ`, and retain one
 exclusive target descriptor through writing, durability, cache invalidation,
 and read-back. Generic raw writes first deactivate a 1 MiB front guard plus the
@@ -172,9 +185,10 @@ source and physical target tail sectors, verify the inactive bulk data, then
 activate the source tail and front guard last. A later failure revalidates the
 same disk generation before attempting to zero every activation region again.
 Linux block `O_EXCL` and `flock` reduce races but do not exclude an uncooperative
-raw writer, so this backend still requires installed integration, VM race and
-hot-swap tests, and representative physical-media certification before the GUI
-can replace its established DD path.
+raw writer. The GUI now uses this broker exclusively for plain, compressed,
+VTSI, virtual, and compressed-virtual raw inputs, but the backend remains alpha
+software pending installed-integration VM race/hot-swap tests and representative
+physical-media certification.
 
 See [SECURITY.md](SECURITY.md) for the complete threat model and private
 vulnerability-reporting guidance.
@@ -184,12 +198,14 @@ vulnerability-reporting guidance.
 Core requirements:
 
 - Linux, Python 3.10 or newer, and PyQt6 6.5 through 6.x;
-- `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`;
+- `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`
+  (`dd` remains used by bounded backup, optical, erase, and constructed-media
+  tools, but not by the GUI raw-image writer);
 - 7-Zip (`7z`) for bounded ISO cataloging and extraction; and
 - `sfdisk` plus `mkfs.vfat` for FAT32 ISO mode, or `mkfs.ntfs` for large-file
   UEFI:NTFS media.
 
-The experimental device broker additionally requires 64-bit Linux, kernel
+The raw-device broker additionally requires 64-bit Linux, kernel
 `diskseq` sysfs data, the `BLKGETDISKSEQ` ioctl, a filesystem supporting strict
 anonymous `O_TMPFILE` snapshots, and enough private workspace for a fully
 allocated expanded image. It fails closed when any requirement is absent.
@@ -211,28 +227,28 @@ ISO mode also needs private temporary space for the extracted tree. WIM
 inspection or splitting can require several additional gigabytes. Missing
 optional tools disable the relevant path instead of weakening validation.
 
-## Experimental privileged backends
+## Privileged host integration
 
-The reviewed backend can build and patch a narrowly supported Syslinux FAT32
-image, transfer its anonymous descriptor to a fixed root-owned helper, and
-perform a same-descriptor, mandatory-read-back device transaction. A separate
-raw/DD profile can likewise transfer a fully allocated, re-attested anonymous
-regular-file snapshot into a guarded same-descriptor transaction; it supports
-images shorter than the target, mandatory pre-activation verification, optional
-complete final verification, and stale physical-tail sanitation. These paths
-are:
+The GUI raw/DD path transfers only a fully allocated, re-attested anonymous
+snapshot to a fixed root-owned helper. It supports images shorter than the
+target, mandatory pre-activation verification, optional complete final
+verification, and stale physical-tail sanitation. The same helper also contains
+a separate backend-only path for a narrowly supported Syslinux FAT32 image.
+These privileged paths are:
 
 - not installed by `pip install` or the ordinary `make install` target;
-- not yet exposed by the GUI;
-- limited to exact matched Syslinux 6.03/6.04 profiles, kernel-removable media,
-  and 512-byte logical sectors; and
+- required for every GUI raw/DD write, with failure closed when the exact host
+  integration is missing or unsafe;
+- limited to eligible removable or explicitly revealed external USB media and
+  512-byte logical sectors (the Syslinux profile additionally requires exact
+  matched 6.03/6.04 payloads); and
 - still gated on native-helper hardening, an installed PolicyKit integration
   test, QEMU SeaBIOS/OVMF results, and representative physical media.
 
 Distribution integrators can stage the isolated launcher, helper, and two exact
-PolicyKit actions with `make install-host-helper PREFIX=/usr`. That target is
-for packaging and backend validation—not an invitation to bypass the GUI gate
-or write irreplaceable media.
+PolicyKit actions with `make install-host-helper PREFIX=/usr`. Source testers
+must invoke it with root privileges as shown above. It does not make alpha media
+writes risk-free; test with expendable media and keep verification enabled.
 
 ## Troubleshooting
 

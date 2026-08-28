@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import array
 import fcntl
+import gzip
 import hashlib
 import os
 import socket
 import stat
+import struct
 import tempfile
 import unittest
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,11 +26,62 @@ from isopropyl.raw_snapshot import (
     RawSnapshotError,
     RawSnapshotOperations,
     RawSnapshotState,
+    build_image_source_snapshot_plan,
+    build_materialized_snapshot_plan,
     build_raw_snapshot_plan,
     observe_raw_source,
+    prepare_image_source_snapshot,
+    prepare_materialized_snapshot,
     prepare_raw_snapshot,
     validate_raw_snapshot_plan,
 )
+from isopropyl.sources import ImageSource, open_image_source
+
+
+def vtsi_fixture(path: Path, *, disk_sectors: int = 12) -> bytes:
+    sector_size = 512
+    signature = 0x78563412
+    sector_zero = bytearray(b"A" * sector_size)
+    sector_zero[440:444] = signature.to_bytes(4, "little")
+    segments = (
+        (0, bytes(sector_zero)),
+        (3, b"B" * (2 * sector_size)),
+        (disk_sectors - 1, b"Z" * sector_size),
+    )
+    data = bytearray()
+    records = bytearray()
+    for disk_start, payload in segments:
+        records.extend(struct.pack(
+            "<QQQ",
+            disk_start,
+            len(payload) // sector_size,
+            len(data),
+        ))
+        data.extend(payload)
+    segment_offset = len(data)
+    padding = b"\0" * (-len(records) % sector_size)
+    footer = bytearray(sector_size)
+    struct.pack_into(
+        "<8sHHQIIIIQ",
+        footer,
+        0,
+        b"VENTOY\0\0",
+        1,
+        0,
+        disk_sectors * sector_size,
+        signature,
+        0,
+        len(segments),
+        (~sum(records)) & 0xFFFFFFFF,
+        segment_offset,
+    )
+    struct.pack_into("<I", footer, 24, (~sum(footer)) & 0xFFFFFFFF)
+    path.write_bytes(bytes(data) + bytes(records) + padding + bytes(footer))
+    expanded = bytearray(disk_sectors * sector_size)
+    for disk_start, payload in segments:
+        offset = disk_start * sector_size
+        expanded[offset:offset + len(payload)] = payload
+    return bytes(expanded)
 
 
 class RawSnapshotTests(unittest.TestCase):
@@ -52,6 +106,38 @@ class RawSnapshotTests(unittest.TestCase):
             self.source,
             self.workspace,
             expected_source_identity=selected,
+            target_device_numbers=self.target_numbers,
+        )
+
+    def image_plan(
+        self,
+        source: ImageSource,
+        expected_size: int,
+        profile: str,
+    ):
+        return build_image_source_snapshot_plan(
+            source,
+            self.workspace,
+            expected_expanded_size=expected_size,
+            materialization_profile=profile,
+            requires_exact_target_size=source.requires_exact_target_size,
+            required_logical_sector_size=(
+                source.required_logical_sector_size or None
+            ),
+            target_device_numbers=self.target_numbers,
+        )
+
+    def virtual_plan(
+        self,
+        source: ImageSource,
+        expected_size: int,
+        profile: str,
+    ):
+        return build_materialized_snapshot_plan(
+            source,
+            self.workspace,
+            expected_expanded_size=expected_size,
+            materialization_profile=profile,
             target_device_numbers=self.target_numbers,
         )
 
@@ -83,6 +169,15 @@ class RawSnapshotTests(unittest.TestCase):
                 raise AssertionError("descriptor ended early")
             data.extend(block)
         return bytes(data)
+
+    @staticmethod
+    def write_descriptor(descriptor: int, payload: bytes) -> None:
+        written = 0
+        while written < len(payload):
+            count = os.pwrite(descriptor, payload[written:], written)
+            if count <= 0:
+                raise AssertionError("test descriptor write made no progress")
+            written += count
 
     def test_real_snapshot_is_private_preallocated_hashed_and_transferable_once(self):
         plan = self.plan()
@@ -465,6 +560,409 @@ class RawSnapshotTests(unittest.TestCase):
         finally:
             prepared.close()
             parent.close()
+
+    def test_bound_plain_gzip_and_zip_sources_materialize_exact_bytes(self):
+        plain = self.root / "bound.img"
+        compressed = self.root / "bound.img.gz"
+        archive = self.root / "bound.zip"
+        plain.write_bytes(self.payload)
+        compressed.write_bytes(gzip.compress(self.payload, mtime=0))
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            output.writestr("nested/bound.img", self.payload)
+
+        for path, profile in (
+            (plain, "plain"),
+            (compressed, "compressed"),
+            (archive, "compressed"),
+        ):
+            with self.subTest(path=path.name), open_image_source(path) as source:
+                plan = self.image_plan(source, len(self.payload), profile)
+                validate_raw_snapshot_plan(plan)
+                updates: list[tuple[int, int]] = []
+                with prepare_image_source_snapshot(
+                    plan,
+                    progress=lambda done, total: updates.append((done, total)),
+                ) as prepared:
+                    result = prepared.result
+                    self.assertEqual(result.materialization_profile, profile)
+                    self.assertFalse(result.requires_exact_target_size)
+                    self.assertIsNone(result.required_logical_sector_size)
+                    self.assertEqual(result.source_identity, plan.source_identity)
+                    self.assertEqual(result.image_size, len(self.payload))
+                    self.assertEqual(
+                        result.image_sha256,
+                        hashlib.sha256(self.payload).hexdigest(),
+                    )
+                    self.assertEqual(
+                        self.descriptor_bytes(
+                            prepared._descriptor,
+                            len(self.payload),
+                        ),
+                        self.payload,
+                    )
+                self.assertEqual(updates[0], (0, len(self.payload)))
+                self.assertEqual(updates[-1], (len(self.payload), len(self.payload)))
+                self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_real_vtsi_materialization_carries_exact_target_constraints(self):
+        path = self.root / "disk.vtsi"
+        expanded = vtsi_fixture(path)
+        with open_image_source(path) as source:
+            self.assertEqual(source.measure(), len(expanded))
+            plan = self.image_plan(source, len(expanded), "vtsi")
+            self.assertTrue(plan.requires_exact_target_size)
+            self.assertEqual(plan.required_logical_sector_size, 512)
+            with prepare_image_source_snapshot(plan) as prepared:
+                result = prepared.result
+                self.assertEqual(result.materialization_profile, "vtsi")
+                self.assertTrue(result.requires_exact_target_size)
+                self.assertEqual(result.required_logical_sector_size, 512)
+                self.assertEqual(
+                    self.descriptor_bytes(prepared._descriptor, len(expanded)),
+                    expanded,
+                )
+
+    def test_materialized_stream_rejects_short_and_extra_expanded_bytes(self):
+        path = self.root / "wrong-length.img.gz"
+        path.write_bytes(gzip.compress(self.payload, mtime=0))
+        with open_image_source(path) as source:
+            for expected, message in (
+                (len(self.payload) - 1, "more|size"),
+                (len(self.payload) + 1, "ended|expected"),
+            ):
+                plan = self.image_plan(source, expected, "compressed")
+                with self.subTest(expected=expected), self.assertRaisesRegex(
+                    RawSnapshotError,
+                    message,
+                ):
+                    prepare_image_source_snapshot(plan)
+                self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_outer_source_mutation_is_rejected_before_decoded_bytes_are_written(self):
+        path = self.root / "mutable.img.gz"
+        path.write_bytes(gzip.compress(self.payload, mtime=0))
+        with open_image_source(path) as source:
+            plan = self.image_plan(source, len(self.payload), "compressed")
+            original_chunks = source.chunks
+            changed = False
+
+            def mutating_chunks(*args, **kwargs):
+                nonlocal changed
+                for block in original_chunks(*args, **kwargs):
+                    if not changed:
+                        changed = True
+                        before = path.stat()
+                        with path.open("r+b", buffering=0) as stream:
+                            stream.seek(0)
+                            stream.write(b"X")
+                        os.utime(
+                            path,
+                            ns=(before.st_atime_ns, before.st_mtime_ns),
+                        )
+                    yield block
+
+            with (
+                patch.object(source, "chunks", new=mutating_chunks),
+                self.assertRaisesRegex(RawSnapshotError, "changed"),
+            ):
+                prepare_image_source_snapshot(plan)
+            self.assertTrue(changed)
+            self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_materialized_snapshot_cancel_and_forged_constraints_fail_closed(self):
+        path = self.root / "cancel.img.gz"
+        path.write_bytes(gzip.compress(self.payload, mtime=0))
+        with open_image_source(path) as source:
+            plan = self.image_plan(source, len(self.payload), "compressed")
+            for forged in (
+                replace(plan, materialization_profile="plain"),
+                replace(plan, requires_exact_target_size=True),
+                replace(plan, required_logical_sector_size=512),
+                replace(plan, image_size=plan.image_size + 1),
+                replace(plan, _bound_source=None),
+            ):
+                with self.subTest(forged=forged), self.assertRaisesRegex(
+                    RawSnapshotError,
+                    "forged|authentic",
+                ):
+                    validate_raw_snapshot_plan(forged)
+
+            with self.assertRaisesRegex(RawSnapshotError, "constraints"):
+                build_image_source_snapshot_plan(
+                    source,
+                    self.workspace,
+                    expected_expanded_size=len(self.payload),
+                    materialization_profile="plain",
+                    requires_exact_target_size=False,
+                    required_logical_sector_size=None,
+                    target_device_numbers=self.target_numbers,
+                )
+
+            builder = RawSnapshotBuilder()
+
+            def cancel_at_start(done: int, _total: int) -> None:
+                if done == 0:
+                    builder.cancel()
+
+            with self.assertRaisesRegex(RawSnapshotCancelled, "cancelled"):
+                builder.execute(plan, progress=cancel_at_start)
+            self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_virtual_and_compressed_virtual_materializers_are_authenticated(self):
+        virtual = self.root / "guest.qcow2"
+        compressed = self.root / "guest.qcow2.gz"
+        virtual.write_bytes(b"bound virtual container")
+        compressed.write_bytes(gzip.compress(b"bound virtual container", mtime=0))
+
+        for path, profile in (
+            (virtual, "virtual"),
+            (compressed, "compressed-virtual"),
+        ):
+            with self.subTest(profile=profile), open_image_source(path) as source:
+                plan = self.virtual_plan(source, len(self.payload), profile)
+                updates: list[tuple[int, int]] = []
+                callback_descriptors: list[int] = []
+
+                def materialize(descriptor: int, check) -> None:
+                    callback_descriptors.append(descriptor)
+                    status = os.fstat(descriptor)
+                    self.assertEqual(status.st_nlink, 0)
+                    self.assertEqual(status.st_size, 0)
+                    self.assertEqual(stat.S_IMODE(status.st_mode), 0o600)
+                    self.assertEqual(
+                        fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE,
+                        os.O_RDWR,
+                    )
+                    self.assertTrue(
+                        fcntl.fcntl(descriptor, fcntl.F_GETFD) & fcntl.FD_CLOEXEC,
+                    )
+                    check()
+                    os.ftruncate(descriptor, len(self.payload))
+                    self.write_descriptor(descriptor, self.payload)
+                    check()
+
+                with prepare_materialized_snapshot(
+                    plan,
+                    materialize,
+                    progress=lambda done, total: updates.append((done, total)),
+                ) as prepared:
+                    self.assertEqual(prepared.result.materialization_profile, profile)
+                    self.assertFalse(prepared.result.requires_exact_target_size)
+                    self.assertIsNone(prepared.result.required_logical_sector_size)
+                    self.assertEqual(
+                        prepared.result.image_sha256,
+                        hashlib.sha256(self.payload).hexdigest(),
+                    )
+                    self.assertEqual(
+                        self.descriptor_bytes(prepared._descriptor, len(self.payload)),
+                        self.payload,
+                    )
+                    os.fstat(source.fileno())
+                self.assertEqual(
+                    updates,
+                    [(0, len(self.payload)), (len(self.payload), len(self.payload))],
+                )
+                with self.assertRaises(OSError):
+                    os.fstat(callback_descriptors[0])
+                os.fstat(source.fileno())
+                self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_sparse_virtual_output_is_fully_allocated_and_double_hashed(self):
+        path = self.root / "sparse.vhdx"
+        path.write_bytes(b"virtual container")
+        expanded_size = 4 * 1024 * 1024
+        expected = b"A" + b"\0" * (expanded_size - 2) + b"Z"
+        read_bytes = 0
+        sparse_blocks: list[int] = []
+
+        def counting_pread(descriptor: int, length: int, offset: int) -> bytes:
+            nonlocal read_bytes
+            block = os.pread(descriptor, length, offset)
+            read_bytes += len(block)
+            return block
+
+        operations = RawSnapshotOperations(pread=counting_pread)
+        with open_image_source(path) as source:
+            plan = self.virtual_plan(source, expanded_size, "virtual")
+
+            def sparse_materializer(descriptor: int, check) -> None:
+                os.ftruncate(descriptor, expanded_size)
+                os.pwrite(descriptor, b"A", 0)
+                os.pwrite(descriptor, b"Z", expanded_size - 1)
+                sparse_blocks.append(os.fstat(descriptor).st_blocks)
+                check()
+
+            builder = RawSnapshotBuilder(operations=operations)
+            with builder.execute_materialized(plan, sparse_materializer) as prepared:
+                self.assertLess(sparse_blocks[0] * 512, expanded_size)
+                self.assertGreaterEqual(
+                    prepared.result.snapshot_identity.blocks * 512,
+                    expanded_size,
+                )
+                self.assertEqual(
+                    prepared.result.image_sha256,
+                    hashlib.sha256(expected).hexdigest(),
+                )
+                self.assertEqual(
+                    self.descriptor_bytes(prepared._descriptor, expanded_size),
+                    expected,
+                )
+        self.assertEqual(read_bytes, expanded_size * 2)
+
+    def test_virtual_materializer_failure_cancel_and_wrong_sizes_clean_up(self):
+        path = self.root / "failure.qcow2"
+        path.write_bytes(b"virtual container")
+        expected_size = 8192
+        with open_image_source(path) as source:
+            plan = self.virtual_plan(source, expected_size, "virtual")
+
+            def fail(_descriptor: int, check) -> None:
+                check()
+                raise ValueError("callback exploded")
+
+            with self.assertRaisesRegex(RawSnapshotError, "callback exploded"):
+                prepare_materialized_snapshot(plan, fail)
+            os.fstat(source.fileno())
+
+            for size in (expected_size - 1, expected_size + 1):
+                def wrong_size(descriptor: int, _check, size=size) -> None:
+                    os.ftruncate(descriptor, size)
+
+                with self.subTest(size=size), self.assertRaisesRegex(
+                    RawSnapshotError,
+                    "exact private",
+                ):
+                    prepare_materialized_snapshot(plan, wrong_size)
+
+            builder = RawSnapshotBuilder()
+
+            def cancel(_descriptor: int, check) -> None:
+                builder.cancel()
+                check()
+
+            with self.assertRaisesRegex(RawSnapshotCancelled, "cancelled"):
+                builder.execute_materialized(plan, cancel)
+            os.fstat(source.fileno())
+        self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_materializer_fd_substitution_does_not_close_caller_descriptor(self):
+        path = self.root / "substitute.vhd"
+        path.write_bytes(b"virtual container")
+        caller_path = self.root / "caller-owned"
+        caller_path.write_bytes(b"caller")
+        caller_descriptor = os.open(caller_path, os.O_RDWR)
+        substituted = -1
+        try:
+            with open_image_source(path) as source:
+                plan = self.virtual_plan(source, 4096, "virtual")
+
+                def substitute(descriptor: int, _check) -> None:
+                    nonlocal substituted
+                    substituted = descriptor
+                    os.dup2(caller_descriptor, descriptor)
+                    os.ftruncate(descriptor, 4096)
+
+                with self.assertRaisesRegex(
+                    RawSnapshotError,
+                    "closed or substituted",
+                ):
+                    prepare_materialized_snapshot(plan, substitute)
+                self.assertEqual(
+                    os.fstat(substituted).st_ino,
+                    os.fstat(caller_descriptor).st_ino,
+                )
+                os.fstat(source.fileno())
+        finally:
+            if substituted >= 0 and substituted != caller_descriptor:
+                os.close(substituted)
+            os.close(caller_descriptor)
+
+    def test_linked_mode_mutated_and_unlocked_destinations_fail_closed(self):
+        path = self.root / "identity.qcow2"
+        path.write_bytes(b"virtual container")
+        with open_image_source(path) as source:
+            plan = self.virtual_plan(source, 4096, "virtual")
+            named = self.root / "named-output"
+            named_descriptor = os.open(
+                named,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                0o600,
+            )
+            called = False
+
+            def must_not_run(_descriptor: int, _check) -> None:
+                nonlocal called
+                called = True
+
+            with patch.object(
+                RawSnapshotBuilder,
+                "_open_anonymous",
+                return_value=named_descriptor,
+            ):
+                with self.assertRaisesRegex(RawSnapshotError, "unlinked"):
+                    prepare_materialized_snapshot(plan, must_not_run)
+            self.assertFalse(called)
+            named.unlink()
+
+            def mutate_mode(descriptor: int, _check) -> None:
+                os.ftruncate(descriptor, 4096)
+                os.fchmod(descriptor, 0o644)
+
+            with self.assertRaisesRegex(RawSnapshotError, "private"):
+                prepare_materialized_snapshot(plan, mutate_mode)
+
+            def unlock(descriptor: int, _check) -> None:
+                os.ftruncate(descriptor, 4096)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+            with self.assertRaisesRegex(RawSnapshotError, "lock was released"):
+                prepare_materialized_snapshot(plan, unlock)
+        self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_virtual_outer_identity_and_plan_profile_forgery_fail_closed(self):
+        path = self.root / "mutable.qcow2"
+        outer = b"virtual container"
+        path.write_bytes(outer)
+        with open_image_source(path) as source:
+            source_descriptor = source.fileno()
+            plan = self.virtual_plan(source, 4096, "virtual")
+            for forged in (
+                replace(plan),
+                replace(plan, materialization_profile="compressed-virtual"),
+                replace(plan, requires_exact_target_size=True),
+                replace(plan, required_logical_sector_size=512),
+                replace(plan, image_size=8192),
+            ):
+                with self.subTest(forged=forged), self.assertRaisesRegex(
+                    RawSnapshotError,
+                    "forged|authentic",
+                ):
+                    validate_raw_snapshot_plan(forged)
+
+            with self.assertRaisesRegex(RawSnapshotError, "stream materialization"):
+                build_image_source_snapshot_plan(
+                    source,
+                    self.workspace,
+                    expected_expanded_size=4096,
+                    materialization_profile="virtual",
+                    requires_exact_target_size=False,
+                    required_logical_sector_size=None,
+                    target_device_numbers=self.target_numbers,
+                )
+            with self.assertRaisesRegex(RawSnapshotError, "execute_materialized"):
+                RawSnapshotBuilder().execute(plan)
+
+            def mutate_source(descriptor: int, check) -> None:
+                os.ftruncate(descriptor, 4096)
+                before = path.stat()
+                path.write_bytes(b"X" * len(outer))
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                check()
+
+            with self.assertRaisesRegex(RawSnapshotError, "changed"):
+                prepare_materialized_snapshot(plan, mutate_source)
+            os.fstat(source_descriptor)
+        self.assertEqual(os.listdir(self.workspace), [])
 
     def test_context_close_discards_untransferred_snapshot(self):
         with prepare_raw_snapshot(self.plan()) as prepared:

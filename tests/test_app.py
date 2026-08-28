@@ -58,10 +58,14 @@ from isopropyl.runtime_validation import (
     RUNTIME_VALIDATION_VERSION, PreparedRuntimeValidation,
     RuntimeValidationCancelled,
 )
+from isopropyl.raw_device import RawDeviceWritePlan
+from isopropyl.raw_device_runner import RawDeviceWriteResult
+from isopropyl.raw_workflow import RawWorkflowCancelled, RawWorkflowError
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
 from isopropyl.wim import WimEdition, WimInfo, WimSelection
 from isopropyl.windows import WindowsCustomization
+from isopropyl.writer import ImageWriter
 from isopropyl.zip_overlay import ZipOverlayPlan, build_zip_overlay_plan
 from tests.test_fat_image import make_fat, write_container
 
@@ -146,6 +150,88 @@ class ImmediateThread:
 
     def start(self) -> None:
         self.target()
+
+
+def fake_raw_plan(target: Device | None = None) -> RawDeviceWritePlan:
+    plan = object.__new__(RawDeviceWritePlan)
+    values = {
+        "device": target or device(),
+        "source_size": 4096,
+        "source_sha256": "a" * 64,
+        "target_capacity": (target or device()).size,
+        "logical_sector_size": 512,
+        "warnings": ("The target will be overwritten.",),
+        "confirmation_phrase": "WRITE RAW /dev/sdz 65:144",
+        "plan_sha256": "b" * 64,
+    }
+    for name, value in values.items():
+        object.__setattr__(plan, name, value)
+    return plan
+
+
+def fake_raw_result(*, final_verification: bool = True) -> RawDeviceWriteResult:
+    result = object.__new__(RawDeviceWriteResult)
+    object.__setattr__(result, "final_verification", final_verification)
+    return result
+
+
+class FakeRawWorkflow:
+    def __init__(
+        self,
+        inspection: ImageInspection,
+        *,
+        target: Device | None = None,
+        prepare_error: BaseException | None = None,
+        execute_error: BaseException | None = None,
+        final_verification: bool = True,
+    ) -> None:
+        self.inspection = inspection
+        self.plan = fake_raw_plan(target)
+        self.result = fake_raw_result(final_verification=final_verification)
+        self.prepare_error = prepare_error
+        self.execute_error = execute_error
+        self.cancelled = False
+        self.closed = False
+        self.prepared = False
+        self.confirmed_phrase: str | None = None
+        self.executed = False
+        self.progress_stages: list[str] = []
+
+    def prepare(self, progress) -> RawDeviceWritePlan:
+        if self.cancelled:
+            raise RawWorkflowCancelled("cancelled")
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        self.prepared = True
+        progress("snapshot", 4096, 4096)
+        return self.plan
+
+    def confirm(self, phrase: str) -> object:
+        if self.cancelled:
+            raise RawWorkflowCancelled("cancelled")
+        if phrase != self.plan.confirmation_phrase:
+            raise RawWorkflowError("confirmation mismatch")
+        self.confirmed_phrase = phrase
+        return object()
+
+    def execute(self, progress) -> RawDeviceWriteResult:
+        if self.cancelled:
+            raise RawWorkflowCancelled("cancelled")
+        if self.execute_error is not None:
+            raise self.execute_error
+        self.executed = True
+        for stage in (
+            "source-validation", "writing", "preactivation-readback", "readback",
+        ):
+            self.progress_stages.append(stage)
+            progress(stage, 4096, 4096)
+        return self.result
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def make_zip_overlay(root: Path, path: str = "extras/readme.txt") -> ZipOverlayPlan:
@@ -949,6 +1035,7 @@ class WindowWriteMethodTests(unittest.TestCase):
             "Ventoy sparse image restore",
             warning.call_args.args[2],
         )
+        self.assertIn("not unmounted or mutated", warning.call_args.args[2])
 
     def test_vtsi_target_geometry_disables_restore(self):
         self.window.inspection = replace(
@@ -1004,6 +1091,7 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertIn("Compressed file:", warning.call_args.args[2])
         self.assertIn("Decoded container:", warning.call_args.args[2])
         self.assertIn("Guest-visible disk:", warning.call_args.args[2])
+        self.assertIn("not unmounted or mutated", warning.call_args.args[2])
 
     def test_catalog_times_reach_execution_and_plan_preview_entries(self):
         modified_ns = 1_709_210_096_123_456_789
@@ -2363,7 +2451,7 @@ class WindowWriteMethodTests(unittest.TestCase):
 
         def consent(*args, **kwargs):
             nonlocal changed
-            if args[1] == "Erase removable drive?":
+            if args[1] == "Prepare authenticated raw write?":
                 self.window.image.write_bytes(b"changed")
                 os.utime(
                     self.window.image,
@@ -2383,229 +2471,240 @@ class WindowWriteMethodTests(unittest.TestCase):
         start_write.assert_not_called()
         self.assertEqual(warning.call_args.args[1], "Image changed")
 
-    def test_start_write_rejects_fresh_target_sector_change(self):
+    def test_every_raw_profile_uses_workflow_and_never_legacy_writer(self):
         status = self.window.image.stat()
         identity = (
             status.st_dev, status.st_ino, status.st_size,
             status.st_mtime_ns, status.st_ctime_ns,
         )
-        backend = Mock()
-        backend.cancelled = False
-        refreshed = replace(device(), logical_sector_size=4096)
+        profiles = {
+            "plain": {},
+            "compressed": {"compression": "gzip"},
+            "vtsi": {"sparse_format": "VTSI"},
+            "virtual": {"virtual_format": "VHDX"},
+            "compressed-virtual": {
+                "compression": "gzip",
+                "virtual_format": "VHDX",
+            },
+        }
+        forbidden = AssertionError("legacy ImageWriter path was reached")
+        for profile, changes in profiles.items():
+            with self.subTest(profile=profile):
+                image_inspection = replace(
+                    optical_windows_inspection(),
+                    size=4096,
+                    container_size=status.st_size,
+                    decoded_container_size=4096,
+                    **changes,
+                )
+                self.window.inspection = image_inspection
+                workflow = FakeRawWorkflow(image_inspection)
+
+                def confirm(plan):
+                    self.assertIs(plan, workflow.plan)
+                    self.assertIs(self.window.raw_workflow, workflow)
+                    self.assertTrue(self.window.operation_active)
+                    return workflow.plan.confirmation_phrase
+
+                with (
+                    patch("isopropyl.app.RawWriteWorkflow", return_value=workflow) as factory,
+                    patch.object(
+                        self.window,
+                        "confirm_raw_write_plan",
+                        side_effect=confirm,
+                    ),
+                    patch.object(ImageWriter, "write", side_effect=forbidden),
+                    patch.object(ImageWriter, "_write_stream", side_effect=forbidden),
+                    patch.object(ImageWriter, "verify", side_effect=forbidden),
+                    patch("isopropyl.app.threading.Thread", ImmediateThread),
+                    patch("isopropyl.app.QMessageBox.information"),
+                    patch.object(self.window, "refresh_devices"),
+                ):
+                    self.window.start_write(
+                        self.window.image, device(), True, identity,
+                    )
+
+                factory.assert_called_once()
+                self.assertIs(factory.call_args.args[1], image_inspection)
+                self.assertEqual(factory.call_args.args[3], identity)
+                self.assertTrue(workflow.prepared)
+                self.assertEqual(
+                    workflow.confirmed_phrase,
+                    workflow.plan.confirmation_phrase,
+                )
+                self.assertTrue(workflow.executed)
+                self.assertTrue(workflow.closed)
+                self.assertIsNone(self.window.raw_workflow)
+                self.assertFalse(self.window.operation_active)
+
+    def test_typed_confirmation_rejection_releases_preparation_without_execute(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        workflow = FakeRawWorkflow(self.window.inspection)
+        forbidden = AssertionError("legacy ImageWriter path was reached")
         with (
-            patch("isopropyl.app.ImageWriter", return_value=backend),
-            patch("isopropyl.app.list_devices", return_value=[refreshed]),
+            patch("isopropyl.app.RawWriteWorkflow", return_value=workflow),
+            patch.object(self.window, "confirm_raw_write_plan", return_value=None),
+            patch.object(ImageWriter, "write", side_effect=forbidden),
+            patch.object(ImageWriter, "_write_stream", side_effect=forbidden),
+            patch.object(ImageWriter, "verify", side_effect=forbidden),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            self.window.start_write(self.window.image, device(), True, identity)
+
+        self.assertTrue(workflow.prepared)
+        self.assertIsNone(workflow.confirmed_phrase)
+        self.assertFalse(workflow.executed)
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertIn("before target mutation", self.window.status.text())
+
+    def test_wrong_typed_phrase_fails_closed_and_releases_preparation(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        workflow = FakeRawWorkflow(self.window.inspection)
+        with (
+            patch("isopropyl.app.RawWriteWorkflow", return_value=workflow),
+            patch.object(self.window, "confirm_raw_write_plan", return_value="wrong"),
             patch("isopropyl.app.threading.Thread", ImmediateThread),
             patch("isopropyl.app.QMessageBox.critical") as critical,
-            patch.object(self.window.logger, "exception"),
-        ):
-            self.window.start_write(
-                self.window.image, device(), False, identity,
-            )
-
-        backend.write.assert_not_called()
-        self.assertTrue(critical.called)
-        self.assertIn("logical sector size changed", critical.call_args.args[2])
-
-    def test_virtual_write_binds_reopened_container_to_consent_identity(self):
-        status = self.window.image.stat()
-        identity = (
-            status.st_dev, status.st_ino, status.st_size,
-            status.st_mtime_ns, status.st_ctime_ns,
-        )
-        self.window.inspection = replace(
-            optical_windows_inspection(), virtual_format="VHDX",
-        )
-        backend = Mock()
-        backend.cancelled = False
-        virtual_info = Mock()
-        virtual_info.identity.device = identity[0]
-        virtual_info.identity.inode = identity[1] + 1
-        virtual_info.identity.size = identity[2]
-        virtual_info.identity.modified_ns = identity[3]
-        virtual_info.identity.changed_ns = identity[4]
-        with (
-            patch("isopropyl.app.ImageWriter", return_value=backend),
-            patch("isopropyl.app.list_devices", return_value=[device()]),
-            patch("isopropyl.app.inspect_virtual_disk", return_value=virtual_info),
-            patch("isopropyl.app.threading.Thread", ImmediateThread),
-            patch("isopropyl.app.QMessageBox.critical") as critical,
-            patch.object(self.window.logger, "exception"),
-        ):
-            self.window.start_write(
-                self.window.image, device(), False, identity,
-            )
-
-        backend.write.assert_not_called()
-        self.assertTrue(critical.called)
-        self.assertIn("virtual disk changed", critical.call_args.args[2])
-
-    def test_compressed_virtual_write_rebinds_decodes_converts_and_verifies_raw(self):
-        status = self.window.image.stat()
-        identity = (
-            status.st_dev, status.st_ino, status.st_size,
-            status.st_mtime_ns, status.st_ctime_ns,
-        )
-        self.window.inspection = replace(
-            optical_windows_inspection(),
-            size=4096,
-            virtual_format="VHDX",
-            compression="gzip",
-            container_size=status.st_size,
-            decoded_container_size=1024,
-        )
-        raw = Path(self.settings_home.name) / "prepared.raw"
-        raw.write_bytes(b"R" * 4096)
-        info = Mock()
-        prepared = Mock(info=info)
-        prepared.info = info
-        converted = Mock(path=raw)
-        converted.path = raw
-        preparer = Mock()
-        preparer.prepare.return_value = prepared
-        converter = Mock()
-        converter.stage.return_value = converted
-        backend = Mock()
-        backend.cancelled = False
-        backend.verify.return_value = True
-        backend.power_off.return_value = False
-
-        with (
-            patch("isopropyl.app.ImageWriter", return_value=backend),
-            patch(
-                "isopropyl.app.CompressedVirtualDiskPreparer",
-                return_value=preparer,
-            ),
-            patch("isopropyl.app.VirtualDiskStager", return_value=converter),
-            patch("isopropyl.app.list_devices", return_value=[device()]),
-            patch("isopropyl.app.image_is_on_device", return_value=False),
-            patch("isopropyl.app.path_is_on_device", return_value=False),
-            patch("isopropyl.app.threading.Thread", ImmediateThread),
-            patch("isopropyl.app.QMessageBox.information") as information,
             patch.object(self.window, "refresh_devices"),
         ):
-            self.window.start_write(
-                self.window.image, device(), True, identity,
-            )
+            self.window.start_write(self.window.image, device(), True, identity)
 
-        kwargs = preparer.prepare.call_args.kwargs
-        self.assertEqual(kwargs["expected_identity"], identity)
-        self.assertEqual(kwargs["expected_format"], "vhdx")
-        self.assertEqual(kwargs["expected_virtual_size"], 4096)
-        converter.stage.assert_called_once()
-        self.assertIs(converter.stage.call_args.args[0], info)
-        self.assertEqual(backend.write.call_args.args[0], raw)
-        self.assertIsNone(backend.write.call_args.kwargs["expected_identity"])
-        backend.verify.assert_called_once()
-        self.assertEqual(backend.verify.call_args.args[:2], (raw, "/dev/sdz"))
-        converted.close.assert_called_once()
-        prepared.close.assert_called_once()
-        information.assert_called_once()
+        self.assertTrue(workflow.prepared)
+        self.assertFalse(workflow.executed)
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertIn("confirmation mismatch", critical.call_args.args[2])
 
-    def test_virtual_write_rejects_target_resident_temporary_root_before_staging(self):
+    def test_raw_workflow_cancellation_fans_out_and_cleans_up(self):
         status = self.window.image.stat()
         identity = (
             status.st_dev, status.st_ino, status.st_size,
             status.st_mtime_ns, status.st_ctime_ns,
         )
-        for compression in ("none", "gzip"):
-            with self.subTest(compression=compression):
-                self.window.inspection = replace(
-                    optical_windows_inspection(),
-                    size=4096,
-                    virtual_format="VHDX",
-                    compression=compression,
-                )
-                backend = Mock(cancelled=False)
-                preparer = Mock()
-                converter = Mock()
-                with (
-                    patch("isopropyl.app.ImageWriter", return_value=backend),
-                    patch(
-                        "isopropyl.app.CompressedVirtualDiskPreparer",
-                        return_value=preparer,
-                    ),
-                    patch("isopropyl.app.VirtualDiskStager", return_value=converter),
-                    patch("isopropyl.app.list_devices", return_value=[device()]),
-                    patch("isopropyl.app.image_is_on_device", return_value=False),
-                    patch("isopropyl.app.path_is_on_device", return_value=True),
-                    patch("isopropyl.app.threading.Thread", ImmediateThread),
-                    patch("isopropyl.app.QMessageBox.critical") as critical,
-                    patch.object(self.window, "refresh_devices"),
-                    patch.object(self.window.logger, "exception"),
-                ):
-                    self.window.start_write(
-                        self.window.image, device(), False, identity,
-                    )
+        workflow = FakeRawWorkflow(self.window.inspection)
+        pending: list[object] = []
 
-                preparer.prepare.assert_not_called()
-                converter.stage.assert_not_called()
-                backend.write.assert_not_called()
-                self.assertIn(
-                    "temporary staging directory", critical.call_args.args[2],
-                )
+        class DeferredThread:
+            def __init__(thread_self, *, target, daemon=False):
+                pending.append(target)
 
-    def test_virtual_write_rechecks_private_stage_location_and_cleans_it(self):
+            def start(thread_self):
+                pass
+
+        with (
+            patch("isopropyl.app.RawWriteWorkflow", return_value=workflow),
+            patch("isopropyl.app.threading.Thread", DeferredThread),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_write(self.window.image, device(), True, identity)
+            self.assertTrue(self.window.operation_active)
+            self.window.cancel()
+            self.assertTrue(workflow.cancelled)
+            pending.pop(0)()
+
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertIn("not mutated", self.window.status.text())
+
+    def test_close_fans_through_raw_workflow_cancellation(self):
         status = self.window.image.stat()
         identity = (
             status.st_dev, status.st_ino, status.st_size,
             status.st_mtime_ns, status.st_ctime_ns,
         )
-        raw = Path(self.settings_home.name) / "target-resident.raw"
-        raw.write_bytes(b"R" * 4096)
-        for compression in ("none", "gzip"):
-            with self.subTest(compression=compression):
-                self.window.inspection = replace(
-                    optical_windows_inspection(),
-                    size=4096,
-                    virtual_format="VHDX",
-                    compression=compression,
-                )
-                info = Mock()
-                for field, value in zip(
-                    ("device", "inode", "size", "modified_ns", "changed_ns"),
-                    identity,
-                ):
-                    setattr(info.identity, field, value)
-                prepared = Mock(info=info)
-                prepared.info = info
-                converted = Mock(path=raw)
-                converted.path = raw
-                preparer = Mock()
-                preparer.prepare.return_value = prepared
-                converter = Mock()
-                converter.stage.return_value = converted
-                backend = Mock(cancelled=False)
-                with (
-                    patch("isopropyl.app.ImageWriter", return_value=backend),
-                    patch(
-                        "isopropyl.app.CompressedVirtualDiskPreparer",
-                        return_value=preparer,
-                    ),
-                    patch("isopropyl.app.VirtualDiskStager", return_value=converter),
-                    patch("isopropyl.app.inspect_virtual_disk", return_value=info),
-                    patch("isopropyl.app.list_devices", return_value=[device()]),
-                    patch(
-                        "isopropyl.app.image_is_on_device",
-                        side_effect=(False, True),
-                    ),
-                    patch("isopropyl.app.path_is_on_device", return_value=False),
-                    patch("isopropyl.app.threading.Thread", ImmediateThread),
-                    patch("isopropyl.app.QMessageBox.critical") as critical,
-                    patch.object(self.window, "refresh_devices"),
-                    patch.object(self.window.logger, "exception"),
-                ):
-                    self.window.start_write(
-                        self.window.image, device(), False, identity,
-                    )
+        workflow = FakeRawWorkflow(self.window.inspection)
+        pending: list[object] = []
 
-                backend.write.assert_not_called()
-                converted.close.assert_called_once()
-                if compression == "gzip":
-                    prepared.close.assert_called_once()
-                self.assertIn(
-                    "private virtual-disk stage", critical.call_args.args[2],
-                )
+        class DeferredThread:
+            def __init__(thread_self, *, target, daemon=False):
+                pending.append(target)
+
+            def start(thread_self):
+                pass
+
+        event = Mock()
+        with (
+            patch("isopropyl.app.RawWriteWorkflow", return_value=workflow),
+            patch("isopropyl.app.threading.Thread", DeferredThread),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_write(self.window.image, device(), True, identity)
+            self.window.closeEvent(event)
+            self.assertTrue(workflow.cancelled)
+            pending.pop(0)()
+
+        event.ignore.assert_called_once()
+        event.accept.assert_not_called()
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+
+    def test_missing_raw_helper_fails_closed_and_releases_workflow(self):
+        status = self.window.image.stat()
+        identity = (
+            status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        workflow = FakeRawWorkflow(
+            self.window.inspection,
+            prepare_error=RawWorkflowError("raw helper unavailable"),
+        )
+        with (
+            patch("isopropyl.app.RawWriteWorkflow", return_value=workflow),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_write(self.window.image, device(), True, identity)
+
+        self.assertFalse(workflow.prepared)
+        self.assertFalse(workflow.executed)
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertIn("helper unavailable", critical.call_args.args[2])
+
+    def test_final_raw_dialog_discloses_exact_plan_and_requires_exact_phrase(self):
+        plan = fake_raw_plan()
+        observed: dict[str, object] = {}
+
+        def inspect(dialog: QDialog) -> int:
+            details = dialog.findChild(QPlainTextEdit, "rawWriteConfirmationDetails")
+            phrase = dialog.findChild(QLineEdit, "rawWriteConfirmationPhrase")
+            button = dialog.findChild(QPushButton, "rawWriteConfirmButton")
+            observed["details"] = details.toPlainText()
+            observed["initially_enabled"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase.lower())
+            observed["wrong_enabled"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase)
+            observed["exact_enabled"] = button.isEnabled()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            phrase = self.window.confirm_raw_write_plan(plan)
+
+        details = str(observed["details"])
+        self.assertEqual(phrase, plan.confirmation_phrase)
+        self.assertFalse(observed["initially_enabled"])
+        self.assertFalse(observed["wrong_enabled"])
+        self.assertTrue(observed["exact_enabled"])
+        self.assertIn("4096 bytes", details)
+        self.assertIn("a" * 64, details)
+        self.assertIn("/dev/sdz", details)
+        self.assertIn("ISOpropyl Test Drive", details)
+        self.assertIn("SERIAL", details)
+        self.assertIn(plan.warnings[0], details)
 
     def test_iso_dispatch_rebuilds_a_fresh_target_sized_plan(self):
         self.window.rebuild_write_recommendation(preserve_selection=False)
