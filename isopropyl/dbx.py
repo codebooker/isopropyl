@@ -61,6 +61,10 @@ class DbxError(ValueError):
     """Bundled policy or PE data could not be evaluated exactly."""
 
 
+class _NonUefiPeImage(DbxError):
+    """A valid PE header conclusively identifies a non-UEFI subsystem."""
+
+
 class DbxState(enum.Enum):
     MATCHED_UNFLAGGED = "matched-unflagged"
     MATCHED_OPTIONAL = "matched-optional"
@@ -398,8 +402,6 @@ def pe_authenticode_sha256(
     if magic != expected_magic:
         raise DbxError("the PE machine and optional-header kind are inconsistent")
     subsystem = _u16(blob, optional + 68, "PE subsystem")
-    if subsystem not in {10, 11, 12, 13}:
-        raise DbxError("the PE image does not use a UEFI subsystem")
     if optional_size < directory_count_offset + 4:
         raise DbxError("the PE optional header omits its data-directory count")
     size_of_headers = _u32(blob, optional + 60, "PE SizeOfHeaders")
@@ -579,7 +581,36 @@ def pe_authenticode_sha256(
         raise DbxError(
             "the PE layout has divergent Microsoft, firmware, or Rufus image digests"
         )
+    if subsystem not in {10, 11, 12, 13}:
+        # Only classify a file as conclusively outside UEFI DBX image-hash
+        # assessment after the complete PE structure and all three independent
+        # Authenticode layout calculations agree.  A malformed file that merely
+        # claims a non-UEFI subsystem must remain UNKNOWN.
+        raise _NonUefiPeImage("the PE image does not use a UEFI subsystem")
     return PeAuthenticodeDigest(machine, architecture, catalog_sha256)
+
+
+def _assess_dbx_conclusively(
+    blob: bytes,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+    catalog: DbxCatalog | None = None,
+) -> DbxAssessment:
+    measured = pe_authenticode_sha256(blob, cancel_check=cancel_check)
+    selected_catalog = catalog if catalog is not None else load_dbx_catalog()
+    unflagged, optional = selected_catalog.hashes_for(measured.architecture)
+    if measured.sha256 in unflagged:
+        state = DbxState.MATCHED_UNFLAGGED
+    elif measured.sha256 in optional:
+        state = DbxState.MATCHED_OPTIONAL
+    else:
+        state = DbxState.NOT_LISTED_IN_SNAPSHOT
+    return DbxAssessment(state, measured.architecture, measured.sha256)
+
+
+def _unknown_assessment(error: DbxError) -> DbxAssessment:
+    message = " ".join(str(error).split())[:512] or "DBX evaluation failed"
+    return DbxAssessment(DbxState.UNKNOWN, error=message)
 
 
 def assess_dbx(
@@ -591,19 +622,11 @@ def assess_dbx(
     """Compare one PE image to the pinned snapshot without claiming firmware state."""
 
     try:
-        measured = pe_authenticode_sha256(blob, cancel_check=cancel_check)
-        selected_catalog = catalog if catalog is not None else load_dbx_catalog()
-        unflagged, optional = selected_catalog.hashes_for(measured.architecture)
+        return _assess_dbx_conclusively(
+            blob, cancel_check=cancel_check, catalog=catalog,
+        )
     except DbxError as error:
-        message = " ".join(str(error).split())[:512] or "DBX evaluation failed"
-        return DbxAssessment(DbxState.UNKNOWN, error=message)
-    if measured.sha256 in unflagged:
-        state = DbxState.MATCHED_UNFLAGGED
-    elif measured.sha256 in optional:
-        state = DbxState.MATCHED_OPTIONAL
-    else:
-        state = DbxState.NOT_LISTED_IN_SNAPSHOT
-    return DbxAssessment(state, measured.architecture, measured.sha256)
+        return _unknown_assessment(error)
 
 
 def assess_staged_dbx(
@@ -650,6 +673,7 @@ def assess_staged_dbx(
     complete = len(selected) == len(candidates)
     payloads: list[StagedDbxPayload] = []
     issues: list[str] = []
+    excluded_non_uefi = 0
     for _priority, _key, entry in selected:
         if cancel_check is not None:
             cancel_check()
@@ -665,19 +689,32 @@ def assess_staged_dbx(
             ))
             complete = False
             continue
-        assessment = assess_dbx(
-            blob, cancel_check=cancel_check, catalog=catalog,
-        )
+        try:
+            assessment = _assess_dbx_conclusively(
+                blob, cancel_check=cancel_check, catalog=catalog,
+            )
+        except _NonUefiPeImage:
+            # Some Windows-internal PE boot applications retain an `.efi`
+            # suffix but use the Windows Boot Application subsystem.  A
+            # conclusively parsed non-UEFI subsystem is outside firmware DBX
+            # image-hash assessment; malformed or ambiguous PE files remain
+            # UNKNOWN below and continue to fail closed.
+            excluded_non_uefi += 1
+            continue
+        except DbxError as error:
+            assessment = _unknown_assessment(error)
         payloads.append(StagedDbxPayload(entry.path, assessment))
         if assessment.state is DbxState.UNKNOWN:
             issues.append(f"{entry.path}: {assessment.error}")
             complete = False
+    candidate_count = len(candidates) - excluded_non_uefi
+    selected_count = len(payloads)
     if len(candidates) > len(selected):
         issues.append(
-            f"selected {len(selected)} of {len(candidates)} staged EFI candidates"
+            f"selected {selected_count} of {candidate_count} staged EFI candidates"
         )
     if cancel_check is not None:
         cancel_check()
     return StagedDbxAnalysis(
-        tuple(payloads), len(candidates), len(selected), complete, tuple(issues),
+        tuple(payloads), candidate_count, selected_count, complete, tuple(issues),
     )

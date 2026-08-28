@@ -26,6 +26,7 @@ def canonical_pe(
     post_section_data: bytes = b"",
     directory_count: int = 16,
     trailer: bytes = b"",
+    subsystem: int = 10,
 ) -> bytes:
     pe_offset = 0x80
     optional_size = 0xE0 if pe32 else 0xF0
@@ -42,7 +43,7 @@ def canonical_pe(
     struct.pack_into("<H", data, optional, 0x10B if pe32 else 0x20B)
     struct.pack_into("<I", data, optional + 36, 0x200)
     struct.pack_into("<I", data, optional + 60, header_size)
-    struct.pack_into("<H", data, optional + 68, 10)
+    struct.pack_into("<H", data, optional + 68, subsystem)
     directories_offset = 96 if pe32 else 112
     directory_count_offset = 92 if pe32 else 108
     struct.pack_into("<I", data, optional + directory_count_offset, directory_count)
@@ -360,6 +361,83 @@ class DbxTests(unittest.TestCase):
             self.assertEqual(result.selected_count, 64)
             self.assertFalse(result.complete)
             self.assertTrue(any("selected 64 of 65" in issue for issue in result.issues))
+
+    def test_staged_tree_excludes_conclusive_windows_internal_subsystems(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "staging"
+            payloads = {
+                "EFI/BOOT/BOOTX64.EFI": canonical_pe(),
+                "EFI/Microsoft/Boot/cdboot.efi": canonical_pe(),
+                "EFI/Microsoft/Boot/cdboot_noprompt.efi": canonical_pe(),
+                "bootmgr.efi": canonical_pe(subsystem=16),
+                "EFI/Microsoft/Boot/memtest.efi": canonical_pe(subsystem=16),
+            }
+            for relative, blob in payloads.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(blob)
+            plan = build_plan(root)
+
+            result = assess_staged_dbx(
+                plan, catalog=self.catalog_with_x64(),
+            )
+
+            self.assertTrue(result.complete)
+            self.assertEqual(result.candidate_count, 3)
+            self.assertEqual(result.selected_count, 3)
+            self.assertEqual(result.issues, ())
+            self.assertEqual(
+                tuple(payload.path for payload in result.payloads),
+                (
+                    "EFI/BOOT/BOOTX64.EFI",
+                    "EFI/Microsoft/Boot/cdboot.efi",
+                    "EFI/Microsoft/Boot/cdboot_noprompt.efi",
+                ),
+            )
+
+    def test_staged_tree_keeps_malformed_dot_efi_as_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "staging"
+            fallback = root / "EFI/BOOT/BOOTX64.EFI"
+            fallback.parent.mkdir(parents=True)
+            fallback.write_bytes(canonical_pe())
+            malformed = root / "EFI/vendor/malformed.efi"
+            malformed.parent.mkdir(parents=True)
+            malformed.write_bytes(b"not a PE image")
+            plan = build_plan(root)
+
+            result = assess_staged_dbx(
+                plan, catalog=self.catalog_with_x64(),
+            )
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.candidate_count, 2)
+            self.assertEqual(result.selected_count, 2)
+            self.assertIs(result.payloads[1].dbx.state, DbxState.UNKNOWN)
+
+    def test_malformed_non_uefi_claim_remains_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "staging"
+            fallback = root / "EFI/BOOT/BOOTX64.EFI"
+            fallback.parent.mkdir(parents=True)
+            fallback.write_bytes(canonical_pe())
+            forged = bytearray(canonical_pe(subsystem=16))
+            optional = 0x80 + 4 + 20
+            struct.pack_into("<I", forged, optional + 60, 0)
+            candidate = root / "EFI/vendor/forged.efi"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(forged)
+            plan = build_plan(root)
+
+            result = assess_staged_dbx(
+                plan, catalog=self.catalog_with_x64(),
+            )
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.candidate_count, 2)
+            self.assertEqual(result.selected_count, 2)
+            self.assertIs(result.payloads[1].dbx.state, DbxState.UNKNOWN)
+            self.assertIn("SizeOfHeaders", result.payloads[1].dbx.error)
 
     def test_staged_analysis_merge_preserves_order_counts_and_incompleteness(self):
         first = StagedDbxPayload(
