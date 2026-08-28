@@ -146,7 +146,10 @@ evidence.
   A candidate serializer/parser records the 88-byte qualified-partition hive
   layout used by two independent open-source implementations, but Microsoft's
   public WMI style values conflict with that internal mapping. Windows-generated
-  fixtures and QEMU therefore gate any hive use. Physical execution still requires
+  fixtures and QEMU therefore gate any hive use. A candidate non-executable
+  WIM-apply request contract now carries strictly validated claims for the
+  parent, exact child geometry, WIM snapshot, edition index/expanded size, and
+  plan receipts. Physical execution still requires privileged re-attestation,
   descriptor-bound privileged `wimlib` block apply, complete image-native BCD
   construction/read-back, offline SAN policy, explicit internal-disk behavior,
   and QEMU/OVMF plus physical certification.

@@ -92,6 +92,7 @@ verified_download.py
 virtual.py
 vtsi.py
 wim.py
+wim_apply_protocol.py
 windows.py
 windows_bcd.py
 windows_bootex.py
