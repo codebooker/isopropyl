@@ -496,7 +496,7 @@ def _single_partition_capacity_bytes(
     partition_sectors = total_sectors - 2048 - trailing_sectors
     if (
         partition_table is PartitionTable.MBR
-        and partition_sectors > _MBR_MAX_PARTITION_SECTORS
+        and total_sectors > _MBR_MAX_PARTITION_SECTORS
     ):
         return 0
     return max(0, partition_sectors) * logical_sector_size
@@ -721,7 +721,7 @@ def _validate_plan_allocation_geometry(
     if capacity <= 0:
         if (
             plan.partition_table is PartitionTable.MBR
-            and plan.device_identity[1] // logical_sector_size - 2048
+            and plan.device_identity[1] // logical_sector_size
             > _MBR_MAX_PARTITION_SECTORS
         ):
             raise FormatValidationError(
@@ -1113,12 +1113,34 @@ def resolve_multi_tools(
     )
 
 
-def partition_script(plan: FormatPlan) -> bytes:
+def _single_partition_geometry(
+    plan: FormatPlan,
+    logical_sector_size: int,
+) -> tuple[int, int]:
+    """Return the exact start and size used by single-partition restores."""
+
+    capacity = _single_partition_capacity_bytes(
+        plan.device_identity[1], plan.partition_table, logical_sector_size,
+    )
+    if capacity <= 0:
+        raise FormatValidationError(
+            "The target has no room for the requested partition geometry"
+        )
+    return 2048, capacity // logical_sector_size
+
+
+def partition_script(plan: FormatPlan, logical_sector_size: int) -> bytes:
+    validate_plan(plan)
     label = "dos" if plan.partition_table is PartitionTable.MBR else "gpt"
     types = _MBR_TYPES if plan.partition_table is PartitionTable.MBR else _GPT_TYPES
-    # A single 1 MiB-aligned partition consumes the remaining space.
+    start_sector, sector_count = _single_partition_geometry(
+        plan, logical_sector_size,
+    )
+    # Explicit geometry prevents sfdisk from rounding an otherwise omitted GPT
+    # end down to its alignment grain.  Validation reuses the same calculation.
     return (
-        f"label: {label}\nunit: sectors\n\nstart=2048, type={types[plan.filesystem]}\n"
+        f"label: {label}\nunit: sectors\n\n"
+        f"start={start_sector}, size={sector_count}, type={types[plan.filesystem]}\n"
     ).encode("ascii")
 
 
@@ -1541,16 +1563,8 @@ def validate_single_partition_metadata(
     if device_size % sector_size:
         raise FormattingError("The target capacity is not an exact logical-sector multiple")
     total_sectors = device_size // sector_size
-    start_sector = 2048
-    if plan.partition_table is PartitionTable.GPT:
-        trailing_sectors = 1 + (
-            _GPT_PARTITION_ENTRY_BYTES + sector_size - 1
-        ) // sector_size
-    else:
-        trailing_sectors = 0
-    expected_size = total_sectors - start_sector - trailing_sectors
-    if expected_size <= 0:
-        raise FormattingError("The target has no room for the frozen partition geometry")
+    start_sector, expected_size = _single_partition_geometry(plan, sector_size)
+    trailing_sectors = total_sectors - start_sector - expected_size
 
     reported = table.get("partitions")
     if not isinstance(reported, list) or len(reported) != 1:
@@ -2139,7 +2153,10 @@ class FormatExecutor:
         )
 
         report("Creating partition table")
-        self._run_process(partition_command(plan, tools), partition_script(plan))
+        self._run_process(
+            partition_command(plan, tools),
+            partition_script(plan, logical_sector_size),
+        )
         self._run_process([tools.pkexec, tools.partprobe, plan.device_path])
         self._run_process([tools.udevadm, "settle"])
 

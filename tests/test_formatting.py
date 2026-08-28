@@ -163,7 +163,10 @@ def single_metadata_payload(
         if plan.partition_table is PartitionTable.GPT else 0
     )
     expected_size = total_sectors - start - trailing_sectors
-    script_type = partition_script(plan).decode("ascii").split("type=", 1)[1].strip()
+    script_type = (
+        partition_script(plan, sector_size).decode("ascii")
+        .split("type=", 1)[1].strip()
+    )
     table = {
         "label": "gpt" if plan.partition_table is PartitionTable.GPT else "dos",
         "device": plan.device_path,
@@ -375,13 +378,29 @@ class FormatPlanTests(unittest.TestCase):
             with self.subTest(filesystem="fat32", sector_size=sector_size):
                 self.assertEqual(
                     restore_allocation_unit_sizes(
-                        "fat32", 2 * 1024**4, sector_size,
+                        "fat32", 2 * 1024**4, sector_size, "gpt",
                     ),
                     (8192, 16384, 32768, 65536),
                 )
                 self.assertEqual(
                     restore_allocation_unit_sizes(
-                        "fat32", 2 * 1024**4 + sector_size, sector_size,
+                        "fat32", 2 * 1024**4 + sector_size,
+                        sector_size, "gpt",
+                    ),
+                    (),
+                )
+        for sector_size in (512, 4096):
+            with self.subTest(table="mbr", sector_size=sector_size):
+                maximum_mbr_size = 0xFFFFFFFF * sector_size
+                self.assertTrue(
+                    restore_allocation_unit_sizes(
+                        "ntfs", maximum_mbr_size, sector_size, "mbr",
+                    )
+                )
+                self.assertEqual(
+                    restore_allocation_unit_sizes(
+                        "ntfs", maximum_mbr_size + sector_size,
+                        sector_size, "mbr",
                     ),
                     (),
                 )
@@ -432,7 +451,7 @@ class FormatPlanTests(unittest.TestCase):
         self.assertTrue(
             restore_filesystem_geometry_supported("ext4", 8 * 1024**3, 0)
         )
-        mbr_limit = (0xFFFFFFFF + 2048) * 512
+        mbr_limit = 0xFFFFFFFF * 512
         self.assertTrue(
             restore_filesystem_geometry_supported(
                 "ext4", mbr_limit, 512, "mbr",
@@ -483,31 +502,41 @@ class FormatPlanTests(unittest.TestCase):
     def test_partition_scripts_have_explicit_table_alignment_and_type(self):
         fat_mbr = create_format_plan(test_device(), "fat32", "mbr")
         self.assertEqual(
-            partition_script(fat_mbr),
-            b"label: dos\nunit: sectors\n\nstart=2048, type=c\n",
+            partition_script(fat_mbr, 512),
+            b"label: dos\nunit: sectors\n\n"
+            b"start=2048, size=62497952, type=c\n",
         )
         for filesystem in ("ext2", "ext3", "ext4"):
             with self.subTest(filesystem=filesystem):
                 ext_mbr = create_format_plan(test_device(), filesystem, "mbr")
                 ext_gpt = create_format_plan(test_device(), filesystem, "gpt")
-                self.assertIn(b"type=83", partition_script(ext_mbr))
-                self.assertIn(b"label: gpt", partition_script(ext_gpt))
+                self.assertIn(b"type=83", partition_script(ext_mbr, 512))
+                self.assertIn(b"label: gpt", partition_script(ext_gpt, 512))
                 self.assertIn(
                     b"0FC63DAF-8483-4772-8E79-3D69D8477DE4",
-                    partition_script(ext_gpt),
+                    partition_script(ext_gpt, 512),
                 )
         for filesystem, expected_type in (("fat12", b"type=1"), ("fat16", b"type=e")):
             with self.subTest(filesystem=filesystem):
                 plan = create_format_plan(
                     test_device(size=128 * 1024 * 1024), filesystem, "mbr",
                 )
-                self.assertIn(expected_type, partition_script(plan))
+                self.assertIn(expected_type, partition_script(plan, 512))
         udf_mbr = create_format_plan(test_device(), "udf", "mbr")
         udf_gpt = create_format_plan(test_device(), "udf", "gpt")
-        self.assertIn(b"type=7", partition_script(udf_mbr))
+        self.assertIn(b"type=7", partition_script(udf_mbr, 512))
         self.assertIn(
             b"EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
-            partition_script(udf_gpt),
+            partition_script(udf_gpt, 512),
+        )
+
+    def test_single_gpt_script_pins_the_exact_full_capacity_geometry(self):
+        plan = create_format_plan(
+            test_device(size=15_376_318_464), "ntfs", "gpt", "WIN11",
+        )
+        self.assertIn(
+            b"start=2048, size=30029791, type=",
+            partition_script(plan, 512),
         )
 
     def test_single_partition_metadata_binds_exact_full_capacity_geometry(self):
@@ -1141,7 +1170,9 @@ class FormatExecutorTests(unittest.TestCase):
         self.assertTrue(hierarchy_queries)
         self.assertTrue(all("--tree" in argv for argv in hierarchy_queries))
         self.assertTrue(all(process.kwargs["shell"] is False for process in self.processes))
-        self.assertEqual(self.processes[0].inputs[0], partition_script(self.plan))
+        self.assertEqual(
+            self.processes[0].inputs[0], partition_script(self.plan, 512),
+        )
         self.assertEqual(self.processes[-2].argv[-1], "/dev/sdz1")
         self.assertEqual(
             self.processes[-2].argv[:9],
