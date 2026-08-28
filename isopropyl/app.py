@@ -816,7 +816,7 @@ class Window(QMainWindow):
     def choose_image(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self, "Choose a disk image", str(Path.home()),
-            "Disk images (*.iso *.img *.raw *.usb *.wic *.vtsi *.vhd *.vhdx *.qcow *.qcow2 *.gz *.gzip *.bz2 *.bzip2 *.xz *.lzma *.zst *.zstd *.Z *.z *.zip);;All files (*)",
+            "Disk images (*.iso *.img *.raw *.usb *.wic *.squashfs *.sqfs *.vtsi *.vhd *.vhdx *.qcow *.qcow2 *.gz *.gzip *.bz2 *.bzip2 *.xz *.lzma *.zst *.zstd *.Z *.z *.zip);;All files (*)",
         )
         if filename:
             self.load_image(Path(filename))

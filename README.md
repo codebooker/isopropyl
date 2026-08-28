@@ -114,6 +114,7 @@ expanded drive visibility are never persisted.
 | Hybrid `.iso` | DD mode | Preserves the supplied disk layout exactly. |
 | Eligible UEFI `.iso` | ISO mode | FAT32 or verified UEFI:NTFS; currently UEFI-only. |
 | `.img`, `.raw`, `.usb`, `.wic` | DD mode | Treated as raw disk images. |
+| SquashFS `.squashfs`, `.sqfs` | DD mode | Validates and reports the standalone SquashFS 4.0 superblock before raw writing. |
 | `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, `.Z`, single-file `.zip` | Streaming DD | The expanded stream is bounded by the selected target. |
 | VHD, VHDX, QCOW, QCOW2 | Convert, then DD | Requires `qemu-img`; backing files and encrypted containers are rejected. |
 | Compressed virtual disk | Decode, convert, then DD | Exactly one supported wrapper; nested compression is rejected. |
@@ -162,14 +163,18 @@ ISOpropyl treats every target write as a destructive transaction:
 - backup, capture, extraction, and staging outputs are created without
   overwriting existing files.
 
-The experimental Syslinux device transaction goes further. It binds the
-kernel's disk-generation sequence before typed confirmation, checks that
-generation again through sysfs and `BLKGETDISKSEQ`, holds one target descriptor
-through write, flush, and complete read-back, and writes sector zero last as the
-activation record. A post-activation failure attempts to blank that sector again
-before reporting the error. Linux block `O_EXCL` and `flock` reduce races but do
-not exclude an uncooperative raw writer, so this path still requires VM and
-physical race testing.
+The experimental device broker goes further. Its separate Syslinux and raw/DD
+profiles bind the kernel's disk-generation sequence before typed confirmation,
+check that generation again through sysfs and `BLKGETDISKSEQ`, and retain one
+exclusive target descriptor through writing, durability, cache invalidation,
+and read-back. Generic raw writes first deactivate a 1 MiB front guard plus the
+source and physical target tail sectors, verify the inactive bulk data, then
+activate the source tail and front guard last. A later failure revalidates the
+same disk generation before attempting to zero every activation region again.
+Linux block `O_EXCL` and `flock` reduce races but do not exclude an uncooperative
+raw writer, so this backend still requires installed integration, VM race and
+hot-swap tests, and representative physical-media certification before the GUI
+can replace its established DD path.
 
 See [SECURITY.md](SECURITY.md) for the complete threat model and private
 vulnerability-reporting guidance.
@@ -184,9 +189,10 @@ Core requirements:
 - `sfdisk` plus `mkfs.vfat` for FAT32 ISO mode, or `mkfs.ntfs` for large-file
   UEFI:NTFS media.
 
-The experimental BIOS helper additionally requires 64-bit Linux, kernel
-`diskseq` sysfs data, and the `BLKGETDISKSEQ` ioctl. It fails closed when any
-of those requirements is absent.
+The experimental device broker additionally requires 64-bit Linux, kernel
+`diskseq` sysfs data, the `BLKGETDISKSEQ` ioctl, a filesystem supporting strict
+anonymous `O_TMPFILE` snapshots, and enough private workspace for a fully
+allocated expanded image. It fails closed when any requirement is absent.
 
 Optional tools unlock additional workflows:
 
@@ -205,23 +211,28 @@ ISO mode also needs private temporary space for the extracted tree. WIM
 inspection or splitting can require several additional gigabytes. Missing
 optional tools disable the relevant path instead of weakening validation.
 
-## Experimental BIOS backend
+## Experimental privileged backends
 
 The reviewed backend can build and patch a narrowly supported Syslinux FAT32
 image, transfer its anonymous descriptor to a fixed root-owned helper, and
-perform a same-descriptor, mandatory-read-back device transaction. It is:
+perform a same-descriptor, mandatory-read-back device transaction. A separate
+raw/DD profile can likewise transfer a fully allocated, re-attested anonymous
+regular-file snapshot into a guarded same-descriptor transaction; it supports
+images shorter than the target, mandatory pre-activation verification, optional
+complete final verification, and stale physical-tail sanitation. These paths
+are:
 
 - not installed by `pip install` or the ordinary `make install` target;
-- not exposed by the GUI;
+- not yet exposed by the GUI;
 - limited to exact matched Syslinux 6.03/6.04 profiles, kernel-removable media,
   and 512-byte logical sectors; and
 - still gated on native-helper hardening, an installed PolicyKit integration
   test, QEMU SeaBIOS/OVMF results, and representative physical media.
 
-Distribution integrators can stage the isolated launcher, helper, and exact
-PolicyKit action with `make install-host-helper PREFIX=/usr`. That target is for
-packaging and backend validation—not an invitation to bypass the GUI gate or
-write irreplaceable media.
+Distribution integrators can stage the isolated launcher, helper, and two exact
+PolicyKit actions with `make install-host-helper PREFIX=/usr`. That target is
+for packaging and backend validation—not an invitation to bypass the GUI gate
+or write irreplaceable media.
 
 ## Troubleshooting
 

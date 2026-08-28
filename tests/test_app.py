@@ -899,7 +899,9 @@ class WindowWriteMethodTests(unittest.TestCase):
             self.window.choose_image()
 
         image_filter = chooser.call_args.args[3]
-        for pattern in ("*.img", "*.raw", "*.usb", "*.wic", "*.vtsi"):
+        for pattern in (
+            "*.img", "*.raw", "*.usb", "*.wic", "*.squashfs", "*.sqfs", "*.vtsi",
+        ):
             self.assertIn(pattern, image_filter)
         for pattern in ("*.wim", "*.esd", "*.ffu"):
             self.assertNotIn(pattern, image_filter)

@@ -18,7 +18,7 @@ from isopropyl.images import (
     boot_identity_fields,
     calculate_checksums, classify_boot_paths, classify_windows_installer_members,
     compare_expected_checksum, inspect_image, parse_7z_listing, parse_expected_checksum,
-    scan_image_contents,
+    scan_image_contents, inspect_squashfs_superblock,
 )
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.partition_tables import PartitionTableInspection
@@ -91,6 +91,39 @@ def vtsi_fixture(expanded: bytes, stored_ranges: tuple[tuple[int, int], ...]) ->
     )
     struct.pack_into("<I", footer, 24, (~sum(footer)) & 0xFFFFFFFF)
     return bytes(data + padded_records + footer)
+
+
+def squashfs_fixture(*, image_size: int = 8192, **changes: int) -> bytes:
+    values = {
+        "magic": 0x73717368,
+        "inodes": 12,
+        "mkfs_time": 1_725_000_000,
+        "block_size": 131_072,
+        "fragments": 0,
+        "compression": 6,
+        "block_log": 17,
+        "flags": 0,
+        "ids": 1,
+        "major": 4,
+        "minor": 0,
+        "root_inode": 0,
+        "bytes_used": 4096,
+        "id_table": 3072,
+        "xattr_table": 0xFFFFFFFFFFFFFFFF,
+        "inode_table": 96,
+        "directory_table": 1024,
+        "fragment_table": 0xFFFFFFFFFFFFFFFF,
+        "lookup_table": 0xFFFFFFFFFFFFFFFF,
+    }
+    values.update(changes)
+    data = bytearray(image_size)
+    struct.pack_into(
+        "<IIIIIHHHHHHQQQQQQQQ",
+        data,
+        0,
+        *values.values(),
+    )
+    return bytes(data)
 
 
 class ImageTests(unittest.TestCase):
@@ -382,6 +415,54 @@ Folder = -
             self.assertTrue(result.raw_compatible)
             self.assertTrue(result.has_mbr)
             self.assertEqual(result.volume_label, "TEST_LINUX")
+
+    def test_detects_standalone_squashfs_from_bound_superblock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, payload, outer_compression in (
+                ("rootfs.squashfs", squashfs_fixture(), "none"),
+                ("misnamed.iso", squashfs_fixture(), "none"),
+                ("rootfs.img.gz", gzip.compress(squashfs_fixture()), "gzip"),
+            ):
+                with self.subTest(name=name):
+                    path = root / name
+                    path.write_bytes(payload)
+                    with patch(
+                        "isopropyl.images.scan_image_contents",
+                        return_value=([], False),
+                    ):
+                        result = inspect_image(path)
+                    self.assertEqual(result.kind, "SquashFS filesystem image")
+                    self.assertIsNotNone(result.squashfs)
+                    assert result.squashfs is not None
+                    self.assertEqual(result.squashfs.version, "4.0")
+                    self.assertEqual(result.squashfs.compression, "Zstandard")
+                    self.assertEqual(result.squashfs.block_size, 131_072)
+                    self.assertEqual(result.compression, outer_compression)
+                    self.assertEqual(
+                        result.layout,
+                        "SquashFS 4.0 (Zstandard) filesystem image",
+                    )
+                    self.assertTrue(result.raw_compatible)
+
+    def test_squashfs_magic_never_overrides_malformed_geometry(self):
+        valid = squashfs_fixture()
+        malformed = (
+            valid[:4],
+            squashfs_fixture(major=3),
+            squashfs_fixture(block_size=65_536),
+            squashfs_fixture(bytes_used=16_384),
+            squashfs_fixture(id_table=4096),
+            squashfs_fixture(fragments=1),
+            squashfs_fixture(root_inode=(4096 << 16)),
+            squashfs_fixture(ids=25),
+            squashfs_fixture(fragments=13, fragment_table=2048),
+        )
+        for payload in malformed:
+            with self.subTest(size=len(payload)):
+                self.assertIsNone(
+                    inspect_squashfs_superblock(payload, len(payload)),
+                )
 
     def test_optical_only_iso_warns(self):
         with tempfile.TemporaryDirectory() as directory:

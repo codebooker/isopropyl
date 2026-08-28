@@ -39,6 +39,7 @@ install-host-helper:
 	install -Dm755 helper/isopropyl-device-helper $(DESTDIR)/usr/libexec/isopropyl-device-helper
 	install -Dm644 isopropyl/syslinux_device_helper.py $(DESTDIR)/usr/libexec/isopropyl/syslinux_device_helper.py
 	install -Dm644 data/io.github.codebooker.isopropyl.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy
+	install -Dm644 data/io.github.codebooker.isopropyl.raw-write.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy
 
 uninstall-host-helper:
 	test "$(PREFIX)" = "/usr"
@@ -46,3 +47,4 @@ uninstall-host-helper:
 	rm -f $(DESTDIR)/usr/libexec/isopropyl/syslinux_device_helper.py
 	rmdir --ignore-fail-on-non-empty $(DESTDIR)/usr/libexec/isopropyl
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy
+	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy

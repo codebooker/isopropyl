@@ -516,6 +516,64 @@ QEMU/SeaBIOS and OVMF results, hot-swap/unplug races, and representative physica
 media remain mandatory before the GUI can offer BIOS construction. Until then,
 hybrid media should use verified DD mode to preserve their existing layout.
 
+## Experimental backend-only raw/DD broker boundary
+
+The generic raw profile is separate from the Syslinux profile and is not yet
+GUI-reachable. It accepts one canonical, singly linked, nonempty regular source
+and one stable private `0700` workspace. Planning binds source device, inode,
+size, mtime, ctime, workspace identity, and a fresh complete target-topology
+device-number set. Neither source nor workspace may reside on the target. The
+builder requires enough available space, creates an unlinked
+`O_TMPFILE | O_EXCL` with mode `0600`, takes a nonblocking exclusive lock,
+preallocates every byte, copies through bounded positional I/O, fsyncs, and
+independently reads and hashes the entire snapshot. The opaque one-shot owner
+exposes no descriptor; transfer duplicates, re-attests, and sends the source
+exactly once through `SCM_RIGHTS`, then consumes the unprivileged owner.
+
+Target authorization binds the authentic snapshot-plan digest, expanded size
+and SHA-256, original source identity, workspace filesystem, complete `Device`
+observation, target topology, major:minor, capacity, 512-byte logical sectors,
+kernel disk generation, verification policy, warnings, and a case-sensitive
+typed phrase. A fresh post-unmount receipt permits only the mounted-to-unmounted
+transition on that same disk generation. The expanded source is capped at
+64 TiB; the target is independently capped at 64 PiB and may be larger than the
+source. Images smaller than 1024 bytes or not aligned to 512 bytes fail before
+confirmation under this initial protocol.
+
+The user-side coordinator verifies one separate exact PolicyKit action whose
+prompt states that caller-supplied data will overwrite the selected target. It
+has no `dd`, pathname, shell, or permissive-policy fallback. The fixed root
+helper independently verifies peer credentials, the single anonymous source
+descriptor, full source hash and stable status, target sysfs topology,
+mounts/swapfiles, holders, USB or removable-MMC transport, source non-residency,
+read-only state, capacity, sector size, and `BLKGETDISKSEQ`. It opens the target
+once with block `O_EXCL`, takes a nonblocking `flock`, and retains that same
+descriptor across mutation, durability, cache invalidation, and read-back. An
+authenticated request-bound PREPARED → COMMIT/CANCEL exchange linearizes the
+last cancellable point.
+
+After COMMIT and another complete identity check, the helper durably zeros a
+front activation guard of up to 1 MiB, the source's final sector, and the
+physical target's final sector when distinct. It writes only the middle source
+bytes, fsyncs and invalidates caches, reads back the inactive bulk, and confirms
+that every activation region is physically zero. It then writes the source tail
+followed by the front guard as the final activation step, flushes again, always
+reads back the activation regions, and optionally hashes the complete final
+source range. The physical final sector remains zero when a shorter source
+could otherwise leave a stale backup GPT header. Every failure after the first
+mutation re-establishes disk generation and geometry before attempting to zero
+all activation regions, fsync, and invalidate caches; skipped or failed cleanup
+is reported explicitly.
+
+This ordering reduces the chance that a failed write appears as valid old or
+new media; it is not power-loss atomicity and it does not erase unused bytes
+between a shorter source and the physical target tail. `O_EXCL` and `flock` do
+not stop a hostile or uncooperative nonexclusive block writer. Native-helper,
+installed PolicyKit/SCM_RIGHTS VM, cache/power-loss, hot-unplug, replacement,
+large-media, and physical boot tests remain mandatory before all GUI raw,
+compressed, virtual, and VTSI inputs may migrate to this broker. There is no
+automatic fallback from a failed broker transaction to the legacy DD path.
+
 ## Boot-time corruption-check boundary
 
 The default-off boot-time option is deliberately narrower than its payload

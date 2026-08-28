@@ -10,6 +10,7 @@ import re
 import select
 import shutil
 import stat
+import struct
 import subprocess
 import time
 from collections import deque
@@ -72,6 +73,17 @@ MAX_WINDOWS_WIM_CANDIDATES = 4
 _SEVEN_ZIP_MODIFIED = re.compile(
     r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?"
 )
+_SQUASHFS_SUPERBLOCK = struct.Struct("<IIIIIHHHHHHQQQQQQQQ")
+_SQUASHFS_MAGIC = 0x73717368
+_SQUASHFS_INVALID_TABLE = 0xFFFFFFFFFFFFFFFF
+_SQUASHFS_COMPRESSIONS = {
+    1: "zlib",
+    2: "LZMA",
+    3: "LZO",
+    4: "XZ",
+    5: "LZ4",
+    6: "Zstandard",
+}
 
 
 class ImageInspectionCancelled(Exception):
@@ -110,6 +122,19 @@ class WindowsInstallerCandidates:
     @property
     def has_installer(self) -> bool:
         return self.valid and bool(self.wim_paths or self.esd_path)
+
+
+@dataclass(frozen=True)
+class SquashFsInspection:
+    """Validated fields from one standalone SquashFS 4.0 superblock."""
+
+    inode_count: int
+    created_at: int
+    block_size: int
+    fragment_count: int
+    compression: str
+    bytes_used: int
+    version: str = "4.0"
 
 
 @dataclass(frozen=True)
@@ -153,6 +178,7 @@ class ImageInspection:
     uefi_selected_count: int = 0
     embedded_uefi_fat: EmbeddedFatImage | None = None
     embedded_uefi_issues: tuple[str, ...] = ()
+    squashfs: SquashFsInspection | None = None
 
     @property
     def partition_table_incomplete(self) -> bool:
@@ -184,6 +210,11 @@ class ImageInspection:
             return f"Sparse {self.sparse_format} disk image"
         if self.virtual_format:
             return f"Virtual {self.virtual_format} disk"
+        if self.squashfs is not None:
+            return (
+                f"SquashFS {self.squashfs.version} "
+                f"({self.squashfs.compression}) filesystem image"
+            )
         if self.partition_table_incomplete:
             return "Disk image with an incompletely inspected partition table"
         if self.partition_table_malformed:
@@ -214,6 +245,106 @@ class ImageInspection:
             parts.append(f"{self.bootloader} {self.bootloader_build}")
         parts.append("raw-write ready" if self.raw_compatible else "may not boot from USB")
         return "  ·  ".join(parts)
+
+
+def inspect_squashfs_superblock(
+    header: bytes,
+    image_size: int,
+) -> SquashFsInspection | None:
+    """Recognize a structurally credible SquashFS 4.0 image at byte zero.
+
+    A four-byte magic match alone is not enough to change write advice. The
+    bounded header captured from the already descriptor-bound image must also
+    describe supported geometry and keep every mandatory metadata table inside
+    ``bytes_used`` and the selected image.
+    """
+
+    if (
+        type(header) is not bytes
+        or type(image_size) is not int
+        or isinstance(image_size, bool)
+        or image_size < _SQUASHFS_SUPERBLOCK.size
+        or len(header) < _SQUASHFS_SUPERBLOCK.size
+    ):
+        return None
+    (
+        magic,
+        inode_count,
+        created_at,
+        block_size,
+        fragment_count,
+        compression_id,
+        block_log,
+        _flags,
+        id_count,
+        major,
+        minor,
+        root_inode,
+        bytes_used,
+        id_table_start,
+        xattr_table_start,
+        inode_table_start,
+        directory_table_start,
+        fragment_table_start,
+        lookup_table_start,
+    ) = _SQUASHFS_SUPERBLOCK.unpack_from(header)
+    if magic != _SQUASHFS_MAGIC:
+        return None
+    if (
+        inode_count == 0
+        or id_count == 0
+        or id_count > inode_count * 2
+        or fragment_count > inode_count
+        or major != 4
+        or minor != 0
+        or compression_id not in _SQUASHFS_COMPRESSIONS
+        or not 12 <= block_log <= 20
+        or block_size != 1 << block_log
+        or not _SQUASHFS_SUPERBLOCK.size <= bytes_used <= image_size
+    ):
+        return None
+    # The upper root-inode bits are relative to inode_table_start, not an
+    # absolute byte position in the filesystem.
+    root_block = root_inode >> 16
+    root_offset = root_inode & 0xFFFF
+    if (
+        root_offset >= 8_192
+        or root_block >= bytes_used
+        or inode_table_start > bytes_used - root_block
+        or inode_table_start + root_block >= bytes_used
+    ):
+        return None
+    mandatory_tables = (
+        id_table_start,
+        inode_table_start,
+        directory_table_start,
+    )
+    optional_tables = (
+        xattr_table_start,
+        fragment_table_start,
+        lookup_table_start,
+    )
+    if any(
+        offset < _SQUASHFS_SUPERBLOCK.size or offset >= bytes_used
+        for offset in mandatory_tables
+    ):
+        return None
+    if any(
+        offset != _SQUASHFS_INVALID_TABLE
+        and (offset < _SQUASHFS_SUPERBLOCK.size or offset >= bytes_used)
+        for offset in optional_tables
+    ):
+        return None
+    if fragment_count > 0 and fragment_table_start == _SQUASHFS_INVALID_TABLE:
+        return None
+    return SquashFsInspection(
+        inode_count,
+        created_at,
+        block_size,
+        fragment_count,
+        _SQUASHFS_COMPRESSIONS[compression_id],
+        bytes_used,
+    )
 
 
 def _looks_like_windows(path: Path, volume_label: str) -> bool:
@@ -885,9 +1016,18 @@ def inspect_image(
     volume_label = ""
     if is_iso9660 and len(descriptor) >= 72:
         volume_label = descriptor[40:72].decode("ascii", errors="replace").strip()
+    squashfs = (
+        inspect_squashfs_superblock(header, size)
+        if not sparse_format and not has_mbr and not has_gpt and not is_iso9660
+        else None
+    )
     if sparse_format:
         kind = "Sparse disk image (VTSI)"
-    elif is_iso9660 or suffix == ".iso":
+    elif is_iso9660:
+        kind = "Optical ISO"
+    elif squashfs is not None:
+        kind = "SquashFS filesystem image"
+    elif suffix == ".iso":
         kind = "Optical ISO"
     elif suffix in RAW_IMAGE_SUFFIXES:
         kind = "Raw disk image"
@@ -1091,6 +1231,7 @@ def inspect_image(
         container_size=container_size,
         embedded_uefi_fat=embedded_uefi_fat,
         embedded_uefi_issues=embedded_uefi_issues,
+        squashfs=squashfs,
     )
     check_inspection()
     final = path.stat()

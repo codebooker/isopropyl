@@ -2,16 +2,17 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Root-side Syslinux disk transaction.
+"""Root-side versioned device transactions.
 
-This module is the narrow privileged half of the Syslinux image pipeline.  It
-does not trust the unprivileged plan or its serialized target observations.
-The caller supplies the already patched anonymous regular file as standard
-input; the helper validates and hashes that seekable descriptor before it
-opens a target.  It then derives safety properties from the opened block
-descriptor and kernel sysfs, retains one Linux exclusive block-device claim
-and one BSD lock through writing, durability, cache invalidation, and complete
-read-back, and reports a bounded machine-readable result.
+This module is the narrow privileged half of the Syslinux and generic raw/DD
+image pipelines.  It does not trust the unprivileged plans or their serialized
+target observations.  The caller transfers one already prepared anonymous
+regular file; the selected exact protocol validates and hashes that seekable
+descriptor before opening a target.  The helper then derives safety properties
+from the opened block descriptor and kernel sysfs, retains one Linux exclusive
+block-device claim and one BSD lock through writing, durability, cache
+invalidation, and required read-back, and reports a bounded machine-readable
+result.
 
 The command-line entry point is only suitable when imported by the installed,
 root-owned, isolated launcher.  Source-checkout and user-writable console
@@ -36,9 +37,13 @@ from pathlib import Path
 
 
 HELPER_PROFILE = "io.github.codebooker.isopropyl/syslinux-device-helper/v1"
+RAW_HELPER_PROFILE = "io.github.codebooker.isopropyl/raw-device-helper/v1"
 SECTOR_SIZE = 512
 COPY_BYTES = 4 * 1024 * 1024
 MAX_IMAGE_BYTES = 128 * 1024 * 1024 * 1024
+MAX_RAW_SOURCE_BYTES = 64 * 1024 * 1024 * 1024 * 1024
+MAX_RAW_TARGET_BYTES = 64 * 1024 * 1024 * 1024 * 1024 * 1024
+RAW_FRONT_GUARD_BYTES = 1024 * 1024
 MAX_TOPOLOGY_NODES = 4_096
 MAX_DIAGNOSTIC_BYTES = 4_096
 CONTROL_TIMEOUT_SECONDS = 30.0
@@ -61,6 +66,7 @@ FAT_COUNT = 2
 MIN_FAT32_CLUSTERS = 65_525
 
 PROTOCOL_MAGIC = b"ISOPROPYL-SYSLX1"
+RAW_PROTOCOL_MAGIC = b"ISOPROPYL-RAW001"
 PROTOCOL_VERSION = 1
 PACKET_READY = 1
 PACKET_REQUEST = 2
@@ -71,6 +77,7 @@ PACKET_COMMIT = 6
 PACKET_CANCEL = 7
 PACKET_MUTATION_STARTED = 8
 OPERATION = "write-image-v1"
+RAW_OPERATION = "write-raw-image-v1"
 PHASE_CODES = {
     "source-validation": 1,
     "writing": 2,
@@ -84,11 +91,15 @@ _PROGRESS_PACKET = struct.Struct("!16sBBH16sB3xQQ")
 _CONTROL_PACKET = struct.Struct("!16sBBH16s")
 _MUTATION_PACKET = _CONTROL_PACKET
 _SUCCESS_PACKET = struct.Struct("!16sBBH16sIIQQIII32s32s32s")
+_RAW_REQUEST_PACKET = struct.Struct("!16sBBH16sIIQQIQB7s32s")
+_RAW_SUCCESS_PACKET = struct.Struct("!16sBBH16sIIQQIQIBB2s32s32s32s")
 MAX_PROTOCOL_PACKET = max(
     _REQUEST_PACKET.size,
+    _RAW_REQUEST_PACKET.size,
     _PROGRESS_PACKET.size,
     _CONTROL_PACKET.size,
     _SUCCESS_PACKET.size,
+    _RAW_SUCCESS_PACKET.size,
 )
 INSTALLED_HELPER_SCRIPT = "/usr/libexec/isopropyl/syslinux_device_helper.py"
 
@@ -177,6 +188,40 @@ class HelperResult:
     cache_invalidated: bool
 
 
+@dataclass(frozen=True)
+class RawHelperRequest:
+    request_id: bytes
+    profile: str
+    target_path: str
+    expected_major_minor: str
+    expected_disk_sequence: int
+    expected_target_size: int
+    expected_sector_size: int
+    source_size: int
+    source_sha256: str
+    final_verification: bool
+
+
+@dataclass(frozen=True)
+class RawHelperResult:
+    request_id: bytes
+    profile: str
+    target_path: str
+    major_minor: str
+    disk_sequence: int
+    target_size: int
+    bytes_written: int
+    source_sha256: str
+    written_sha256: str
+    readback_sha256: str
+    logical_sector_size: int
+    front_guard_bytes: int
+    target_tail_sanitized: bool
+    final_verification: bool
+    exclusive_open: bool
+    cache_invalidated: bool
+
+
 Progress = Callable[[str, int, int], None]
 
 
@@ -213,6 +258,9 @@ class HelperOperations:
         inspect_kernel_target(device_number)
     )
     active_devices: Callable[[], frozenset[int]] = lambda: active_kernel_devices()
+    inspect_raw_target: Callable[[int], KernelTargetObservation] = lambda device_number: (
+        inspect_kernel_target(device_number, allow_fixed_usb=True)
+    )
 
 
 def _bounded(value: object, fallback: str) -> str:
@@ -392,8 +440,12 @@ def inspect_kernel_target(
     device_number: int,
     *,
     sys_root: Path = Path("/sys"),
+    allow_fixed_usb: bool = False,
 ) -> KernelTargetObservation:
     """Derive whole-disk and transport safety from root-owned kernel sysfs."""
+
+    if type(allow_fixed_usb) is not bool:
+        raise HelperTargetError("The fixed-USB target policy is invalid")
 
     node = _resolved_sysfs_node(device_number, sys_root)
     if (node / "partition").exists():
@@ -416,7 +468,7 @@ def inspect_kernel_target(
         raise HelperTargetError("Kernel disk sequence is outside the supported range")
     transport = _transport_for_node(node, sys_root)
     removable = removable_text == "1"
-    if transport == "usb" and removable:
+    if transport == "usb" and (removable or allow_fixed_usb):
         pass
     elif transport == "mmc" and removable:
         pass
@@ -531,6 +583,52 @@ def validate_helper_request(request: HelperRequest) -> None:
         raise HelperRequestError("The expected image digest is invalid")
 
 
+def validate_raw_helper_request(request: RawHelperRequest) -> None:
+    if type(request) is not RawHelperRequest:
+        raise HelperRequestError("An exact raw-device helper request is required")
+    if type(request.request_id) is not bytes or len(request.request_id) != 16:
+        raise HelperRequestError("The raw-device request identifier is invalid")
+    if request.profile != RAW_HELPER_PROFILE:
+        raise HelperRequestError("The raw-device helper profile is unsupported")
+    if type(request.target_path) is not str or _TARGET_PATH.fullmatch(request.target_path) is None:
+        raise HelperRequestError("The raw-device target path is invalid")
+    if (
+        type(request.expected_major_minor) is not str
+        or _MAJOR_MINOR.fullmatch(request.expected_major_minor) is None
+    ):
+        raise HelperRequestError("The expected raw-device kernel identity is invalid")
+    if (
+        type(request.expected_disk_sequence) is not int
+        or isinstance(request.expected_disk_sequence, bool)
+        or not 0 < request.expected_disk_sequence <= 0xFFFFFFFFFFFFFFFF
+    ):
+        raise HelperRequestError("The expected raw-device disk sequence is invalid")
+    if (
+        type(request.expected_target_size) is not int
+        or isinstance(request.expected_target_size, bool)
+        or not 2 * SECTOR_SIZE
+        <= request.expected_target_size
+        <= MAX_RAW_TARGET_BYTES
+        or request.expected_target_size % SECTOR_SIZE
+        or type(request.source_size) is not int
+        or isinstance(request.source_size, bool)
+        or not 2 * SECTOR_SIZE
+        <= request.source_size
+        <= min(request.expected_target_size, MAX_RAW_SOURCE_BYTES)
+        or request.source_size % SECTOR_SIZE
+    ):
+        raise HelperRequestError("The raw source or target size is invalid")
+    if request.expected_sector_size != SECTOR_SIZE:
+        raise HelperRequestError("The raw-device helper requires 512-byte logical sectors")
+    if (
+        type(request.source_sha256) is not str
+        or _SHA256.fullmatch(request.source_sha256) is None
+    ):
+        raise HelperRequestError("The raw source digest is invalid")
+    if type(request.final_verification) is not bool:
+        raise HelperRequestError("The raw-device verification policy is invalid")
+
+
 def _status_snapshot(status: os.stat_result) -> tuple[int, ...]:
     return (
         status.st_dev,
@@ -560,6 +658,23 @@ def _validate_source_status(
         raise HelperSourceError("The privileged source image is not owned by the invoking user")
     if status.st_size != request.expected_size:
         raise HelperSourceError("The privileged source size does not match the target capacity")
+
+
+def _validate_raw_source_status(
+    status: os.stat_result,
+    request: RawHelperRequest,
+    invoking_uid: int,
+) -> None:
+    if not stat.S_ISREG(status.st_mode):
+        raise HelperSourceError("Standard input is not the anonymous raw image")
+    if status.st_nlink != 0:
+        raise HelperSourceError("The privileged raw source must have no filesystem name")
+    if stat.S_IMODE(status.st_mode) != 0o600:
+        raise HelperSourceError("The privileged raw source must have mode 0600")
+    if status.st_uid != invoking_uid:
+        raise HelperSourceError("The privileged raw source is not owned by the invoking user")
+    if status.st_size != request.source_size:
+        raise HelperSourceError("The privileged raw source size changed")
 
 
 def _read_exact_at(
@@ -1259,6 +1374,572 @@ def execute_helper_transaction(
                 pass
 
 
+def _raw_front_guard_size(request: RawHelperRequest) -> int:
+    return min(RAW_FRONT_GUARD_BYTES, request.source_size - SECTOR_SIZE)
+
+
+def _validate_raw_target_observation(
+    observation: KernelTargetObservation,
+    request: RawHelperRequest,
+    device_number: int,
+    active: frozenset[int],
+    source_device: int,
+) -> None:
+    if type(observation) is not KernelTargetObservation:
+        raise HelperTargetError("Kernel raw-target inspection returned invalid evidence")
+    transport_ok = (
+        observation.transport == "usb"
+        or (observation.transport == "mmc" and observation.removable)
+    )
+    if (
+        observation.device_number != device_number
+        or device_number not in observation.related_device_numbers
+        or not transport_ok
+        or observation.read_only
+        or observation.logical_sector_size != request.expected_sector_size
+        or observation.has_holders
+        or observation.disk_sequence != request.expected_disk_sequence
+    ):
+        raise HelperTargetError("Kernel raw-target safety properties do not match this request")
+    if observation.related_device_numbers & active:
+        raise HelperTargetError(
+            "The selected raw target or one of its dependants is mounted or active swap",
+        )
+    if source_device in observation.related_device_numbers:
+        raise HelperTargetError("The anonymous raw source resides on the selected target")
+
+
+def _require_raw_opened_target_identity(
+    descriptor: int,
+    request: RawHelperRequest,
+    device_number: int,
+    operations: HelperOperations,
+    *,
+    verification: bool,
+) -> None:
+    error_type = HelperVerificationError if verification else HelperTargetError
+    try:
+        status = operations.fstat(descriptor)
+        size = operations.ioctl_u64(descriptor, BLKGETSIZE64)
+        disk_sequence = operations.ioctl_u64(descriptor, BLKGETDISKSEQ)
+        sector_size = operations.ioctl_uint(descriptor, BLKSSZGET)
+        read_only = operations.ioctl_uint(descriptor, BLKROGET)
+    except OSError as error:
+        raise error_type("Could not revalidate the opened raw target identity") from error
+    if (
+        not stat.S_ISBLK(status.st_mode)
+        or status.st_rdev != device_number
+        or size != request.expected_target_size
+        or disk_sequence != request.expected_disk_sequence
+        or sector_size != request.expected_sector_size
+        or read_only != 0
+    ):
+        raise error_type("The opened raw target is no longer the authorized disk generation")
+
+
+def _read_raw_target_exact(
+    descriptor: int,
+    offset: int,
+    size: int,
+    *,
+    operations: HelperOperations,
+    label: str,
+) -> bytes:
+    blocks: list[bytes] = []
+    consumed = 0
+    while consumed < size:
+        try:
+            block = operations.pread(descriptor, size - consumed, offset + consumed)
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise HelperVerificationError(_bounded(error, f"Could not read {label}")) from error
+        if type(block) is not bytes or not block or len(block) > size - consumed:
+            raise HelperVerificationError(f"The {label} made invalid read progress")
+        blocks.append(block)
+        consumed += len(block)
+    return b"".join(blocks)
+
+
+def _raw_deactivation_regions(request: RawHelperRequest) -> tuple[tuple[int, int], ...]:
+    guard = _raw_front_guard_size(request)
+    candidates = (
+        (0, guard),
+        (request.source_size - SECTOR_SIZE, SECTOR_SIZE),
+        (request.expected_target_size - SECTOR_SIZE, SECTOR_SIZE),
+    )
+    unique: list[tuple[int, int]] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def _zero_raw_regions(
+    descriptor: int,
+    request: RawHelperRequest,
+    operations: HelperOperations,
+) -> None:
+    for offset, size in _raw_deactivation_regions(request):
+        _write_exact(
+            descriptor,
+            b"\0" * size,
+            offset,
+            write_at=operations.pwrite,
+        )
+
+
+def execute_raw_helper_transaction(
+    request: RawHelperRequest,
+    *,
+    source_descriptor: int = 0,
+    invoking_uid: int,
+    operations: HelperOperations = HelperOperations(),
+    progress: Progress = lambda _phase, _done, _total: None,
+    mutation_started: Callable[[], None] = lambda: None,
+) -> RawHelperResult:
+    """Write one anonymous raw snapshot under a same-FD disk-generation lease."""
+
+    validate_raw_helper_request(request)
+    if (
+        type(source_descriptor) is not int
+        or isinstance(source_descriptor, bool)
+        or source_descriptor < 0
+    ):
+        raise HelperSourceError("The privileged raw source descriptor is invalid")
+    if type(invoking_uid) is not int or isinstance(invoking_uid, bool) or invoking_uid < 0:
+        raise HelperRequestError("The invoking user identity is invalid")
+    try:
+        source_before = operations.fstat(source_descriptor)
+        source_flags = operations.get_flags(source_descriptor)
+    except OSError as error:
+        raise HelperSourceError(
+            _bounded(error, "Could not inspect the anonymous raw source"),
+        ) from error
+    _validate_raw_source_status(source_before, request, invoking_uid)
+    if source_flags & os.O_ACCMODE != os.O_RDWR or source_flags & os.O_APPEND:
+        raise HelperSourceError("The anonymous raw source has unsafe access flags")
+    try:
+        operations.flock(source_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise HelperSourceError("The anonymous raw source is not exclusively owned") from error
+
+    source_sha256 = _hash_descriptor(
+        source_descriptor,
+        request.source_size,
+        read_at=operations.pread,
+        progress=progress,
+        phase="source-validation",
+    )
+    if source_sha256 != request.source_sha256:
+        raise HelperSourceError("The anonymous raw source failed its bound SHA-256")
+    try:
+        source_after_hash = operations.fstat(source_descriptor)
+    except OSError as error:
+        raise HelperSourceError("The anonymous raw source disappeared") from error
+    if _status_snapshot(source_after_hash) != _status_snapshot(source_before):
+        raise HelperSourceError("The anonymous raw source changed during validation")
+
+    guard_size = _raw_front_guard_size(request)
+    source_tail_offset = request.source_size - SECTOR_SIZE
+    target_tail_offset = request.expected_target_size - SECTOR_SIZE
+    source_front = _read_exact_at(
+        source_descriptor,
+        0,
+        guard_size,
+        read_at=operations.pread,
+        label="raw activation guard",
+    )
+    source_tail = _read_exact_at(
+        source_descriptor,
+        source_tail_offset,
+        SECTOR_SIZE,
+        read_at=operations.pread,
+        label="raw source tail sector",
+    )
+
+    try:
+        path_status = operations.lstat(request.target_path)
+    except OSError as error:
+        raise HelperTargetError(_bounded(error, "The selected raw target is unavailable")) from error
+    if not stat.S_ISBLK(path_status.st_mode):
+        raise HelperTargetError("The privileged raw target path is not a block device")
+    expected_device_number = _parse_dev(request.expected_major_minor)
+    if path_status.st_rdev != expected_device_number:
+        raise HelperTargetError("The privileged raw target path changed kernel identity")
+    pre_observation = operations.inspect_raw_target(expected_device_number)
+    _validate_raw_target_observation(
+        pre_observation,
+        request,
+        expected_device_number,
+        operations.active_devices(),
+        source_before.st_dev,
+    )
+
+    flags = (
+        os.O_RDWR
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    target_descriptor = -1
+    mutation_attempted = False
+    try:
+        try:
+            target_descriptor = operations.open(request.target_path, flags)
+        except OSError as error:
+            if error.errno == errno.EBUSY:
+                raise HelperTargetError("The raw target is mounted, claimed, or busy") from error
+            raise HelperTargetError(
+                _bounded(error, "Could not exclusively open the raw target"),
+            ) from error
+        try:
+            operations.flock(target_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise HelperTargetError("Another lock-aware process is using the raw target") from error
+        _require_raw_opened_target_identity(
+            target_descriptor,
+            request,
+            expected_device_number,
+            operations,
+            verification=False,
+        )
+        live_observation = operations.inspect_raw_target(expected_device_number)
+        _validate_raw_target_observation(
+            live_observation,
+            request,
+            expected_device_number,
+            operations.active_devices(),
+            source_before.st_dev,
+        )
+        try:
+            current_path = operations.lstat(request.target_path)
+        except OSError as error:
+            raise HelperTargetError("The raw target path disappeared after exclusive open") from error
+        if (
+            not stat.S_ISBLK(current_path.st_mode)
+            or current_path.st_rdev != expected_device_number
+        ):
+            raise HelperTargetError("The raw target path was replaced during exclusive open")
+        try:
+            source_before_commit = operations.fstat(source_descriptor)
+        except OSError as error:
+            raise HelperSourceError("The anonymous raw source disappeared before commit") from error
+        if _status_snapshot(source_before_commit) != _status_snapshot(source_before):
+            raise HelperSourceError("The anonymous raw source changed before commit")
+
+        mutation_started()
+        _require_raw_opened_target_identity(
+            target_descriptor,
+            request,
+            expected_device_number,
+            operations,
+            verification=False,
+        )
+        try:
+            committed_path = operations.lstat(request.target_path)
+        except OSError as error:
+            raise HelperTargetError("The raw target path disappeared before mutation") from error
+        if (
+            not stat.S_ISBLK(committed_path.st_mode)
+            or committed_path.st_rdev != expected_device_number
+        ):
+            raise HelperTargetError("The raw target path changed before mutation")
+        committed_observation = operations.inspect_raw_target(expected_device_number)
+        _validate_raw_target_observation(
+            committed_observation,
+            request,
+            expected_device_number,
+            operations.active_devices(),
+            source_before.st_dev,
+        )
+        try:
+            source_after_commit = operations.fstat(source_descriptor)
+        except OSError as error:
+            raise HelperSourceError("The anonymous raw source disappeared during commit") from error
+        if _status_snapshot(source_after_commit) != _status_snapshot(source_before):
+            raise HelperSourceError("The anonymous raw source changed during the commit lease")
+
+        # Deactivate the complete primary metadata envelope first and make it
+        # durable before touching bulk data. Then clear both the source-end and
+        # physical target-end sectors so stale backup GPT headers cannot remain
+        # active on either an equal-size or larger destination.
+        mutation_attempted = True
+        _write_exact(
+            target_descriptor,
+            b"\0" * guard_size,
+            0,
+            write_at=operations.pwrite,
+        )
+        _retry(
+            lambda: operations.fsync(target_descriptor),
+            "Could not durably deactivate the raw target front guard",
+        )
+        for offset in dict.fromkeys((source_tail_offset, target_tail_offset)):
+            _write_exact(
+                target_descriptor,
+                b"\0" * SECTOR_SIZE,
+                offset,
+                write_at=operations.pwrite,
+            )
+        _retry(
+            lambda: operations.fsync(target_descriptor),
+            "Could not durably sanitize the raw target tail metadata",
+        )
+
+        written_digest = hashlib.sha256(source_front)
+        offset = guard_size
+        progress("writing", 0, request.source_size)
+        while offset < source_tail_offset:
+            wanted = min(COPY_BYTES, source_tail_offset - offset)
+            try:
+                block = operations.pread(source_descriptor, wanted, offset)
+            except InterruptedError:
+                continue
+            except OSError as error:
+                raise HelperSourceError(_bounded(error, "Could not read the raw source")) from error
+            if type(block) is not bytes or not block or len(block) > wanted:
+                raise HelperSourceError("The anonymous raw source made invalid read progress")
+            written_digest.update(block)
+            _write_exact(
+                target_descriptor,
+                block,
+                offset,
+                write_at=operations.pwrite,
+            )
+            offset += len(block)
+            progress("writing", offset, request.source_size)
+        written_digest.update(source_tail)
+        written_sha256 = written_digest.hexdigest()
+        if written_sha256 != request.source_sha256:
+            raise HelperSourceError("The raw source changed while the target was being written")
+        try:
+            source_after_write = operations.fstat(source_descriptor)
+        except OSError as error:
+            raise HelperSourceError("The anonymous raw source disappeared after writing") from error
+        if _status_snapshot(source_after_write) != _status_snapshot(source_before):
+            raise HelperSourceError("The anonymous raw source changed while writing")
+
+        try:
+            _retry(
+                lambda: operations.fsync(target_descriptor),
+                "Could not make the raw target bulk data durable",
+            )
+            operations.ioctl_void(target_descriptor, BLKFLSBUF)
+        except HelperError:
+            raise
+        except OSError as error:
+            raise HelperVerificationError(
+                _bounded(error, "Could not flush and invalidate the raw target cache"),
+            ) from error
+
+        preactivation_digest = hashlib.sha256(source_front)
+        offset = guard_size
+        middle_size = source_tail_offset - guard_size
+        progress("preactivation-readback", 0, middle_size)
+        while offset < source_tail_offset:
+            wanted = min(COPY_BYTES, source_tail_offset - offset)
+            block = _read_raw_target_exact(
+                target_descriptor,
+                offset,
+                wanted,
+                operations=operations,
+                label="raw pre-activation read-back",
+            )
+            preactivation_digest.update(block)
+            offset += len(block)
+            progress("preactivation-readback", offset - guard_size, middle_size)
+        preactivation_digest.update(source_tail)
+        if preactivation_digest.hexdigest() != request.source_sha256:
+            raise HelperVerificationError(
+                "The raw target failed verification before activation",
+            )
+        if _read_raw_target_exact(
+            target_descriptor,
+            0,
+            guard_size,
+            operations=operations,
+            label="inactive raw front guard",
+        ) != b"\0" * guard_size:
+            raise HelperVerificationError(
+                "The raw front guard activation region is not inactive",
+            )
+        if _read_raw_target_exact(
+            target_descriptor,
+            source_tail_offset,
+            SECTOR_SIZE,
+            operations=operations,
+            label="inactive raw source tail",
+        ) != b"\0" * SECTOR_SIZE:
+            raise HelperVerificationError("The raw source-tail activation sector is not inactive")
+        if target_tail_offset != source_tail_offset and _read_raw_target_exact(
+            target_descriptor,
+            target_tail_offset,
+            SECTOR_SIZE,
+            operations=operations,
+            label="sanitized physical target tail",
+        ) != b"\0" * SECTOR_SIZE:
+            raise HelperVerificationError("The stale physical target tail was not sanitized")
+
+        _require_raw_opened_target_identity(
+            target_descriptor,
+            request,
+            expected_device_number,
+            operations,
+            verification=True,
+        )
+        _write_exact(
+            target_descriptor,
+            source_tail,
+            source_tail_offset,
+            write_at=operations.pwrite,
+        )
+        _retry(
+            lambda: operations.fsync(target_descriptor),
+            "Could not durably write the raw source tail",
+        )
+        _write_exact(
+            target_descriptor,
+            source_front,
+            0,
+            write_at=operations.pwrite,
+        )
+        try:
+            _retry(
+                lambda: operations.fsync(target_descriptor),
+                "Could not durably activate the raw target",
+            )
+            operations.ioctl_void(target_descriptor, BLKFLSBUF)
+        except HelperError:
+            raise
+        except OSError as error:
+            raise HelperVerificationError(
+                _bounded(error, "Could not flush the activated raw target cache"),
+            ) from error
+        progress("writing", request.source_size, request.source_size)
+
+        if _read_raw_target_exact(
+            target_descriptor,
+            0,
+            guard_size,
+            operations=operations,
+            label="activated raw front guard",
+        ) != source_front:
+            raise HelperVerificationError("The activated raw front guard failed read-back")
+        if _read_raw_target_exact(
+            target_descriptor,
+            source_tail_offset,
+            SECTOR_SIZE,
+            operations=operations,
+            label="activated raw source tail",
+        ) != source_tail:
+            raise HelperVerificationError("The activated raw source tail failed read-back")
+        if target_tail_offset != source_tail_offset and _read_raw_target_exact(
+            target_descriptor,
+            target_tail_offset,
+            SECTOR_SIZE,
+            operations=operations,
+            label="final sanitized physical target tail",
+        ) != b"\0" * SECTOR_SIZE:
+            raise HelperVerificationError("The physical target tail sanitation did not persist")
+
+        readback_sha256 = ""
+        if request.final_verification:
+            readback_sha256 = _hash_descriptor(
+                target_descriptor,
+                request.source_size,
+                read_at=operations.pread,
+                progress=progress,
+                phase="readback",
+            )
+            if readback_sha256 != request.source_sha256:
+                raise HelperVerificationError("The complete raw target read-back does not match")
+
+        _require_raw_opened_target_identity(
+            target_descriptor,
+            request,
+            expected_device_number,
+            operations,
+            verification=True,
+        )
+        try:
+            final_path = operations.lstat(request.target_path)
+            final_source = operations.fstat(source_descriptor)
+        except OSError as error:
+            raise HelperVerificationError("The raw transaction identity changed at completion") from error
+        if (
+            not stat.S_ISBLK(final_path.st_mode)
+            or final_path.st_rdev != expected_device_number
+            or _status_snapshot(final_source) != _status_snapshot(source_before)
+        ):
+            raise HelperVerificationError("The raw source or target identity changed at completion")
+        final_observation = operations.inspect_raw_target(expected_device_number)
+        _validate_raw_target_observation(
+            final_observation,
+            request,
+            expected_device_number,
+            operations.active_devices(),
+            source_before.st_dev,
+        )
+        return RawHelperResult(
+            request.request_id,
+            RAW_HELPER_PROFILE,
+            request.target_path,
+            request.expected_major_minor,
+            request.expected_disk_sequence,
+            request.expected_target_size,
+            request.source_size,
+            source_sha256,
+            written_sha256,
+            readback_sha256,
+            request.expected_sector_size,
+            guard_size,
+            target_tail_offset != source_tail_offset,
+            request.final_verification,
+            True,
+            True,
+        )
+    except BaseException as error:
+        if mutation_attempted and target_descriptor >= 0:
+            try:
+                _require_raw_opened_target_identity(
+                    target_descriptor,
+                    request,
+                    expected_device_number,
+                    operations,
+                    verification=True,
+                )
+            except BaseException as identity_error:
+                original = _bounded(error, "The committed raw transaction failed")
+                identity = _bounded(identity_error, "target identity could not be re-established")
+                raise HelperVerificationError(
+                    f"{original}; emergency raw deactivation was skipped because {identity}",
+                ) from error
+            try:
+                _zero_raw_regions(target_descriptor, request, operations)
+                _retry(
+                    lambda: operations.fsync(target_descriptor),
+                    "Could not durably deactivate the failed raw target",
+                )
+                operations.ioctl_void(target_descriptor, BLKFLSBUF)
+            except BaseException as deactivation_error:
+                original = _bounded(error, "The committed raw transaction failed")
+                deactivation = _bounded(
+                    deactivation_error,
+                    "emergency raw deactivation failed",
+                )
+                raise HelperVerificationError(
+                    f"{original}; emergency raw deactivation also failed: {deactivation}",
+                ) from error
+        raise
+    finally:
+        if target_descriptor >= 0:
+            try:
+                operations.close(target_descriptor)
+            except OSError:
+                pass
+
+
 def pack_helper_request(
     request_id: bytes,
     major_number: int,
@@ -1364,6 +2045,114 @@ def unpack_helper_request(
     return request
 
 
+def pack_raw_helper_request(
+    request_id: bytes,
+    major_number: int,
+    minor_number: int,
+    disk_sequence: int,
+    target_size: int,
+    sector_size: int,
+    source_size: int,
+    sha256_hex: str,
+    *,
+    final_verification: bool,
+) -> bytes:
+    """Pack the exact raw-device request; every root-side field is untrusted."""
+
+    if (
+        type(request_id) is not bytes
+        or len(request_id) != 16
+        or type(major_number) is not int
+        or type(minor_number) is not int
+        or not 0 <= major_number <= 0xFFFFFFFF
+        or not 0 <= minor_number <= 0xFFFFFFFF
+        or type(disk_sequence) is not int
+        or isinstance(disk_sequence, bool)
+        or not 0 < disk_sequence <= 0xFFFFFFFFFFFFFFFF
+        or type(target_size) is not int
+        or isinstance(target_size, bool)
+        or not 0 <= target_size <= 0xFFFFFFFFFFFFFFFF
+        or type(sector_size) is not int
+        or isinstance(sector_size, bool)
+        or not 0 <= sector_size <= 0xFFFFFFFF
+        or type(source_size) is not int
+        or isinstance(source_size, bool)
+        or not 0 <= source_size <= 0xFFFFFFFFFFFFFFFF
+        or type(sha256_hex) is not str
+        or _SHA256.fullmatch(sha256_hex) is None
+        or type(final_verification) is not bool
+    ):
+        raise HelperRequestError("The privileged raw request cannot be encoded")
+    return _RAW_REQUEST_PACKET.pack(
+        RAW_PROTOCOL_MAGIC,
+        PROTOCOL_VERSION,
+        PACKET_REQUEST,
+        0,
+        request_id,
+        major_number,
+        minor_number,
+        disk_sequence,
+        target_size,
+        sector_size,
+        source_size,
+        int(final_verification),
+        b"\0" * 7,
+        bytes.fromhex(sha256_hex),
+    )
+
+
+def unpack_raw_helper_request(
+    packet: bytes,
+    *,
+    sys_root: Path = Path("/sys"),
+) -> RawHelperRequest:
+    if type(packet) is not bytes or len(packet) != _RAW_REQUEST_PACKET.size:
+        raise HelperRequestError("The privileged raw request has the wrong size")
+    (
+        magic,
+        version,
+        packet_type,
+        reserved,
+        request_id,
+        major_number,
+        minor_number,
+        disk_sequence,
+        target_size,
+        sector_size,
+        source_size,
+        final_verification,
+        trailing_reserved,
+        digest,
+    ) = _RAW_REQUEST_PACKET.unpack(packet)
+    if (
+        magic != RAW_PROTOCOL_MAGIC
+        or version != PROTOCOL_VERSION
+        or packet_type != PACKET_REQUEST
+        or reserved != 0
+        or final_verification not in {0, 1}
+        or trailing_reserved != b"\0" * 7
+    ):
+        raise HelperRequestError("The privileged raw request is unsupported")
+    try:
+        device_number = os.makedev(major_number, minor_number)
+    except (OverflowError, ValueError) as error:
+        raise HelperRequestError("The raw request has an invalid device number") from error
+    request = RawHelperRequest(
+        request_id,
+        RAW_HELPER_PROFILE,
+        _target_path_from_kernel(device_number, sys_root=sys_root),
+        f"{major_number}:{minor_number}",
+        disk_sequence,
+        target_size,
+        sector_size,
+        source_size,
+        digest.hex(),
+        bool(final_verification),
+    )
+    validate_raw_helper_request(request)
+    return request
+
+
 def unpack_server_packet(packet: bytes) -> tuple[object, ...]:
     """Strictly decode one trusted-helper packet for the GUI-side runner."""
 
@@ -1421,6 +2210,76 @@ def unpack_server_packet(packet: bytes) -> tuple[object, ...]:
     raise HelperRequestError("The helper response packet has an invalid type or size")
 
 
+def unpack_raw_server_packet(packet: bytes) -> tuple[object, ...]:
+    """Strictly decode one raw-device helper packet for its runner."""
+
+    if type(packet) is not bytes or len(packet) < _HEADER.size:
+        raise HelperRequestError("The raw helper response is truncated")
+    magic, version, packet_type, reserved = _HEADER.unpack(packet[:_HEADER.size])
+    if magic != RAW_PROTOCOL_MAGIC or version != PROTOCOL_VERSION or reserved != 0:
+        raise HelperRequestError("The raw helper response is unsupported")
+    if packet_type == PACKET_READY and len(packet) == _HEADER.size:
+        return ("ready",)
+    if packet_type == PACKET_PREPARED and len(packet) == _CONTROL_PACKET.size:
+        _, _, _, _, request_id = _CONTROL_PACKET.unpack(packet)
+        return ("prepared", request_id)
+    if packet_type == PACKET_PROGRESS and len(packet) == _PROGRESS_PACKET.size:
+        _, _, _, _, request_id, phase_code, done, total = _PROGRESS_PACKET.unpack(packet)
+        phase = PHASE_NAMES.get(phase_code)
+        if phase is None or done > total:
+            raise HelperRequestError("The raw helper progress packet is invalid")
+        return ("progress", request_id, phase, done, total)
+    if packet_type == PACKET_MUTATION_STARTED and len(packet) == _MUTATION_PACKET.size:
+        _, _, _, _, request_id = _MUTATION_PACKET.unpack(packet)
+        return ("mutation-started", request_id)
+    if packet_type == PACKET_SUCCESS and len(packet) == _RAW_SUCCESS_PACKET.size:
+        (
+            _,
+            _,
+            _,
+            _,
+            request_id,
+            major_number,
+            minor_number,
+            disk_sequence,
+            target_size,
+            sector_size,
+            source_size,
+            guard_size,
+            target_tail_sanitized,
+            final_verification,
+            trailing_reserved,
+            source_digest,
+            written_digest,
+            readback_digest,
+        ) = _RAW_SUCCESS_PACKET.unpack(packet)
+        if (
+            target_tail_sanitized not in {0, 1}
+            or final_verification not in {0, 1}
+            or trailing_reserved != b"\0" * 2
+        ):
+            raise HelperRequestError("The raw helper result flags are invalid")
+        if not final_verification and any(readback_digest):
+            raise HelperRequestError("The raw helper returned an unexpected read-back digest")
+        return (
+            "success",
+            request_id,
+            major_number,
+            minor_number,
+            disk_sequence,
+            target_size,
+            sector_size,
+            source_size,
+            guard_size,
+            bool(target_tail_sanitized),
+            bool(final_verification),
+            source_digest.hex(),
+            written_digest.hex(),
+            readback_digest.hex() if final_verification else "",
+        )
+    raise HelperRequestError("The raw helper response has an invalid type or size")
+
+
 def pack_helper_control(request_id: bytes, *, commit: bool) -> bytes:
     """Encode the only two client decisions accepted after root preflight."""
 
@@ -1428,6 +2287,18 @@ def pack_helper_control(request_id: bytes, *, commit: bool) -> bytes:
         raise HelperRequestError("The privileged control decision cannot be encoded")
     return _CONTROL_PACKET.pack(
         PROTOCOL_MAGIC,
+        PROTOCOL_VERSION,
+        PACKET_COMMIT if commit else PACKET_CANCEL,
+        0,
+        request_id,
+    )
+
+
+def pack_raw_helper_control(request_id: bytes, *, commit: bool) -> bytes:
+    if type(request_id) is not bytes or len(request_id) != 16 or type(commit) is not bool:
+        raise HelperRequestError("The privileged raw control decision cannot be encoded")
+    return _CONTROL_PACKET.pack(
+        RAW_PROTOCOL_MAGIC,
         PROTOCOL_VERSION,
         PACKET_COMMIT if commit else PACKET_CANCEL,
         0,
@@ -1450,10 +2321,14 @@ class _ProtocolProgress:
         channel: socket.socket,
         request_id: bytes,
         expected_uid: int,
+        protocol_magic: bytes = PROTOCOL_MAGIC,
     ) -> None:
+        if protocol_magic not in {PROTOCOL_MAGIC, RAW_PROTOCOL_MAGIC}:
+            raise HelperRequestError("The privileged protocol profile is invalid")
         self._channel = channel
         self._request_id = request_id
         self._expected_uid = expected_uid
+        self._protocol_magic = protocol_magic
         self._connected = True
         self._mutation_started = False
 
@@ -1464,11 +2339,12 @@ class _ProtocolProgress:
             self._channel,
             expected_uid=self._expected_uid,
             request_id=self._request_id,
+            protocol_magic=self._protocol_magic,
         )
         _send_packet(
             self._channel,
             _CONTROL_PACKET.pack(
-                PROTOCOL_MAGIC,
+                self._protocol_magic,
                 PROTOCOL_VERSION,
                 PACKET_PREPARED,
                 0,
@@ -1486,7 +2362,7 @@ class _ProtocolProgress:
             _send_packet(
                 self._channel,
                 _MUTATION_PACKET.pack(
-                    PROTOCOL_MAGIC,
+                    self._protocol_magic,
                     PROTOCOL_VERSION,
                     PACKET_MUTATION_STARTED,
                     0,
@@ -1505,13 +2381,14 @@ class _ProtocolProgress:
                 self._channel,
                 expected_uid=self._expected_uid,
                 request_id=self._request_id,
+                protocol_magic=self._protocol_magic,
             )
         if self._connected:
             try:
                 _send_packet(
                     self._channel,
                     _PROGRESS_PACKET.pack(
-                        PROTOCOL_MAGIC,
+                        self._protocol_magic,
                         PROTOCOL_VERSION,
                         PACKET_PROGRESS,
                         0,
@@ -1590,6 +2467,7 @@ def _receive_control(
     expected_uid: int,
     request_id: bytes,
     timeout: float = CONTROL_TIMEOUT_SECONDS,
+    protocol_magic: bytes = PROTOCOL_MAGIC,
 ) -> bool:
     """Receive one authenticated COMMIT/CANCEL packet after target preflight."""
 
@@ -1629,7 +2507,7 @@ def _receive_control(
         raise HelperRequestError("The privileged commit decision has the wrong size")
     magic, version, packet_type, reserved, observed_id = _CONTROL_PACKET.unpack(packet)
     if (
-        magic != PROTOCOL_MAGIC
+        magic != protocol_magic
         or version != PROTOCOL_VERSION
         or packet_type not in {PACKET_COMMIT, PACKET_CANCEL}
         or reserved != 0
@@ -1644,6 +2522,7 @@ def _poll_cancel(
     *,
     expected_uid: int,
     request_id: bytes,
+    protocol_magic: bytes = PROTOCOL_MAGIC,
 ) -> None:
     """Consume an in-band CANCEL promptly while root preflight is still safe."""
 
@@ -1658,6 +2537,7 @@ def _poll_cancel(
         expected_uid=expected_uid,
         request_id=request_id,
         timeout=0,
+        protocol_magic=protocol_magic,
     ):
         raise HelperRequestError("COMMIT arrived before the privileged helper was prepared")
     raise HelperCancelled("The device transaction was cancelled before mutation")
@@ -1805,22 +2685,35 @@ def main(argv: list[str] | None = None) -> int:
             raise HelperRequestError("The device helper requires 64-bit Linux userspace")
         _verify_installed_helper()
         arguments = sys.argv[1:] if argv is None else argv
-        if arguments != [OPERATION]:
+        if len(arguments) != 1 or arguments[0] not in {OPERATION, RAW_OPERATION}:
             raise HelperRequestError("The privileged helper operation is unsupported")
+        operation = arguments[0]
+        protocol_magic = (
+            PROTOCOL_MAGIC if operation == OPERATION else RAW_PROTOCOL_MAGIC
+        )
         invoking_uid = _invoking_uid()
         _require_initial_namespaces()
         _harden_process(invoking_uid)
         channel = _protocol_channel(invoking_uid)
         _send_packet(
             channel,
-            _HEADER.pack(PROTOCOL_MAGIC, PROTOCOL_VERSION, PACKET_READY, 0),
+            _HEADER.pack(protocol_magic, PROTOCOL_VERSION, PACKET_READY, 0),
         )
         packet, source_descriptor = _receive_request(
             channel,
             expected_uid=invoking_uid,
         )
-        request = unpack_helper_request(packet)
-        progress = _ProtocolProgress(channel, request.request_id, invoking_uid)
+        request: HelperRequest | RawHelperRequest = (
+            unpack_helper_request(packet)
+            if operation == OPERATION
+            else unpack_raw_helper_request(packet)
+        )
+        progress = _ProtocolProgress(
+            channel,
+            request.request_id,
+            invoking_uid,
+            protocol_magic,
+        )
 
         def begin_mutation() -> None:
             # All root-side source/target checks and the exclusive open have
@@ -1831,42 +2724,81 @@ def main(argv: list[str] | None = None) -> int:
                 channel,
                 expected_uid=invoking_uid,
                 request_id=request.request_id,
+                protocol_magic=protocol_magic,
             ):
                 raise HelperCancelled("The device transaction was cancelled before mutation")
             _defer_ordinary_termination()
             progress.begin_mutation()
 
-        result = execute_helper_transaction(
-            request,
-            source_descriptor=source_descriptor,
-            invoking_uid=invoking_uid,
-            progress=progress,
-            mutation_started=begin_mutation,
-        )
+        result: HelperResult | RawHelperResult
+        if type(request) is HelperRequest:
+            result = execute_helper_transaction(
+                request,
+                source_descriptor=source_descriptor,
+                invoking_uid=invoking_uid,
+                progress=progress,
+                mutation_started=begin_mutation,
+            )
+        elif type(request) is RawHelperRequest:
+            result = execute_raw_helper_transaction(
+                request,
+                source_descriptor=source_descriptor,
+                invoking_uid=invoking_uid,
+                progress=progress,
+                mutation_started=begin_mutation,
+            )
+        else:
+            raise HelperRequestError("The privileged helper request type is unsupported")
         major_number, minor_number = (
             int(part) for part in result.major_minor.split(":", 1)
         )
         try:
-            _send_packet(
-                channel,
-                _SUCCESS_PACKET.pack(
-                PROTOCOL_MAGIC,
-                PROTOCOL_VERSION,
-                PACKET_SUCCESS,
-                0,
-                result.request_id,
-                major_number,
-                minor_number,
-                result.disk_sequence,
-                result.bytes_written,
-                result.logical_sector_size,
-                result.disk_signature,
-                result.volume_id,
-                bytes.fromhex(result.source_sha256),
-                bytes.fromhex(result.written_sha256),
-                bytes.fromhex(result.readback_sha256),
-                ),
-            )
+            if type(result) is HelperResult:
+                response = _SUCCESS_PACKET.pack(
+                    PROTOCOL_MAGIC,
+                    PROTOCOL_VERSION,
+                    PACKET_SUCCESS,
+                    0,
+                    result.request_id,
+                    major_number,
+                    minor_number,
+                    result.disk_sequence,
+                    result.bytes_written,
+                    result.logical_sector_size,
+                    result.disk_signature,
+                    result.volume_id,
+                    bytes.fromhex(result.source_sha256),
+                    bytes.fromhex(result.written_sha256),
+                    bytes.fromhex(result.readback_sha256),
+                )
+            elif type(result) is RawHelperResult:
+                response = _RAW_SUCCESS_PACKET.pack(
+                    RAW_PROTOCOL_MAGIC,
+                    PROTOCOL_VERSION,
+                    PACKET_SUCCESS,
+                    0,
+                    result.request_id,
+                    major_number,
+                    minor_number,
+                    result.disk_sequence,
+                    result.target_size,
+                    result.logical_sector_size,
+                    result.bytes_written,
+                    result.front_guard_bytes,
+                    int(result.target_tail_sanitized),
+                    int(result.final_verification),
+                    b"\0" * 2,
+                    bytes.fromhex(result.source_sha256),
+                    bytes.fromhex(result.written_sha256),
+                    (
+                        bytes.fromhex(result.readback_sha256)
+                        if result.final_verification
+                        else b"\0" * 32
+                    ),
+                )
+            else:
+                raise HelperError("The privileged helper result type is unsupported")
+            _send_packet(channel, response)
         except HelperError:
             # The disk has already passed durability and complete read-back.
             # A vanished GUI cannot turn that verified outcome into a failed

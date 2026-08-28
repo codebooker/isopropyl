@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -599,6 +600,87 @@ class InstallationTests(unittest.TestCase):
         )
         return pkexec, launcher, script, policy
 
+    def _assert_raw_policy(self, path: Path) -> None:
+        policy_text = path.read_text(encoding="utf-8")
+        policy_root = ET.parse(path).getroot()
+        self.assertEqual(policy_root.tag, "policyconfig")
+        actions = policy_root.findall("action")
+        self.assertEqual(len(actions), 1)
+        action = actions[0]
+        self.assertEqual(
+            action.get("id"),
+            "io.github.codebooker.isopropyl.write-raw-image",
+        )
+        self.assertEqual(len(action.findall("description")), 1)
+        self.assertEqual(len(action.findall("message")), 1)
+        defaults = action.findall("defaults")
+        self.assertEqual(len(defaults), 1)
+        self.assertEqual(len(list(defaults[0])), 3)
+        self.assertEqual(
+            {child.tag: (child.text or "").strip() for child in defaults[0]},
+            {
+                "allow_any": "no",
+                "allow_inactive": "no",
+                "allow_active": "auth_admin",
+            },
+        )
+        annotations = action.findall("annotate")
+        self.assertEqual(len(annotations), 2)
+        self.assertEqual(
+            {
+                node.get("key"): (node.text or "").strip()
+                for node in annotations
+            },
+            {
+                "org.freedesktop.policykit.exec.path":
+                "/usr/libexec/isopropyl-device-helper",
+                "org.freedesktop.policykit.exec.argv1": "write-raw-image-v1",
+            },
+        )
+        self.assertIn("caller-supplied raw image", policy_text)
+        self.assertIn(
+            "overwrite the selected removable or external USB target",
+            policy_text,
+        )
+
+    def test_raw_policy_launcher_and_make_targets_are_narrow_at_source(self):
+        repository = Path(__file__).resolve().parents[1]
+        raw_policy = (
+            repository
+            / "data/io.github.codebooker.isopropyl.raw-write.policy"
+        )
+        self._assert_raw_policy(raw_policy)
+
+        launcher = (
+            repository / "helper/isopropyl-device-helper"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '/usr/libexec/isopropyl/syslinux_device_helper.py "$@"',
+            launcher,
+        )
+
+        makefile = (repository / "Makefile").read_text(encoding="utf-8")
+        ordinary_install = makefile.split("\ninstall:\n", 1)[1].split(
+            "\nuninstall:\n", 1,
+        )[0]
+        host_install = makefile.split("\ninstall-host-helper:\n", 1)[1].split(
+            "\nuninstall-host-helper:\n", 1,
+        )[0]
+        host_uninstall = makefile.split("\nuninstall-host-helper:\n", 1)[1]
+        self.assertNotIn("libexec/isopropyl-device-helper", ordinary_install)
+        self.assertNotIn("polkit-1/actions", ordinary_install)
+        for asset in (
+            "helper/isopropyl-device-helper",
+            "isopropyl/syslinux_device_helper.py",
+            "data/io.github.codebooker.isopropyl.policy",
+            "data/io.github.codebooker.isopropyl.raw-write.policy",
+        ):
+            self.assertIn(asset, host_install)
+        self.assertIn(
+            "io.github.codebooker.isopropyl.raw-write.policy",
+            host_uninstall,
+        )
+
     def test_fixed_root_owned_install_and_exact_policy_are_required(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -707,11 +789,51 @@ class InstallationTests(unittest.TestCase):
                 root / "usr/libexec/isopropyl-device-helper": 0o755,
                 root / "usr/libexec/isopropyl/syslinux_device_helper.py": 0o644,
                 root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy": 0o644,
+                root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy": 0o644,
             }
             for path, mode in expected.items():
                 with self.subTest(path=path):
                     self.assertTrue(path.is_file())
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+
+            launcher_text = (
+                root / "usr/libexec/isopropyl-device-helper"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                '/usr/libexec/isopropyl/syslinux_device_helper.py "$@"',
+                launcher_text,
+            )
+
+            raw_policy_path = (
+                root
+                / "usr/share/polkit-1/actions/"
+                "io.github.codebooker.isopropyl.raw-write.policy"
+            )
+            self._assert_raw_policy(raw_policy_path)
+
+    @unittest.skipUnless(shutil.which("make"), "make is not installed")
+    def test_ordinary_install_excludes_privileged_helper_and_policies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = Path(__file__).resolve().parents[1]
+            completed = subprocess.run(
+                [
+                    "make",
+                    "install",
+                    "PREFIX=/usr",
+                    "PYTHON_SITE=/usr/lib/python3/site-packages",
+                    f"DESTDIR={root}",
+                ],
+                cwd=repository,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse((root / "usr/libexec/isopropyl-device-helper").exists())
+            self.assertFalse((root / "usr/libexec/isopropyl").exists())
+            actions = root / "usr/share/polkit-1/actions"
+            self.assertFalse(actions.exists())
 
 
 if __name__ == "__main__":
