@@ -191,7 +191,9 @@ bundle is accepted only when every named artifact resolves at the same exact
 version. ISOpropyl does not use Rufus's version-suffix or prefix fallback.
 The pure staging policy in `isopropyl/syslinux_staging.py` independently
 re-pins each exact `ldlinux.c32` size, SHA-256, license, and provenance before
-it may appear in a plan; it never executes the module on the Linux host.
+it may appear in a plan. The optional private-tree consumer copies those exact
+bytes as data only after source and extracted-tree validation; neither component
+executes the module on the Linux host.
 
 The non-destructive implementation in `isopropyl/syslinux.py` adapts the on-disk
 ADV, extent, patch-area checksum, first-sector-pointer, and FAT VBR merge formats

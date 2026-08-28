@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import hashlib
 import os
 import tempfile
 import threading
@@ -9,9 +10,13 @@ import unittest
 import zipfile
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 import isopropyl.iso_staging as iso_staging
+import isopropyl.syslinux_staging as syslinux_staging
+from isopropyl.boot_identity import analyze_bootloader_members
+from isopropyl.bootloaders import BoundBootArtifact, BoundBootBundle
 from isopropyl.extraction import (
     ExtractionCancelled,
     ExtractionProgress,
@@ -69,6 +74,47 @@ from tests.test_fat_image import make_fat, write_container
 SEVEN_ZIP = "/usr/bin/7z"
 WIMLIB = "/usr/bin/wimlib-imagex"
 LARGE_TEMP_PARENT = Path(__file__).resolve().parent.parent
+SYSLINUX_BLOB = b"ISOLINUX 6.03 2014-10-06"
+SYSLINUX_CONFIG = b"DEFAULT linux\n\nLABEL linux\n  LINUX /vmlinuz\n"
+SYSLINUX_C32 = b"integration fixture ldlinux.c32"
+SYSLINUX_BUILD = "6.03-2014-10-06"
+SYSLINUX_PROVENANCE = "fixture://syslinux-6.03"
+SYSLINUX_TEST_PINS = MappingProxyType({
+    SYSLINUX_BUILD: (
+        len(SYSLINUX_C32),
+        hashlib.sha256(SYSLINUX_C32).hexdigest(),
+        SYSLINUX_PROVENANCE,
+    ),
+})
+
+
+def syslinux_entries(*, existing_c32: bool = False) -> tuple[ArchiveEntry, ...]:
+    catalog = basic_entries() + (
+        ArchiveEntry("isolinux", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("isolinux/isolinux.bin", len(SYSLINUX_BLOB)),
+        ArchiveEntry("isolinux/isolinux.cfg", len(SYSLINUX_CONFIG)),
+    )
+    if existing_c32:
+        catalog += (ArchiveEntry("isolinux/ldlinux.c32", len(SYSLINUX_C32)),)
+    return catalog
+
+
+def syslinux_analysis():
+    return analyze_bootloader_members({
+        "isolinux/isolinux.bin": SYSLINUX_BLOB,
+    })
+
+
+def syslinux_c32_bundle() -> BoundBootBundle:
+    digest = SYSLINUX_TEST_PINS[SYSLINUX_BUILD][1]
+    return BoundBootBundle(
+        "syslinux",
+        SYSLINUX_BUILD,
+        "blank-bios-module",
+        (BoundBootArtifact("ldlinux.c32", SYSLINUX_C32, digest),),
+        "GPL-2.0-or-later",
+        SYSLINUX_PROVENANCE,
+    )
 
 
 def basic_entries() -> tuple[ArchiveEntry, ...]:
@@ -351,6 +397,13 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual(plan.image_identity[2], len(b"ISO placeholder"))
             self.assertEqual(len(plan.catalog_digest), 64)
             self.assertEqual(plan.content_bytes, 13)
+            self.assertEqual(plan.staged_entries, plan.effective_entries)
+            self.assertEqual(
+                plan.staged_catalog_digest,
+                plan.effective_catalog_digest,
+            )
+            self.assertIsNone(plan.syslinux_staging)
+            self.assertEqual(plan.syslinux_content_bytes, 0)
             self.assertFalse(plan.needs_wim_split)
             self.assertIsNone(plan.autounattend_xml)
             with self.assertRaises(FrozenInstanceError):
@@ -467,6 +520,107 @@ class IsoStagingTests(unittest.TestCase):
             )
             validate_iso_staging_plan(plan)
 
+    def test_overlay_cannot_supply_syslinux_identity_or_module_evidence(self):
+        entries = syslinux_entries()
+        boot_analysis = syslinux_analysis()
+        bundle = syslinux_c32_bundle()
+        source_payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root,
+                (("isolinux/ldlinux.c32", SYSLINUX_C32),),
+            )
+
+            def base_only_reader(_image, member, **_kwargs):
+                if member not in source_payloads:
+                    raise OSError("member is supplied only by the overlay")
+                return source_payloads[member]
+
+            with (
+                patch.object(
+                    syslinux_staging,
+                    "PINNED_SYSLINUX_C32",
+                    SYSLINUX_TEST_PINS,
+                ),
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    return_value=boot_analysis,
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=base_only_reader,
+                ),
+                self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "originate in the base ISO",
+                ),
+            ):
+                self.make_plan(
+                    root,
+                    entries,
+                    overlay=overlay,
+                    write_plan=overlay_write_plan(entries, overlay),
+                    syslinux_c32_bundle=bundle,
+                )
+
+    def test_unrelated_overlay_composes_with_private_syslinux_staging(self):
+        entries = syslinux_entries()
+        boot_analysis = syslinux_analysis()
+        bundle = syslinux_c32_bundle()
+        source_payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+        }
+
+        def populate_sources(tree: Path, _image: Path) -> None:
+            for relative, data in source_payloads.items():
+                tree.joinpath(*Path(relative).parts).write_bytes(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlay = make_overlay(
+                root,
+                (("extras/diagnostic.txt", b"overlay"),),
+            )
+            with (
+                patch.object(
+                    syslinux_staging,
+                    "PINNED_SYSLINUX_C32",
+                    SYSLINUX_TEST_PINS,
+                ),
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    return_value=boot_analysis,
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=lambda _image, member, **_kwargs: source_payloads[member],
+                ),
+            ):
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    overlay=overlay,
+                    write_plan=overlay_write_plan(entries, overlay),
+                    syslinux_c32_bundle=bundle,
+                )
+                result = IsoStagingExecutor(
+                    extractor=FakeExtractor(mutate=populate_sources),
+                ).execute(plan)
+
+            self.assertEqual(
+                (result.destination / "extras/diagnostic.txt").read_bytes(),
+                b"overlay",
+            )
+            self.assertEqual(
+                (result.destination / "isolinux/ldlinux.c32").read_bytes(),
+                SYSLINUX_C32,
+            )
+
     def test_forged_distro_catalog_is_rejected_before_executor_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -568,6 +722,376 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual(updates[-1].stage, "Complete")
             self.assertEqual(updates[-1].fraction, 1.0)
             self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_syslinux_private_staging_creates_exact_redirect_and_module(self):
+        entries = syslinux_entries()
+        boot_analysis = syslinux_analysis()
+        bundle = syslinux_c32_bundle()
+        source_payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+        }
+        descriptor_reads: list[tuple[str, int | None]] = []
+
+        def analyze(_image, _paths, *, image_fd=None, **_kwargs):
+            self.assertIsNotNone(image_fd)
+            return boot_analysis
+
+        def read_member(_image, member, *, image_fd=None, **_kwargs):
+            descriptor_reads.append((member, image_fd))
+            self.assertIsNotNone(image_fd)
+            return source_payloads[member]
+
+        def populate_sources(tree: Path, _image: Path) -> None:
+            for relative, data in source_payloads.items():
+                tree.joinpath(*Path(relative).parts).write_bytes(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(
+                    syslinux_staging,
+                    "PINNED_SYSLINUX_C32",
+                    SYSLINUX_TEST_PINS,
+                ),
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    side_effect=analyze,
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=read_member,
+                ),
+            ):
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    write_plan=write_plan(entries),
+                    syslinux_c32_bundle=bundle,
+                )
+                validate_iso_staging_plan(plan)
+                result = IsoStagingExecutor(
+                    extractor=FakeExtractor(mutate=populate_sources),
+                ).execute(plan)
+
+            assert plan.syslinux_staging is not None
+            redirect = plan.syslinux_staging.root_redirect
+            assert redirect is not None
+            self.assertEqual(
+                (result.destination / "syslinux.cfg").read_bytes(),
+                redirect.data,
+            )
+            self.assertEqual(
+                (result.destination / "isolinux/ldlinux.c32").read_bytes(),
+                SYSLINUX_C32,
+            )
+            self.assertEqual(
+                plan.syslinux_content_bytes,
+                len(redirect.data) + len(SYSLINUX_C32),
+            )
+            self.assertEqual(
+                plan.content_bytes,
+                sum(
+                    entry.size for entry in plan.staged_entries
+                    if entry.kind is EntryKind.FILE
+                ),
+            )
+            self.assertEqual(result.catalog_digest, plan.staged_catalog_digest)
+            self.assertEqual(result.files, 6)
+            self.assertTrue(descriptor_reads)
+            self.assertTrue(all(descriptor is not None for _, descriptor in descriptor_reads))
+
+    def test_syslinux_private_staging_reuses_exact_existing_c32(self):
+        entries = syslinux_entries(existing_c32=True)
+        boot_analysis = syslinux_analysis()
+        bundle = syslinux_c32_bundle()
+        payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+            "isolinux/ldlinux.c32": SYSLINUX_C32,
+        }
+
+        def populate_sources(tree: Path, _image: Path) -> None:
+            for relative, data in payloads.items():
+                tree.joinpath(*Path(relative).parts).write_bytes(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(
+                    syslinux_staging,
+                    "PINNED_SYSLINUX_C32",
+                    SYSLINUX_TEST_PINS,
+                ),
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    return_value=boot_analysis,
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=lambda _image, member, **_kwargs: payloads[member],
+                ),
+            ):
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    write_plan=write_plan(entries),
+                    syslinux_c32_bundle=bundle,
+                )
+                result = IsoStagingExecutor(
+                    extractor=FakeExtractor(mutate=populate_sources),
+                ).execute(plan)
+
+            assert plan.syslinux_staging is not None
+            self.assertEqual(
+                tuple(item.path for item in plan.syslinux_staging.additions),
+                ("syslinux.cfg",),
+            )
+            self.assertEqual(
+                (result.destination / "isolinux/ldlinux.c32").read_bytes(),
+                SYSLINUX_C32,
+            )
+
+    def test_syslinux_rejects_same_size_extractor_substitution_before_publish(self):
+        entries = syslinux_entries()
+        boot_analysis = syslinux_analysis()
+        bundle = syslinux_c32_bundle()
+        payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+        }
+
+        def substitute_config(tree: Path, _image: Path) -> None:
+            (tree / "isolinux/isolinux.bin").write_bytes(SYSLINUX_BLOB)
+            (tree / "isolinux/isolinux.cfg").write_bytes(
+                b"X" * len(SYSLINUX_CONFIG)
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(
+                    syslinux_staging,
+                    "PINNED_SYSLINUX_C32",
+                    SYSLINUX_TEST_PINS,
+                ),
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    return_value=boot_analysis,
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=lambda _image, member, **_kwargs: payloads[member],
+                ),
+            ):
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    write_plan=write_plan(entries),
+                    syslinux_c32_bundle=bundle,
+                )
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "forged or stale",
+                ):
+                    IsoStagingExecutor(
+                        extractor=FakeExtractor(mutate=substitute_config),
+                    ).execute(plan)
+
+            self.assertFalse(plan.destination.exists())
+            self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_syslinux_revalidates_sources_and_reused_module_before_publish(self):
+        selection = selected_esd()
+        customization = WindowsCustomization(install_image=selection)
+        boot_analysis = syslinux_analysis()
+        bundle = syslinux_c32_bundle()
+        for existing_c32, mutation_path in (
+            (False, "isolinux/isolinux.cfg"),
+            (True, "isolinux/ldlinux.c32"),
+            (False, "syslinux.cfg"),
+            (False, "isolinux/ldlinux.c32"),
+        ):
+            with self.subTest(
+                existing_c32=existing_c32,
+                mutation_path=mutation_path,
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                entries = syslinux_entries(existing_c32=existing_c32) + (
+                    ArchiveEntry("sources", kind=EntryKind.DIRECTORY),
+                    ArchiveEntry("sources/install.esd", 7),
+                )
+                payloads = {
+                    "isolinux/isolinux.bin": SYSLINUX_BLOB,
+                    "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+                }
+                if existing_c32:
+                    payloads["isolinux/ldlinux.c32"] = SYSLINUX_C32
+
+                def populate_sources(tree: Path, _image: Path) -> None:
+                    for relative, data in payloads.items():
+                        tree.joinpath(*Path(relative).parts).write_bytes(data)
+
+                def mutating_inspector(
+                    source: Path, _tool: str, _cancel_event,
+                ) -> WimInfo:
+                    target = source.parents[1].joinpath(*Path(mutation_path).parts)
+                    original = target.read_bytes()
+                    target.write_bytes(b"X" * len(original))
+                    return inspected_wim(source, selection.editions)
+
+                with (
+                    patch.object(
+                        syslinux_staging,
+                        "PINNED_SYSLINUX_C32",
+                        SYSLINUX_TEST_PINS,
+                    ),
+                    patch(
+                        "isopropyl.iso_staging.analyze_iso_bootloaders",
+                        return_value=boot_analysis,
+                    ),
+                    patch(
+                        "isopropyl.iso_staging.read_archive_member_with_7z",
+                        side_effect=lambda _image, member, **_kwargs: payloads[member],
+                    ),
+                ):
+                    plan = self.make_plan(
+                        root,
+                        entries,
+                        write_plan=write_plan(entries),
+                        syslinux_c32_bundle=bundle,
+                        windows_customization=customization,
+                        windows_architecture="amd64",
+                        wimlib_resolver=lambda: WIMLIB,
+                    )
+                    with self.assertRaises(IsoStagingSafetyError):
+                        IsoStagingExecutor(
+                            extractor=FakeExtractor(mutate=populate_sources),
+                            wim_inspector=mutating_inspector,
+                        ).execute(plan)
+
+                self.assertFalse(plan.destination.exists())
+                self.assertEqual(list(root.glob(".ready-media.*.partial")), [])
+
+    def test_syslinux_plan_rejects_incomplete_or_forged_optional_bindings(self):
+        entries = syslinux_entries()
+        boot_analysis = syslinux_analysis()
+        bundle = syslinux_c32_bundle()
+        payloads = {
+            "isolinux/isolinux.bin": SYSLINUX_BLOB,
+            "isolinux/isolinux.cfg": SYSLINUX_CONFIG,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(
+                    syslinux_staging,
+                    "PINNED_SYSLINUX_C32",
+                    SYSLINUX_TEST_PINS,
+                ),
+                patch(
+                    "isopropyl.iso_staging.analyze_iso_bootloaders",
+                    return_value=boot_analysis,
+                ),
+                patch(
+                    "isopropyl.iso_staging.read_archive_member_with_7z",
+                    side_effect=lambda _image, member, **_kwargs: payloads[member],
+                ),
+            ):
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    write_plan=write_plan(entries),
+                    syslinux_c32_bundle=bundle,
+                )
+                candidates = (
+                    replace(plan, syslinux_analysis=None),
+                    replace(plan, syslinux_c32_bundle=None),
+                    replace(plan, syslinux_staging=None),
+                    replace(
+                        plan,
+                        syslinux_content_bytes=plan.syslinux_content_bytes + 1,
+                    ),
+                    replace(plan, staged_catalog_digest="0" * 64),
+                    replace(plan, staged_entries=plan.effective_entries),
+                )
+                for candidate in candidates:
+                    extractor = FakeExtractor()
+                    with self.subTest(candidate=candidate), self.assertRaises(
+                        IsoStagingSafetyError,
+                    ):
+                        IsoStagingExecutor(extractor=extractor).execute(candidate)
+                    self.assertEqual(extractor.calls, [])
+            self.assertFalse(plan.destination.exists())
+
+    def test_syslinux_exclusive_file_helper_never_replaces_or_reads_hardlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tree"
+            root.mkdir()
+            existing = root / "syslinux.cfg"
+            existing.write_bytes(b"existing")
+            item = syslinux_staging.SyslinuxStageFile(
+                "syslinux.cfg",
+                b"generated",
+                hashlib.sha256(b"generated").hexdigest(),
+                syslinux_staging.StageDisposition.CREATE,
+            )
+            root_fd = os.open(root, iso_staging._DIR_FLAGS)
+            try:
+                device = os.fstat(root_fd).st_dev
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "exclusively create",
+                ):
+                    iso_staging._create_staged_syslinux_file(
+                        root_fd, item, device, lambda: None,
+                    )
+                self.assertEqual(existing.read_bytes(), b"existing")
+
+                original = root / "loader.bin"
+                alias = root / "loader-alias.bin"
+                original.write_bytes(b"payload")
+                os.link(original, alias)
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "changed while opening",
+                ):
+                    iso_staging._read_staged_file_bytes(
+                        root_fd,
+                        "loader.bin",
+                        len(b"payload"),
+                        device,
+                        lambda: None,
+                    )
+
+                escaped = root.parent / "escaped"
+                escape_item = syslinux_staging.SyslinuxStageFile(
+                    "../escaped",
+                    b"escape",
+                    hashlib.sha256(b"escape").hexdigest(),
+                    syslinux_staging.StageDisposition.CREATE,
+                )
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "canonical and relative",
+                ):
+                    iso_staging._create_staged_syslinux_file(
+                        root_fd, escape_item, device, lambda: None,
+                    )
+                self.assertFalse(escaped.exists())
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "canonical and relative",
+                ):
+                    iso_staging._read_staged_file_bytes(
+                        root_fd,
+                        "../outside",
+                        1,
+                        device,
+                        lambda: None,
+                    )
+            finally:
+                os.close(root_fd)
 
     def test_overlay_uses_canonical_targets_for_explicit_and_implicit_base_dirs(self):
         entries = (

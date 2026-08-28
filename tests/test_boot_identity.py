@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -127,6 +128,56 @@ class BootIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "not installed"):
                 read_archive_member_with_7z(Path("fixture.iso"), "isolinux.bin")
         which.assert_called_once_with("7z", path="/usr/bin:/bin")
+
+    def test_payload_reader_enforces_caller_specific_streaming_cap(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"12345")
+        os.close(write_fd)
+
+        class FinishedProcess:
+            def __init__(self) -> None:
+                self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                raise AssertionError("finished fixture must not be killed")
+
+        process = FinishedProcess()
+        try:
+            with (
+                patch(
+                    "isopropyl.boot_identity._trusted_7z",
+                    return_value="/usr/bin/7z",
+                ),
+                patch(
+                    "isopropyl.boot_identity.subprocess.Popen",
+                    return_value=process,
+                ),
+                self.assertRaisesRegex(ValueError, "inspection size limit"),
+            ):
+                read_archive_member_with_7z(
+                    Path("fixture.iso"),
+                    "isolinux.bin",
+                    max_bytes=4,
+                )
+        finally:
+            process.stdout.close()
+
+        for invalid in (0, True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError,
+                "read limit",
+            ):
+                read_archive_member_with_7z(
+                    Path("fixture.iso"),
+                    "isolinux.bin",
+                    max_bytes=invalid,  # type: ignore[arg-type]
+                )
 
     def test_member_selection_rejects_traversal_and_is_bounded_to_payloads(self):
         selected = bootloader_member_paths([

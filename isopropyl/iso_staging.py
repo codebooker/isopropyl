@@ -13,6 +13,7 @@ caller builds a target-specific constructed-media plan from it.
 import ctypes
 import errno
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
@@ -30,6 +32,12 @@ from .constructed import (
     ConstructedMediaSafetyError,
     scan_staging_tree,
 )
+from .boot_identity import (
+    BootloaderAnalysis,
+    analyze_iso_bootloaders,
+    read_archive_member_with_7z,
+)
+from .bootloaders import BoundBootBundle
 from .distro_policies import (
     DistroPolicyError,
     match_distro_member_exclusion,
@@ -67,6 +75,7 @@ from .iso import (
     WriteMode,
     WritePlan,
     merge_additive_embedded_entries,
+    merge_additive_generated_entries,
     merge_additive_overlay_entries,
     validate_extraction_entries,
 )
@@ -76,6 +85,16 @@ from .timestamps import (
     TimestampPreservationError,
     apply_descriptor_mtime,
     mtime_matches,
+)
+from .syslinux_staging import (
+    StageDisposition,
+    SyslinuxStageFile,
+    SyslinuxStagingError,
+    SyslinuxStagingPlan,
+    plan_syslinux_staging,
+    syslinux_staging_analysis_paths,
+    syslinux_staging_read_paths,
+    validate_syslinux_staging_plan,
 )
 from .wim import (
     FileIdentity as WimFileIdentity,
@@ -149,6 +168,7 @@ _RENAME_NOREPLACE = 1
 _WIM_PART = re.compile(r"install(?:(?P<number>[2-9][0-9]*))?\.swm", re.IGNORECASE)
 _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
 _CATALOG_WITNESS_TOKEN = object()
+_SYSLINUX_BIND_TIMEOUT_SECONDS = 60.0
 
 
 def _is_install_wim_path(path: str) -> bool:
@@ -162,6 +182,14 @@ def _is_install_wim_path(path: str) -> bool:
 
 @dataclass(frozen=True)
 class IsoStagingPlan:
+    """One bound private-tree plan.
+
+    ``effective_entries`` is the base/embedded/overlay catalog.
+    ``staged_entries`` additionally includes planned Syslinux files, but is
+    intentionally still before WIM splitting and generated answer files.  Its
+    digest is a planning/result binding, not a hash manifest of the final tree.
+    """
+
     image: Path
     image_identity: FileIdentity
     destination: Path
@@ -188,6 +216,12 @@ class IsoStagingPlan:
     base_with_embedded_entries: tuple[ArchiveEntry, ...] = ()
     base_with_embedded_catalog_digest: str = ""
     embedded_content_bytes: int = 0
+    syslinux_analysis: BootloaderAnalysis | None = None
+    syslinux_c32_bundle: BoundBootBundle | None = None
+    syslinux_staging: SyslinuxStagingPlan | None = None
+    syslinux_content_bytes: int = 0
+    staged_entries: tuple[ArchiveEntry, ...] = ()
+    staged_catalog_digest: str = ""
 
     @property
     def needs_wim_split(self) -> bool:
@@ -210,6 +244,8 @@ class IsoStagingProgress:
 
 @dataclass(frozen=True)
 class IsoStagingResult:
+    """Published tree metadata; ``catalog_digest`` binds ``staged_entries``."""
+
     destination: Path
     image_identity: FileIdentity
     catalog_digest: str
@@ -532,6 +568,7 @@ def _validate_staging_scalar_bindings(plan: IsoStagingPlan) -> None:
     for name, value in (
         ("content bytes", plan.content_bytes),
         ("required free bytes", plan.required_free_bytes),
+        ("Syslinux content bytes", plan.syslinux_content_bytes),
     ):
         if type(value) is not int or value < 0:
             raise IsoStagingSafetyError(f"The staging plan {name} value is invalid")
@@ -549,6 +586,16 @@ def _validate_staging_scalar_bindings(plan: IsoStagingPlan) -> None:
             raise IsoStagingSafetyError(f"The staging plan {name} is invalid")
     if plan.image_identity[2] <= 0:
         raise IsoStagingSafetyError("The staging plan image identity is invalid")
+    for name, digest in (
+        ("catalog digest", plan.catalog_digest),
+        ("effective catalog digest", plan.effective_catalog_digest),
+        ("staged catalog digest", plan.staged_catalog_digest),
+    ):
+        if (
+            type(digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise IsoStagingSafetyError(f"The staging plan {name} is invalid")
 
 
 def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> str | None:
@@ -758,6 +805,177 @@ def _existing_windows_answer_file(
     return None
 
 
+def _status_identity(info: os.stat_result) -> FileIdentity:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_bound_syslinux_inputs(
+    image: Path,
+    image_identity: FileIdentity,
+    entries: tuple[ArchiveEntry, ...],
+    module_bundle: BoundBootBundle,
+    *,
+    analysis_entries: tuple[ArchiveEntry, ...] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> tuple[
+    BootloaderAnalysis,
+    dict[str, bytes],
+    dict[str, bytes],
+    SyslinuxStagingPlan,
+]:
+    """Rebuild the Syslinux decision from one identity-bound ISO descriptor."""
+
+    descriptor = -1
+    deadline = time.monotonic() + _SYSLINUX_BIND_TIMEOUT_SECONDS
+    try:
+        if cancel_check is not None:
+            cancel_check()
+        descriptor = os.open(
+            image,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _status_identity(opened) != image_identity:
+            raise IsoStagingSafetyError(
+                "The ISO changed before Syslinux staging was bound"
+            )
+        analysis_catalog = entries if analysis_entries is None else analysis_entries
+        analysis_paths = syslinux_staging_analysis_paths(analysis_catalog)
+        analysis_sizes = {
+            entry.path: entry.size
+            for entry in analysis_catalog
+            if entry.path in analysis_paths
+        }
+
+        def read_analysis_member(_image: Path, member: str) -> bytes:
+            remaining_read = deadline - time.monotonic()
+            if remaining_read <= 0:
+                raise TimeoutError(
+                    "Syslinux staging reached its overall time limit"
+                )
+            expected_size = analysis_sizes.get(member)
+            if expected_size is None:
+                raise OSError("The Isolinux candidate left the bound base catalog")
+            return read_archive_member_with_7z(
+                image,
+                member,
+                timeout=min(15.0, remaining_read),
+                image_fd=descriptor,
+                cancel_check=cancel_check,
+                max_bytes=expected_size,
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Syslinux staging reached its overall time limit")
+        analysis = analyze_iso_bootloaders(
+            image,
+            analysis_paths,
+            reader=read_analysis_member,
+            timeout=min(30.0, remaining),
+            image_fd=descriptor,
+            cancel_check=cancel_check,
+        )
+        read_paths = syslinux_staging_read_paths(entries, analysis)
+        entry_by_path = {entry.path: entry for entry in entries}
+        base_paths = {
+            entry.path
+            for entry in analysis_catalog
+            if entry.kind is EntryKind.FILE
+        }
+        if any(path not in base_paths for path in read_paths):
+            raise IsoStagingSafetyError(
+                "The initial Syslinux profile requires all evidence to originate "
+                "in the base ISO"
+            )
+        payloads: dict[str, bytes] = {}
+        for path in read_paths:
+            if cancel_check is not None:
+                cancel_check()
+            entry = entry_by_path.get(path)
+            if entry is None or entry.kind is not EntryKind.FILE:
+                raise IsoStagingSafetyError(
+                    "The Syslinux read set is not bound to the effective ISO catalog"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Syslinux staging reached its overall time limit"
+                )
+            payload = read_archive_member_with_7z(
+                image,
+                path,
+                timeout=min(15.0, remaining),
+                image_fd=descriptor,
+                cancel_check=cancel_check,
+                max_bytes=entry.size,
+            )
+            if len(payload) != entry.size:
+                raise IsoStagingSafetyError(
+                    f"The Syslinux source member {path!r} changed size"
+                )
+            payloads[path] = payload
+        final = os.fstat(descriptor)
+        if _status_identity(final) != image_identity:
+            raise IsoStagingSafetyError(
+                "The ISO changed while Syslinux staging was bound"
+            )
+        existing_files = {
+            path: data for path, data in payloads.items()
+            if PurePosixPath(path).name.casefold().endswith(".c32")
+        }
+        source_files = {
+            path: data for path, data in payloads.items()
+            if path not in existing_files
+        }
+        staging = plan_syslinux_staging(
+            entries,
+            analysis,
+            module_bundle,
+            source_files=source_files,
+            existing_files=existing_files,
+        )
+        return analysis, source_files, existing_files, staging
+    except IsoStagingSafetyError:
+        raise
+    except (OSError, TimeoutError, ValueError, SyslinuxStagingError) as error:
+        raise IsoStagingSafetyError(
+            f"Could not bind the Syslinux staging profile: {error}"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _merge_syslinux_staging_catalog(
+    entries: tuple[ArchiveEntry, ...],
+    staging: SyslinuxStagingPlan | None,
+) -> tuple[tuple[ArchiveEntry, ...], int]:
+    if staging is None:
+        return entries, 0
+    generated = tuple(
+        ArchiveEntry(item.path, len(item.data))
+        for item in staging.additions
+    )
+    try:
+        merged = merge_additive_generated_entries(entries, generated)
+    except (UnsafeArchiveError, ValueError) as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    added_bytes = sum(item.size for item in merged.overlay_entries)
+    if added_bytes != sum(len(item.data) for item in staging.additions):
+        raise IsoStagingSafetyError(
+            "The generated Syslinux byte accounting is inconsistent"
+        )
+    return merged.merged_entries, added_bytes
+
+
 def build_iso_staging_plan(
     image: Path,
     destination: Path,
@@ -771,8 +989,13 @@ def build_iso_staging_plan(
     windows_customization: WindowsCustomization | None = None,
     windows_architecture: str = "amd64",
     wimlib_resolver: Callable[[], str] = resolve_wimlib,
+    syslinux_c32_bundle: BoundBootBundle | None = None,
 ) -> IsoStagingPlan:
-    """Bind validated ISO/overlay catalogs and a write plan to a new output path."""
+    """Bind validated ISO/overlay catalogs and a write plan to a new output path.
+
+    ``syslinux_c32_bundle`` is a backend-only, already-bound data input.  This
+    function never downloads it, authorizes BIOS mode, or touches a device.
+    """
 
     if cancel_check is not None:
         cancel_check()
@@ -885,6 +1108,27 @@ def build_iso_staging_plan(
         cancel_check,
     )
 
+    syslinux_analysis: BootloaderAnalysis | None = None
+    syslinux_staging: SyslinuxStagingPlan | None = None
+    if syslinux_c32_bundle is not None:
+        (
+            syslinux_analysis,
+            _syslinux_sources,
+            _syslinux_existing,
+            syslinux_staging,
+        ) = _read_bound_syslinux_inputs(
+            extraction.image,
+            extraction.image_identity,
+            effective_entries,
+            syslinux_c32_bundle,
+            analysis_entries=safe_entries,
+            cancel_check=cancel_check,
+        )
+    staged_entries, syslinux_content_bytes = _merge_syslinux_staging_catalog(
+        effective_entries,
+        syslinux_staging,
+    )
+
     wimlib_imagex: str | None = None
     if wim_source is not None or wim_selection is not None:
         try:
@@ -899,12 +1143,17 @@ def build_iso_staging_plan(
         (entry.size for entry in effective_entries if entry.path == wim_source), 0,
     )
     content_bytes = sum(
-        entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
+        entry.size for entry in staged_entries if entry.kind is EntryKind.FILE
     )
     overlay_bytes = overlay.content_bytes if overlay is not None else 0
     if (
         content_bytes
-        != extraction.content_bytes + embedded_content_bytes + overlay_bytes
+        != (
+            extraction.content_bytes
+            + embedded_content_bytes
+            + overlay_bytes
+            + syslinux_content_bytes
+        )
     ):
         raise IsoStagingSafetyError(
             "The embedded/overlay expanded-size accounting is inconsistent"
@@ -951,6 +1200,12 @@ def build_iso_staging_plan(
             base_with_embedded_entries,
         ),
         embedded_content_bytes=embedded_content_bytes,
+        syslinux_analysis=syslinux_analysis,
+        syslinux_c32_bundle=syslinux_c32_bundle,
+        syslinux_staging=syslinux_staging,
+        syslinux_content_bytes=syslinux_content_bytes,
+        staged_entries=staged_entries,
+        staged_catalog_digest=_catalog_digest(staged_entries),
     )
 
 
@@ -1010,6 +1265,78 @@ def validate_iso_staging_plan(
     _validate_wim_selection_catalog(effective_entries, plan.wim_selection)
     if wim_source != plan.wim_source:
         raise IsoStagingSafetyError("The plan contains inconsistent WIM transformation data")
+
+    syslinux_fields = (
+        plan.syslinux_analysis,
+        plan.syslinux_c32_bundle,
+        plan.syslinux_staging,
+    )
+    if all(value is None for value in syslinux_fields):
+        if plan.syslinux_content_bytes != 0:
+            raise IsoStagingSafetyError(
+                "The staging plan has unbound Syslinux byte accounting"
+            )
+        rebuilt_syslinux: SyslinuxStagingPlan | None = None
+    elif any(value is None for value in syslinux_fields):
+        raise IsoStagingSafetyError(
+            "The staging plan contains an incomplete Syslinux binding"
+        )
+    else:
+        if (
+            type(plan.syslinux_analysis) is not BootloaderAnalysis
+            or type(plan.syslinux_c32_bundle) is not BoundBootBundle
+            or type(plan.syslinux_staging) is not SyslinuxStagingPlan
+        ):
+            raise IsoStagingSafetyError(
+                "The staging plan contains invalid Syslinux inputs"
+            )
+        assert plan.syslinux_analysis is not None
+        assert plan.syslinux_c32_bundle is not None
+        assert plan.syslinux_staging is not None
+        (
+            fresh_analysis,
+            fresh_sources,
+            fresh_existing,
+            rebuilt_syslinux,
+        ) = _read_bound_syslinux_inputs(
+            plan.image,
+            plan.image_identity,
+            effective_entries,
+            plan.syslinux_c32_bundle,
+            analysis_entries=entries,
+            cancel_check=cancel_check,
+        )
+        if fresh_analysis != plan.syslinux_analysis:
+            raise IsoStagingSafetyError(
+                "The Syslinux bootloader analysis changed"
+            )
+        try:
+            validate_syslinux_staging_plan(
+                plan.syslinux_staging,
+                effective_entries,
+                fresh_analysis,
+                plan.syslinux_c32_bundle,
+                source_files=fresh_sources,
+                existing_files=fresh_existing,
+            )
+        except SyslinuxStagingError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        if rebuilt_syslinux != plan.syslinux_staging:
+            raise IsoStagingSafetyError(
+                "The Syslinux private-tree plan changed"
+            )
+    staged_entries, syslinux_content_bytes = _merge_syslinux_staging_catalog(
+        effective_entries,
+        rebuilt_syslinux,
+    )
+    if (
+        staged_entries != plan.staged_entries
+        or _catalog_digest(staged_entries) != plan.staged_catalog_digest
+        or syslinux_content_bytes != plan.syslinux_content_bytes
+    ):
+        raise IsoStagingSafetyError(
+            "The staged catalog binding is invalid or conflicts with generated content"
+        )
     if plan.autounattend_xml is not None and not isinstance(
         plan.autounattend_xml, str,
     ):
@@ -1146,14 +1473,17 @@ def validate_iso_staging_plan(
         raise IsoStagingSafetyError("The ISO, destination, or content binding changed")
     overlay_bytes = plan.overlay.content_bytes if plan.overlay is not None else 0
     expected_content = (
-        rebuilt.content_bytes + embedded_content_bytes + overlay_bytes
+        rebuilt.content_bytes
+        + embedded_content_bytes
+        + overlay_bytes
+        + syslinux_content_bytes
     )
     catalog_content = sum(
-        entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
+        entry.size for entry in staged_entries if entry.kind is EntryKind.FILE
     )
     if plan.content_bytes != expected_content or expected_content != catalog_content:
         raise IsoStagingSafetyError(
-            "The ISO and ZIP overlay expanded-size accounting is invalid"
+            "The staged ISO expanded-size accounting is invalid"
         )
     if wim_source is None and plan.wim_selection is None:
         if plan.wimlib_imagex is not None:
@@ -1289,6 +1619,20 @@ def _open_staged_directory(
     parts: tuple[str, ...],
     root_device: int,
 ) -> int:
+    if (
+        type(parts) is not tuple
+        or any(
+            type(component) is not str
+            or component in {"", ".", "..", "/"}
+            or "/" in component
+            or "\\" in component
+            or "\x00" in component
+            for component in parts
+        )
+    ):
+        raise IsoStagingSafetyError(
+            "A private staging directory path is not canonical and relative"
+        )
     current = os.dup(root_fd)
     try:
         for component in parts:
@@ -1309,6 +1653,382 @@ def _open_staged_directory(
     except BaseException:
         os.close(current)
         raise
+
+
+def _stable_staged_file_fields(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _staged_relative_parts(path: str) -> tuple[str, ...]:
+    if type(path) is not str:
+        raise IsoStagingSafetyError("A private staging path must be text")
+    pure = PurePosixPath(path)
+    parts = pure.parts
+    if (
+        not path
+        or pure.is_absolute()
+        or pure.as_posix() != path
+        or not parts
+        or any(
+            component in {"", ".", "..", "/"}
+            or "/" in component
+            or "\\" in component
+            or "\x00" in component
+            for component in parts
+        )
+    ):
+        raise IsoStagingSafetyError(
+            "A private staging path is not canonical and relative"
+        )
+    return parts
+
+
+def _read_staged_file_bytes(
+    root_fd: int,
+    path: str,
+    expected_size: int,
+    root_device: int,
+    cancel_check: Callable[[], None],
+) -> bytes:
+    """Read one exact private-tree file through stable no-follow descriptors."""
+
+    parts = _staged_relative_parts(path)
+    if type(expected_size) is not int or expected_size < 0:
+        raise IsoStagingSafetyError("A Syslinux staged-file binding is invalid")
+    parent_parts = parts[:-1]
+    parent = _open_staged_directory(root_fd, parent_parts, root_device)
+    descriptor = -1
+    try:
+        try:
+            observed = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent,
+            )
+        except OSError as error:
+            raise IsoStagingSafetyError(
+                f"Could not safely open staged Syslinux file {path!r}"
+            ) from error
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != root_device
+            or opened.st_nlink != 1
+            or opened.st_size != expected_size
+            or _stable_staged_file_fields(opened)
+            != _stable_staged_file_fields(observed)
+        ):
+            raise IsoStagingSafetyError(
+                f"Staged Syslinux file {path!r} changed while opening"
+            )
+        payload = bytearray()
+        remaining = expected_size
+        while remaining:
+            cancel_check()
+            try:
+                block = os.read(descriptor, min(1024 * 1024, remaining))
+            except OSError as error:
+                raise IsoStagingSafetyError(
+                    f"Could not read staged Syslinux file {path!r}"
+                ) from error
+            if not block:
+                raise IsoStagingSafetyError(
+                    f"Staged Syslinux file {path!r} ended early"
+                )
+            payload.extend(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise IsoStagingSafetyError(
+                f"Staged Syslinux file {path!r} grew while reading"
+            )
+        after = os.fstat(descriptor)
+        reopened_parent = _open_staged_directory(
+            root_fd, parent_parts, root_device,
+        )
+        try:
+            rebound = os.stat(
+                parts[-1], dir_fd=reopened_parent, follow_symlinks=False,
+            )
+            if (
+                (os.fstat(reopened_parent).st_dev, os.fstat(reopened_parent).st_ino)
+                != (os.fstat(parent).st_dev, os.fstat(parent).st_ino)
+                or _stable_staged_file_fields(after)
+                != _stable_staged_file_fields(opened)
+                or _stable_staged_file_fields(rebound)
+                != _stable_staged_file_fields(opened)
+            ):
+                raise IsoStagingSafetyError(
+                    f"Staged Syslinux file {path!r} changed while reading"
+                )
+        finally:
+            os.close(reopened_parent)
+        return bytes(payload)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _create_staged_syslinux_file(
+    root_fd: int,
+    item: SyslinuxStageFile,
+    root_device: int,
+    cancel_check: Callable[[], None],
+) -> None:
+    if (
+        type(item) is not SyslinuxStageFile
+        or item.disposition is not StageDisposition.CREATE
+        or type(item.path) is not str
+        or type(item.data) is not bytes
+        or type(item.sha256) is not str
+        or not hmac.compare_digest(
+            hashlib.sha256(item.data).hexdigest(), item.sha256,
+        )
+    ):
+        raise IsoStagingSafetyError("A generated Syslinux file is invalid")
+    parts = _staged_relative_parts(item.path)
+    parent_parts = parts[:-1]
+    parent = _open_staged_directory(root_fd, parent_parts, root_device)
+    descriptor = -1
+    created_identity: tuple[int, int] | None = None
+    try:
+        cancel_check()
+        try:
+            descriptor = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent,
+            )
+        except OSError as error:
+            raise IsoStagingSafetyError(
+                f"Could not exclusively create Syslinux file {item.path!r}"
+            ) from error
+        opened = os.fstat(descriptor)
+        created_identity = opened.st_dev, opened.st_ino
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != root_device
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+        ):
+            raise IsoStagingSafetyError(
+                f"Generated Syslinux file {item.path!r} is unsafe"
+            )
+        view = memoryview(item.data)
+        offset = 0
+        while offset < len(view):
+            cancel_check()
+            try:
+                written = os.write(descriptor, view[offset:offset + 1024 * 1024])
+            except OSError as error:
+                raise IsoStagingSafetyError(
+                    f"Could not write Syslinux file {item.path!r}"
+                ) from error
+            if written <= 0:
+                raise IsoStagingSafetyError(
+                    f"Could not completely write Syslinux file {item.path!r}"
+                )
+            offset += written
+        os.fsync(descriptor)
+        final = os.fstat(descriptor)
+        if (
+            (final.st_dev, final.st_ino) != created_identity
+            or not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or final.st_size != len(item.data)
+        ):
+            raise IsoStagingSafetyError(
+                f"Generated Syslinux file {item.path!r} changed while writing"
+            )
+        os.close(descriptor)
+        descriptor = -1
+        os.fsync(parent)
+        reopened_parent = _open_staged_directory(
+            root_fd, parent_parts, root_device,
+        )
+        try:
+            if (
+                (os.fstat(reopened_parent).st_dev, os.fstat(reopened_parent).st_ino)
+                != (os.fstat(parent).st_dev, os.fstat(parent).st_ino)
+            ):
+                raise IsoStagingSafetyError(
+                    f"The parent of generated Syslinux file {item.path!r} moved"
+                )
+        finally:
+            os.close(reopened_parent)
+        rebound = _read_staged_file_bytes(
+            root_fd,
+            item.path,
+            len(item.data),
+            root_device,
+            cancel_check,
+        )
+        if not hmac.compare_digest(hashlib.sha256(rebound).hexdigest(), item.sha256):
+            raise IsoStagingSafetyError(
+                f"Generated Syslinux file {item.path!r} failed read-back"
+            )
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+            descriptor = -1
+        if created_identity is not None:
+            try:
+                current = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == created_identity:
+                    os.unlink(parts[-1], dir_fd=parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _validate_staged_syslinux_sources(
+    root_fd: int,
+    plan: IsoStagingPlan,
+    root_device: int,
+    cancel_check: Callable[[], None],
+) -> None:
+    """Rebuild the pure Syslinux plan from the current private-tree bytes."""
+
+    assert plan.syslinux_staging is not None
+    assert plan.syslinux_analysis is not None
+    assert plan.syslinux_c32_bundle is not None
+    paths = syslinux_staging_read_paths(
+        plan.effective_entries,
+        plan.syslinux_analysis,
+    )
+    entry_by_path = {entry.path: entry for entry in plan.effective_entries}
+    try:
+        payloads = {
+            path: _read_staged_file_bytes(
+                root_fd,
+                path,
+                entry_by_path[path].size,
+                root_device,
+                cancel_check,
+            )
+            for path in paths
+        }
+    except KeyError as error:
+        raise IsoStagingSafetyError(
+            "The Syslinux read set left the effective staging catalog"
+        ) from error
+    existing_files = {
+        path: data for path, data in payloads.items()
+        if PurePosixPath(path).name.casefold().endswith(".c32")
+    }
+    source_files = {
+        path: data for path, data in payloads.items()
+        if path not in existing_files
+    }
+    try:
+        validate_syslinux_staging_plan(
+            plan.syslinux_staging,
+            plan.effective_entries,
+            plan.syslinux_analysis,
+            plan.syslinux_c32_bundle,
+            source_files=source_files,
+            existing_files=existing_files,
+        )
+    except SyslinuxStagingError as error:
+        raise IsoStagingSafetyError(str(error)) from error
+
+
+def _open_private_syslinux_root(root: Path) -> tuple[int, int]:
+    try:
+        initial = os.lstat(root)
+        descriptor = os.open(root, _DIR_FLAGS)
+    except OSError as error:
+        raise IsoStagingSafetyError(
+            "Could not safely open the private Syslinux staging tree"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(initial.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino)
+        ):
+            raise IsoStagingSafetyError(
+                "The private Syslinux staging root changed while opening"
+            )
+        return descriptor, opened.st_dev
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _materialize_syslinux_staging(
+    root: Path,
+    plan: IsoStagingPlan,
+    cancel_check: Callable[[], None],
+) -> None:
+    if plan.syslinux_staging is None:
+        return
+    root_fd, root_device = _open_private_syslinux_root(root)
+    try:
+        _validate_staged_syslinux_sources(
+            root_fd, plan, root_device, cancel_check,
+        )
+        for item in plan.syslinux_staging.additions:
+            _create_staged_syslinux_file(
+                root_fd, item, root_device, cancel_check,
+            )
+    finally:
+        os.close(root_fd)
+    _verify_extracted_catalog(root, plan.staged_entries)
+
+
+def _revalidate_materialized_syslinux_staging(
+    root: Path,
+    plan: IsoStagingPlan,
+    cancel_check: Callable[[], None],
+) -> None:
+    """Recheck every Syslinux-bound byte immediately before publication."""
+
+    if plan.syslinux_staging is None:
+        return
+    root_fd, root_device = _open_private_syslinux_root(root)
+    try:
+        _validate_staged_syslinux_sources(
+            root_fd, plan, root_device, cancel_check,
+        )
+        for item in plan.syslinux_staging.additions:
+            payload = _read_staged_file_bytes(
+                root_fd,
+                item.path,
+                len(item.data),
+                root_device,
+                cancel_check,
+            )
+            if (
+                not hmac.compare_digest(payload, item.data)
+                or not hmac.compare_digest(
+                    hashlib.sha256(payload).hexdigest(), item.sha256,
+                )
+            ):
+                raise IsoStagingSafetyError(
+                    f"Generated Syslinux file {item.path!r} changed before publication"
+                )
+    finally:
+        os.close(root_fd)
 
 
 def _bind_catalog_directory_mtimes(
@@ -1761,6 +2481,22 @@ class IsoStagingExecutor:
                 self._check_cancelled()
                 _verify_extracted_catalog(tree, plan.effective_entries)
 
+            if plan.syslinux_staging is not None:
+                self._check_cancelled()
+                pre_syslinux_bytes = plan.content_bytes - plan.syslinux_content_bytes
+                progress(IsoStagingProgress(
+                    "Preparing Syslinux boot files",
+                    "",
+                    pre_syslinux_bytes,
+                    plan.content_bytes,
+                ))
+                _materialize_syslinux_staging(
+                    tree,
+                    plan,
+                    self._check_cancelled,
+                )
+                self._check_cancelled()
+
             selected_wim_path: Path | None = None
             selected_wim_identity: WimFileIdentity | None = None
             if plan.wim_selection is not None:
@@ -1799,7 +2535,7 @@ class IsoStagingExecutor:
             wim_parts: tuple[str, ...] = ()
             expected_files = {
                 _case_key(entry.path): _ScannedFile(entry.path, entry.size)
-                for entry in plan.effective_entries if entry.kind is EntryKind.FILE
+                for entry in plan.staged_entries if entry.kind is EntryKind.FILE
             }
             if plan.wim_source is not None:
                 self._check_cancelled()
@@ -1910,7 +2646,7 @@ class IsoStagingExecutor:
                 raise IsoStagingSafetyError(
                     "The final staging files do not match the transformed ISO catalog"
                 )
-            expected_directories = _expected_directories(plan.effective_entries)
+            expected_directories = _expected_directories(plan.staged_entries)
             actual_directories = {_case_key(item.path): item.path for item in directories}
             if actual_directories != expected_directories:
                 raise IsoStagingSafetyError(
@@ -1923,11 +2659,11 @@ class IsoStagingExecutor:
             if _catalog_digest(plan.entries) != plan.catalog_digest:
                 raise IsoStagingSafetyError("The ISO catalog binding changed during staging")
             if (
-                _catalog_digest(plan.effective_entries)
-                != plan.effective_catalog_digest
+                _catalog_digest(plan.staged_entries)
+                != plan.staged_catalog_digest
             ):
                 raise IsoStagingSafetyError(
-                    "The effective catalog binding changed during staging"
+                    "The staged catalog binding changed during staging"
                 )
             if (
                 selected_wim_path is not None
@@ -1938,6 +2674,11 @@ class IsoStagingExecutor:
                 raise IsoStagingSafetyError(
                     "The selected WIM/ESD changed before staging was published"
                 )
+            _revalidate_materialized_syslinux_staging(
+                tree,
+                plan,
+                self._check_cancelled,
+            )
             _check_parent(plan, parent_fd)
             if os.path.lexists(plan.destination):
                 raise IsoStagingSafetyError("The staging destination appeared before publication")
@@ -1949,7 +2690,7 @@ class IsoStagingExecutor:
             result = IsoStagingResult(
                 destination=plan.destination,
                 image_identity=plan.image_identity,
-                catalog_digest=plan.effective_catalog_digest,
+                catalog_digest=plan.staged_catalog_digest,
                 directories=len(directories),
                 files=len(files),
                 bytes_staged=total_bytes,

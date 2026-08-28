@@ -567,6 +567,25 @@ def merge_additive_embedded_entries(
     )
 
 
+def merge_additive_generated_entries(
+    base_entries: Iterable[ArchiveEntry],
+    generated_entries: Iterable[ArchiveEntry],
+) -> AdditiveOverlayMerge:
+    """Add application-generated files without replacing media content.
+
+    Generated boot files are already constrained by their feature-specific
+    planner.  This shared merge still revalidates the complete portable FAT
+    namespace, including case aliases and implied-directory collisions.
+    """
+
+    return _merge_additive_entries(
+        base_entries,
+        generated_entries,
+        namespace="generated boot",
+        reject_reserved=False,
+    )
+
+
 def select_write_mode(inspection: ImageInspection, requested: WriteMode | None = None) -> WriteMode:
     if requested is WriteMode.EXTRACTED_ISO and not (
         inspection.is_iso9660 or inspection.kind == "Optical ISO"

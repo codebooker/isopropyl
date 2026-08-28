@@ -368,13 +368,25 @@ re-identified, while the config is size/hash-bound, ASCII/control-checked, and
 rejected if it can load direct or transitive modules through `UI`, `COM32`,
 `CONFIG`, `INCLUDE`, `MENU INCLUDE`, or a `.c32` reference. Supporting those
 directives later requires parsing and pinning their full dependency closure.
-This policy still performs no filesystem mutation.
+The policy itself still performs no filesystem mutation. An optional ISO
+staging consumer accepts only an already prepared immutable C32 bundle, reopens
+the identity-bound ISO, rebuilds the analysis and policy from exact member
+bytes, and repeats validation against the extractor's actual files before any
+addition. It creates only policy-authorized files through exclusive no-follow
+descriptors in the unpublished private tree, fsyncs and reads them back, then
+requires the Syslinux-adjusted planned namespace, sizes, digest, and free-space
+accounting to match. A second exact-byte pass immediately precedes publication;
+the existing final-tree scan separately covers later WIM and answer-file
+transformations. The initial profile requires every Syslinux identity, config,
+and reused C32 byte to originate in the base ISO; overlay/embedded-origin
+evidence fails closed. It never downloads a bundle, replaces media content, or
+authorizes a device write; the normal GUI caller supplies no Syslinux C32 bundle.
 
-This is not authorization to write a device. Descriptor-safe private-tree
-integration, a bounded privileged executor, exact post-write sector
-verification, QEMU/SeaBIOS and OVMF gates, and physical BIOS testing remain
-mandatory before the GUI can offer BIOS construction. Until then, hybrid media
-should use verified DD mode to preserve its existing boot layout.
+This is not authorization to write a device. Root `ldlinux.sys` materialization,
+a bounded privileged executor, exact post-write sector verification,
+QEMU/SeaBIOS and OVMF gates, and physical BIOS testing remain mandatory before
+the GUI can offer BIOS construction. Until then, hybrid media should use
+verified DD mode to preserve its existing boot layout.
 
 ## Boot-time corruption-check boundary
 

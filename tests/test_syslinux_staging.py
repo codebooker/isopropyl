@@ -17,6 +17,8 @@ from isopropyl.syslinux_staging import (
     SyslinuxStagingError,
     bind_syslinux_c32_bundle,
     plan_syslinux_staging,
+    syslinux_staging_analysis_paths,
+    syslinux_staging_read_paths,
     validate_syslinux_staging_plan,
 )
 
@@ -130,6 +132,117 @@ class SyslinuxStagingTests(unittest.TestCase):
         validate_syslinux_staging_plan(
             result, catalog, analysis(), module_bundle(), source_files=sources,
         )
+
+    def test_read_paths_return_exact_required_iso_members(self):
+        catalog = entries()
+        self.assertEqual(
+            syslinux_staging_read_paths(catalog, analysis()),
+            ("isolinux/isolinux.bin", "isolinux/isolinux.cfg"),
+        )
+
+        data = VERSIONS["6.03-2014-10-06"][1]
+        with_c32 = catalog + (
+            ArchiveEntry("isolinux/ldlinux.c32", len(data)),
+        )
+        self.assertEqual(
+            syslinux_staging_read_paths(with_c32, analysis()),
+            (
+                "isolinux/isolinux.bin",
+                "isolinux/isolinux.cfg",
+                "isolinux/ldlinux.c32",
+            ),
+        )
+
+        root_catalog = entries("syslinux.cfg") + (
+            ArchiveEntry("ldlinux.c32", len(data)),
+        )
+        self.assertEqual(
+            syslinux_staging_read_paths(root_catalog, analysis()),
+            ("isolinux/isolinux.bin", "syslinux.cfg", "ldlinux.c32"),
+        )
+
+    def test_analysis_paths_enforce_profile_specific_count_and_byte_caps(self):
+        self.assertEqual(
+            syslinux_staging_analysis_paths(entries()),
+            ("isolinux/isolinux.bin",),
+        )
+        too_many = tuple(
+            ArchiveEntry(f"boot-{index}/isolinux.bin", 1)
+            for index in range(staging.MAX_SYSLINUX_IDENTITY_COUNT + 1)
+        )
+        oversized = (
+            ArchiveEntry(
+                "isolinux.bin",
+                staging.MAX_SYSLINUX_LOADER_BYTES + 1,
+            ),
+        )
+        for catalog in (too_many, oversized):
+            with self.subTest(catalog=catalog), self.assertRaisesRegex(
+                SyslinuxStagingError,
+                "bounded staging profile",
+            ):
+                syslinux_staging_analysis_paths(catalog)
+
+    def test_read_paths_include_every_validated_identity_source(self):
+        blob_size = len(bootloader_blob("6.03-2014-10-06"))
+        catalog = (
+            ArchiveEntry("one", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("one/isolinux.bin", blob_size),
+            ArchiveEntry("one/isolinux.cfg", len(CONFIG_DATA)),
+            ArchiveEntry("two", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("two/isolinux.bin", blob_size),
+        )
+        boot_analysis = analysis(
+            "6.03-2014-10-06", "one/isolinux.bin", "two/isolinux.bin",
+        )
+        self.assertEqual(
+            syslinux_staging_read_paths(catalog, boot_analysis),
+            (
+                "one/isolinux.bin",
+                "two/isolinux.bin",
+                "one/isolinux.cfg",
+            ),
+        )
+
+        unbound = catalog + (
+            ArchiveEntry("three", kind=EntryKind.DIRECTORY),
+            ArchiveEntry("three/isolinux.bin", blob_size),
+        )
+        with self.assertRaisesRegex(
+            SyslinuxStagingError,
+            "every cataloged Isolinux payload",
+        ):
+            syslinux_staging_read_paths(unbound, boot_analysis)
+
+    def test_read_paths_fail_closed_on_invalid_selection_or_c32_layout(self):
+        invalid_cases = (
+            (entries() + (ArchiveEntry("isolinux/syslinux.cfg", 10),), analysis()),
+            (entries() + (ArchiveEntry("other/menu.c32", 10),), analysis()),
+            (
+                entries() + (
+                    ArchiveEntry(
+                        "isolinux/ldlinux.c32",
+                        staging.MAX_SYSLINUX_C32_BYTES + 1,
+                    ),
+                ),
+                analysis(),
+            ),
+            (
+                entries() + (
+                    ArchiveEntry(
+                        "isolinux/ldlinux.c32", kind=EntryKind.DIRECTORY,
+                    ),
+                ),
+                analysis(),
+            ),
+        )
+        for catalog, boot_analysis in invalid_cases:
+            with self.subTest(catalog=catalog):
+                with self.assertRaises(SyslinuxStagingError):
+                    syslinux_staging_read_paths(catalog, boot_analysis)
+
+        with self.assertRaises(SyslinuxStagingError):
+            syslinux_staging_read_paths(entries(), object())  # type: ignore[arg-type]
 
     def test_exact_604_pre1_uses_its_own_module(self):
         version = "6.04-pre1"

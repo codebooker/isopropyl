@@ -44,7 +44,11 @@ from .iso import (
 
 
 MAX_SYSLINUX_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_SYSLINUX_C32_BYTES = 1024 * 1024
 MAX_SYSLINUX_DIRECTORY_BYTES = 127
+MAX_SYSLINUX_IDENTITY_COUNT = 8
+MAX_SYSLINUX_LOADER_BYTES = 4 * 1024 * 1024
+MAX_SYSLINUX_IDENTITY_BYTES = 16 * 1024 * 1024
 _CONFIG_NAMES = frozenset({"isolinux.cfg", "syslinux.cfg", "extlinux.conf"})
 _DIRECTORY_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -235,6 +239,33 @@ def _validated_catalog(entries: Sequence[ArchiveEntry]) -> tuple[ArchiveEntry, .
     return validated
 
 
+def syslinux_staging_analysis_paths(
+    entries: Sequence[ArchiveEntry],
+) -> tuple[str, ...]:
+    """Return the bounded base-ISO Isolinux candidates safe to inspect."""
+
+    catalog = _validated_catalog(entries)
+    candidates = tuple(
+        entry for entry in catalog
+        if PurePosixPath(entry.path).name.casefold() == "isolinux.bin"
+    )
+    if (
+        not candidates
+        or len(candidates) > MAX_SYSLINUX_IDENTITY_COUNT
+        or any(
+            entry.kind is not EntryKind.FILE
+            or entry.size <= 0
+            or entry.size > MAX_SYSLINUX_LOADER_BYTES
+            for entry in candidates
+        )
+        or sum(entry.size for entry in candidates) > MAX_SYSLINUX_IDENTITY_BYTES
+    ):
+        raise SyslinuxStagingError(
+            "the Isolinux candidate set exceeds the bounded staging profile",
+        )
+    return tuple(entry.path for entry in candidates)
+
+
 def bind_syslinux_c32_bundle(bundle: BoundBootBundle) -> BoundSyslinuxC32:
     """Independently bind one exact, immutable ``ldlinux.c32`` artifact."""
 
@@ -301,6 +332,32 @@ def _validated_syslinux_identities(
     )
     if not identities:
         raise SyslinuxStagingError("the image has no exact Isolinux identity")
+
+    identity_sources = tuple(item.source for item in identities)
+    cataloged_sources = tuple(
+        entry.path for entry in entries_by_path.values()
+        if PurePosixPath(entry.path).name.casefold() == "isolinux.bin"
+    )
+    if (
+        len(set(identity_sources)) != len(identity_sources)
+        or set(identity_sources) != set(cataloged_sources)
+    ):
+        raise SyslinuxStagingError(
+            "every cataloged Isolinux payload requires an exact identity",
+        )
+    if (
+        len(identity_sources) > MAX_SYSLINUX_IDENTITY_COUNT
+        or any(
+            entries_by_path[source].size > MAX_SYSLINUX_LOADER_BYTES
+            for source in identity_sources
+        )
+        or sum(
+            entries_by_path[source].size for source in identity_sources
+        ) > MAX_SYSLINUX_IDENTITY_BYTES
+    ):
+        raise SyslinuxStagingError(
+            "the Isolinux identity set exceeds the bounded staging profile",
+        )
 
     builds: set[str] = set()
     for identity in identities:
@@ -554,12 +611,10 @@ def _existing_bytes(
     return result
 
 
-def _bind_c32_target(
+def _cataloged_c32(
     entries: tuple[ArchiveEntry, ...],
     config_parent: str,
-    module: BoundSyslinuxC32,
-    existing_files: Mapping[str, bytes] | None,
-) -> SyslinuxStageFile:
+) -> tuple[str, ArchiveEntry | None]:
     # The patched CurrentDirName is added to Syslinux's module search path
     # before ldlinux.c32 is started. Rufus image mode likewise preserves the
     # extracted config-local module rather than adding the blank-media root one.
@@ -578,8 +633,49 @@ def _bind_c32_target(
     if len(c32_entries) > 1:
         raise SyslinuxStagingError("the ISO catalog contains ambiguous C32 modules")
 
-    supplied = _existing_bytes(existing_files)
     existing = c32_entries[0] if c32_entries else None
+    if existing is not None and (
+        existing.kind is not EntryKind.FILE
+        or existing.size <= 0
+        or existing.size > MAX_SYSLINUX_C32_BYTES
+    ):
+        raise SyslinuxStagingError(
+            "the existing ldlinux.c32 catalog entry is invalid",
+        )
+    return target, existing
+
+
+def syslinux_staging_read_paths(
+    entries: Sequence[ArchiveEntry],
+    analysis: BootloaderAnalysis,
+) -> tuple[str, ...]:
+    """Return the exact ISO members whose bytes the pure planner will require."""
+
+    catalog = _validated_catalog(entries)
+    entries_by_path = {item.path: item for item in catalog}
+    occupied = _occupied_keys(catalog)
+    _build, identities = _validated_syslinux_identities(analysis, entries_by_path)
+    if ("ldlinux.sys",) in occupied:
+        raise SyslinuxStagingError("the ISO already contains a root ldlinux.sys")
+    _bootloader, config = _select_config(catalog, identities)
+    parent = _relative_parent(config.path)
+    _patch_directory(parent)
+    _target, existing_c32 = _cataloged_c32(catalog, parent)
+    paths = tuple(identity.source for identity in identities) + (config.path,)
+    if existing_c32 is not None:
+        paths += (existing_c32.path,)
+    return tuple(dict.fromkeys(paths))
+
+
+def _bind_c32_target(
+    entries: tuple[ArchiveEntry, ...],
+    config_parent: str,
+    module: BoundSyslinuxC32,
+    existing_files: Mapping[str, bytes] | None,
+) -> SyslinuxStageFile:
+    target, existing = _cataloged_c32(entries, config_parent)
+
+    supplied = _existing_bytes(existing_files)
     if existing is None:
         if supplied:
             raise SyslinuxStagingError(
@@ -587,7 +683,7 @@ def _bind_c32_target(
             )
         disposition = StageDisposition.CREATE
     else:
-        if existing.kind is not EntryKind.FILE or existing.size != len(module.data):
+        if existing.size != len(module.data):
             raise SyslinuxStagingError(
                 "the existing ldlinux.c32 catalog entry is invalid",
             )

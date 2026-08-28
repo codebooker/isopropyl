@@ -208,6 +208,8 @@ def fake_iso_staging_plan(
         overlay=overlay,
         effective_entries=effective_entries,
         effective_catalog_digest=digest,
+        staged_entries=effective_entries,
+        staged_catalog_digest=digest,
     )
 
 
@@ -225,7 +227,7 @@ def fake_staged_iso(plan: IsoStagingPlan, destination: Path):
         destination=destination,
         bytes_staged=plan.content_bytes,
         image_identity=plan.image_identity,
-        catalog_digest=plan.effective_catalog_digest,
+        catalog_digest=plan.staged_catalog_digest,
     )
 
 
@@ -2922,6 +2924,7 @@ class WindowZipOverlayTests(unittest.TestCase):
         self.assertEqual(args[3], recommendation.iso_plan)
         self.assertIs(kwargs["overlay"], self.overlay)
         self.assertTrue(callable(kwargs["cancel_check"]))
+        self.assertNotIn("syslinux_c32_bundle", kwargs)
         continuation.assert_called_once()
         pending = continuation.call_args.args[0]
         self.assertIs(pending.staging_plan.overlay, self.overlay)
@@ -3629,6 +3632,13 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         root = Path(self.settings_home.name) / "ready-media"
         staging_plan = fake_iso_staging_plan(
             self.window.image, root, self.window.archive_entries(), plan,
+        )
+        # Generated private-tree files intentionally make the staged catalog
+        # differ from the pre-transformation effective ISO catalog.
+        staging_plan = replace(
+            staging_plan,
+            effective_catalog_digest="e" * 64,
+            staged_catalog_digest="s" * 64,
         )
         prepared = fake_runtime_validation()
         acknowledged_digest = "f" * 64

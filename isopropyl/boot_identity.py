@@ -402,9 +402,12 @@ def _trusted_7z() -> str | None:
 def read_archive_member_with_7z(
     image: Path, member: str, *, timeout: float = 15.0,
     image_fd: int | None = None, cancel_check: Callable[[], None] | None = None,
+    max_bytes: int = MAX_BOOT_BLOB_SIZE,
 ) -> bytes:
     """Read one exact member with the host 7z tool, with time and size caps."""
 
+    if type(max_bytes) is not int or not 0 < max_bytes <= MAX_BOOT_BLOB_SIZE:
+        raise ValueError("The boot payload read limit is invalid")
     executable = _trusted_7z()
     if not executable:
         raise OSError("7z is not installed; boot payload members were not read")
@@ -431,11 +434,14 @@ def read_archive_member_with_7z(
                 if process.poll() is not None:
                     break
                 continue
-            block = os.read(process.stdout.fileno(), 1024 * 1024)
+            block = os.read(
+                process.stdout.fileno(),
+                min(1024 * 1024, max_bytes + 1 - len(output)),
+            )
             if not block:
                 break
             output.extend(block)
-            if len(output) > MAX_BOOT_BLOB_SIZE:
+            if len(output) > max_bytes:
                 raise ValueError(f"{member} exceeds the inspection size limit")
         if cancel_check is not None:
             cancel_check()
@@ -453,6 +459,7 @@ def read_archive_member_with_7z(
 def analyze_iso_bootloaders(
     image: Path, member_paths: Iterable[str], *, reader: MemberReader | None = None,
     timeout: float = 30.0, image_fd: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> BootloaderAnalysis:
     """Read selected image members and analyze payload identity.
 
@@ -481,6 +488,8 @@ def analyze_iso_bootloaders(
             "matching is disabled"
         )
     for member in selected:
+        if cancel_check is not None:
+            cancel_check()
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
             issues.append("Bootloader inspection reached its overall time limit")
@@ -491,11 +500,14 @@ def analyze_iso_bootloaders(
                 reader(image, member) if reader
                 else read_archive_member_with_7z(
                     image, member, timeout=min(15.0, remaining), image_fd=image_fd,
+                    cancel_check=cancel_check,
                 )
             )
         except (OSError, TimeoutError, ValueError) as error:
             issues.append(f"{member}: {error}")
             complete = False
+    if cancel_check is not None:
+        cancel_check()
     result = analyze_bootloader_members(blobs)
     return BootloaderAnalysis(
         result.identities, tuple(issues) + result.issues,

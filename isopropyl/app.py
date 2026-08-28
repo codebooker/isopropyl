@@ -5500,7 +5500,7 @@ class Window(QMainWindow):
                 if (
                     staged.image_identity != staging_plan.image_identity
                     or staged.catalog_digest
-                    != staging_plan.effective_catalog_digest
+                    != staging_plan.staged_catalog_digest
                 ):
                     raise RuntimeError(
                         "The ISO staging result does not match its source/catalog plan"
