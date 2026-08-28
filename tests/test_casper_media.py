@@ -751,6 +751,14 @@ class ExecutorTests(unittest.TestCase):
             self.assertNotIn("--append", flat)
             self.assertNotIn("--delete", flat)
             self.assertNotIn("--resize", flat)
+            hierarchy_queries = [
+                command for command, _kwargs in commands
+                if command[0] == "/usr/bin/lsblk"
+                and "PATH,TYPE,PKNAME,FSTYPE,LABEL,MAJ:MIN,MOUNTPOINTS,RO"
+                in command
+            ]
+            self.assertTrue(hierarchy_queries)
+            self.assertTrue(all("--tree" in command for command in hierarchy_queries))
             self.assertEqual(
                 sum(command[1] == "unmount" for command, _kwargs in commands), 2,
             )

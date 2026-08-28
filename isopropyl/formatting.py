@@ -1994,7 +1994,7 @@ class FormatExecutor:
 
         result = self._run_probe(
             [
-                tools.lsblk, "--json", "--paths", "--output",
+                tools.lsblk, "--json", "--paths", "--tree", "--output",
                 "PATH,TYPE,PKNAME,MAJ:MIN", plan.device_path,
             ],
             purpose="Partition identity inspection",
@@ -2087,7 +2087,8 @@ class FormatExecutor:
             self._check_cancelled()
             result = self._run_probe(
                 [
-                    tools.lsblk, "--json", "--paths", "--output", "PATH,TYPE",
+                    tools.lsblk, "--json", "--paths", "--tree", "--output",
+                    "PATH,TYPE",
                     plan.device_path,
                 ],
                 purpose="New partition discovery",
@@ -2191,7 +2192,8 @@ class MultiFormatExecutor(FormatExecutor):
         for attempt in range(self._discovery_attempts):
             result = self._run_probe(
                 [
-                    tools.lsblk, "--json", "--paths", "--output", "PATH,TYPE",
+                    tools.lsblk, "--json", "--paths", "--tree", "--output",
+                    "PATH,TYPE",
                     plan.device_path,
                 ],
                 purpose="New partition discovery",

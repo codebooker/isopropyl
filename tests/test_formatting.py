@@ -1131,6 +1131,15 @@ class FormatExecutorTests(unittest.TestCase):
         )
         self.assertTrue(all(call[1]["shell"] is False for call in self.run_calls))
         self.assertTrue(all(call[1]["timeout"] > 0 for call in self.run_calls))
+        hierarchy_queries = [
+            argv for argv, _kwargs in self.run_calls
+            if argv[0].endswith("/lsblk")
+            and any(value in argv for value in (
+                "PATH,TYPE", "PATH,TYPE,PKNAME,MAJ:MIN",
+            ))
+        ]
+        self.assertTrue(hierarchy_queries)
+        self.assertTrue(all("--tree" in argv for argv in hierarchy_queries))
         self.assertTrue(all(process.kwargs["shell"] is False for process in self.processes))
         self.assertEqual(self.processes[0].inputs[0], partition_script(self.plan))
         self.assertEqual(self.processes[-2].argv[-1], "/dev/sdz1")
@@ -2018,6 +2027,15 @@ class MultiFormatExecutorTests(unittest.TestCase):
             ["/dev/sdz1", "/dev/sdz2"],
         )
         self.assertTrue(all(call[1]["shell"] is False for call in self.run_calls))
+        hierarchy_queries = [
+            argv for argv, _kwargs in self.run_calls
+            if argv[0].endswith("/lsblk")
+            and any(value in argv for value in (
+                "PATH,TYPE", "PATH,TYPE,PKNAME,MAJ:MIN",
+            ))
+        ]
+        self.assertTrue(hierarchy_queries)
+        self.assertTrue(all("--tree" in argv for argv in hierarchy_queries))
         self.assertTrue(all(process.kwargs["shell"] is False for process in self.processes))
         self.assertEqual(self.processes[0].inputs[0], multi_partition_script(self.plan))
         mkfs_commands = [

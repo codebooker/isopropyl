@@ -534,7 +534,7 @@ def read_media_layout(
         block_result = _completed_or_error(
             runner,
             [
-                tools.lsblk, "--bytes", "--json", "--paths", "--output",
+                tools.lsblk, "--bytes", "--json", "--paths", "--tree", "--output",
                 "PATH,TYPE,FSTYPE,LABEL,MAJ:MIN,MOUNTPOINTS,RO", device.path,
             ],
         )

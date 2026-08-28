@@ -1081,7 +1081,8 @@ class CasperMediaExecutor:
             )
             blocks = self._run(
                 [
-                    plan.tools.lsblk, "--bytes", "--json", "--paths", "--output",
+                    plan.tools.lsblk, "--bytes", "--json", "--paths", "--tree",
+                    "--output",
                     "PATH,TYPE,PKNAME,FSTYPE,LABEL,MAJ:MIN,MOUNTPOINTS,RO",
                     plan.device.path,
                 ],

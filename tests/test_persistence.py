@@ -507,6 +507,7 @@ class PersistenceBackendPlanTests(unittest.TestCase):
             layout = read_media_layout(device, root, tools, runner=runner)
             self.assertEqual(layout, initial_layout(root))
             self.assertEqual(calls[0][0][:3], ["/usr/bin/pkexec", "/usr/sbin/sfdisk", "--json"])
+            self.assertIn("--tree", calls[1][0])
             self.assertTrue(all(call[1]["shell"] is False for call in calls))
 
 
