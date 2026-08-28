@@ -215,8 +215,14 @@ confirmations and expanded drive visibility are never persisted.
   both bundles, the selected config directory, root loader, and private FAT32
   plan before building and patching. Its public entry point has no injectable
   descriptor-owning dependency and returns only a patched-attested owner.
-  Target/device-plan authorization, privileged streaming and read-back, QEMU,
-  and physical boot certification still gate BIOS support.
+  A non-executable target receipt now additionally binds the exact composite,
+  complete freshly re-probed removable-device observation, live block topology
+  and major:minor, equal image and target capacity, 512-byte logical sectors,
+  fail-closed source/workspace non-residency,
+  mandatory read-back, warnings, and an exact typed phrase. Cloned plans and
+  confirmations lose authority. A root-owned helper that retains one descriptor
+  and lock through streaming, durability, and read-back, plus QEMU and physical
+  boot certification, still gate BIOS support.
 - Parse El Torito BIOS/UEFI entries, including the bounded embedded-FAT subset,
   and inspect EFI PE architecture, certificate framing, and SBAT. A sealed,
   resource-limited worker can report embedded
@@ -372,9 +378,10 @@ Boot, card-reader, and physical-media testing is still required. BIOS options
 remain intentionally hidden. The unpatched root tree, deterministic mount-free
 FAT32 builder, independent parser, live mapper, pure patch plans, and anonymous
 regular-file transaction are joined to an authenticated published ISO-staging
-receipt and byte-verified end to end in the backend. The remaining gates are a
-witnessed target/device plan, privileged device streaming and read-back,
-QEMU/SeaBIOS/OVMF results, and physical evidence.
+  receipt and byte-verified end to end in the backend. That exact pipeline can
+  now be bound to one freshly re-probed target and typed confirmation without
+  opening it for I/O. The remaining gates are the installed root-owned streaming/read-back
+  helper, QEMU/SeaBIOS/OVMF results, and physical evidence.
 
 The detailed, evidence-based status lives in [FEATURE_MATRIX.md](FEATURE_MATRIX.md)
 and [ROADMAP.md](ROADMAP.md).

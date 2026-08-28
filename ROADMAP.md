@@ -71,9 +71,14 @@ evidence.
   formatter, mount, loop device, named scratch file, or subprocess. Matching
   pre/post-publication manifests now authenticate the published ISO tree, and a
   witnessed composite binds that receipt, exact bundles/config/root loader, and
-  private plan before returning only a patched-attested image owner. Remaining
-  gates are a witnessed target/device authorization plan, bounded privileged
-  device streaming/read-back, QEMU/SeaBIOS plus OVMF, and physical
+  private plan before returning only a patched-attested image owner. A separate
+  clone-resistant process-local receipt now binds that exact composite to a
+  freshly reproduced complete removable-device observation and descendant
+  topology, live block identity, exact capacity, 512-byte sector geometry,
+  fail-closed source/workspace non-residency, mandatory read-back, warnings, and
+  typed confirmation without preparing or opening the target for I/O. Remaining
+  gates are the installed root-owned executor that retains one descriptor and
+  lock across streaming/durability/read-back, QEMU/SeaBIOS plus OVMF, and physical
   certification. Do not expose payloads or remove a BIOS blocker before those
   gates pass. GRUB BIOS follows only after
   its prefix, module set, filesystem, and boot-region layout can be reproduced

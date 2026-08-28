@@ -457,12 +457,29 @@ attestation without exposing an unpatched owner. Its public entry point accepts
 no injectable builder or transaction capable of retaining the anonymous
 descriptor, and it returns only the patched-attested stream owner.
 
-This is still not authorization to write a device. The authenticated
-ISO-to-patched-image pipeline and target must first be joined by one witnessed
-target/device plan. A privileged executor with transaction-wide target
-ownership, exact device read-back, QEMU/SeaBIOS and OVMF gates, and physical BIOS
-testing remain mandatory before the GUI can offer BIOS construction. Until then,
-hybrid media should use verified DD mode to preserve its existing boot layout.
+The next non-executable boundary joins that authentic composite to one exact
+removable target. Its non-init receipt binds the exact composite and `Device`
+objects, all public digests and media IDs, complete discovery fields, live block
+major:minor, equal image/target capacity, fixed 512-byte logical sectors,
+source/workspace non-residency, mandatory read-back, warnings, and a case-sensitive
+typed phrase. Manual construction, `dataclasses.replace()`, refreshed equivalent
+objects, and cross-plan confirmations lose authority. A bounded, trusted-path,
+read-only `lsblk` probe must reproduce the complete discovery record and supplies
+the descendant/stacked-device identities used for fail-closed source/workspace
+residency checks at planning, validation, and confirmation. These process-local
+receipts prevent in-process substitution; they are not serialized privilege
+credentials. Planning and confirmation do not prepare an image, unmount, or open
+the target for I/O.
+
+This is still not authorization to write a device. The required executor is an
+installed, root-owned helper that opens the target once, independently verifies
+all bounded serialized input as untrusted, verifies descriptor identity and
+geometry, retains the same descriptor and lock across
+bounded streaming, durability, and exact SHA-256 read-back, and rejects every
+short, extra, or mismatched byte. No separate-command or pathname fallback is
+permitted. QEMU/SeaBIOS and OVMF gates plus physical BIOS testing remain mandatory
+before the GUI can offer BIOS construction. Until then, hybrid media should use
+verified DD mode to preserve its existing boot layout.
 
 ## Boot-time corruption-check boundary
 
