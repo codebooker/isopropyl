@@ -3,4 +3,6 @@ include tools/certify_freedos_boot.py
 include tools/certify_syslinux_boot.py
 include tools/certify_wim_apply_backend.py
 include tools/validate_windows_bcd_capture.py
+include tools/import_windows_bcd_capture.py
+include tools/capture_windows_bcd_oracle.ps1
 include certifications/syslinux-6.03-seabios-2026-08-28.json

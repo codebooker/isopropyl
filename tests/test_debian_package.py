@@ -156,6 +156,7 @@ class DebianPackageTests(unittest.TestCase):
             "usr/bin/isopropyl",
             "usr/bin/isopropyl-cli",
             "usr/bin/isopropyl-validate-windows-bcd-capture",
+            "usr/bin/isopropyl-import-windows-bcd-capture",
             "usr/libexec/isopropyl-device-helper",
         }
         for name, (member, _content) in self.data.items():
@@ -180,6 +181,9 @@ class DebianPackageTests(unittest.TestCase):
 
         required = {
             "usr/bin/isopropyl-validate-windows-bcd-capture",
+            "usr/bin/isopropyl-import-windows-bcd-capture",
+            "usr/lib/isopropyl-tools/import_windows_bcd_capture.py",
+            "usr/share/doc/isopropyl/examples/capture_windows_bcd_oracle.ps1",
             "usr/lib/isopropyl-tools/validate_windows_bcd_capture.py",
             "usr/libexec/isopropyl/syslinux_device_helper.py",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy",
@@ -236,6 +240,24 @@ class DebianPackageTests(unittest.TestCase):
         self.assertEqual(
             self.data["usr/lib/isopropyl-tools/validate_windows_bcd_capture.py"][1],
             (ROOT / "tools/validate_windows_bcd_capture.py").read_bytes(),
+        )
+        importer_launcher = self.data[
+            "usr/bin/isopropyl-import-windows-bcd-capture"
+        ][1].decode("utf-8")
+        self.assertTrue(importer_launcher.startswith("#!/usr/bin/python3 -I\n"))
+        self.assertIn(
+            "/usr/lib/isopropyl-tools/import_windows_bcd_capture.py",
+            importer_launcher,
+        )
+        self.assertEqual(
+            self.data["usr/lib/isopropyl-tools/import_windows_bcd_capture.py"][1],
+            (ROOT / "tools/import_windows_bcd_capture.py").read_bytes(),
+        )
+        self.assertEqual(
+            self.data[
+                "usr/share/doc/isopropyl/examples/capture_windows_bcd_oracle.ps1"
+            ][1],
+            (ROOT / "tools/capture_windows_bcd_oracle.ps1").read_bytes(),
         )
         desktop = self.data[
             "usr/share/applications/io.github.codebooker.isopropyl.desktop"

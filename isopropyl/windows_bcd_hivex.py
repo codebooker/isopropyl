@@ -623,8 +623,7 @@ def verify_bcd_hive_against_fixture(
         raise BcdHiveError("The BCD hive path or backend result is invalid") from error
 
 
-def _verify_concrete_hive(fixture: BcdOracleFixture, inspect: object) -> BcdHiveObservation:
-    _validated_fixture(fixture)
+def _read_concrete_hive(inspect: object) -> BcdHiveObservation:
     if not callable(inspect):
         raise BcdHiveError("The concrete hive inspector is unavailable")
     receipt, evidence = inspect(
@@ -642,10 +641,39 @@ def _verify_concrete_hive(fixture: BcdOracleFixture, inspect: object) -> BcdHive
         or _SHA256.fullmatch(store_sha256) is None
     ):
         raise BcdHiveError("The concrete hive receipt is malformed")
-    observed = _observation(store_size, store_sha256, evidence)
+    return _observation(store_size, store_sha256, evidence)
+
+
+def _verify_concrete_hive(fixture: BcdOracleFixture, inspect: object) -> BcdHiveObservation:
+    _validated_fixture(fixture)
+    observed = _read_concrete_hive(inspect)
     if observed != _expected_observation(fixture):
         raise BcdHiveError("The BCD hive registry snapshot contradicts its oracle fixture")
     return observed
+
+
+def read_bcd_hive_descriptor(descriptor: int) -> BcdHiveObservation:
+    """Read typed evidence from one caller-owned descriptor without trusting it."""
+
+    if type(descriptor) is not int or descriptor < 0:
+        raise BcdHiveError("The BCD hive descriptor must be a non-negative integer")
+    try:
+        from .windows_hive import (
+            WindowsHiveError,
+            inspect_windows_hive_descriptor,
+        )
+    except (ImportError, OSError) as error:
+        raise BcdHiveError("The read-only Windows hive backend is unavailable") from error
+    try:
+        return _read_concrete_hive(
+            lambda inspector: inspect_windows_hive_descriptor(descriptor, inspector),
+        )
+    except BcdHiveError:
+        raise
+    except WindowsHiveError as error:
+        raise BcdHiveError("The BCD hive descriptor could not be inspected read-only") from error
+    except (OSError, TypeError, ValueError) as error:
+        raise BcdHiveError("The BCD hive descriptor or backend result is invalid") from error
 
 
 def verify_bcd_hive_descriptor_against_fixture(

@@ -96,6 +96,8 @@ wim_apply_backend.py
 wim_apply_protocol.py
 windows.py
 windows_bcd.py
+windows_bcd_capture.py
+windows_bcd_capture_import.py
 windows_bcd_hivex.py
 windows_bcd_oracle.py
 windows_bootex.py
@@ -132,6 +134,21 @@ PAYLOAD_FILES: tuple[tuple[str, str, int], ...] = (
     (
         "tools/validate_windows_bcd_capture.py",
         "usr/lib/isopropyl-tools/validate_windows_bcd_capture.py",
+        0o644,
+    ),
+    (
+        "packaging/debian/isopropyl-import-windows-bcd-capture",
+        "usr/bin/isopropyl-import-windows-bcd-capture",
+        0o755,
+    ),
+    (
+        "tools/import_windows_bcd_capture.py",
+        "usr/lib/isopropyl-tools/import_windows_bcd_capture.py",
+        0o644,
+    ),
+    (
+        "tools/capture_windows_bcd_oracle.ps1",
+        "usr/share/doc/isopropyl/examples/capture_windows_bcd_oracle.ps1",
         0o644,
     ),
     (

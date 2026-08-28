@@ -235,6 +235,31 @@ class HiveInspectionTests(unittest.TestCase):
             with self.subTest(descriptor=descriptor), self.assertRaises(WindowsHiveError):
                 self._inspect_descriptor(descriptor, lambda handle: None)
 
+    def test_descriptor_access_mode_is_checked_after_duplication(self) -> None:
+        readable = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        writable = os.open(self.path, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        self.addCleanup(os.close, readable)
+        self.addCleanup(os.close, writable)
+        duplicated: list[int] = []
+        real_dup = os.dup
+
+        def substitute_duplicate(_descriptor: int) -> int:
+            result = real_dup(writable)
+            duplicated.append(result)
+            return result
+
+        with (
+            patch(
+                "isopropyl.windows_hive.os.dup",
+                side_effect=substitute_duplicate,
+            ),
+            self.assertRaisesRegex(WindowsHiveError, "must be read-only"),
+        ):
+            self._inspect_descriptor(readable, lambda _handle: None)
+        self.assertEqual(len(duplicated), 1)
+        with self.assertRaises(OSError):
+            os.fstat(duplicated[0])
+
     def test_same_size_source_mutation_is_caught_by_complete_hash(self) -> None:
         def mutate(handle: FakeHive) -> None:
             self.path.write_bytes(b"x" * len(self.payload))

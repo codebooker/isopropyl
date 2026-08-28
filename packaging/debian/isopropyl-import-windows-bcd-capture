@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+import runpy
+
+
+runpy.run_path(
+    "/usr/lib/isopropyl-tools/import_windows_bcd_capture.py",
+    run_name="__main__",
+)

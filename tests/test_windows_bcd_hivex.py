@@ -18,6 +18,7 @@ from isopropyl.windows_bcd_hivex import (
     BcdHiveError,
     BcdHiveValue,
     _HivexSession,
+    read_bcd_hive_descriptor,
     read_bcd_hive_snapshot,
     verify_bcd_hive_descriptor_against_fixture,
     verify_bcd_hive_snapshot,
@@ -300,6 +301,25 @@ class WindowsBcdHivexTests(unittest.TestCase):
                 os.close(descriptor)
         self.assertEqual(len(module.handles), 1)
         self.assertTrue(module.handles[0].closed)
+
+    def test_descriptor_reader_derives_observation_without_a_fixture_claim(self):
+        expected = bound_fixture()
+        module = FakeHivexModule(tree_for_fixture(expected))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "BCD"
+            path.write_bytes(SNAPSHOT)
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                with patch(
+                    "isopropyl.windows_hive.importlib.import_module",
+                    return_value=module,
+                ):
+                    observed = read_bcd_hive_descriptor(descriptor)
+                self.assertEqual(observed.objects, expected.objects)
+                self.assertEqual(observed.store_size, len(SNAPSHOT))
+                self.assertEqual(observed.store_sha256, hashlib.sha256(SNAPSHOT).hexdigest())
+            finally:
+                os.close(descriptor)
 
     def test_missing_concrete_reader_is_normalized_for_both_public_wrappers(self):
         from isopropyl.windows_bcd_hivex import verify_bcd_hive_against_fixture

@@ -203,9 +203,22 @@ issue requesting a private contact channel without disclosing the vulnerability.
   and returned handle collections are
   bounded, but hivex still runs in-process without a wall-clock deadline,
   cancellation, or native-crash isolation; this developer evidence tool is not a
-  privileged parsing boundary. Tests are synthetic and cannot remove native BCD
-  authoring, QEMU/OVMF, or physical-media execution blockers. No application,
-  helper, PolicyKit, or device-writing path imports these modules yet.
+  privileged parsing boundary. A separate strict RAW schema deliberately carries
+  no registry-tree interpretation. Its Linux importer pins an exact seven-file
+  inventory through distinct read-only no-follow descriptors, derives the tree
+  only through the sealed hivex reader, revalidates every byte, and publishes an
+  eleven-file evidence directory through `renameat2(RENAME_NOREPLACE)`. The
+  destination parent must be owned by the effective UID and exclude group/other
+  writers; parent and temporary directory identities are rebound immediately
+  around commit. Hostile same-EUID namespace manipulation remains out of scope,
+  and any detected post-rename identity or durability uncertainty is reported as
+  committed rather than success. The Windows collector accepts only ISO/index/new
+  output parameters and operates on fixed VHD files beneath an Administrators/
+  SYSTEM-only NTFS parent, but has only static and independent GPT/CRC tests on
+  this Linux host. No PowerShell parser, embedded-C# compilation, Hyper-V run, or
+  authentic cohort has been completed. Tests are otherwise synthetic and cannot
+  remove native BCD authoring, QEMU/OVMF, or physical-media execution blockers.
+  No application, helper, PolicyKit, or device-writing path imports these modules.
 - The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
   dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
   2.06/2.12/2.14 blank-media research bundles, plus the exact upstream UEFI

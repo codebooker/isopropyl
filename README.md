@@ -291,13 +291,15 @@ expanded drive visibility are never persisted.
 Unsupported or ambiguous formats fail closed. Direct FFU/WIM/ESD device apply,
 executable Windows To Go (an internal fail-closed layout/capacity preview, a
 device-free anonymous-NTFS-image WIM backend certificate, and a non-authorizing
-typed Windows BCD differential-evidence contract plus read-only hive verifier
-now exist), and general
+typed Windows BCD differential-evidence contract, experimental Windows collector,
+atomic Linux importer, and read-only hive verifier now exist), and general
 device-facing BIOS/dual-firmware construction from arbitrary payloads remain
 roadmap work. The certification backend explicitly rejects block devices and is
 not a claim about hostile same-UID processes, Windows boot, or physical media.
-The BCD contract and hive-reader tests currently use synthetic evidence only;
-they cannot create, modify, publish, or trust a boot hive.
+The BCD parser/importer tests currently use synthetic evidence only. The collector
+has static and independent GPT/CRC tests but has not run under PowerShell, Hyper-V,
+or Windows on this development host; none of these components can create, modify,
+publish as trusted, or authorize use of a boot hive.
 
 ## Windows customization
 
@@ -403,7 +405,7 @@ Optional tools unlock additional workflows:
 | Zstandard images | Python `zstandard` or `zstd` |
 | Legacy Unix `.Z` images | `gzip` |
 | Busy-drive process names | `fuser` (`psmisc`) |
-| Read-only maintainer validation of captured Windows BCD hives | Python `hivex` (`python3-hivex`) |
+| Read-only import/validation of captured Windows BCD hives | Python `hivex` (`python3-hivex`) |
 
 ISO mode also needs private temporary space for the extracted tree. WIM
 inspection or splitting can require several additional gigabytes. Missing
@@ -551,6 +553,38 @@ the Windows To Go write path. No authentic Windows capture is bundled yet. Hive
 bytes and returned collections are bounded, but the optional native parser runs
 in-process without a wall-clock deadline or crash isolation; use this maintainer
 tool only on disposable copies and never as a privileged service boundary.
+
+An experimental maintainer collector now builds the four raw captures inside
+disposable fixed VHD files on Windows. Run it only in a throwaway Windows 11 VM
+from an elevated PowerShell 7.4 `-NoProfile` session with Hyper-V enabled, an
+absolute ISO path, and a new output name beneath a pre-existing local NTFS
+directory whose protected DACL grants full control only to Administrators and
+SYSTEM:
+
+```powershell
+pwsh.exe -NoProfile -File .\tools\capture_windows_bcd_oracle.ps1 `
+  -IsoPath C:\Images\Windows11.iso -ImageIndex 1 `
+  -OutputDirectory C:\ISOpropylCaptureRoot\capture-1
+```
+
+The conservative collector needs roughly 128 GiB of free working space, creates
+one 64 GiB fixed VHD plus one sequential full clone, accepts no physical-disk
+identifier, and emits exactly seven evidence files. Its PowerShell/C# and
+Hyper-V behavior is not yet runtime-certified. Copy that seven-file directory
+to Linux, create an owner-only destination parent (`chmod 700`), and import it:
+
+```bash
+mkdir -m 700 imported-captures
+isopropyl-import-windows-bcd-capture windows-capture imported-captures/capture-1
+```
+
+The importer pins seven distinct singly linked regular files, independently
+parses all four hives through sealed snapshots, derives the canonical JSON
+cohort, rehashes every source and copy, and publishes eleven files with
+no-replace atomic rename. It rejects group/other-writable destination parents.
+Hostile processes running as the same Linux effective UID are outside its
+namespace threat model. Import success remains explicitly non-authorizing and
+does not establish authentic Windows provenance or bootability.
 
 Read [CONTRIBUTING.md](https://github.com/codebooker/isopropyl/blob/main/CONTRIBUTING.md) before changing a destructive path.
 Brand assets and usage guidance are in [BRANDING.md](https://github.com/codebooker/isopropyl/blob/main/BRANDING.md).

@@ -354,16 +354,6 @@ def inspect_windows_hive_descriptor(
         raise TypeError("The hive inspector must be callable")
     if type(descriptor) is not int or descriptor < 0:
         raise WindowsHiveError("The hive source descriptor is invalid")
-    try:
-        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-    except OSError as error:
-        raise WindowsHiveError("The hive source descriptor is unavailable") from error
-    if flags & os.O_ACCMODE != os.O_RDONLY:
-        raise WindowsHiveError("The hive source descriptor must be read-only")
-    path_flag = getattr(os, "O_PATH", 0)
-    if path_flag and flags & path_flag:
-        raise WindowsHiveError("An O_PATH descriptor cannot supply hive bytes")
-
     source = -1
     try:
         source = os.dup(descriptor)
@@ -372,6 +362,18 @@ def inspect_windows_hive_descriptor(
         if source >= 0:
             os.close(source)
         raise WindowsHiveError("The hive source descriptor could not be duplicated") from error
+    try:
+        flags = fcntl.fcntl(source, fcntl.F_GETFL)
+    except OSError as error:
+        os.close(source)
+        raise WindowsHiveError("The duplicated hive source is unavailable") from error
+    if flags & os.O_ACCMODE != os.O_RDONLY:
+        os.close(source)
+        raise WindowsHiveError("The hive source descriptor must be read-only")
+    path_flag = getattr(os, "O_PATH", 0)
+    if path_flag and flags & path_flag:
+        os.close(source)
+        raise WindowsHiveError("An O_PATH descriptor cannot supply hive bytes")
     return _inspect_open_source(source, inspector)
 
 

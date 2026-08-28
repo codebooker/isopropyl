@@ -149,8 +149,14 @@ evidence.
   typed evidence envelope now models actual BCD registry kinds, derives graph and
   boot semantics from captured values, binds the complete frozen GPT geometry and
   Microsoft command provenance, and requires a four-run one-GUID-at-a-time
-  differential set. Its unit fixtures are explicitly synthetic: Windows-generated
-  captures, native hivex construction, and QEMU still gate any hive use. A
+  differential set. A strict registry-free RAW schema, developer-only fixed-VHD
+  PowerShell collector, and descriptor-bound atomic Linux importer now implement
+  the evidence handoff. The importer derives registry evidence through hivex,
+  verifies the entire cohort before output, and publishes exact source copies plus
+  canonical fixtures without replacement. Its unit fixtures remain synthetic;
+  the collector has independent GPT/CRC and static safety tests but has not run on
+  Windows here. An authentic Windows capture, native hivex construction, and QEMU
+  still gate any hive use. A
   read-only verifier now pins each captured hive descriptor, snapshots it into a
   sealed memfd, decodes its typed registry tree with optional hivex, binds the
   complete store digest/size, and compares a four-hive cohort without exposing a
