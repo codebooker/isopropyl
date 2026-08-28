@@ -52,6 +52,8 @@ class BrandingTests(unittest.TestCase):
     def test_hero_and_screenshot_are_well_formed(self):
         hero = ET.parse(ROOT / "data" / "isopropyl-hero.svg").getroot()
         self.assertEqual(hero.attrib.get("viewBox"), "0 0 1200 360")
+        hero_text = "".join(hero.itertext())
+        self.assertIn("Bootable media, without the guesswork.", hero_text)
 
         screenshot = QImage(str(ROOT / "data" / "screenshot.png"))
         self.assertFalse(screenshot.isNull())

@@ -1,18 +1,20 @@
 <div align="center">
 
-![ISOpropyl — Bootable media, made simple](https://raw.githubusercontent.com/codebooker/isopropyl/aa5125e38d44eba7692c11e61add6816a10a12fb/data/isopropyl-hero.svg)
+![ISOpropyl — Bootable media, without the guesswork](https://raw.githubusercontent.com/codebooker/isopropyl/dbde952ddde89e7b4e0b08533c0e2c5014fc6696/data/isopropyl-hero.svg)
 
 [![Tests](https://github.com/codebooker/isopropyl/actions/workflows/test.yml/badge.svg)](https://github.com/codebooker/isopropyl/actions/workflows/test.yml)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-F6922E.svg)](https://github.com/codebooker/isopropyl/blob/main/LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux-252B35.svg?logo=linux&logoColor=white)](#requirements)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-5B6574.svg)](#project-status)
 
-**Create Linux and Windows installation media with clear choices, guarded writes,
-and end-to-end verification.**
+### Powerful enough for Windows installers. Careful enough for `/dev`.
 
-[Install](#install-a-debianubuntu-alpha-package) · [Quick start](#quick-start) · [Features](#highlights) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
+**A Linux-native image writer with guarded device selection, transparent write
+plans, Windows customization, and end-to-end verification.**
 
-<sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; VERIFIED WRITING &amp; FAST ZERO</sub>
+[Build & install](#build-a-debianubuntu-alpha-package) · [Quick start](#quick-start) · [Capabilities](#capabilities) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
+
+<sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; VERIFIED WRITES</sub>
 
 </div>
 
@@ -20,10 +22,10 @@ and end-to-end verification.**
 
 <p align="center"><sub>Rendered with synthetic image and device metadata. No physical drive was written.</sub></p>
 
-ISOpropyl turns Linux and Windows images into bootable USB and SD media without
-running an entire graphical application as root. It pairs an approachable Qt
-interface with explicit write methods, detailed preflight inspection, narrow
-privilege boundaries, and verification after writing.
+ISOpropyl gives Linux users a polished way to create bootable USB and SD media
+without running an entire graphical application as root. It pairs an
+approachable Qt interface with explicit write methods, detailed media
+inspection, narrow privilege boundaries, and read-back verification.
 
 It is inspired by Rufus, but it is a Linux-native project—not a port and not yet
 a feature-for-feature replacement.
@@ -34,7 +36,17 @@ a feature-for-feature replacement.
 > leave verification enabled, and check the target model, capacity, path, and
 > serial before approving a write.
 
-## Highlights
+## Why ISOpropyl
+
+| Inspect first | Keep privilege narrow | Verify the result |
+|---|---|---|
+| See image structure, boot modes, architectures, checksums, Windows editions, and compatibility warnings before erasing anything. | The Qt app and CLI stay unprivileged. Raw/DD writes and fast zero use fixed project PolicyKit actions; other tools elevate bounded system argument arrays without shell text. | Raw writes use mandatory pre-activation read-back. Full post-write verification is on by default and filesystem-aware writes hash every copied file. |
+
+No unattended confirmation, no internal-disk targets, and no shell-constructed
+root commands. Destructive operations name the exact device, revalidate its
+identity, and require an explicit confirmation.
+
+## Capabilities
 
 | Capability | What ISOpropyl does |
 |---|---|
@@ -52,7 +64,7 @@ a feature-for-feature replacement.
 For the exhaustive, evidence-based Rufus comparison, see the
 [feature matrix](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md).
 
-## Install a Debian/Ubuntu alpha package
+## Build a Debian/Ubuntu alpha package
 
 The repository contains an offline, reproducible `.deb` builder for 64-bit x86
 (`amd64`) and ARM (`arm64`). Its dependencies have been checked against **Debian
@@ -297,9 +309,9 @@ for the complete threat model and private vulnerability-reporting guidance.
 Core requirements:
 
 - Linux, Python 3.10 or newer, and PyQt6 6.5 through 6.x;
-- `lsblk`, `findmnt`, `udisksctl`, `pkexec`, GNU `dd`, and util-linux `flock`
-  (`dd` remains used by bounded backup, optical, erase, and constructed-media
-  tools, but not by the GUI or CLI raw-image writer);
+- `lsblk`, `findmnt`, `partprobe`, `udevadm`, `udisksctl`, `pkexec`, GNU `dd`,
+  and util-linux `flock` (`dd` remains used by bounded backup, optical, erase,
+  and constructed-media tools, but not by the GUI or CLI raw-image writer);
 - 7-Zip (`7z`) for bounded ISO cataloging and extraction; and
 - `sfdisk` plus `mkfs.vfat` for FAT32 ISO mode, or `mkfs.ntfs` for large-file
   UEFI:NTFS media.
@@ -319,6 +331,7 @@ Optional tools unlock additional workflows:
 | exFAT/UDF/ext restore | `mkfs.exfat`, `mkudffs` 1.1+, `mkfs.ext2/3/4` |
 | Surface and fake-capacity tests | `badblocks`, `f3probe` |
 | Additional ISO inspection | `xorriso` |
+| Authenticated Ubuntu downloads | `gpgv` and the system CA certificate store |
 | Zstandard images | Python `zstandard` or `zstd` |
 | Legacy Unix `.Z` images | `gzip` |
 | Busy-drive process names | `fuser` (`psmisc`) |

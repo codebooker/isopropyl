@@ -21,9 +21,10 @@
     </p>
     <p>
       It can inspect common boot layouts, calculate and compare checksums, stream
-      compressed disk images, explicitly download a signed and verified Ubuntu
-      LTS image, acquire and hash-verify exact public Windows 11 x64 and ARM64
-      ISOs directly from Microsoft, restore validated VTSI sparse disk images, privately
+      compressed disk images, explicitly download Ubuntu LTS media authenticated
+      through its signed checksum manifest, acquire and hash-verify exact public
+      Windows 11 x64 and ARM64 ISOs directly from Microsoft, restore validated
+      VTSI sparse disk images, privately
       decode and convert compressed virtual disk images, select Windows WIM/ESD
       editions, customize supported Windows installers,
       add bounded ZIP overlays to eligible ISO-mode media without replacing files,
