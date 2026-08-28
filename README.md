@@ -54,7 +54,7 @@ identity, and require an explicit confirmation.
 | **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and a second typed warning for fixed USB disks or risky image profiles. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
 | **Syslinux BIOS developer preview** | For exact supported Syslinux 6.03/6.04 images, an explicit environment-gated preview can add a legacy-BIOS path while retaining the source UEFI files. It uses hash-pinned payloads, a target-bound typed confirmation, MBR-last activation, and mandatory full-device SHA-256 read-back. The normal GUI keeps it hidden pending a native hardened helper and physical-media certification. |
-| **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, and can generate a reviewed `autounattend.xml` for setup, privacy, account, quality-of-life, and Windows 11 Secure Boot policy options. |
+| **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, can generate a reviewed `autounattend.xml`, and offers a narrowly profiled Windows 2023-generation installer-boot update for exact supported Microsoft media. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
 | **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, performs full or scan-and-skip logical zeroing, and runs bad-block or fake-capacity tests in separate warned workflows. |
@@ -317,6 +317,18 @@ Windows, installer, and recovery media from booting, so it requires a separate
 recovery and BitLocker-risk acknowledgment—including confirmation that the image
 already contains the latest applicable updates—and is never enabled by default.
 
+A separate default-off option can update installer boot files from
+`sources/boot.wim` for the exact reviewed Windows 11 25H2 v2 English x64 and
+ARM64 Microsoft ISOs. It is limited to direct FAT32 construction, binds the
+complete ISO to Microsoft's published SHA-256, extracts only the reviewed
+`EFI_EX` and `Fonts_EX` paths, verifies PE architecture and EFI subsystem, and
+hashes every replacement before and after committing it to the private staging
+tree. It requires an explicit acknowledgment that the target firmware already
+trusts Windows UEFI CA 2023; older 2011-only firmware may not boot it. A present
+PE certificate table is structural evidence—not certificate-chain,
+revocation, signing-time, or target-firmware validation—and the root
+`bootmgr_EX.efi` mapping is not described as CA-2023-signed.
+
 ## Safety by design
 
 ISOpropyl treats every target write as a destructive transaction:
@@ -375,7 +387,7 @@ Optional tools unlock additional workflows:
 
 | Capability | Tool |
 |---|---|
-| Windows WIM/ESD inspection, selection, and splitting | `wimlib-imagex` (`wimtools`) |
+| Windows WIM/ESD inspection, selection, splitting, and 2023-generation boot-file extraction | `wimlib-imagex` (`wimtools`) |
 | VHD/VHDX/QCOW/QCOW2 input and VHD/VHDX backup | `qemu-img` |
 | exFAT/UDF/ext restore | `mkfs.exfat`, `mkudffs` 1.1+, `mkfs.ext2/3/4` |
 | Surface and fake-capacity tests | `badblocks`, `f3probe` |

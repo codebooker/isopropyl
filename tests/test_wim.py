@@ -18,18 +18,22 @@ from isopropyl.wim import (
     CommandResult,
     WimCancelled,
     WimCommandError,
+    WimExtractExecutor,
     WimInfo,
     WimMetadataError,
     WimSplitExecutor,
     WimToolUnavailable,
     WimValidationError,
+    create_extract_plan,
     create_split_plan,
+    extract_command,
     inspect_wim,
     parse_wim_info_xml,
     requires_fat32_split,
     resolve_wimlib,
     run_bounded_command,
     split_command,
+    validate_extract_plan,
     validate_split_plan,
     validate_wim_selection,
 )
@@ -357,6 +361,335 @@ class WimInfoTests(unittest.TestCase):
             )
         self.assertFalse(seen[0][1]["shell"])
         self.assertEqual(seen[0][1]["stdin"], subprocess.DEVNULL)
+
+
+class WimExtractTests(unittest.TestCase):
+    PATHS = ("Windows/Boot/EFI_EX", "Windows/Boot/Fonts_EX")
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "boot.wim"
+        self.source.write_bytes(b"bound boot wim")
+        self.destination = self.root / "bootex"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def plan(self, **kwargs):
+        values = {
+            "image_index": 2,
+            "paths": self.PATHS,
+            "wimlib_imagex": TOOL,
+        }
+        values.update(kwargs)
+        return create_extract_plan(self.source, self.destination, **values)
+
+    @staticmethod
+    def populate(argv, *, extra=None):
+        destination_argument = next(
+            argument for argument in argv if argument.startswith("--dest-dir=")
+        )
+        destination = Path(destination_argument.split("=", 1)[1])
+        efi = destination / "Windows" / "Boot" / "EFI_EX"
+        fonts = destination / "Windows" / "Boot" / "Fonts_EX"
+        efi.mkdir(parents=True)
+        fonts.mkdir()
+        (efi / "bootmgfw_EX.efi").write_bytes(b"signed efi")
+        (fonts / "wgl4_boot.ttf").write_bytes(b"font")
+        if extra is not None:
+            extra(destination)
+
+    def test_plan_binds_one_source_and_builds_exact_no_glob_argv(self):
+        plan = self.plan()
+        self.assertEqual(plan.source, str(self.source.resolve()))
+        self.assertEqual(plan.source_identity[2], len(b"bound boot wim"))
+        staged = (self.root / "private-stage").resolve()
+        self.assertEqual(extract_command(plan, staged), [
+            TOOL,
+            "extract",
+            str(self.source.resolve()),
+            "2",
+            *self.PATHS,
+            f"--dest-dir={staged}",
+            "--no-globs",
+            "--preserve-dir-structure",
+            "--no-acls",
+            "--no-attributes",
+            "--check",
+        ])
+
+    def test_success_uses_bound_descriptor_and_commits_private_tree(self):
+        calls = []
+
+        def popen(argv, **kwargs):
+            self.populate(argv)
+            calls.append((argv, kwargs))
+            return FakeProcess(argv, **kwargs)
+
+        stages = []
+        result = WimExtractExecutor(popen=popen).execute(self.plan(), stages.append)
+        self.assertEqual(result.directory, str(self.destination))
+        self.assertEqual(result.total_size, len(b"signed efi") + len(b"font"))
+        self.assertEqual(
+            [Path(path).relative_to(self.destination).as_posix() for path in result.files],
+            [
+                "Windows/Boot/EFI_EX/bootmgfw_EX.efi",
+                "Windows/Boot/Fonts_EX/wgl4_boot.ttf",
+            ],
+        )
+        self.assertEqual(self.destination.stat().st_mode & 0o777, 0o700)
+        self.assertRegex(calls[0][0][2], r"^/proc/self/fd/[0-9]+$")
+        descriptor = int(calls[0][0][2].rsplit("/", 1)[1])
+        self.assertEqual(calls[0][1]["pass_fds"], (descriptor,))
+        self.assertFalse(calls[0][1]["shell"])
+        self.assertEqual(stages[-1], "Complete")
+        self.assertEqual(list(self.root.glob(".bootex.*.partial")), [])
+
+    def test_rejects_unsafe_overlapping_or_forged_requests(self):
+        invalid_paths = (
+            (),
+            ("Windows\\Boot\\EFI_EX",),
+            ("/Windows/Boot/EFI_EX",),
+            ("--to-stdout",),
+            ("@attacker-list",),
+            ("Windows/../EFI_EX",),
+            ("Windows/Boot/*",),
+            ("Windows/Boot/EFI_EX", "windows/boot/efi_ex"),
+            ("Windows/Boot", "Windows/Boot/EFI_EX"),
+            ("Windows/COM1/file",),
+            ("Windows/Boot/ trailing",),
+            ("Windows/Boot/e\u0301",),
+        )
+        for paths in invalid_paths:
+            with self.subTest(paths=paths), self.assertRaises(WimValidationError):
+                self.plan(paths=paths)
+        plan = self.plan()
+        for forged in (
+            replace(plan, image_index=True),
+            replace(plan, source="boot.wim"),
+            replace(plan, paths=list(plan.paths)),
+            replace(plan, destination_directory="relative"),
+            replace(plan, wimlib_imagex="/tmp/wimlib-imagex"),
+            replace(plan, source_identity=(1, 2, 3)),
+        ):
+            with self.subTest(forged=forged), self.assertRaises(
+                (WimValidationError, WimToolUnavailable)
+            ):
+                validate_extract_plan(forged)
+        esd = self.root / "boot.esd"
+        esd.write_bytes(b"esd")
+        with self.assertRaisesRegex(WimValidationError, "non-spanned"):
+            create_extract_plan(
+                esd, self.root / "esd-output", image_index=1,
+                paths=("Windows/Boot/EFI_EX",), wimlib_imagex=TOOL,
+            )
+
+    def test_changed_source_is_rejected_before_spawn(self):
+        plan = self.plan()
+        self.source.write_bytes(b"a changed boot wim")
+        calls = []
+        with self.assertRaisesRegex(WimValidationError, "changed"):
+            WimExtractExecutor(
+                popen=lambda *args, **kwargs: calls.append((args, kwargs))
+            ).execute(plan)
+        self.assertEqual(calls, [])
+        self.assertFalse(self.destination.exists())
+
+    def test_bound_descriptor_survives_path_rebind_but_operation_fails_closed(self):
+        plan = self.plan()
+        original = self.root / "original.wim"
+        observed = []
+
+        def popen(argv, **kwargs):
+            self.source.rename(original)
+            self.source.write_bytes(b"attacker source")
+            observed.append(Path(argv[2]).read_bytes())
+            self.source.unlink()
+            original.rename(self.source)
+            self.populate(argv)
+            return FakeProcess(argv, **kwargs)
+
+        with self.assertRaisesRegex(WimValidationError, "changed"):
+            WimExtractExecutor(popen=popen).execute(plan)
+        self.assertEqual(observed, [b"bound boot wim"])
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.root.glob(".bootex.*.partial")), [])
+
+    def test_missing_unexpected_special_or_excessive_outputs_never_commit(self):
+        def run(extra=None, *, populate=True):
+            def popen(argv, **kwargs):
+                if populate:
+                    self.populate(argv, extra=extra)
+                return FakeProcess(argv, **kwargs)
+
+            return WimExtractExecutor(popen=popen).execute(self.plan())
+
+        with self.assertRaisesRegex(WimCommandError, "every requested"):
+            run(populate=False)
+        self.assertFalse(self.destination.exists())
+
+        def unexpected(destination):
+            (destination / "outside.txt").write_bytes(b"no")
+
+        with self.assertRaisesRegex(WimCommandError, "unexpected extraction file"):
+            run(unexpected)
+        self.assertFalse(self.destination.exists())
+
+        def symlink(destination):
+            (destination / "Windows" / "Boot" / "EFI_EX" / "link").symlink_to(
+                "/etc/passwd"
+            )
+
+        with self.assertRaisesRegex(WimCommandError, "non-regular"):
+            run(symlink)
+        self.assertFalse(self.destination.exists())
+
+        def outside_hardlink(destination):
+            external = self.root / "outside-hardlink"
+            external.write_bytes(b"linked")
+            os.link(
+                external,
+                destination / "Windows" / "Boot" / "EFI_EX" / "linked.efi",
+            )
+
+        with self.assertRaisesRegex(WimCommandError, "links outside"):
+            run(outside_hardlink)
+        self.assertFalse(self.destination.exists())
+
+        def oversized(destination):
+            with (destination / "Windows" / "Boot" / "EFI_EX" / "huge").open(
+                "wb"
+            ) as stream:
+                stream.truncate(512 * 1024 * 1024 + 1)
+
+        with self.assertRaisesRegex(WimCommandError, "too large"):
+            run(oversized)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.root.glob(".bootex.*.partial")), [])
+
+    def test_internal_hardlinks_are_contained_and_allowed(self):
+        def popen(argv, **kwargs):
+            def link_copy(destination):
+                efi = destination / "Windows" / "Boot" / "EFI_EX"
+                os.link(efi / "bootmgfw_EX.efi", efi / "bootmgr_EX.efi")
+
+            self.populate(argv, extra=link_copy)
+            return FakeProcess(argv, **kwargs)
+
+        result = WimExtractExecutor(popen=popen).execute(self.plan())
+        boot_files = [path for path in result.files if path.endswith(".efi")]
+        self.assertEqual(len(boot_files), 2)
+        self.assertEqual(os.stat(boot_files[0]).st_ino, os.stat(boot_files[1]).st_ino)
+
+    def test_command_failure_and_output_overflow_fail_closed(self):
+        def failed(argv, **kwargs):
+            return FakeProcess(argv, stderr_data=b"extract failed", code=5, **kwargs)
+
+        with self.assertRaisesRegex(WimCommandError, "extract failed"):
+            WimExtractExecutor(popen=failed).execute(self.plan())
+        self.assertFalse(self.destination.exists())
+
+        def noisy(argv, **kwargs):
+            return FakeProcess(argv, stdout_data=b"x" * (1024 * 1024 + 1), **kwargs)
+
+        with self.assertRaisesRegex(WimCommandError, "too much output"):
+            WimExtractExecutor(popen=noisy).execute(self.plan())
+        self.assertFalse(self.destination.exists())
+
+    def test_preflight_and_in_flight_cancellation_leave_nothing(self):
+        executor = WimExtractExecutor(popen=lambda *_args, **_kwargs: None)
+        executor.cancel()
+        with self.assertRaises(WimCancelled):
+            executor.execute(self.plan())
+        self.assertFalse(self.destination.exists())
+
+        started = threading.Event()
+        holder = {}
+
+        def popen(argv, **kwargs):
+            process = FakeProcess(argv, blocked=True, **kwargs)
+            holder["process"] = process
+            started.set()
+            return process
+
+        executor = WimExtractExecutor(popen=popen)
+        errors = []
+
+        def execute():
+            try:
+                executor.execute(self.plan())
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=execute)
+        thread.start()
+        self.assertTrue(started.wait(timeout=2))
+        executor.cancel()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(holder["process"].terminated)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], WimCancelled)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.root.glob(".bootex.*.partial")), [])
+
+    @unittest.skipUnless(
+        Path(TOOL).is_file(),
+        "wimlib-imagex is required for the production extraction integration test",
+    )
+    def test_real_wimlib_extracts_exact_index_two_paths_with_structure(self):
+        empty = self.root / "empty-image"
+        empty.mkdir()
+        source_tree = self.root / "setup-image"
+        efi = source_tree / "Windows" / "Boot" / "EFI_EX"
+        fonts = source_tree / "Windows" / "Boot" / "Fonts_EX"
+        efi.mkdir(parents=True)
+        fonts.mkdir(parents=True)
+        (efi / "bootmgfw_EX.efi").write_bytes(b"MZfixture")
+        (fonts / "font_EX.ttf").write_bytes(b"font")
+        source_wim = self.root / "synthetic-boot.wim"
+        environment = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+        subprocess.run(
+            [
+                TOOL, "capture", str(empty), str(source_wim), "placeholder",
+                "--compress=none",
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        subprocess.run(
+            [TOOL, "append", str(source_tree), str(source_wim), "setup"],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+
+        destination = self.root / "real-extract"
+        plan = create_extract_plan(
+            source_wim,
+            destination,
+            image_index=2,
+            paths=("Windows/Boot/EFI_EX", "Windows/Boot/Fonts_EX"),
+            wimlib_imagex=TOOL,
+        )
+        result = WimExtractExecutor().execute(plan)
+
+        self.assertEqual(result.directory, str(destination))
+        self.assertEqual(result.total_size, 13)
+        self.assertEqual(
+            (destination / "Windows/Boot/EFI_EX/bootmgfw_EX.efi").read_bytes(),
+            b"MZfixture",
+        )
+        self.assertEqual(
+            (destination / "Windows/Boot/Fonts_EX/font_EX.ttf").read_bytes(),
+            b"font",
+        )
 
 
 class WimSplitTests(unittest.TestCase):

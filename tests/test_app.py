@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
-    QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+    QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
 )
 
 from isopropyl.app import (
@@ -26,7 +26,7 @@ from isopropyl.app import (
     FreeDosDownloadToken,
     IsoStagingPreparationRequest,
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
-    PreparedSyslinuxWrite,
+    PreparedSyslinuxWrite, STYLE,
     StagedDbxConfirmation,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
     WindowsDownloadToken, ZipOverlayPlanningToken,
@@ -82,6 +82,7 @@ from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
 from isopropyl.wim import WimEdition, WimInfo, WimSelection
 from isopropyl.windows import WindowsCustomization
+from isopropyl.windows_bootex import WindowsBootExOptions
 from isopropyl.writer import ImageWriter
 from isopropyl.zip_overlay import ZipOverlayPlan, build_zip_overlay_plan
 from tests.test_fat_image import make_fat, write_container
@@ -941,6 +942,58 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.application.processEvents()
         self.settings_home.cleanup()
 
+    def test_main_workflow_remains_reachable_without_fullscreen(self):
+        previous_style = self.application.styleSheet()
+        self.application.setStyleSheet(STYLE)
+        try:
+            self.window.show()
+            scroll = self.window.findChild(
+                QScrollArea, "mainWorkflowScrollArea",
+            )
+            self.assertIsNotNone(scroll)
+            assert scroll is not None
+            self.assertLessEqual(self.window.minimumHeight(), 520)
+
+            for size in ((1366, 768), (1280, 720), (1024, 768), (1024, 600), (700, 520)):
+                with self.subTest(size=size):
+                    self.window.resize(*size)
+                    scroll.verticalScrollBar().setValue(0)
+                    self.application.processEvents()
+                    self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+                    self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+
+                    # The destructive action and live progress remain pinned
+                    # while the body scrolls, so fullscreen is never required.
+                    before = self.window.write_button.mapTo(
+                        self.window.centralWidget(),
+                        self.window.write_button.rect().topLeft(),
+                    )
+                    scroll.verticalScrollBar().setValue(
+                        scroll.verticalScrollBar().maximum(),
+                    )
+                    self.application.processEvents()
+                    after = self.window.write_button.mapTo(
+                        self.window.centralWidget(),
+                        self.window.write_button.rect().topLeft(),
+                    )
+                    self.assertTrue(self.window.write_button.isVisible())
+                    self.assertEqual(before, after)
+                    self.assertLess(
+                        after.y() + self.window.write_button.height(),
+                        self.window.centralWidget().height() + 1,
+                    )
+                    settings_position = self.window.settings_button.mapTo(
+                        scroll.viewport(),
+                        self.window.settings_button.rect().topLeft(),
+                    )
+                    self.assertGreaterEqual(settings_position.y(), 0)
+                    self.assertLessEqual(
+                        settings_position.y() + self.window.settings_button.height(),
+                        scroll.viewport().height(),
+                    )
+        finally:
+            self.application.setStyleSheet(previous_style)
+
     def syslinux_write_plan(self, inspection: ImageInspection):
         self.window.inspection = inspection
         entries = self.window.archive_entries()
@@ -1394,6 +1447,37 @@ class WindowWriteMethodTests(unittest.TestCase):
             firmware_target=FirmwareTarget.UEFI_ONLY,
         )
         self.assertTrue(plan.executable)
+
+    def test_path_covered_embedded_fat_members_use_complete_base_catalog(self):
+        write_container(self.window.image, make_fat(FatType.FAT12))
+        catalog = inspect_eltorito_file(self.window.image)
+        descriptor = os.open(self.window.image, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            embedded = inspect_uefi_eltorito_fat(descriptor, catalog)
+        finally:
+            os.close(descriptor)
+        assert embedded is not None
+        original = self.window.inspection
+        assert original is not None
+        base_members = tuple(
+            ImageMember(
+                entry.path,
+                entry.size,
+                "directory" if entry.is_directory else "file",
+            )
+            for entry in embedded.entries
+        )
+        self.window.inspection = replace(
+            original,
+            members=base_members,
+            embedded_uefi_fat=embedded,
+            embedded_uefi_issues=(),
+        )
+
+        self.assertEqual(
+            self.window.constructed_base_entries(),
+            self.window.archive_entries(),
+        )
 
     def test_dbx_match_warning_is_precise_and_defaults_to_cancel(self):
         match = DbxAssessment(
@@ -2328,6 +2412,86 @@ class WindowWriteMethodTests(unittest.TestCase):
         with patch("isopropyl.app.QDialog.exec", new=reject_changed_value):
             self.window.configure_windows()
         self.assertTrue(self.window.windows_options.disable_fast_startup)
+
+    def test_bootex_option_is_separate_requires_exact_profile_and_acknowledgment(self):
+        self.window.inspection = replace(
+            optical_windows_inspection(),
+            members=optical_windows_inspection().members + (
+                ImageMember("sources/boot.wim", 16, "file"),
+            ),
+        )
+        profile = SimpleNamespace(
+            iso_size=self.window.image.stat().st_size,
+            architecture="x64",
+        )
+
+        def enable_and_save(dialog) -> int:
+            checkbox = dialog.findChild(QCheckBox, "windowsBootExCheckBox")
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsBootExFirmwareAcknowledgment",
+            )
+            assert checkbox is not None and acknowledgment is not None
+            self.assertTrue(checkbox.isEnabled())
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(acknowledgment.isEnabled())
+            self.assertIn("whole-ISO SHA-256", checkbox.toolTip())
+            checkbox.setChecked(True)
+            self.assertTrue(acknowledgment.isEnabled())
+            acknowledgment.setChecked(True)
+            buttons = dialog.findChildren(QDialogButtonBox)
+            buttons[-1].button(QDialogButtonBox.StandardButton.Save).click()
+            return QDialog.DialogCode.Accepted
+
+        with (
+            patch(
+                "isopropyl.app.available_bootex_profiles",
+                return_value=(profile,),
+            ),
+            patch("isopropyl.app.QDialog.exec", new=enable_and_save),
+        ):
+            self.window.configure_windows()
+
+        self.assertEqual(
+            self.window.windows_bootex,
+            WindowsBootExOptions(True, True),
+        )
+        self.assertFalse(self.window.windows_options.enabled)
+
+        observed = {}
+
+        def inspect_preview(dialog: QDialog) -> int:
+            details = dialog.findChild(QPlainTextEdit)
+            assert details is not None
+            observed["text"] = details.toPlainText()
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect_preview):
+            self.window.preview_iso_plan()
+        self.assertIn(
+            "windows-boot-files: wimlib-imagex (wimtools)",
+            observed["text"],
+        )
+
+        def inspect_disabled(dialog) -> int:
+            checkbox = dialog.findChild(QCheckBox, "windowsBootExCheckBox")
+            acknowledgment = dialog.findChild(
+                QCheckBox, "windowsBootExFirmwareAcknowledgment",
+            )
+            assert checkbox is not None and acknowledgment is not None
+            self.assertFalse(checkbox.isEnabled())
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(acknowledgment.isEnabled())
+            return QDialog.DialogCode.Rejected
+
+        with (
+            patch("isopropyl.app.available_bootex_profiles", return_value=()),
+            patch("isopropyl.app.QDialog.exec", new=inspect_disabled),
+        ):
+            self.window.configure_windows()
+        self.assertEqual(
+            self.window.windows_bootex,
+            WindowsBootExOptions(True, True),
+        )
 
     def test_quality_of_life_defaults_off_requires_edition_and_acknowledgment(self):
         source = ArchiveEntry("sources/install.wim", 16)

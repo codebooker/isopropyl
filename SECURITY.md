@@ -350,6 +350,26 @@ issue requesting a private contact channel without disclosing the vulnerability.
   This is an ISOpropyl construction invariant, not a claim that every unusual
   booted Windows Setup launch context has been physically certified. ISOpropyl
   never emits an automatic target-disk wipe instruction for Windows Setup.
+- The Windows 2023-generation installer-boot transform is a separate,
+  default-off direct-FAT32 option, not an answer-file setting. Planning hashes
+  the complete ISO and requires one exact reviewed Microsoft-published Windows
+  11 25H2 v2 English x64/ARM64 size and SHA-256 profile. Execution revalidates
+  the source identity and complete hash, extracts only literal
+  `Windows/Boot/EFI_EX` and `Windows/Boot/Fonts_EX` paths from
+  `sources/boot.wim` index 2 through fixed `wimlib-imagex --no-globs`
+  arguments, and accepts only a bounded, singly linked regular-file tree.
+  Replacement executables must match the selected PE architecture and EFI
+  subsystem and have a structurally present certificate table. Only the
+  fallback loader, root `bootmgr.efi`, and direct boot fonts may be replaced;
+  each destination is identity- and hash-bound, atomically replaced inside the
+  unpublished private tree, reopened, hashed, and included in the final staging
+  manifest and receipt. A failure discards that private staging workflow before
+  device construction. The user separately acknowledges that 2011-only
+  firmware may not boot the result. Whole-ISO provenance and a certificate-table
+  presence do not establish the individual signer's chain, revocation status,
+  signing time, Windows UEFI CA 2023 identity, or the target firmware's trust;
+  in particular, ISOpropyl does not label the root `bootmgr_EX.efi` mapping as
+  CA-2023-signed.
 - A generated local administrator initially has a blank password. ISOpropyl
   emits one sequential first-logon command that requests password replacement
   and applies the chosen expiration policy, but Windows S mode does not run

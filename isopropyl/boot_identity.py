@@ -404,16 +404,65 @@ def read_archive_member_with_7z(
     image_fd: int | None = None, cancel_check: Callable[[], None] | None = None,
     max_bytes: int = MAX_BOOT_BLOB_SIZE,
 ) -> bytes:
-    """Read one exact member with the host 7z tool, with time and size caps."""
+    """Read one exact member with deterministic optical-namespace selection.
+
+    7-Zip chooses different filesystems for a ``.iso`` pathname and the same
+    bytes exposed through ``/proc/self/fd``.  Prefer UDF, then ISO9660, before
+    retaining auto-detection solely for non-optical compatibility.  Selected
+    boot payloads are non-empty; an empty result therefore means that the
+    member was absent from that candidate namespace.
+    """
 
     if type(max_bytes) is not int or not 0 < max_bytes <= MAX_BOOT_BLOB_SIZE:
         raise ValueError("The boot payload read limit is invalid")
     executable = _trusted_7z()
     if not executable:
         raise OSError("7z is not installed; boot payload members were not read")
+    deadline = time.monotonic() + timeout
+    for archive_type in ("Udf", "Iso", None):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Timed out reading {member}")
+        try:
+            payload = _read_archive_member_once(
+                executable,
+                image,
+                member,
+                timeout=remaining,
+                image_fd=image_fd,
+                cancel_check=cancel_check,
+                max_bytes=max_bytes,
+                archive_type=archive_type,
+            )
+        except _ArchiveNamespaceUnavailable:
+            continue
+        if payload or archive_type is None:
+            return payload
+    raise OSError(f"7z could not read {member}")
+
+
+class _ArchiveNamespaceUnavailable(OSError):
+    pass
+
+
+def _read_archive_member_once(
+    executable: str,
+    image: Path,
+    member: str,
+    *,
+    timeout: float,
+    image_fd: int | None,
+    cancel_check: Callable[[], None] | None,
+    max_bytes: int,
+    archive_type: str | None,
+) -> bytes:
     source = str(image) if image_fd is None else f"/proc/self/fd/{image_fd}"
+    type_switch = () if archive_type is None else (f"-t{archive_type}",)
     process = subprocess.Popen(
-        [executable, "x", "-so", "-spd", "-y", "--", source, member],
+        [
+            executable, "x", "-so", "-spd", "-y", *type_switch,
+            "--", source, member,
+        ],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         pass_fds=(() if image_fd is None else (image_fd,)),
     )
@@ -447,7 +496,9 @@ def read_archive_member_with_7z(
             cancel_check()
         returncode = process.wait(timeout=1)
         if returncode:
-            raise OSError(f"7z could not read {member}")
+            raise _ArchiveNamespaceUnavailable(
+                f"7z could not read {member} as {archive_type or 'auto'}"
+            )
         return bytes(output)
     finally:
         selector.close()

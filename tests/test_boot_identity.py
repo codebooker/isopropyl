@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import isopropyl.boot_identity as boot_identity_module
 from isopropyl.boot_identity import (
     BootloaderAnalysis, analyze_bootloader_blob, analyze_bootloader_members,
     analyze_iso_bootloaders, bootloader_member_paths, identify_grub_blob,
@@ -128,6 +129,68 @@ class BootIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "not installed"):
                 read_archive_member_with_7z(Path("fixture.iso"), "isolinux.bin")
         which.assert_called_once_with("7z", path="/usr/bin:/bin")
+
+    def test_payload_reader_prefers_udf_and_falls_back_to_iso9660(self):
+        with (
+            patch(
+                "isopropyl.boot_identity._trusted_7z",
+                return_value="/usr/bin/7z",
+            ),
+            patch(
+                "isopropyl.boot_identity._read_archive_member_once",
+                side_effect=(b"", b"MZ-iso"),
+            ) as reader,
+        ):
+            self.assertEqual(
+                read_archive_member_with_7z(
+                    Path("fixture.iso"), "EFI/BOOT/BOOTX64.EFI",
+                ),
+                b"MZ-iso",
+            )
+        self.assertEqual(
+            [call.kwargs["archive_type"] for call in reader.call_args_list],
+            ["Udf", "Iso"],
+        )
+
+        with (
+            patch(
+                "isopropyl.boot_identity._trusted_7z",
+                return_value="/usr/bin/7z",
+            ),
+            patch(
+                "isopropyl.boot_identity._read_archive_member_once",
+                return_value=b"MZ-udf",
+            ) as reader,
+        ):
+            self.assertEqual(
+                read_archive_member_with_7z(
+                    Path("fixture.iso"), "EFI/BOOT/BOOTX64.EFI",
+                ),
+                b"MZ-udf",
+            )
+        reader.assert_called_once()
+        self.assertEqual(reader.call_args.kwargs["archive_type"], "Udf")
+
+    def test_payload_reader_reaches_auto_only_after_both_optical_types_fail(self):
+        unavailable = boot_identity_module._ArchiveNamespaceUnavailable("fixture")
+        with (
+            patch(
+                "isopropyl.boot_identity._trusted_7z",
+                return_value="/usr/bin/7z",
+            ),
+            patch(
+                "isopropyl.boot_identity._read_archive_member_once",
+                side_effect=(unavailable, unavailable, b"other-archive"),
+            ) as reader,
+        ):
+            self.assertEqual(
+                read_archive_member_with_7z(Path("fixture.img"), "payload"),
+                b"other-archive",
+            )
+        self.assertEqual(
+            [call.kwargs["archive_type"] for call in reader.call_args_list],
+            ["Udf", "Iso", None],
+        )
 
     def test_payload_reader_enforces_caller_specific_streaming_cap(self):
         read_fd, write_fd = os.pipe()

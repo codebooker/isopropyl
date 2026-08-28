@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -25,6 +26,12 @@ MAX_INFO_OUTPUT = 4 * MIB
 MAX_COMMAND_OUTPUT = MIB
 MAX_IMAGES = 128
 MAX_XML_ELEMENTS = 20_000
+MAX_EXTRACT_PATHS = 32
+MAX_EXTRACT_PATH_CHARACTERS = 1024
+MAX_EXTRACT_PATH_BYTES = 4096
+MAX_EXTRACT_PATH_COMPONENTS = 32
+MAX_EXTRACT_FILES = 8192
+MAX_EXTRACT_BYTES = 512 * MIB
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _TRUSTED_TOOL_DIRECTORIES = frozenset(_TRUSTED_TOOL_PATH.split(":"))
 _PART_NAME = re.compile(r"install(?:(?P<number>[2-9][0-9]*))?\.swm", re.IGNORECASE)
@@ -143,6 +150,25 @@ class WimSplitPlan:
 class WimSplitResult:
     directory: str
     parts: tuple[str, ...]
+    total_size: int
+
+
+@dataclass(frozen=True)
+class WimExtractPlan:
+    """An exact, identity-bound extraction from one non-spanned WIM."""
+
+    source: str
+    source_identity: FileIdentity
+    image_index: int
+    paths: tuple[str, ...]
+    destination_directory: str
+    wimlib_imagex: str
+
+
+@dataclass(frozen=True)
+class WimExtractResult:
+    directory: str
+    files: tuple[str, ...]
     total_size: int
 
 
@@ -599,6 +625,184 @@ def inspect_wim(
         os.close(descriptor)
 
 
+_EXTRACT_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
+_EXTRACT_RESERVED_COMPONENT = re.compile(
+    r"^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|"
+    r"com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$",
+    re.IGNORECASE,
+)
+_EXTRACT_FORBIDDEN_CHARACTERS = frozenset('<>:"\\|?*')
+
+
+def _validate_extract_paths(paths: object) -> tuple[str, ...]:
+    if (
+        not isinstance(paths, (tuple, list))
+        or not paths
+        or len(paths) > MAX_EXTRACT_PATHS
+    ):
+        raise WimValidationError(
+            f"Between 1 and {MAX_EXTRACT_PATHS} exact WIM paths are required"
+        )
+    validated: list[str] = []
+    aliases: list[tuple[str, ...]] = []
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            raise WimValidationError("Each exact WIM path must be non-empty text")
+        if len(path) > MAX_EXTRACT_PATH_CHARACTERS:
+            raise WimValidationError("An exact WIM path is too long")
+        try:
+            encoded = path.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise WimValidationError("An exact WIM path contains invalid Unicode") from error
+        if len(encoded) > MAX_EXTRACT_PATH_BYTES:
+            raise WimValidationError("An exact WIM path is too long")
+        if unicodedata.normalize("NFC", path) != path:
+            raise WimValidationError("An exact WIM path is not NFC-normalized")
+        if any(
+            unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+            for character in path
+        ):
+            raise WimValidationError("An exact WIM path contains unsafe Unicode")
+        if (
+            path.startswith(("/", "\\"))
+            or path.startswith(("-", "@"))
+            or "\\" in path
+            or _EXTRACT_DRIVE_PATH.match(path)
+            or any(character in _EXTRACT_FORBIDDEN_CHARACTERS for character in path)
+        ):
+            raise WimValidationError("An exact WIM path has unsafe Windows syntax")
+        components = tuple(path.split("/"))
+        if (
+            not 1 <= len(components) <= MAX_EXTRACT_PATH_COMPONENTS
+            or any(component in {"", ".", ".."} for component in components)
+        ):
+            raise WimValidationError("An exact WIM path has an unsafe component")
+        for component in components:
+            if component != component.strip() or component.endswith("."):
+                raise WimValidationError(
+                    "An exact WIM path has component whitespace or dots"
+                )
+            if _EXTRACT_RESERVED_COMPONENT.fullmatch(component):
+                raise WimValidationError(
+                    "An exact WIM path contains a reserved device name"
+                )
+            if (
+                len(component.encode("utf-8")) > 255
+                or len(component.encode("utf-16-le")) // 2 > 255
+            ):
+                raise WimValidationError("An exact WIM path has an overlong component")
+        alias = tuple(component.casefold() for component in components)
+        if alias in aliases:
+            raise WimValidationError("Exact WIM paths must be unique")
+        if any(
+            alias[:len(other)] == other or other[:len(alias)] == alias
+            for other in aliases
+        ):
+            raise WimValidationError("Exact WIM paths must not overlap")
+        validated.append(path)
+        aliases.append(alias)
+    return tuple(validated)
+
+
+def _extract_destination_path(path: str | os.PathLike[str]) -> Path:
+    raw = Path(path).expanduser()
+    if raw.name in {"", ".", ".."}:
+        raise WimValidationError("A dedicated WIM extraction directory is required")
+    try:
+        parent = raw.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise WimValidationError(
+            "The WIM extraction parent directory is unavailable"
+        ) from error
+    if not parent.is_dir():
+        raise WimValidationError("The WIM extraction parent must be a directory")
+    destination = parent / raw.name
+    if destination.exists() or destination.is_symlink():
+        raise WimValidationError("The WIM extraction directory must not already exist")
+    return destination
+
+
+def create_extract_plan(
+    source: str | os.PathLike[str],
+    destination_directory: str | os.PathLike[str],
+    *,
+    image_index: int,
+    paths: Sequence[str],
+    wimlib_imagex: str,
+) -> WimExtractPlan:
+    source_path, status = _regular_file(source)
+    if source_path.suffix.casefold() != ".wim":
+        raise WimValidationError("Only one non-spanned .wim source can be extracted")
+    if (
+        not isinstance(image_index, int)
+        or isinstance(image_index, bool)
+        or not 1 <= image_index <= 2_147_483_647
+    ):
+        raise WimValidationError("The WIM image index must be a positive integer")
+    exact_paths = _validate_extract_paths(paths)
+    destination = _extract_destination_path(destination_directory)
+    return WimExtractPlan(
+        source=str(source_path),
+        source_identity=_identity(status),
+        image_index=image_index,
+        paths=exact_paths,
+        destination_directory=str(destination),
+        wimlib_imagex=_validate_wimlib_path(wimlib_imagex),
+    )
+
+
+def validate_extract_plan(plan: WimExtractPlan) -> None:
+    if not isinstance(plan, WimExtractPlan):
+        raise WimValidationError("A WimExtractPlan is required")
+    _validate_wimlib_path(plan.wimlib_imagex)
+    if (
+        not os.path.isabs(plan.source)
+        or Path(plan.source).suffix.casefold() != ".wim"
+    ):
+        raise WimValidationError("WIM extraction plan contains an invalid source")
+    if (
+        not isinstance(plan.image_index, int)
+        or isinstance(plan.image_index, bool)
+        or not 1 <= plan.image_index <= 2_147_483_647
+    ):
+        raise WimValidationError("WIM extraction plan contains an invalid image index")
+    if _validate_extract_paths(plan.paths) != plan.paths:
+        raise WimValidationError("WIM extraction paths are not canonical")
+    if not os.path.isabs(plan.destination_directory):
+        raise WimValidationError("WIM extraction plan contains a relative destination")
+    destination = Path(plan.destination_directory)
+    if destination.name in {"", ".", ".."}:
+        raise WimValidationError("WIM extraction plan contains an invalid destination")
+    if (
+        not isinstance(plan.source_identity, tuple)
+        or len(plan.source_identity) != 6
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in plan.source_identity
+        )
+    ):
+        raise WimValidationError("WIM extraction plan contains an invalid source identity")
+
+
+def extract_command(plan: WimExtractPlan, staged_destination: Path) -> list[str]:
+    validate_extract_plan(plan)
+    if not staged_destination.is_absolute():
+        raise WimValidationError("The staged WIM extraction directory must be absolute")
+    return [
+        plan.wimlib_imagex,
+        "extract",
+        plan.source,
+        str(plan.image_index),
+        *plan.paths,
+        f"--dest-dir={staged_destination}",
+        "--no-globs",
+        "--preserve-dir-structure",
+        "--no-acls",
+        "--no-attributes",
+        "--check",
+    ]
+
+
 def requires_fat32_split(size: int) -> bool:
     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
         raise WimValidationError("Image size must be a non-negative integer")
@@ -715,6 +919,230 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _validate_extracted_tree(
+    directory: Path,
+    requested_paths: tuple[str, ...],
+) -> tuple[tuple[Path, ...], int]:
+    root_status = directory.lstat()
+    if (
+        not stat.S_ISDIR(root_status.st_mode)
+        or stat.S_IMODE(root_status.st_mode) & 0o077
+    ):
+        raise WimCommandError("The WIM extraction root is not a private directory")
+
+    requested = tuple(
+        tuple(component.casefold() for component in path.split("/"))
+        for path in requested_paths
+    )
+    materialized: set[tuple[str, ...]] = set()
+    aliases: set[tuple[str, ...]] = set()
+    files: list[Path] = []
+    file_statuses: list[os.stat_result] = []
+    total_size = 0
+    entries_seen = 0
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name.casefold())
+        except OSError as error:
+            raise WimCommandError("Could not inspect extracted WIM output") from error
+        for entry in entries:
+            entries_seen += 1
+            if entries_seen > MAX_EXTRACT_FILES:
+                raise WimCommandError("wimlib-imagex created too many extraction entries")
+            output = Path(entry.path)
+            try:
+                status = entry.stat(follow_symlinks=False)
+                relative = output.relative_to(directory).as_posix()
+                _validate_extract_paths((relative,))
+            except (OSError, ValueError, WimValidationError) as error:
+                raise WimCommandError(
+                    "wimlib-imagex created an unsafe extraction path"
+                ) from error
+            alias = tuple(component.casefold() for component in relative.split("/"))
+            if alias in aliases:
+                raise WimCommandError(
+                    "wimlib-imagex created case-ambiguous extraction paths"
+                )
+            aliases.add(alias)
+            exact = alias in requested
+            descendant = any(alias[:len(root)] == root for root in requested)
+            ancestor = any(root[:len(alias)] == alias for root in requested)
+            if exact:
+                materialized.add(alias)
+
+            if stat.S_ISDIR(status.st_mode):
+                if not (exact or descendant or ancestor):
+                    raise WimCommandError(
+                        "wimlib-imagex created an unexpected extraction directory"
+                    )
+                pending.append(output)
+                continue
+            if not stat.S_ISREG(status.st_mode):
+                raise WimCommandError(
+                    "wimlib-imagex created a non-regular extraction output"
+                )
+            if not (exact or descendant):
+                raise WimCommandError(
+                    "wimlib-imagex created an unexpected extraction file"
+                )
+            total_size += status.st_size
+            if total_size > MAX_EXTRACT_BYTES:
+                raise WimCommandError("wimlib-imagex extraction is too large")
+            descriptor = -1
+            try:
+                descriptor = os.open(output, _SOURCE_FLAGS)
+                descriptor_status = os.fstat(descriptor)
+                if _identity(descriptor_status) != _identity(status):
+                    raise WimCommandError(
+                        "An extracted WIM file changed during validation"
+                    )
+                os.fsync(descriptor)
+            except OSError as error:
+                raise WimCommandError(
+                    "Could not validate an extracted WIM file"
+                ) from error
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            files.append(output)
+            file_statuses.append(status)
+
+    missing = set(requested) - materialized
+    if missing:
+        raise WimCommandError("wimlib-imagex did not extract every requested path")
+    internal_links: dict[tuple[int, int], int] = {}
+    for status in file_statuses:
+        key = (status.st_dev, status.st_ino)
+        internal_links[key] = internal_links.get(key, 0) + 1
+    if any(
+        status.st_nlink != internal_links[(status.st_dev, status.st_ino)]
+        for status in file_statuses
+    ):
+        raise WimCommandError("An extracted WIM file has links outside the private tree")
+    files.sort(key=lambda path: path.relative_to(directory).as_posix().casefold())
+    return tuple(files), total_size
+
+
+class WimExtractExecutor:
+    """Extract literal WIM paths into a new private directory, or commit nothing."""
+
+    def __init__(
+        self,
+        *,
+        popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        timeout_seconds: float = 20 * 60,
+    ) -> None:
+        if timeout_seconds <= 0 or timeout_seconds > 24 * 60 * 60:
+            raise WimValidationError(
+                "Extraction timeout must be between 0 and 86400 seconds"
+            )
+        self._popen = popen
+        self._timeout_seconds = timeout_seconds
+        self._cancelled = threading.Event()
+        self._process: subprocess.Popen[bytes] | None = None
+        self._used = False
+        self._lock = threading.Lock()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._lock:
+            process = self._process
+        if process is not None:
+            _stop_process(process)
+
+    def _process_started(self, process: subprocess.Popen[bytes]) -> None:
+        with self._lock:
+            self._process = process
+
+    def _check_cancelled(self) -> None:
+        if self.cancelled:
+            raise WimCancelled("WIM extraction was cancelled")
+
+    def execute(
+        self,
+        plan: WimExtractPlan,
+        stage: StageCallback = lambda _message: None,
+    ) -> WimExtractResult:
+        if self._used:
+            raise WimValidationError("A WIM extraction executor can only be used once")
+        self._used = True
+        validate_extract_plan(plan)
+        self._check_cancelled()
+
+        source, source_descriptor, status = _open_regular_file(plan.source)
+        if str(source) != plan.source or _identity(status) != plan.source_identity:
+            os.close(source_descriptor)
+            raise WimValidationError("The WIM source changed after extraction was planned")
+        staging: Path | None = None
+        try:
+            destination = _extract_destination_path(plan.destination_directory)
+            staging = Path(tempfile.mkdtemp(
+                prefix=f".{destination.name}.",
+                suffix=".partial",
+                dir=destination.parent,
+            ))
+            os.chmod(staging, 0o700)
+            self._check_cancelled()
+            stage("Extracting Windows boot files")
+            command = extract_command(plan, staging)
+            command[2] = _descriptor_path(source_descriptor)
+            result = run_bounded_command(
+                command,
+                timeout_seconds=self._timeout_seconds,
+                max_output=MAX_COMMAND_OUTPUT,
+                cancel_event=self._cancelled,
+                popen=self._popen,
+                process_started=self._process_started,
+                pass_fds=(source_descriptor,),
+            )
+            with self._lock:
+                self._process = None
+            if not _descriptor_still_bound(
+                source, source_descriptor, plan.source_identity,
+            ):
+                raise WimValidationError("The WIM source changed while it was extracted")
+            if result.returncode:
+                detail = _error_text(result.stderr)
+                raise WimCommandError(
+                    detail or "wimlib-imagex could not extract the requested paths"
+                )
+            self._check_cancelled()
+            stage("Validating extracted Windows boot files")
+            files, total_size = _validate_extracted_tree(staging, plan.paths)
+            _fsync_directory(staging)
+            self._check_cancelled()
+            if destination.exists() or destination.is_symlink():
+                raise WimValidationError(
+                    "The WIM extraction destination appeared during the operation"
+                )
+            staging.rename(destination)
+            _fsync_directory(destination.parent)
+            committed_files = tuple(
+                str(destination / path.relative_to(staging)) for path in files
+            )
+            try:
+                stage("Complete")
+            except Exception:
+                pass
+            return WimExtractResult(str(destination), committed_files, total_size)
+        finally:
+            os.close(source_descriptor)
+            with self._lock:
+                process = self._process
+                self._process = None
+            if process is not None:
+                _stop_process(process)
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging)
 
 
 class WimSplitExecutor:

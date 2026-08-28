@@ -3,16 +3,20 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from isopropyl.extraction import (
     ExtractionCancelled, ExtractionError, ExtractionSafetyError, SafeIsoExtractor,
     build_extraction_plan, extraction_command,
 )
 from isopropyl.iso import ArchiveEntry, EntryKind, UnsafeArchiveError
+from isopropyl.images import SevenZipNamespace
 
 
 TOOL = "/usr/bin/7z"
@@ -27,12 +31,38 @@ def payload_streamer(payloads):
     return stream
 
 
+class FakeExtractionProcess:
+    def __init__(self, payload: bytes):
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.write(stdout_write, payload)
+        os.close(stdout_write)
+        os.close(stderr_write)
+        self.stdout = os.fdopen(stdout_read, "rb", buffering=0)
+        self.stderr = os.fdopen(stderr_read, "rb", buffering=0)
+        self.returncode = 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        del timeout
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+
 class ExtractionTests(unittest.TestCase):
     def plan(self, root: Path, entries):
         image = root / "source.iso"
         image.write_bytes(b"ISO placeholder")
         return build_extraction_plan(
             image, root / "media", entries, seven_zip=TOOL,
+            archive_namespace=SevenZipNamespace.ISO9660,
         )
 
     def test_extracts_regular_tree_and_atomically_publishes(self):
@@ -229,9 +259,76 @@ class ExtractionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "image.iso"
             image.write_bytes(b"iso")
-            command = extraction_command(TOOL, image, "EFI/BOOT/BOOTX64.EFI")
-            self.assertEqual(command[:6], (TOOL, "x", "-so", "-spd", "-y", "--"))
+            command = extraction_command(
+                TOOL, image, "EFI/BOOT/BOOTX64.EFI",
+                SevenZipNamespace.UDF,
+            )
+            self.assertEqual(
+                command[:7],
+                (TOOL, "x", "-so", "-spd", "-y", "-tUdf", "--"),
+            )
             self.assertEqual(command[-1], "EFI/BOOT/BOOTX64.EFI")
+
+    def test_default_streamer_uses_bound_descriptor_and_plan_namespace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.plan(root, (ArchiveEntry("file", 4),))
+            process = FakeExtractionProcess(b"data")
+            popen = Mock(return_value=process)
+            result = SafeIsoExtractor(popen=popen).execute(plan)
+            command = popen.call_args.args[0]
+            inherited = popen.call_args.kwargs["pass_fds"]
+            self.assertEqual(len(inherited), 1)
+            self.assertIn("-tIso", command)
+            self.assertIn(f"/proc/self/fd/{inherited[0]}", command)
+            self.assertNotIn(str(plan.image), command)
+            self.assertEqual((result.destination / "file").read_bytes(), b"data")
+
+    def test_forged_namespace_is_rejected_before_private_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.plan(root, (ArchiveEntry("file", 1),))
+            forged = replace(plan, archive_namespace="Iso")
+            with self.assertRaisesRegex(ExtractionSafetyError, "namespace"):
+                SafeIsoExtractor(
+                    streamer=payload_streamer({"file": b"x"}),
+                ).execute(forged)
+            self.assertFalse(plan.destination.exists())
+
+    @unittest.skipUnless(
+        shutil.which("genisoimage") and shutil.which("7z"),
+        "genisoimage and 7z are required for dual-namespace regression coverage",
+    )
+    def test_real_dual_namespace_plan_and_extraction_use_bound_udf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree = root / "tree"
+            tree.mkdir()
+            (tree / "ISOONLY.TXT").write_bytes(b"iso")
+            (tree / "UDFONLY.TXT").write_bytes(b"udf")
+            image = root / "dual.iso"
+            subprocess.run(
+                [
+                    shutil.which("genisoimage") or "genisoimage",
+                    "-quiet", "-udf", "-o", str(image),
+                    "-hide", "UDFONLY.TXT", str(tree),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            entries = (
+                ArchiveEntry("ISOONLY.TXT", 3),
+                ArchiveEntry("UDFONLY.TXT", 3),
+            )
+            plan = build_extraction_plan(
+                image, root / "media", entries, seven_zip=TOOL,
+            )
+            self.assertIs(plan.archive_namespace, SevenZipNamespace.UDF)
+            result = SafeIsoExtractor().execute(plan)
+            self.assertEqual(result.bytes_written, 6)
+            self.assertEqual((result.destination / "ISOONLY.TXT").read_bytes(), b"iso")
+            self.assertEqual((result.destination / "UDFONLY.TXT").read_bytes(), b"udf")
 
 
 if __name__ == "__main__":

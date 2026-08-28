@@ -82,7 +82,7 @@ from .iso import (
     merge_additive_overlay_entries,
     validate_extraction_entries,
 )
-from .images import ImageMember, scan_image_contents
+from .images import ImageMember, SevenZipNamespace, scan_image_contents
 from .timestamps import (
     STAGING_MTIME_TOLERANCE_NS,
     TimestampPreservationError,
@@ -100,9 +100,13 @@ from .syslinux_staging import (
     validate_syslinux_staging_plan,
 )
 from .wim import (
+    MAX_EXTRACT_BYTES as WIM_MAX_EXTRACT_BYTES,
     FileIdentity as WimFileIdentity,
     WimCancelled,
     WimError,
+    WimExtractExecutor,
+    WimExtractPlan,
+    WimExtractResult,
     WimInfo,
     WimSelection,
     WimSplitExecutor,
@@ -110,6 +114,7 @@ from .wim import (
     WimSplitResult,
     WimToolUnavailable,
     WimValidationError,
+    create_extract_plan,
     create_split_plan,
     inspect_wim,
     resolve_wimlib,
@@ -123,6 +128,20 @@ from .windows import (
     answer_file_install_index,
     answer_file_install_path,
     generate_autounattend,
+)
+from .windows_bootex import (
+    MAX_EXTRACTED_TOTAL_BYTES as BOOTEX_MAX_EXTRACTED_TOTAL_BYTES,
+    BootExError,
+    BootExPlan,
+    BootExRequest,
+    BootExResult,
+    BootExSourceBinding,
+    WindowsBootExOptions,
+    apply_bootex_plan,
+    bind_bootex_source,
+    build_bootex_plan,
+    validate_bootex_source_binding,
+    validate_bootex_result,
 )
 from .zip_overlay import (
     ZipOverlayChanged,
@@ -159,6 +178,10 @@ Progress = Callable[["IsoStagingProgress"], None]
 Publisher = Callable[[Path, Path, int], None]
 SplitPlanBuilder = Callable[[Path, Path, str], WimSplitPlan]
 WimInspector = Callable[[Path, str, threading.Event], WimInfo]
+ExtractPlanBuilder = Callable[..., WimExtractPlan]
+BootExSourceBinder = Callable[..., BootExSourceBinding]
+BootExPlanBuilder = Callable[..., BootExPlan]
+BootExApplier = Callable[..., BootExResult]
 OverlayApplier = Callable[..., ZipOverlayResult]
 CatalogScanner = Callable[..., tuple[list[ImageMember], bool]]
 
@@ -173,6 +196,13 @@ _FALLBACK_LOADER = re.compile(r"boot[A-Za-z0-9]+\.efi", re.IGNORECASE)
 _CATALOG_WITNESS_TOKEN = object()
 _RESULT_WITNESS_TOKEN = object()
 _SYSLINUX_BIND_TIMEOUT_SECONDS = 60.0
+_BOOTEX_WIM_PATHS = (
+    "Windows/Boot/EFI_EX",
+    "Windows/Boot/Fonts_EX",
+)
+_BOOTEX_EXTRA_SPACE = (
+    WIM_MAX_EXTRACT_BYTES + BOOTEX_MAX_EXTRACTED_TOTAL_BYTES
+)
 
 
 def _is_install_wim_path(path: str) -> bool:
@@ -208,6 +238,7 @@ class IsoStagingPlan:
     wim_selection: WimSelection | None
     wimlib_imagex: str | None
     autounattend_xml: str | None
+    archive_namespace: SevenZipNamespace = SevenZipNamespace.UDF
     windows_customization: WindowsCustomization | None = None
     windows_architecture: str | None = None
     overlay: ZipOverlayPlan | None = None
@@ -227,6 +258,9 @@ class IsoStagingPlan:
     syslinux_content_bytes: int = 0
     staged_entries: tuple[ArchiveEntry, ...] = ()
     staged_catalog_digest: str = ""
+    windows_bootex_options: WindowsBootExOptions | None = None
+    windows_bootex_source: BootExSourceBinding | None = None
+    windows_boot_wim_source: str | None = None
 
     @property
     def needs_wim_split(self) -> bool:
@@ -264,6 +298,7 @@ class IsoStagingResult:
     wim_parts: tuple[str, ...]
     autounattend_added: bool
     tree_manifest: StagingTreeManifest | None = field(default=None, repr=False)
+    windows_bootex: BootExResult | None = field(default=None, repr=False)
     _receipt: _PublishedReceipt | None = field(
         default=None, init=False, repr=False, compare=False,
     )
@@ -282,6 +317,7 @@ class _PublishedReceipt:
     bytes_staged: int
     wim_parts: tuple[str, ...]
     autounattend_added: bool
+    windows_bootex: BootExResult | None
 
 
 @dataclass(frozen=True)
@@ -289,6 +325,7 @@ class _CatalogWitness:
     token: object
     image_identity: FileIdentity
     catalog_digest: str
+    archive_namespace: SevenZipNamespace
 
 
 def _identity(path: Path) -> FileIdentity:
@@ -347,7 +384,8 @@ def _verify_complete_source_catalog(
     expected_entries: tuple[ArchiveEntry, ...],
     scanner: CatalogScanner,
     cancel_check: Callable[[], None] | None,
-) -> FileIdentity:
+    archive_namespace: SevenZipNamespace | None = None,
+) -> tuple[FileIdentity, SevenZipNamespace]:
     """Relist the bound source and prove the caller supplied its full catalog."""
 
     try:
@@ -374,10 +412,27 @@ def _verify_complete_source_catalog(
             )
         if cancel_check is not None:
             cancel_check()
+        candidates = (
+            (archive_namespace,)
+            if archive_namespace is not None
+            else (SevenZipNamespace.UDF, SevenZipNamespace.ISO9660)
+        )
+        members: list[ImageMember] = []
+        complete = False
+        selected_namespace: SevenZipNamespace | None = None
         try:
-            members, complete = scanner(
-                source, image_fd=descriptor, cancel_check=cancel_check,
-            )
+            for candidate in candidates:
+                if type(candidate) is not SevenZipNamespace:
+                    raise TypeError("invalid optical namespace")
+                members, complete = scanner(
+                    source,
+                    image_fd=descriptor,
+                    namespace=candidate,
+                    cancel_check=cancel_check,
+                )
+                if complete is True and type(members) is list and members:
+                    selected_namespace = candidate
+                    break
         except (OSError, TypeError, ValueError) as error:
             raise IsoStagingSafetyError(
                 "The ISO source catalog could not be verified"
@@ -400,7 +455,11 @@ def _verify_complete_source_catalog(
             )
     finally:
         os.close(descriptor)
-    if complete is not True or type(members) is not list:
+    if (
+        complete is not True
+        or type(members) is not list
+        or type(selected_namespace) is not SevenZipNamespace
+    ):
         raise IsoStagingSafetyError(
             "The complete ISO source catalog could not be verified"
         )
@@ -430,8 +489,11 @@ def _verify_complete_source_catalog(
             "The supplied ISO catalog does not match the complete bound source catalog"
         )
     return (
-        before.st_dev, before.st_ino, before.st_size,
-        before.st_mtime_ns, before.st_ctime_ns,
+        (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        ),
+        selected_namespace,
     )
 
 
@@ -484,6 +546,22 @@ def _merge_embedded_catalog(
 ]:
     embedded_entries = _embedded_archive_entries(embedded)
     if not embedded_entries:
+        return tuple(entries), (), (), 0
+    base_file_keys = {
+        _case_key(entry.path)
+        for entry in entries if entry.kind is EntryKind.FILE
+    }
+    embedded_file_keys = {
+        _case_key(entry.path)
+        for entry in embedded_entries if entry.kind is EntryKind.FILE
+    }
+    colliding_files = base_file_keys & embedded_file_keys
+    if embedded_file_keys and colliding_files == embedded_file_keys:
+        # Optical bridge images commonly expose fallback EFI paths both in the
+        # complete UDF tree and in their El Torito FAT image.  When every
+        # embedded file path is already covered, prefer the cataloged UDF tree
+        # and materialize none of the optical-only copy.  A mixed
+        # collision/addition set remains ambiguous and is rejected below.
         return tuple(entries), (), (), 0
     try:
         merged = merge_additive_embedded_entries(entries, embedded_entries)
@@ -593,6 +671,10 @@ def _validate_overlay(
 
 
 def _validate_staging_scalar_bindings(plan: IsoStagingPlan) -> None:
+    if type(plan.archive_namespace) is not SevenZipNamespace:
+        raise IsoStagingSafetyError(
+            "The staging plan optical namespace binding is invalid"
+        )
     for name, value in (
         ("content bytes", plan.content_bytes),
         ("required free bytes", plan.required_free_bytes),
@@ -816,6 +898,61 @@ def _fixed_wim_resolver(path: str) -> Callable[[str], str | None]:
     return lambda name: path if name == "wimlib-imagex" else None
 
 
+def _bootex_architecture(value: str) -> str:
+    normalized = value.casefold() if isinstance(value, str) else ""
+    if normalized in {"amd64", "x64"}:
+        return "x64"
+    if normalized == "arm64":
+        return "arm64"
+    raise IsoStagingSafetyError(
+        "Windows 2023-generation boot media requires x64 or ARM64 Windows"
+    )
+
+
+def _bootex_wim_source(entries: Sequence[ArchiveEntry]) -> ArchiveEntry:
+    exact = tuple(
+        entry for entry in entries
+        if entry.kind is EntryKind.FILE and entry.path == "sources/boot.wim"
+    )
+    aliases = tuple(
+        entry for entry in entries
+        if entry.kind is EntryKind.FILE
+        and entry.path.casefold() == "sources/boot.wim"
+    )
+    if len(exact) != 1 or aliases != exact:
+        raise IsoStagingSafetyError(
+            "Windows 2023-generation boot media requires one canonical "
+            "sources/boot.wim"
+        )
+    return exact[0]
+
+
+def _validate_bootex_layout(
+    write_plan: WritePlan,
+    overlay: ZipOverlayPlan | None,
+    syslinux_c32_bundle: BoundBootBundle | None,
+) -> None:
+    layout = write_plan.layout
+    if (
+        layout is None
+        or layout.main_filesystem is not FileSystem.FAT32
+        or layout.partition_count != 1
+        or layout.boot_strategy is not BootStrategy.IMAGE_NATIVE
+    ):
+        raise IsoStagingSafetyError(
+            "Windows 2023-generation boot files initially require direct "
+            "UEFI/FAT32 ISO mode; UEFI:NTFS uses a separate 2011-CA bridge"
+        )
+    if overlay is not None:
+        raise IsoStagingSafetyError(
+            "Windows 2023-generation boot files do not yet compose with ZIP overlays"
+        )
+    if syslinux_c32_bundle is not None:
+        raise IsoStagingSafetyError(
+            "Windows 2023-generation boot files do not compose with Syslinux"
+        )
+
+
 _WINDOWS_ANSWER_FILE_PATHS = frozenset({
     "autounattend.xml",
     "sources/$oem$/$$/panther/unattend.xml",
@@ -1018,7 +1155,9 @@ def build_iso_staging_plan(
     cancel_check: Callable[[], None] | None = None,
     windows_customization: WindowsCustomization | None = None,
     windows_architecture: str = "amd64",
+    windows_bootex: WindowsBootExOptions | None = None,
     wimlib_resolver: Callable[[], str] = resolve_wimlib,
+    bootex_source_binder: BootExSourceBinder = bind_bootex_source,
     syslinux_c32_bundle: BoundBootBundle | None = None,
     syslinux_payload_bundle: BoundBootBundle | None = None,
 ) -> IsoStagingPlan:
@@ -1059,6 +1198,26 @@ def build_iso_staging_plan(
         if windows_customization is not None else None
     )
     _validate_wim_selection_catalog(effective_entries, wim_selection)
+
+    bound_bootex_options: WindowsBootExOptions | None = None
+    bound_bootex_source: BootExSourceBinding | None = None
+    boot_wim_source: str | None = None
+    bootex_architecture: str | None = None
+    if windows_bootex is not None:
+        if not isinstance(windows_bootex, WindowsBootExOptions):
+            raise IsoStagingSafetyError(
+                "Windows 2023-generation boot options are invalid"
+            )
+        if windows_bootex.enabled:
+            if not windows_bootex.acknowledge_firmware_compatibility:
+                raise IsoStagingSafetyError(
+                    "Windows 2023-generation boot files require explicit firmware "
+                    "compatibility acknowledgment"
+                )
+            _validate_bootex_layout(write_plan, overlay, syslinux_c32_bundle)
+            boot_wim_source = _bootex_wim_source(effective_entries).path
+            bootex_architecture = _bootex_architecture(windows_architecture)
+            bound_bootex_options = windows_bootex
 
     answer_file: str | None = None
     bound_windows_customization: WindowsCustomization | None = None
@@ -1122,21 +1281,45 @@ def build_iso_staging_plan(
         bound_windows_customization = windows_customization
         bound_windows_architecture = windows_architecture
 
+    source_catalog_identity, archive_namespace = _verify_complete_source_catalog(
+        image, safe_entries, scan_image_contents, cancel_check,
+    )
     try:
         extraction = build_extraction_plan(
-            image, destination, safe_entries, seven_zip=seven_zip,
+            image,
+            destination,
+            safe_entries,
+            seven_zip=seven_zip,
+            archive_namespace=archive_namespace,
         )
     except ExtractionUnavailable as error:
         raise IsoStagingUnavailable(str(error)) from error
     except (ExtractionSafetyError, ExtractionError, OSError) as error:
         raise IsoStagingSafetyError(str(error)) from error
-    source_catalog_identity = _verify_complete_source_catalog(
-        extraction.image, safe_entries, scan_image_contents, cancel_check,
-    )
     if source_catalog_identity != extraction.image_identity:
         raise IsoStagingSafetyError(
             "The ISO source identity changed during catalog binding"
         )
+    if bound_bootex_options is not None:
+        assert bootex_architecture is not None
+        try:
+            bound_bootex_source = bootex_source_binder(
+                extraction.image,
+                architecture=bootex_architecture,
+                cancel_check=cancel_check,
+            )
+            validate_bootex_source_binding(bound_bootex_source)
+        except BootExError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        if (
+            bound_bootex_source.source_iso.path != extraction.image
+            or bound_bootex_source.source_iso.identity[:5]
+            != extraction.image_identity
+            or bound_bootex_source.profile.architecture != bootex_architecture
+        ):
+            raise IsoStagingSafetyError(
+                "The Windows 2023-generation source binding does not match this ISO"
+            )
     _validate_embedded_source(
         extraction.image,
         extraction.image_identity,
@@ -1168,7 +1351,11 @@ def build_iso_staging_plan(
     )
 
     wimlib_imagex: str | None = None
-    if wim_source is not None or wim_selection is not None:
+    if (
+        wim_source is not None
+        or wim_selection is not None
+        or bound_bootex_source is not None
+    ):
         try:
             wimlib_imagex = wimlib_resolver()
             # Reuse wim.py's exact trusted-path validation instead of accepting
@@ -1196,7 +1383,10 @@ def build_iso_staging_plan(
         raise IsoStagingSafetyError(
             "The embedded/overlay expanded-size accounting is inconsistent"
         )
-    required_free = content_bytes + split_extra + OUTPUT_SPACE_RESERVE
+    bootex_extra = _BOOTEX_EXTRA_SPACE if bound_bootex_source is not None else 0
+    required_free = (
+        content_bytes + split_extra + bootex_extra + OUTPUT_SPACE_RESERVE
+    )
     try:
         if shutil.disk_usage(extraction.destination.parent).free < required_free:
             raise IsoStagingSafetyError(
@@ -1222,6 +1412,7 @@ def build_iso_staging_plan(
         windows_customization=bound_windows_customization,
         windows_architecture=bound_windows_architecture,
         autounattend_xml=answer_file,
+        archive_namespace=extraction.archive_namespace,
         overlay=overlay,
         effective_entries=effective_entries,
         effective_catalog_digest=_catalog_digest(effective_entries),
@@ -1229,6 +1420,7 @@ def build_iso_staging_plan(
             _CATALOG_WITNESS_TOKEN,
             extraction.image_identity,
             _catalog_digest(safe_entries),
+            extraction.archive_namespace,
         ),
         embedded_fat=embedded_fat,
         embedded_entries=embedded_entries,
@@ -1245,6 +1437,9 @@ def build_iso_staging_plan(
         syslinux_content_bytes=syslinux_content_bytes,
         staged_entries=staged_entries,
         staged_catalog_digest=_catalog_digest(staged_entries),
+        windows_bootex_options=bound_bootex_options,
+        windows_bootex_source=bound_bootex_source,
+        windows_boot_wim_source=boot_wim_source,
     )
 
 
@@ -1381,6 +1576,49 @@ def validate_iso_staging_plan(
         raise IsoStagingSafetyError(
             "The staged catalog binding is invalid or conflicts with generated content"
         )
+    bootex_fields = (
+        plan.windows_bootex_options,
+        plan.windows_bootex_source,
+        plan.windows_boot_wim_source,
+    )
+    if all(value is None for value in bootex_fields):
+        pass
+    elif any(value is None for value in bootex_fields):
+        raise IsoStagingSafetyError(
+            "The staging plan contains an incomplete Windows BootEx binding"
+        )
+    else:
+        if (
+            not isinstance(plan.windows_bootex_options, WindowsBootExOptions)
+            or not plan.windows_bootex_options.enabled
+            or not plan.windows_bootex_options.acknowledge_firmware_compatibility
+            or not isinstance(plan.windows_bootex_source, BootExSourceBinding)
+            or plan.windows_boot_wim_source != "sources/boot.wim"
+        ):
+            raise IsoStagingSafetyError(
+                "The staging plan contains invalid Windows BootEx inputs"
+            )
+        _validate_bootex_layout(
+            plan.write_plan,
+            plan.overlay,
+            plan.syslinux_c32_bundle,
+        )
+        if _bootex_wim_source(effective_entries).path != plan.windows_boot_wim_source:
+            raise IsoStagingSafetyError(
+                "The Windows BootEx WIM binding changed"
+            )
+        try:
+            validate_bootex_source_binding(plan.windows_bootex_source)
+        except BootExError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        if (
+            plan.windows_bootex_source.source_iso.path != plan.image
+            or plan.windows_bootex_source.source_iso.identity[:5]
+            != plan.image_identity
+        ):
+            raise IsoStagingSafetyError(
+                "The Windows BootEx ISO binding changed"
+            )
     if plan.autounattend_xml is not None and not isinstance(
         plan.autounattend_xml, str,
     ):
@@ -1498,13 +1736,18 @@ def validate_iso_staging_plan(
         or witness.token is not _CATALOG_WITNESS_TOKEN
         or witness.image_identity != plan.image_identity
         or witness.catalog_digest != plan.catalog_digest
+        or witness.archive_namespace is not plan.archive_namespace
     ):
         raise IsoStagingSafetyError(
             "The complete ISO source catalog witness is invalid"
         )
     try:
         rebuilt = build_extraction_plan(
-            plan.image, plan.destination, entries, seven_zip=plan.seven_zip,
+            plan.image,
+            plan.destination,
+            entries,
+            seven_zip=plan.seven_zip,
+            archive_namespace=plan.archive_namespace,
         )
     except ExtractionUnavailable as error:
         raise IsoStagingUnavailable(str(error)) from error
@@ -1513,6 +1756,7 @@ def validate_iso_staging_plan(
     if (
         rebuilt.image_identity != plan.image_identity
         or rebuilt.destination_parent_identity != plan.destination_parent_identity
+        or rebuilt.archive_namespace is not plan.archive_namespace
     ):
         raise IsoStagingSafetyError("The ISO, destination, or content binding changed")
     overlay_bytes = plan.overlay.content_bytes if plan.overlay is not None else 0
@@ -1529,7 +1773,11 @@ def validate_iso_staging_plan(
         raise IsoStagingSafetyError(
             "The staged ISO expanded-size accounting is invalid"
         )
-    if wim_source is None and plan.wim_selection is None:
+    if (
+        wim_source is None
+        and plan.wim_selection is None
+        and plan.windows_bootex_source is None
+    ):
         if plan.wimlib_imagex is not None:
             raise IsoStagingSafetyError("The plan contains an unnecessary WIM tool")
     else:
@@ -1544,7 +1792,14 @@ def validate_iso_staging_plan(
     split_extra = next(
         (entry.size for entry in effective_entries if entry.path == wim_source), 0,
     )
-    expected_free = plan.content_bytes + split_extra + OUTPUT_SPACE_RESERVE
+    bootex_extra = (
+        _BOOTEX_EXTRA_SPACE
+        if plan.windows_bootex_source is not None
+        else 0
+    )
+    expected_free = (
+        plan.content_bytes + split_extra + bootex_extra + OUTPUT_SPACE_RESERVE
+    )
     if plan.required_free_bytes != expected_free:
         raise IsoStagingSafetyError("The plan contains invalid free-space accounting")
     try:
@@ -1591,6 +1846,7 @@ def validate_published_syslinux_staging(
             receipt.bytes_staged,
             receipt.wim_parts,
             receipt.autounattend_added,
+            receipt.windows_bootex,
         )
         != (
             result.destination,
@@ -1601,6 +1857,7 @@ def validate_published_syslinux_staging(
             result.bytes_staged,
             result.wim_parts,
             result.autounattend_added,
+            result.windows_bootex,
         )
     ):
         raise IsoStagingSafetyError(
@@ -1622,6 +1879,9 @@ def validate_published_syslinux_staging(
         plan.autounattend_xml is not None,
         plan.windows_customization is not None,
         plan.windows_architecture is not None,
+        plan.windows_bootex_options is not None,
+        plan.windows_bootex_source is not None,
+        plan.windows_boot_wim_source is not None,
     )):
         raise IsoStagingSafetyError(
             "The initial Syslinux image profile does not compose with Windows transforms",
@@ -1657,6 +1917,7 @@ def validate_published_syslinux_staging(
         and type(result.wim_parts) is tuple
         and not result.wim_parts
         and result.autounattend_added is False
+        and result.windows_bootex is None
         and type(result.tree_manifest) is StagingTreeManifest
     )
     if not scalar_shape:
@@ -2448,15 +2709,23 @@ class IsoStagingExecutor:
         *,
         extractor: SafeIsoExtractor | None = None,
         wim_splitter: WimSplitExecutor | None = None,
+        wim_extractor: WimExtractExecutor | None = None,
         split_plan_builder: SplitPlanBuilder = _default_split_plan_builder,
+        extract_plan_builder: ExtractPlanBuilder = create_extract_plan,
         wim_inspector: WimInspector = _default_wim_inspector,
+        bootex_plan_builder: BootExPlanBuilder = build_bootex_plan,
+        bootex_applier: BootExApplier = apply_bootex_plan,
         overlay_applier: OverlayApplier = apply_zip_overlay,
         publisher: Publisher = _rename_noreplace,
     ) -> None:
         self._extractor = extractor or SafeIsoExtractor()
         self._wim_splitter = wim_splitter
+        self._wim_extractor = wim_extractor
         self._split_plan_builder = split_plan_builder
+        self._extract_plan_builder = extract_plan_builder
         self._wim_inspector = wim_inspector
+        self._bootex_plan_builder = bootex_plan_builder
+        self._bootex_applier = bootex_applier
         self._overlay_applier = overlay_applier
         self._publisher = publisher
         self._cancelled = threading.Event()
@@ -2544,7 +2813,11 @@ class IsoStagingExecutor:
             progress(IsoStagingProgress("Preparing", "", 0, plan.content_bytes))
 
             extraction_plan = build_extraction_plan(
-                plan.image, tree, plan.entries, seven_zip=plan.seven_zip,
+                plan.image,
+                tree,
+                plan.entries,
+                seven_zip=plan.seven_zip,
+                archive_namespace=plan.archive_namespace,
             )
             if extraction_plan.image_identity != plan.image_identity:
                 raise IsoStagingSafetyError("The ISO source changed before extraction")
@@ -2564,7 +2837,7 @@ class IsoStagingExecutor:
                 tree, plan.entries, self._check_cancelled,
             )
 
-            if plan.embedded_fat is not None:
+            if plan.embedded_entries:
                 self._check_cancelled()
                 progress(IsoStagingProgress(
                     "Expanding embedded UEFI boot image",
@@ -2729,10 +3002,106 @@ class IsoStagingExecutor:
                 selected_wim_identity = source_identity
 
             wim_parts: tuple[str, ...] = ()
+            bootex_result: BootExResult | None = None
             expected_files = {
                 _case_key(entry.path): _ScannedFile(entry.path, entry.size)
                 for entry in plan.staged_entries if entry.kind is EntryKind.FILE
             }
+            if plan.windows_bootex_source is not None:
+                self._check_cancelled()
+                assert plan.windows_boot_wim_source == "sources/boot.wim"
+                assert plan.wimlib_imagex is not None
+                boot_wim = tree / "sources" / "boot.wim"
+                payload_destination = private_root / "bootex-payload"
+                progress(IsoStagingProgress(
+                    "Extracting Windows 2023-generation boot files",
+                    plan.windows_boot_wim_source,
+                    0,
+                    plan.content_bytes,
+                ))
+                extract_plan = self._extract_plan_builder(
+                    boot_wim,
+                    payload_destination,
+                    image_index=2,
+                    paths=_BOOTEX_WIM_PATHS,
+                    wimlib_imagex=plan.wimlib_imagex,
+                )
+                wim_extractor = self._wim_extractor or WimExtractExecutor()
+                self._set_active(wim_extractor)
+                extracted = wim_extractor.execute(
+                    extract_plan,
+                    lambda stage: progress(IsoStagingProgress(
+                        stage,
+                        plan.windows_boot_wim_source or "",
+                        0,
+                        plan.content_bytes,
+                    )),
+                )
+                self._set_active(None)
+                self._check_cancelled()
+                if (
+                    not isinstance(extracted, WimExtractResult)
+                    or extracted.directory != str(payload_destination)
+                    or not extracted.files
+                    or extracted.total_size <= 0
+                    or extracted.total_size > WIM_MAX_EXTRACT_BYTES
+                ):
+                    raise IsoStagingSafetyError(
+                        "The WIM extractor returned invalid Windows BootEx data"
+                    )
+                extracted_root = payload_destination / "Windows" / "Boot"
+                source_binding = plan.windows_bootex_source
+                bootex_plan = self._bootex_plan_builder(
+                    BootExRequest(
+                        plan.image,
+                        extracted_root,
+                        tree,
+                        architecture=source_binding.profile.architecture,
+                        expected_release_id=source_binding.profile.release_id,
+                    ),
+                    cancel_check=self._check_cancelled,
+                )
+                if (
+                    not isinstance(bootex_plan, BootExPlan)
+                    or bootex_plan.profile != source_binding.profile
+                    or bootex_plan.source_iso != source_binding.source_iso
+                ):
+                    raise IsoStagingSafetyError(
+                        "The executed Windows BootEx plan does not match its "
+                        "confirmed whole-ISO binding"
+                    )
+                progress(IsoStagingProgress(
+                    "Replacing Windows 2023-generation boot files",
+                    "efi/boot",
+                    0,
+                    plan.content_bytes,
+                ))
+                bootex_result = self._bootex_applier(
+                    bootex_plan,
+                    cancel_check=self._check_cancelled,
+                )
+                try:
+                    validate_bootex_result(bootex_plan, bootex_result)
+                except BootExError as error:
+                    raise IsoStagingSafetyError(
+                        "The Windows BootEx result does not match its execution plan"
+                    ) from error
+                for replacement in bootex_result.replacements:
+                    key = _case_key(replacement.destination_path)
+                    current = expected_files.get(key)
+                    if (
+                        current is None
+                        or current.path != replacement.destination_path
+                        or current.size != replacement.old_size
+                    ):
+                        raise IsoStagingSafetyError(
+                            "A Windows BootEx destination was not bound to the "
+                            "staged ISO catalog"
+                        )
+                    expected_files[key] = _ScannedFile(
+                        replacement.destination_path,
+                        replacement.new_size,
+                    )
             if plan.wim_source is not None:
                 self._check_cancelled()
                 progress(IsoStagingProgress(
@@ -2876,7 +3245,10 @@ class IsoStagingExecutor:
                 self._check_cancelled,
             )
             private_manifest: StagingTreeManifest | None = None
-            if plan.syslinux_staging is not None:
+            if (
+                plan.syslinux_staging is not None
+                or plan.windows_bootex_source is not None
+            ):
                 manifest_file_limit = (
                     FAT32_MAX_FILE_SIZE
                     if plan.write_plan.layout is not None
@@ -2897,8 +3269,27 @@ class IsoStagingExecutor:
                     or private_manifest.total_bytes != sum(item.size for item in files)
                 ):
                     raise IsoStagingSafetyError(
-                        "The private Syslinux tree changed before publication",
+                        "The private transformed tree changed before publication",
                     )
+                if bootex_result is not None:
+                    manifest_files = {
+                        _case_key(item.path): item
+                        for item in private_manifest.files
+                    }
+                    for replacement in bootex_result.replacements:
+                        item = manifest_files.get(
+                            _case_key(replacement.destination_path)
+                        )
+                        if (
+                            item is None
+                            or item.path != replacement.destination_path
+                            or item.size != replacement.new_size
+                            or item.sha256 != replacement.new_sha256
+                        ):
+                            raise IsoStagingSafetyError(
+                                "The final staging manifest does not match the "
+                                "Windows BootEx replacement receipt"
+                            )
             _check_parent(plan, parent_fd)
             if os.path.lexists(plan.destination):
                 raise IsoStagingSafetyError("The staging destination appeared before publication")
@@ -2925,7 +3316,7 @@ class IsoStagingExecutor:
                     or published_manifest.total_bytes != total_bytes
                 ):
                     raise IsoStagingSafetyError(
-                        "The Syslinux staging tree changed during publication",
+                        "The transformed staging tree changed during publication",
                     )
             result = IsoStagingResult(
                 destination=plan.destination,
@@ -2937,6 +3328,7 @@ class IsoStagingExecutor:
                 wim_parts=wim_parts,
                 autounattend_added=answer_added,
                 tree_manifest=published_manifest,
+                windows_bootex=bootex_result,
             )
             if published_manifest is not None:
                 object.__setattr__(
@@ -2954,6 +3346,7 @@ class IsoStagingExecutor:
                         result.bytes_staged,
                         result.wim_parts,
                         result.autounattend_added,
+                        result.windows_bootex,
                     ),
                 )
             try:
@@ -2967,7 +3360,7 @@ class IsoStagingExecutor:
             raise IsoStagingCancelled("ISO staging was cancelled") from error
         except ExtractionUnavailable as error:
             raise IsoStagingUnavailable(str(error)) from error
-        except (ExtractionSafetyError, WimValidationError) as error:
+        except (ExtractionSafetyError, WimValidationError, BootExError) as error:
             raise IsoStagingSafetyError(str(error)) from error
         except (ExtractionError, WimError) as error:
             raise IsoStagingError(str(error)) from error

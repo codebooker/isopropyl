@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 from .iso import ArchiveEntry, EntryKind, validate_extraction_entries
+from .images import SevenZipNamespace, scan_image_catalog
 from .timestamps import (
     STAGING_MTIME_TOLERANCE_NS,
     TimestampPreservationError,
@@ -32,7 +33,7 @@ from .timestamps import (
 CHUNK_SIZE = 1024 * 1024
 OUTPUT_SPACE_RESERVE = 64 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
-TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+TRUSTED_PATH = "/usr/bin:/bin"
 
 
 class ExtractionError(RuntimeError):
@@ -63,6 +64,7 @@ class ExtractionPlan:
     entries: tuple[ArchiveEntry, ...]
     content_bytes: int
     seven_zip: str
+    archive_namespace: SevenZipNamespace
 
 
 @dataclass(frozen=True)
@@ -106,18 +108,28 @@ def _identity(path: Path) -> FileIdentity:
 
 def _trusted_7z() -> str:
     executable = shutil.which("7z", path=TRUSTED_PATH)
-    if not executable or executable not in {"/usr/bin/7z", "/usr/sbin/7z", "/bin/7z", "/sbin/7z"}:
+    if not executable or executable not in {"/usr/bin/7z", "/bin/7z"}:
         raise ExtractionUnavailable("7-Zip was not found in a trusted system directory")
     return executable
 
 
-def extraction_command(seven_zip: str, image: Path, member: str) -> tuple[str, ...]:
-    if seven_zip not in {"/usr/bin/7z", "/usr/sbin/7z", "/bin/7z", "/sbin/7z"}:
+def extraction_command(
+    seven_zip: str,
+    image: Path,
+    member: str,
+    archive_namespace: SevenZipNamespace,
+) -> tuple[str, ...]:
+    if seven_zip not in {"/usr/bin/7z", "/bin/7z"}:
         raise ExtractionSafetyError("The extraction plan contains an untrusted 7-Zip path")
     # Re-run the same catalog validator for this exact member. This prevents a
     # manually forged plan from turning option-like text into an archive query.
     normalized = validate_extraction_entries((ArchiveEntry(member),))[0].path
-    return (seven_zip, "x", "-so", "-spd", "-y", "--", str(image), normalized)
+    if type(archive_namespace) is not SevenZipNamespace:
+        raise ExtractionSafetyError("The extraction plan has no bound optical namespace")
+    return (
+        seven_zip, "x", "-so", "-spd", "-y",
+        f"-t{archive_namespace.value}", "--", str(image), normalized,
+    )
 
 
 def build_extraction_plan(
@@ -126,6 +138,7 @@ def build_extraction_plan(
     entries: Sequence[ArchiveEntry],
     *,
     seven_zip: str | None = None,
+    archive_namespace: SevenZipNamespace | None = None,
 ) -> ExtractionPlan:
     source = image.expanduser().resolve(strict=True)
     source_identity = _identity(source)
@@ -149,10 +162,48 @@ def build_extraction_plan(
     if free < content_bytes + OUTPUT_SPACE_RESERVE:
         raise ExtractionSafetyError("There is not enough free space to stage the ISO contents")
     tool = seven_zip or _trusted_7z()
-    extraction_command(tool, source, safe_entries[0].path)
+    if archive_namespace is None:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                source,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            bound = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(bound.st_mode)
+                or (
+                    bound.st_dev, bound.st_ino, bound.st_size,
+                    bound.st_mtime_ns, bound.st_ctime_ns,
+                ) != source_identity
+            ):
+                raise ExtractionSafetyError(
+                    "The ISO source changed before namespace selection"
+                )
+            catalog = scan_image_catalog(
+                source,
+                image_fd=descriptor,
+                allow_auto_fallback=False,
+                seven_zip=tool,
+            )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if (
+            not catalog.complete
+            or type(catalog.namespace) is not SevenZipNamespace
+        ):
+            raise ExtractionUnavailable(
+                "7-Zip could not select a valid UDF or ISO9660 namespace"
+            )
+        archive_namespace = catalog.namespace
+    if type(archive_namespace) is not SevenZipNamespace:
+        raise ExtractionSafetyError("Extraction requires a bound UDF or ISO9660 namespace")
+    extraction_command(tool, source, safe_entries[0].path, archive_namespace)
     return ExtractionPlan(
         source, source_identity, output, (parent_status.st_dev, parent_status.st_ino),
-        safe_entries, content_bytes, tool,
+        safe_entries, content_bytes, tool, archive_namespace,
     )
 
 
@@ -234,11 +285,42 @@ class SafeIsoExtractor:
     ) -> int:
         if self._streamer is not None:
             return self._streamer(plan.image, member, output, self._check_cancelled)
-        process = self._popen(
-            list(extraction_command(plan.seven_zip, plan.image, member)),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env={**os.environ, "LC_ALL": "C", "LANG": "C"}, shell=False,
-        )
+        image_fd = -1
+        try:
+            image_fd = os.open(
+                plan.image,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            bound = os.fstat(image_fd)
+            if (
+                not stat.S_ISREG(bound.st_mode)
+                or (
+                    bound.st_dev, bound.st_ino, bound.st_size,
+                    bound.st_mtime_ns, bound.st_ctime_ns,
+                ) != plan.image_identity
+            ):
+                raise ExtractionSafetyError(
+                    "The ISO source changed before descriptor-bound extraction"
+                )
+            descriptor_path = Path(f"/proc/self/fd/{image_fd}")
+            process = self._popen(
+                list(extraction_command(
+                    plan.seven_zip,
+                    descriptor_path,
+                    member,
+                    plan.archive_namespace,
+                )),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                pass_fds=(image_fd,),
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+                shell=False,
+            )
+        finally:
+            if image_fd >= 0:
+                os.close(image_fd)
         with self._lock:
             self._process = process
         if process.stdout is None or process.stderr is None:
@@ -307,7 +389,12 @@ class SafeIsoExtractor:
             raise ExtractionSafetyError("The ISO source changed after extraction was planned")
         if validate_extraction_entries(plan.entries) != plan.entries:
             raise ExtractionSafetyError("The extraction plan contains non-normalized members")
-        extraction_command(plan.seven_zip, plan.image, plan.entries[0].path)
+        extraction_command(
+            plan.seven_zip,
+            plan.image,
+            plan.entries[0].path,
+            plan.archive_namespace,
+        )
         parent_status = plan.destination.parent.stat()
         if (parent_status.st_dev, parent_status.st_ino) != plan.destination_parent_identity:
             raise ExtractionSafetyError("The extraction destination parent changed")

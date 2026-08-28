@@ -2,6 +2,7 @@ import hashlib
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import gzip
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -13,12 +14,12 @@ from unittest.mock import Mock, patch
 
 from isopropyl.images import (
     ChecksumCancelled, ImageInspectionCancelled, ImageInspectionTimedOut,
-    ImageMember,
+    ImageMember, SevenZipNamespace,
     NON_RAW_SUFFIXES, RAW_IMAGE_SUFFIXES, SPARSE_SUFFIXES,
     boot_identity_fields,
     calculate_checksums, classify_boot_paths, classify_windows_installer_members,
     compare_expected_checksum, inspect_image, parse_7z_listing, parse_expected_checksum,
-    scan_image_contents, inspect_squashfs_superblock,
+    scan_image_catalog, scan_image_contents, inspect_squashfs_superblock,
 )
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.partition_tables import PartitionTableInspection
@@ -393,6 +394,7 @@ Folder = -
                 self.assertEqual(
                     popen.call_args.args[0][-1], f"/proc/self/fd/{image.fileno()}",
                 )
+                self.assertIn("-tUdf", popen.call_args.args[0])
                 self.assertEqual(
                     popen.call_args.kwargs["env"],
                     {
@@ -400,6 +402,104 @@ Folder = -
                         "PATH": "/usr/bin:/bin",
                     },
                 )
+
+    def test_archive_catalog_falls_back_from_unavailable_udf_to_explicit_iso(self):
+        listing = b"""header
+----------
+Path = README.TXT
+Folder = -
+Size = 3
+"""
+        unavailable = FakeCatalogProcess(b"", returncode=2)
+        iso = FakeCatalogProcess(listing)
+        with (
+            patch("isopropyl.images._trusted_7z", return_value="/usr/bin/7z"),
+            patch(
+                "isopropyl.images.subprocess.Popen",
+                side_effect=(unavailable, iso),
+            ) as popen,
+        ):
+            result = scan_image_catalog(
+                Path("fixture.iso"), allow_auto_fallback=False,
+            )
+        self.assertTrue(result.complete)
+        self.assertIs(result.namespace, SevenZipNamespace.ISO9660)
+        self.assertEqual(tuple(item.path for item in result.members), ("README.TXT",))
+        self.assertIn("-tUdf", popen.call_args_list[0].args[0])
+        self.assertIn("-tIso", popen.call_args_list[1].args[0])
+
+    def test_optical_inspection_disables_legacy_auto_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "optical.iso"
+            data = bytearray(18 * 2048)
+            offset = 16 * 2048
+            data[offset + 1:offset + 6] = b"CD001"
+            path.write_bytes(data)
+            with patch(
+                "isopropyl.images.scan_image_contents",
+                return_value=([], False),
+            ) as scanner:
+                inspect_image(path)
+        self.assertFalse(scanner.call_args.kwargs["allow_auto_fallback"])
+
+    def test_raw_inspection_retains_legacy_auto_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "disk.img"
+            path.write_bytes(b"raw image")
+            with patch(
+                "isopropyl.images.scan_image_contents",
+                return_value=([], False),
+            ) as scanner:
+                inspect_image(path)
+        self.assertTrue(scanner.call_args.kwargs["allow_auto_fallback"])
+
+    @unittest.skipUnless(
+        shutil.which("genisoimage") and shutil.which("7z"),
+        "genisoimage and 7z are required for dual-namespace regression coverage",
+    )
+    def test_real_dual_iso_prefers_udf_through_bound_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree = root / "tree"
+            tree.mkdir()
+            (tree / "ISOONLY.TXT").write_bytes(b"iso")
+            (tree / "UDFONLY.TXT").write_bytes(b"udf")
+            image = root / "dual.iso"
+            subprocess.run(
+                [
+                    shutil.which("genisoimage") or "genisoimage",
+                    "-quiet", "-udf", "-o", str(image),
+                    "-hide", "UDFONLY.TXT", str(tree),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            descriptor = os.open(image, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                selected = scan_image_catalog(
+                    image,
+                    image_fd=descriptor,
+                    allow_auto_fallback=False,
+                )
+                iso_only = scan_image_catalog(
+                    image,
+                    image_fd=descriptor,
+                    namespace=SevenZipNamespace.ISO9660,
+                    allow_auto_fallback=False,
+                )
+            finally:
+                os.close(descriptor)
+        self.assertTrue(selected.complete)
+        self.assertIs(selected.namespace, SevenZipNamespace.UDF)
+        self.assertEqual(
+            {item.path for item in selected.members},
+            {"ISOONLY.TXT", "UDFONLY.TXT"},
+        )
+        self.assertEqual(
+            {item.path for item in iso_only.members},
+            {"ISOONLY.TXT"},
+        )
 
     def test_detects_hybrid_iso_and_volume_label(self):
         with tempfile.TemporaryDirectory() as directory:

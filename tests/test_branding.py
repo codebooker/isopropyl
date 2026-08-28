@@ -57,7 +57,7 @@ class BrandingTests(unittest.TestCase):
 
         screenshot = QImage(str(ROOT / "data" / "screenshot.png"))
         self.assertFalse(screenshot.isNull())
-        self.assertEqual((screenshot.width(), screenshot.height()), (1080, 920))
+        self.assertEqual((screenshot.width(), screenshot.height()), (1080, 960))
 
     def test_package_readme_uses_host_independent_asset_and_document_links(self):
         readme = (ROOT / "README.md").read_text("utf-8")

@@ -9,6 +9,7 @@ License: AGPL-3+
  version 3 can be found in /usr/share/common-licenses/AGPL-3.
 
 Files: isopropyl/windows.py
+       isopropyl/windows_bootex.py
 Copyright: 2022-2026 Pete Batard <pete@akeo.ie>
            2026 ISOpropyl contributors
 License: GPL-3+ and AGPL-3+

@@ -16,6 +16,7 @@ from unittest.mock import patch
 import isopropyl.iso_staging as iso_staging
 import isopropyl.syslinux as syslinux
 import isopropyl.syslinux_staging as syslinux_staging
+import isopropyl.windows_bootex as windows_bootex
 from isopropyl.boot_identity import analyze_bootloader_members
 from isopropyl.bootloaders import BoundBootArtifact, BoundBootBundle
 from isopropyl.extraction import (
@@ -43,6 +44,7 @@ from isopropyl.iso import (
     merge_additive_embedded_entries,
     merge_additive_overlay_entries,
 )
+from isopropyl.images import SevenZipNamespace
 from isopropyl.iso_staging import (
     IsoStagingCancelled,
     IsoStagingError,
@@ -57,6 +59,7 @@ from isopropyl.wim import (
     WimCancelled,
     WimEdition,
     WimError,
+    WimExtractResult,
     WimInfo,
     WimSelection,
     WimSplitPlan,
@@ -65,11 +68,16 @@ from isopropyl.wim import (
 from isopropyl.windows import (
     WindowsCustomization, answer_file_install_index, answer_file_install_path,
 )
+from isopropyl.windows_bootex import (
+    BootExProfile,
+    WindowsBootExOptions,
+)
 from isopropyl.zip_overlay import (
     apply_zip_overlay,
     build_zip_overlay_plan,
 )
 from tests.test_fat_image import make_fat, write_container
+from tests.test_windows_bootex import signed_efi
 
 
 SEVEN_ZIP = "/usr/bin/7z"
@@ -179,7 +187,8 @@ def fake_catalog_scanner(entries: tuple[ArchiveEntry, ...]):
         for entry in entries
     ]
 
-    def scan(_image, *, image_fd=None, cancel_check=None):
+    def scan(_image, *, image_fd=None, namespace=None, cancel_check=None):
+        del image_fd, namespace
         if cancel_check is not None:
             cancel_check()
         return list(members), True
@@ -198,6 +207,21 @@ def selected_esd_entries() -> tuple[ArchiveEntry, ...]:
     return basic_entries() + (
         ArchiveEntry("sources", kind=EntryKind.DIRECTORY),
         ArchiveEntry("sources/install.esd", 7),
+    )
+
+
+def bootex_entries() -> tuple[ArchiveEntry, ...]:
+    return (
+        ArchiveEntry("efi", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("efi/boot", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("efi/boot/bootx64.efi", 12),
+        ArchiveEntry("efi/microsoft", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("efi/microsoft/boot", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("efi/microsoft/boot/fonts", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("efi/microsoft/boot/fonts/segoe_slboot.ttf", 8),
+        ArchiveEntry("bootmgr.efi", 11),
+        ArchiveEntry("sources", kind=EntryKind.DIRECTORY),
+        ArchiveEntry("sources/boot.wim", 16),
     )
 
 
@@ -415,6 +439,43 @@ class BlockingSplitter(FakeSplitter):
         return super().execute(plan, stage)
 
 
+class FakeBootExWimExtractor:
+    def __init__(self, *, error: BaseException | None = None):
+        self.error = error
+        self.cancelled = False
+        self.calls = []
+
+    def cancel(self):
+        self.cancelled = True
+
+    def execute(self, plan, stage):
+        self.calls.append(plan)
+        if self.cancelled:
+            raise WimCancelled("cancelled")
+        if self.error is not None:
+            raise self.error
+        stage("Extracting Windows boot files")
+        destination = Path(plan.destination_directory)
+        efi = destination / "Windows" / "Boot" / "EFI_EX"
+        fonts = destination / "Windows" / "Boot" / "Fonts_EX"
+        efi.mkdir(parents=True)
+        fonts.mkdir(parents=True)
+        payloads = (
+            (efi / "bootmgfw_EX.efi", signed_efi()),
+            (efi / "bootmgr_EX.efi", signed_efi()),
+            (fonts / "segoe_slboot.ttf", b"new-font"),
+        )
+        for path, data in payloads:
+            path.write_bytes(data)
+        stage("Complete")
+        files = tuple(str(path) for path, _data in payloads)
+        return WimExtractResult(
+            str(destination),
+            files,
+            sum(len(data) for _path, data in payloads),
+        )
+
+
 class IsoStagingTests(unittest.TestCase):
     def setUp(self) -> None:
         patches = (
@@ -457,6 +518,167 @@ class IsoStagingTests(unittest.TestCase):
                 **kwargs,
             )
 
+    @staticmethod
+    def fixture_bootex_profile(*, sha256: str | None = None) -> BootExProfile:
+        payload = b"ISO placeholder"
+        return BootExProfile(
+            "fixture-windows-11-25h2-x64",
+            "Windows 11",
+            "25H2 v2",
+            "English (United States)",
+            "x64",
+            "fixture.iso",
+            len(payload),
+            sha256 or hashlib.sha256(payload).hexdigest(),
+            "https://www.microsoft.com/en-us/software-download/windows11",
+            "efi/boot/bootx64.efi",
+        )
+
+    def test_bootex_only_is_hash_bound_transformed_and_manifested_without_answer_file(self):
+        entries = bootex_entries()
+        profile = self.fixture_bootex_profile()
+        wim_extractor = FakeBootExWimExtractor()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                windows_bootex,
+                "available_bootex_profiles",
+                return_value=(profile,),
+            ),
+            patch.object(iso_staging, "resolve_wimlib", return_value=WIMLIB),
+        ):
+            root = Path(directory)
+            plan = self.make_plan(
+                root,
+                entries,
+                windows_bootex=WindowsBootExOptions(True, True),
+                windows_architecture="amd64",
+                wimlib_resolver=lambda: WIMLIB,
+            )
+            self.assertIsNone(plan.autounattend_xml)
+            self.assertIsNone(plan.windows_customization)
+            self.assertIsNotNone(plan.windows_bootex_source)
+            self.assertEqual(
+                plan.windows_bootex_source.source_iso.sha256,
+                profile.iso_sha256,
+            )
+            result = IsoStagingExecutor(
+                extractor=FakeExtractor(),
+                wim_extractor=wim_extractor,
+            ).execute(plan)
+            self.assertFalse(result.autounattend_added)
+            self.assertIsNotNone(result.windows_bootex)
+            self.assertIsNotNone(result.tree_manifest)
+            self.assertEqual(len(wim_extractor.calls), 1)
+            self.assertEqual(wim_extractor.calls[0].image_index, 2)
+            self.assertEqual(
+                wim_extractor.calls[0].paths,
+                ("Windows/Boot/EFI_EX", "Windows/Boot/Fonts_EX"),
+            )
+            self.assertEqual(
+                (result.destination / "efi/boot/bootx64.efi").read_bytes(),
+                signed_efi(),
+            )
+            self.assertEqual(
+                (result.destination / "bootmgr.efi").read_bytes(),
+                signed_efi(),
+            )
+            self.assertEqual(
+                (
+                    result.destination
+                    / "efi/microsoft/boot/fonts/segoe_slboot.ttf"
+                ).read_bytes(),
+                b"new-font",
+            )
+
+    def test_bootex_fails_closed_on_acknowledgment_hash_and_composition(self):
+        entries = bootex_entries()
+        profile = self.fixture_bootex_profile()
+        contexts = (
+            (
+                "acknowledgment",
+                {"windows_bootex": WindowsBootExOptions(True, False)},
+            ),
+            (
+                "direct UEFI/FAT32",
+                {
+                    "windows_bootex": WindowsBootExOptions(True, True),
+                    "write_plan": write_plan(entries, filesystem=FileSystem.NTFS),
+                },
+            ),
+        )
+        for message, arguments in contexts:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(IsoStagingSafetyError, message):
+                    self.make_plan(Path(directory), entries, **arguments)
+
+        wrong = self.fixture_bootex_profile(sha256="0" * 64)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                windows_bootex,
+                "available_bootex_profiles",
+                return_value=(wrong,),
+            ),
+            self.assertRaisesRegex(IsoStagingSafetyError, "SHA-256"),
+        ):
+            self.make_plan(
+                Path(directory),
+                entries,
+                windows_bootex=WindowsBootExOptions(True, True),
+                wimlib_resolver=lambda: WIMLIB,
+            )
+
+    def test_bootex_rejects_incomplete_receipt_and_post_apply_same_size_drift(self):
+        entries = bootex_entries()
+        profile = self.fixture_bootex_profile()
+
+        def incomplete_applier(plan, *, cancel_check=None):
+            result = windows_bootex.apply_bootex_plan(
+                plan, cancel_check=cancel_check,
+            )
+            return replace(result, replacements=result.replacements[:-1])
+
+        def drifting_applier(plan, *, cancel_check=None):
+            result = windows_bootex.apply_bootex_plan(
+                plan, cancel_check=cancel_check,
+            )
+            replacement = result.replacements[0]
+            target = plan.staging_root.joinpath(
+                *replacement.destination_path.split("/"),
+            )
+            target.write_bytes(b"X" * replacement.new_size)
+            return result
+
+        for message, applier in (
+            ("does not match its execution plan", incomplete_applier),
+            ("manifest does not match", drifting_applier),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(
+                    windows_bootex,
+                    "available_bootex_profiles",
+                    return_value=(profile,),
+                ),
+            ):
+                root = Path(directory)
+                plan = self.make_plan(
+                    root,
+                    entries,
+                    windows_bootex=WindowsBootExOptions(True, True),
+                    windows_architecture="amd64",
+                    wimlib_resolver=lambda: WIMLIB,
+                )
+                with self.assertRaisesRegex(IsoStagingSafetyError, message):
+                    IsoStagingExecutor(
+                        extractor=FakeExtractor(),
+                        wim_extractor=FakeBootExWimExtractor(),
+                        bootex_applier=applier,
+                    ).execute(plan)
+                self.assertFalse(plan.destination.exists())
+
     def test_plan_is_frozen_and_binds_source_catalog_parent_and_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = self.make_plan(Path(directory))
@@ -479,6 +701,7 @@ class IsoStagingTests(unittest.TestCase):
             self.assertEqual(plan.syslinux_content_bytes, 0)
             self.assertFalse(plan.needs_wim_split)
             self.assertIsNone(plan.autounattend_xml)
+            self.assertIs(plan.archive_namespace, SevenZipNamespace.UDF)
             with self.assertRaises(FrozenInstanceError):
                 plan.catalog_digest = "0" * 64  # type: ignore[misc]
             forged_entries = tuple(
@@ -488,6 +711,42 @@ class IsoStagingTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(IsoStagingSafetyError, "catalog binding"):
                 validate_iso_staging_plan(replace(plan, entries=forged_entries))
+            with self.assertRaisesRegex(IsoStagingSafetyError, "catalog witness"):
+                validate_iso_staging_plan(replace(
+                    plan, archive_namespace=SevenZipNamespace.ISO9660,
+                ))
+            with self.assertRaisesRegex(IsoStagingSafetyError, "namespace binding"):
+                validate_iso_staging_plan(replace(
+                    plan, archive_namespace="Udf",  # type: ignore[arg-type]
+                ))
+
+    def test_staging_catalog_falls_back_to_and_binds_explicit_iso9660(self):
+        entries = basic_entries()
+        seen: list[SevenZipNamespace] = []
+        complete = fake_catalog_scanner(entries)
+
+        def scanner(image, *, image_fd=None, namespace=None, cancel_check=None):
+            assert isinstance(namespace, SevenZipNamespace)
+            seen.append(namespace)
+            if namespace is SevenZipNamespace.UDF:
+                return [], False
+            return complete(
+                image,
+                image_fd=image_fd,
+                namespace=namespace,
+                cancel_check=cancel_check,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self.make_plan(
+                Path(directory), entries, catalog_scanner=scanner,
+            )
+            self.assertEqual(
+                seen,
+                [SevenZipNamespace.UDF, SevenZipNamespace.ISO9660],
+            )
+            self.assertIs(plan.archive_namespace, SevenZipNamespace.ISO9660)
+            validate_iso_staging_plan(plan)
 
     def test_embedded_fat_tree_is_bound_materialized_and_counted(self):
         base_entries = (ArchiveEntry("README.txt", 5),)
@@ -535,6 +794,46 @@ class IsoStagingTests(unittest.TestCase):
                 b"MZ!",
             )
             self.assertEqual(result.bytes_staged, 8)
+
+    def test_path_covered_embedded_fat_files_use_the_complete_base_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "embedded.iso"
+            write_container(image, make_fat(FatType.FAT12))
+            catalog = inspect_eltorito_file(image)
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded = inspect_uefi_eltorito_fat(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            assert embedded is not None
+            base_entries = tuple(
+                ArchiveEntry(
+                    entry.path,
+                    entry.size,
+                    EntryKind.DIRECTORY if entry.is_directory else EntryKind.FILE,
+                )
+                for entry in embedded.entries
+            )
+            with patch(
+                "isopropyl.iso_staging.scan_image_contents",
+                fake_catalog_scanner(base_entries),
+            ):
+                plan = build_iso_staging_plan(
+                    image,
+                    root / "ready-media",
+                    base_entries,
+                    write_plan(base_entries),
+                    seven_zip=SEVEN_ZIP,
+                    embedded_fat=embedded,
+                )
+            self.assertEqual(plan.embedded_entries, ())
+            self.assertEqual(plan.embedded_targets, ())
+            self.assertEqual(plan.embedded_content_bytes, 0)
+            self.assertEqual(plan.base_with_embedded_entries, base_entries)
+            validate_iso_staging_plan(plan)
+            result = IsoStagingExecutor(extractor=FakeExtractor()).execute(plan)
+            self.assertEqual(result.bytes_staged, 3)
 
     def test_distro_exclusion_is_rechecked_before_extraction(self):
         entries = basic_entries() + (ArchiveEntry(".miso", 1),)

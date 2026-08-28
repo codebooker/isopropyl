@@ -3,6 +3,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import calendar
+import enum
 import hashlib
 import hmac
 import os
@@ -88,6 +89,20 @@ _SQUASHFS_COMPRESSIONS = {
 
 class ImageInspectionCancelled(Exception):
     pass
+
+
+class SevenZipNamespace(enum.Enum):
+    """One explicit optical namespace understood by 7-Zip."""
+
+    UDF = "Udf"
+    ISO9660 = "Iso"
+
+
+@dataclass(frozen=True)
+class ImageCatalogScan:
+    members: tuple["ImageMember", ...]
+    complete: bool
+    namespace: SevenZipNamespace | None
 
 
 class ImageInspectionTimedOut(OSError):
@@ -670,17 +685,21 @@ def _trusted_7z() -> str | None:
     return normalized
 
 
-def scan_image_contents(
-    path: Path, *, image_fd: int | None = None,
-    cancel_check: Callable[[], None] | None = None,
-) -> tuple[list[ImageMember], bool]:
-    executable = _trusted_7z()
+def _scan_image_contents_once(
+    path: Path,
+    executable: str,
+    *,
+    image_fd: int | None,
+    namespace: SevenZipNamespace | None,
+    cancel_check: Callable[[], None] | None,
+) -> tuple[list[ImageMember], str]:
     if not executable:
-        return [], False
+        return [], "failed"
     source = str(path) if image_fd is None else f"/proc/self/fd/{image_fd}"
+    type_switch = (() if namespace is None else (f"-t{namespace.value}",))
     try:
         process = subprocess.Popen(
-            [executable, "l", "-slt", source],
+            [executable, "l", "-slt", *type_switch, "--", source],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             pass_fds=(() if image_fd is None else (image_fd,)),
@@ -690,10 +709,10 @@ def scan_image_contents(
             },
         )
     except (OSError, subprocess.SubprocessError):
-        return [], False
+        return [], "failed"
     if process.stdout is None:
         _stop_catalog_process(process)
-        return [], False
+        return [], "failed"
     descriptor = process.stdout.fileno()
     output = bytearray()
     deadline = time.monotonic() + 20.0
@@ -733,25 +752,26 @@ def scan_image_contents(
                 failed = True
                 break
         if failed:
-            return [], False
+            return [], "failed"
         while process.poll() is None:
             if cancel_check is not None:
                 cancel_check()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return [], False
+                return [], "failed"
             try:
                 process.wait(timeout=min(0.1, remaining))
             except subprocess.TimeoutExpired:
                 continue
         returncode = process.poll()
         if returncode:
-            return [], False
+            return [], "unavailable"
         try:
             listing = output.decode("utf-8", errors="replace")
-            return parse_7z_listing(listing), True
+            members = parse_7z_listing(listing)
+            return (members, "complete") if members else ([], "unavailable")
         except ValueError:
-            return [], False
+            return [], "failed"
     finally:
         if process.poll() is None:
             _stop_catalog_process(process)
@@ -759,6 +779,75 @@ def scan_image_contents(
             process.stdout.close()
         except OSError:
             pass
+
+
+def scan_image_catalog(
+    path: Path,
+    *,
+    image_fd: int | None = None,
+    namespace: SevenZipNamespace | None = None,
+    allow_auto_fallback: bool = True,
+    cancel_check: Callable[[], None] | None = None,
+    seven_zip: str | None = None,
+) -> ImageCatalogScan:
+    """List one descriptor-bound namespace, preferring UDF over ISO9660.
+
+    ``namespace`` makes the request exact.  Without it, UDF and ISO9660 are
+    tried explicitly in that order.  Legacy 7-Zip auto-detection is retained
+    only as a final compatibility path for non-optical disk/archive formats;
+    ISO extraction callers disable it.
+    """
+
+    if namespace is not None and type(namespace) is not SevenZipNamespace:
+        return ImageCatalogScan((), False, None)
+    executable = seven_zip or _trusted_7z()
+    if not executable:
+        return ImageCatalogScan((), False, None)
+    normalized = os.path.normpath(executable)
+    if (
+        not os.path.isabs(normalized)
+        or os.path.dirname(normalized) not in _TRUSTED_7Z_DIRECTORIES
+        or os.path.basename(normalized) != "7z"
+    ):
+        return ImageCatalogScan((), False, None)
+    candidates: tuple[SevenZipNamespace | None, ...]
+    if namespace is not None:
+        candidates = (namespace,)
+    else:
+        candidates = (
+            SevenZipNamespace.UDF,
+            SevenZipNamespace.ISO9660,
+            *((None,) if allow_auto_fallback else ()),
+        )
+    for candidate in candidates:
+        members, state = _scan_image_contents_once(
+            path,
+            normalized,
+            image_fd=image_fd,
+            namespace=candidate,
+            cancel_check=cancel_check,
+        )
+        if state == "complete":
+            return ImageCatalogScan(tuple(members), True, candidate)
+        if state == "failed":
+            return ImageCatalogScan((), False, None)
+    return ImageCatalogScan((), False, None)
+
+
+def scan_image_contents(
+    path: Path, *, image_fd: int | None = None,
+    namespace: SevenZipNamespace | None = None,
+    allow_auto_fallback: bool = True,
+    cancel_check: Callable[[], None] | None = None,
+) -> tuple[list[ImageMember], bool]:
+    result = scan_image_catalog(
+        path,
+        image_fd=image_fd,
+        namespace=namespace,
+        allow_auto_fallback=allow_auto_fallback,
+        cancel_check=cancel_check,
+    )
+    return list(result.members), result.complete
 
 
 def _stop_catalog_process(process: subprocess.Popen[bytes]) -> None:
@@ -1066,7 +1155,10 @@ def inspect_image(
     try:
         members, contents_scanned = (
             scan_image_contents(
-                path, image_fd=inspection_fd, cancel_check=check_inspection,
+                path,
+                image_fd=inspection_fd,
+                allow_auto_fallback=not (is_iso9660 or suffix == ".iso"),
+                cancel_check=check_inspection,
             )
             if inspection_fd >= 0 else ([], False)
         )

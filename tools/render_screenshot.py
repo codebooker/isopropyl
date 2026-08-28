@@ -80,7 +80,7 @@ def _render() -> int:
     window.rebuild_write_recommendation(preserve_selection=False)
     window.status.setText("Ready when you are")
 
-    window.resize(1080, 920)
+    window.resize(1080, 960)
     window.show()
     application.processEvents()
     destination = Path(__file__).resolve().parents[1] / "data" / "screenshot.png"

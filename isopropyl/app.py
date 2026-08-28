@@ -11,7 +11,7 @@ import json
 import stat
 import tempfile
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib.resources import files
 from pathlib import Path
 
@@ -163,6 +163,10 @@ from .windows import (
     online_account_bypass_compatibility, quality_of_life_compatibility,
     secure_boot_revocation_policy_compatibility, windows_architecture,
 )
+from .windows_bootex import (
+    WindowsBootExOptions,
+    available_bootex_profiles,
+)
 from .zip_overlay import (
     ZipOverlayPlan, build_zip_overlay_plan,
 )
@@ -255,6 +259,9 @@ class IsoStagingPreparationRequest:
     windows_architecture: str
     persistence_profile: CasperCompatibilityProfile | None
     persistence_bytes: int
+    windows_bootex: WindowsBootExOptions = field(
+        default_factory=WindowsBootExOptions,
+    )
     runtime_validation_requested: bool = False
     syslinux_dependency_key: str | None = None
 
@@ -413,6 +420,7 @@ class Window(QMainWindow):
         self.iso_workspace: tempfile.TemporaryDirectory[str] | None = None
         self.runtime_validation_cancel_event = threading.Event()
         self.windows_options = WindowsCustomization()
+        self.windows_bootex = WindowsBootExOptions()
         self.windows_wim_candidates: tuple[ArchiveEntry, ...] = ()
         self.windows_install_source_count = 0
         self.windows_wim_member: ArchiveEntry | None = None
@@ -453,7 +461,12 @@ class Window(QMainWindow):
             self.on_staged_dbx_confirmation_requested
         )
         self.setWindowTitle("ISOpropyl")
-        self.setMinimumSize(720, 700)
+        self.setMinimumSize(680, 520)
+        available = self.screen().availableGeometry()
+        self.resize(
+            max(self.minimumWidth(), min(1000, available.width() - 64)),
+            max(self.minimumHeight(), min(720, available.height() - 64)),
+        )
         self.setAcceptDrops(True)
         self.build_ui()
         self.bridge.status_changed.connect(self.status.setText)
@@ -712,8 +725,26 @@ class Window(QMainWindow):
 
     def build_ui(self) -> None:
         root = QWidget(objectName="root")
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(36, 20, 36, 20)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.main_scroll = QScrollArea(objectName="mainWorkflowScrollArea")
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.main_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.main_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.main_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.main_scroll.viewport().setAutoFillBackground(False)
+
+        content = QWidget(objectName="workflowContent")
+        content.setAutoFillBackground(False)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(32, 20, 32, 20)
         layout.setSpacing(10)
 
         eyebrow = QLabel("ISOPROPYL")
@@ -730,9 +761,12 @@ class Window(QMainWindow):
             "1", "Disk image",
             "Choose a Linux or Windows ISO, a FreeDOS USB image, or a raw disk image",
         )
-        source_row = QHBoxLayout()
         self.image_label = QLabel("No image selected")
         self.image_label.setObjectName("muted")
+        self.image_label.setWordWrap(True)
+        self.source_card.layout().addWidget(self.image_label)
+        source_actions = QHBoxLayout()
+        source_actions.addStretch()
         choose = QPushButton("Choose image…")
         choose.clicked.connect(self.choose_image)
         download = QPushButton("Download official image…")
@@ -758,13 +792,13 @@ class Window(QMainWindow):
         )
         freedos_download.triggered.connect(self.download_freedos_image)
         download.setMenu(download_menu)
-        source_row.addWidget(self.image_label, 1)
-        source_row.addWidget(download)
-        source_row.addWidget(choose)
-        self.source_card.layout().addLayout(source_row)
+        source_actions.addWidget(download)
+        source_actions.addWidget(choose)
+        self.source_card.layout().addLayout(source_actions)
         image_tools = QHBoxLayout()
         self.image_detail = QLabel("DD mode · Image type and boot layout will appear here")
         self.image_detail.setObjectName("muted")
+        self.image_detail.setWordWrap(True)
         self.source_card.layout().addWidget(self.image_detail)
         method_row = QHBoxLayout()
         method_label = QLabel("Write method")
@@ -863,6 +897,7 @@ class Window(QMainWindow):
         self.target_card.layout().addLayout(target_row)
         self.device_detail = QLabel("Connect a removable drive, then refresh")
         self.device_detail.setObjectName("muted")
+        self.device_detail.setWordWrap(True)
         self.target_card.layout().addWidget(self.device_detail)
         layout.addWidget(self.target_card)
 
@@ -887,11 +922,15 @@ class Window(QMainWindow):
         self.show_external.toggled.connect(self.refresh_devices)
         write_options.addWidget(self.verify)
         write_options.addWidget(self.runtime_validation)
-        write_options.addWidget(self.show_external)
         write_options.addStretch()
         options.addLayout(write_options)
-        utility_options = QHBoxLayout()
-        utility_options.addStretch()
+        external_options = QHBoxLayout()
+        external_options.addWidget(self.show_external)
+        external_options.addStretch()
+        options.addLayout(external_options)
+        utility_options = QVBoxLayout()
+        utility_primary = QHBoxLayout()
+        utility_primary.addStretch()
         log_button = QPushButton("View log")
         log_button.clicked.connect(self.show_log)
         self.uefi_shell_button = QPushButton("Create UEFI Shell…")
@@ -900,28 +939,40 @@ class Window(QMainWindow):
             "multi-architecture GPT/FAT32 boot media."
         )
         self.uefi_shell_button.clicked.connect(self.create_uefi_shell_media)
-        utility_options.addWidget(self.uefi_shell_button)
+        utility_primary.addWidget(self.uefi_shell_button)
         self.tools_button = QPushButton("Drive tools…")
         self.tools_button.clicked.connect(self.show_drive_tools)
-        utility_options.addWidget(self.tools_button)
+        utility_primary.addWidget(self.tools_button)
         self.optical_button = QPushButton("Save optical disc…")
         self.optical_button.clicked.connect(self.save_optical_disc)
-        utility_options.addWidget(self.optical_button)
+        utility_primary.addWidget(self.optical_button)
+        utility_secondary = QHBoxLayout()
+        utility_secondary.addStretch()
         self.settings_button = QPushButton("Settings…")
         self.settings_button.clicked.connect(self.show_settings)
-        utility_options.addWidget(self.settings_button)
-        utility_options.addWidget(log_button)
+        utility_secondary.addWidget(self.settings_button)
+        utility_secondary.addWidget(log_button)
+        utility_options.addLayout(utility_primary)
+        utility_options.addLayout(utility_secondary)
         options.addLayout(utility_options)
         layout.addLayout(options)
 
+        layout.addStretch(1)
+        self.main_scroll.setWidget(content)
+        root_layout.addWidget(self.main_scroll, 1)
+
+        footer = QWidget(objectName="workflowFooter")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(32, 8, 32, 20)
+        footer_layout.setSpacing(8)
         self.status = QLabel("Ready when you are")
         self.status.setObjectName("status")
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
-        layout.addWidget(self.status)
-        layout.addWidget(self.progress)
+        footer_layout.addWidget(self.status)
+        footer_layout.addWidget(self.progress)
 
         actions = QHBoxLayout()
         self.cancel_button = QPushButton("Cancel")
@@ -933,7 +984,8 @@ class Window(QMainWindow):
         actions.addWidget(self.cancel_button)
         actions.addStretch()
         actions.addWidget(self.write_button)
-        layout.addLayout(actions)
+        footer_layout.addLayout(actions)
+        root_layout.addWidget(footer)
         self.setCentralWidget(root)
 
     def card(self, number: str, title: str, text: str) -> QFrame:
@@ -943,6 +995,7 @@ class Window(QMainWindow):
         heading.setObjectName("cardTitle")
         detail = QLabel(text)
         detail.setObjectName("muted")
+        detail.setWordWrap(True)
         box.addWidget(heading)
         box.addWidget(detail)
         return frame
@@ -1860,6 +1913,7 @@ class Window(QMainWindow):
         self.runtime_validation.setChecked(False)
         self.runtime_validation.blockSignals(False)
         self.windows_options = WindowsCustomization()
+        self.windows_bootex = WindowsBootExOptions()
         if self.windows_wim_extractor is not None:
             self.windows_wim_extractor.cancel()
         self.windows_metadata_generation += 1
@@ -2042,6 +2096,19 @@ class Window(QMainWindow):
         base_entries = self.archive_entries()
         embedded_entries = self.embedded_archive_entries()
         if not embedded_entries:
+            return base_entries
+        base_file_keys = {
+            unicodedata.normalize("NFC", entry.path).casefold()
+            for entry in base_entries if entry.kind is EntryKind.FILE
+        }
+        embedded_file_keys = {
+            unicodedata.normalize("NFC", entry.path).casefold()
+            for entry in embedded_entries if entry.kind is EntryKind.FILE
+        }
+        if embedded_file_keys and embedded_file_keys <= base_file_keys:
+            # UDF Windows media can expose the same fallback loader both in
+            # its normal tree and in an El Torito FAT image.  The staging
+            # backend binds this wholly path-covered case to the UDF tree.
             return base_entries
         return merge_additive_embedded_entries(
             base_entries,
@@ -2804,12 +2871,13 @@ class Window(QMainWindow):
             )
             if warning != QMessageBox.StandardButton.Yes:
                 return
-        if self.windows_options.enabled:
+        if self.windows_options.enabled or self.windows_bootex.enabled:
             warning = QMessageBox.warning(
                 self, "Windows profile cannot be applied in DD mode",
-                "A Windows customization profile is selected, but DD mode copies "
-                "the ISO byte-for-byte and cannot add autounattend.xml. The profile "
-                "will not be applied to this USB.\n\nContinue without the profile?",
+                "Windows media customization is selected, but DD mode copies the "
+                "ISO byte-for-byte and cannot add autounattend.xml or replace the "
+                "installer's boot files. These options will not be applied to this "
+                "USB.\n\nContinue without them?",
                 QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -2978,6 +3046,7 @@ class Window(QMainWindow):
             or device.size > MAX_SYSLINUX_REGULAR_IMAGE_BYTES
             or device.size % 512
             or self.windows_options.enabled
+            or self.windows_bootex.enabled
             or self.zip_overlay_plan is not None
             or inspection.embedded_uefi_fat is not None
             or self.selected_persistence_bytes()
@@ -5760,7 +5829,9 @@ class Window(QMainWindow):
                 f"{len(embedded.entries)} entries · "
                 f"{self.display_size(embedded.content_bytes)}",
                 "Merge policy: missing files are added from the bound El Torito "
-                "image; every file or alias collision blocks ISO mode.",
+                "image; a wholly path-covered embedded file tree is superseded "
+                "by the complete UDF tree, while "
+                "mixed additions and collisions block ISO mode.",
             ))
         if self.zip_overlay_plan is not None:
             merge = self.zip_overlay_merge
@@ -5797,11 +5868,28 @@ class Window(QMainWindow):
                 "System Partition; current updates and recovery readiness are "
                 "required"
             )
+        if self.windows_bootex.enabled:
+            lines.extend((
+                "Windows boot files: replace the removable fallback loader, "
+                "root bootmgr.efi, and matching boot fonts with the 2023-generation "
+                "files extracted from sources/boot.wim index 2",
+                "Boot-file provenance: the complete ISO must match one exact "
+                "Microsoft-published Windows 11 25H2 v2 SHA-256 before confirmation",
+                "Firmware requirement: the target PC must already trust Windows "
+                "UEFI CA 2023; ISOpropyl does not update firmware, and root "
+                "bootmgr_EX.efi is not represented as CA-2023-signed",
+                "Initial compatibility: direct UEFI/FAT32 only; no ZIP overlay, "
+                "UEFI:NTFS bridge, persistence, or runtime fallback wrapper",
+            ))
         lines.extend(("", "Dependencies:"))
         lines.extend(
             f"• {requirement.key}: {', '.join(requirement.alternatives)}"
             for requirement in plan.requirements
         )
+        if self.windows_bootex.enabled:
+            lines.append(
+                "• windows-boot-files: wimlib-imagex (wimtools)"
+            )
         lines.extend(("", "Execution blockers:"))
         lines.extend(f"• {blocker}" for blocker in plan.blockers)
         dialog = QDialog(self)
@@ -5967,6 +6055,61 @@ class Window(QMainWindow):
             return
         if not self.confirm_dbx_matches(inspection):
             return
+        if self.windows_bootex.enabled:
+            layout = write_plan.layout
+            incompatibility = ""
+            if (
+                layout is None
+                or layout.boot_strategy is not BootStrategy.IMAGE_NATIVE
+                or layout.main_filesystem.value != "fat32"
+                or layout.partition_count != 1
+            ):
+                incompatibility = (
+                    "Choose the direct UEFI/FAT32 ISO-mode plan; UEFI:NTFS "
+                    "depends on a separate Windows UEFI CA 2011 bridge."
+                )
+            elif overlay is not None:
+                incompatibility = "Remove the ZIP overlay before using this first profile."
+            elif self.selected_persistence_bytes():
+                incompatibility = "Disable persistent storage before using this profile."
+            elif self.runtime_validation.isChecked():
+                incompatibility = (
+                    "Disable the boot-time corruption wrapper before using this profile."
+                )
+            if incompatibility:
+                QMessageBox.warning(
+                    self,
+                    "Windows 2023-generation boot files unavailable",
+                    incompatibility,
+                )
+                return
+            supported, reason = self.windows_bootex_preflight()
+            if not supported:
+                QMessageBox.warning(
+                    self,
+                    "Windows 2023-generation boot files unavailable",
+                    reason,
+                )
+                return
+            bootex_answer = QMessageBox.question(
+                self,
+                "Prepare Windows 2023-generation boot media?",
+                "ISOpropyl will hash the complete ISO against the exact reviewed "
+                "Microsoft Windows 11 25H2 v2 profile, extract only EFI_EX and "
+                "Fonts_EX from sources/boot.wim index 2, then replace the "
+                "removable fallback loader, root bootmgr.efi, and matching boot "
+                "fonts inside private staging. Every replacement is read back "
+                "before the tree is published.\n\n"
+                "The target PC must already trust Windows UEFI CA 2023. ISOpropyl "
+                "does not update firmware, inspect the target firmware database, "
+                "or claim that root bootmgr_EX.efi is itself CA-2023-signed. "
+                "Systems that trust only the 2011 certificate may not boot this "
+                "media.\n\nContinue?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if bootex_answer != QMessageBox.StandardButton.Yes:
+                return
         if not device.removable:
             warning = QMessageBox.warning(
                 self, "External hard drive or SSD selected",
@@ -6149,6 +6292,7 @@ class Window(QMainWindow):
             architecture,
             persistence_profile=persistence_profile,
             persistence_bytes=persistence_bytes,
+            windows_bootex=self.windows_bootex,
             runtime_validation_requested=runtime_validation_requested,
             syslinux_dependency_key=syslinux_dependency_key,
         )
@@ -6218,6 +6362,7 @@ class Window(QMainWindow):
                     cancel_check=check_cancelled,
                     windows_customization=request.windows_customization,
                     windows_architecture=request.windows_architecture,
+                    windows_bootex=request.windows_bootex,
                     **syslinux_arguments,
                 )
                 if request.runtime_validation_requested:
@@ -6283,6 +6428,7 @@ class Window(QMainWindow):
                 and self.inspection == request.inspection
                 and self.selected_device() == request.device
                 and self.zip_overlay_plan == request.overlay
+                and self.windows_bootex == request.windows_bootex
                 and self.archive_entries() == request.base_entries
                 and image_identity(request.image) == request.image_identity
                 and not path_is_on_device(request.workspace.name, request.device)
@@ -6349,6 +6495,20 @@ class Window(QMainWindow):
                 if request.windows_customization.enabled else None
             )
             or result.wim_selection != request.windows_customization.install_image
+            or result.windows_bootex_options != (
+                request.windows_bootex if request.windows_bootex.enabled else None
+            )
+            or (
+                request.windows_bootex.enabled
+                and result.windows_bootex_source is None
+            )
+            or (
+                not request.windows_bootex.enabled
+                and (
+                    result.windows_bootex_source is not None
+                    or result.windows_boot_wim_source is not None
+                )
+            )
             or (
                 request.syslinux_dependency_key is None
                 and any((
@@ -7129,6 +7289,26 @@ class Window(QMainWindow):
                 f"{staging_plan.wim_selection.display_label} from "
                 f"{staging_plan.wim_selection.source_name}."
             )
+        if staging_plan.windows_bootex_source is not None:
+            bootex_source = staging_plan.windows_bootex_source
+            customization += (
+                "\nWindows 2023-generation boot files: extract EFI_EX and "
+                "Fonts_EX from sources/boot.wim index 2, then replace only the "
+                "architecture fallback loader, root bootmgr.efi, and matching "
+                "existing boot fonts in private staging."
+                f"\nReviewed profile: {bootex_source.profile.product} "
+                f"{bootex_source.profile.release} · "
+                f"{bootex_source.profile.language} · "
+                f"{bootex_source.profile.architecture}."
+                f"\nExact whole-ISO SHA-256: {bootex_source.source_iso.sha256}."
+                "\nTrust scope: exact Microsoft-published ISO identity plus PE "
+                "architecture/subsystem/signature-table structure; certificate "
+                "chain, revocation, signing time, live firmware trust, and Secure "
+                "Version Number are not evaluated. root bootmgr_EX.efi is not "
+                "represented as CA-2023-signed."
+                "\nFirmware requirement: target firmware must already trust "
+                "Windows UEFI CA 2023; 2011-only systems may not boot this media."
+            )
         if staging_plan.overlay is not None:
             final_files = sum(
                 entry.kind is EntryKind.FILE
@@ -7407,6 +7587,14 @@ class Window(QMainWindow):
                     staged.image_identity != staging_plan.image_identity
                     or staged.catalog_digest
                     != staging_plan.staged_catalog_digest
+                    or (
+                        staging_plan.windows_bootex_source is not None
+                        and getattr(staged, "windows_bootex", None) is None
+                    )
+                    or (
+                        staging_plan.windows_bootex_source is None
+                        and getattr(staged, "windows_bootex", None) is not None
+                    )
                 ):
                     raise RuntimeError(
                         "The ISO staging result does not match its source/catalog plan"
@@ -7921,6 +8109,58 @@ class Window(QMainWindow):
         refresh()
         dialog.exec()
 
+    def windows_bootex_preflight(self) -> tuple[bool, str]:
+        """Return a fast UI gate; the staging planner still hashes the whole ISO."""
+
+        if self.image is None or self.inspection is None:
+            return False, "Inspect a Windows 11 installer image first"
+        architectures = set(self.inspection.architectures)
+        detected = tuple(
+            architecture for architecture, marker in (
+                ("x64", "x64"), ("arm64", "ARM64"),
+            )
+            if marker in architectures
+        )
+        if len(detected) != 1:
+            return False, (
+                "The 2023-generation boot-file profile requires exactly one "
+                "detected x64 or ARM64 Windows architecture"
+            )
+        try:
+            size = self.image.stat().st_size
+            profiles = tuple(
+                profile for profile in available_bootex_profiles()
+                if profile.iso_size == size
+                and profile.architecture == detected[0]
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            return False, f"The reviewed Windows profile is unavailable: {error}"
+        if len(profiles) != 1:
+            return False, (
+                "This first profile is limited to the exact reviewed Microsoft "
+                "Windows 11 25H2 v2 English x64/ARM64 ISO sizes"
+            )
+        entries = self.archive_entries()
+        exact = tuple(
+            entry for entry in entries
+            if entry.kind is EntryKind.FILE
+            and entry.path == "sources/boot.wim"
+        )
+        aliases = tuple(
+            entry for entry in entries
+            if entry.kind is EntryKind.FILE
+            and entry.path.casefold() == "sources/boot.wim"
+        )
+        if len(exact) != 1 or aliases != exact:
+            return False, (
+                "The installer must contain one canonical sources/boot.wim"
+            )
+        return True, (
+            "Eligible for exact whole-ISO SHA-256 validation during private "
+            "planning. The target PC must already trust Windows UEFI CA 2023; "
+            "ISOpropyl does not update firmware."
+        )
+
     def configure_windows(self) -> None:
         if not self.inspection or not self.inspection.has_windows_installer:
             return
@@ -7929,9 +8169,9 @@ class Window(QMainWindow):
         dialog.resize(700, 650)
         layout = QVBoxLayout(dialog)
         notice = QLabel(
-            "These options generate an auditable autounattend.xml profile. "
-            "ISOpropyl does not apply it in raw-write mode yet; export it for inspection "
-            "or use it with filesystem-aware Windows media."
+            "Setup options generate an auditable autounattend.xml profile. The "
+            "separate boot-file option transforms only exact reviewed media. "
+            "Neither is applied in raw/DD mode."
         )
         notice.setWordWrap(True)
         notice.setObjectName("muted")
@@ -7950,6 +8190,7 @@ class Window(QMainWindow):
         layout.addWidget(tabs)
 
         current = self.windows_options
+        current_bootex = self.windows_bootex
         source_heading = QLabel("Windows image source")
         source_heading.setObjectName("cardTitle")
         source_combo = QComboBox()
@@ -8105,6 +8346,23 @@ class Window(QMainWindow):
         secure_boot_policy_acknowledgment.setObjectName(
             "windowsSecureBootRevocationPolicyAcknowledgment",
         )
+        bootex = QCheckBox(
+            "Use the Windows 2023-generation installer boot files (25H2 v2)"
+        )
+        bootex.setObjectName("windowsBootExCheckBox")
+        bootex_supported, bootex_reason = self.windows_bootex_preflight()
+        bootex.setEnabled(bootex_supported)
+        bootex.setToolTip(bootex_reason)
+        bootex_note = QLabel(bootex_reason)
+        bootex_note.setWordWrap(True)
+        bootex_note.setObjectName("muted")
+        bootex_acknowledgment = QCheckBox(
+            "I confirm the target PC's firmware already trusts Windows UEFI CA "
+            "2023 and understand that 2011-only firmware may not boot this media"
+        )
+        bootex_acknowledgment.setObjectName(
+            "windowsBootExFirmwareAcknowledgment"
+        )
         fast_startup = QCheckBox(
             "Disable Windows Fast Startup (use full shutdowns; startup may be slower)"
         )
@@ -8154,6 +8412,9 @@ class Window(QMainWindow):
         secure_boot_policy_note.setObjectName("muted")
         setup_layout.addWidget(secure_boot_policy_note)
         setup_layout.addWidget(secure_boot_policy_acknowledgment)
+        setup_layout.addWidget(bootex)
+        setup_layout.addWidget(bootex_note)
+        setup_layout.addWidget(bootex_acknowledgment)
         setup_layout.addWidget(fast_startup)
         setup_layout.addWidget(quality_of_life)
         quality_of_life_note = QLabel()
@@ -8211,6 +8472,11 @@ class Window(QMainWindow):
         )
         secure_boot_policy_acknowledgment.setChecked(
             current.acknowledge_secure_boot_revocation_risk,
+        )
+        bootex.setChecked(current_bootex.enabled and bootex_supported)
+        bootex_acknowledgment.setChecked(
+            current_bootex.acknowledge_firmware_compatibility
+            and bootex_supported,
         )
         fast_startup.setChecked(current.disable_fast_startup)
         quality_of_life.setChecked(current.quality_of_life)
@@ -8288,6 +8554,12 @@ class Window(QMainWindow):
             if not enabled:
                 secure_boot_policy_acknowledgment.setChecked(False)
 
+        def update_bootex_acknowledgment() -> None:
+            enabled = bootex.isEnabled() and bootex.isChecked()
+            bootex_acknowledgment.setEnabled(enabled)
+            if not enabled:
+                bootex_acknowledgment.setChecked(False)
+
         source_combo.currentIndexChanged.connect(update_offline_account_control)
         image_combo.currentIndexChanged.connect(update_offline_account_control)
         source_combo.currentIndexChanged.connect(update_quality_of_life_control)
@@ -8301,12 +8573,14 @@ class Window(QMainWindow):
         secure_boot_policy.toggled.connect(
             update_secure_boot_policy_acknowledgment,
         )
+        bootex.toggled.connect(update_bootex_acknowledgment)
         update_offline_account_control()
         update_offline_account_acknowledgment()
         update_quality_of_life_control()
         update_quality_of_life_acknowledgment()
         update_secure_boot_policy_control()
         update_secure_boot_policy_acknowledgment()
+        update_bootex_acknowledgment()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel
@@ -8368,6 +8642,21 @@ class Window(QMainWindow):
                 install_image_path=install_image_path,
             )
 
+        def selected_bootex() -> WindowsBootExOptions:
+            options = WindowsBootExOptions(
+                enabled=bootex.isEnabled() and bootex.isChecked(),
+                acknowledge_firmware_compatibility=(
+                    bootex_acknowledgment.isEnabled()
+                    and bootex_acknowledgment.isChecked()
+                ),
+            )
+            if options.enabled and not options.acknowledge_firmware_compatibility:
+                raise ValueError(
+                    "Acknowledge the target firmware requirement before enabling "
+                    "the Windows 2023-generation boot files"
+                )
+            return options
+
         def profile_architecture(options: WindowsCustomization) -> str:
             if options.install_image is not None:
                 return options.install_image.edition.architecture
@@ -8414,6 +8703,7 @@ class Window(QMainWindow):
         def accept() -> None:
             try:
                 options = selected()
+                bootex_options = selected_bootex()
                 generate_autounattend(
                     options, profile_architecture(options)
                 )
@@ -8424,7 +8714,9 @@ class Window(QMainWindow):
                 return
             self.select_windows_wim_source(selected_source())
             self.windows_options = options
+            self.windows_bootex = bootex_options
             self.logger.info("Windows customization profile updated: %s", options)
+            self.logger.info("Windows BootEx profile updated: %s", bootex_options)
             dialog.accept()
 
         def inspect_metadata() -> None:
@@ -8437,6 +8729,7 @@ class Window(QMainWindow):
                 return
             try:
                 options = selected()
+                bootex_options = selected_bootex()
                 generate_autounattend(options, profile_architecture(options))
             except ValueError as error:
                 QMessageBox.warning(dialog, "Invalid Windows options", str(error))
@@ -8445,6 +8738,7 @@ class Window(QMainWindow):
                 return
             self.select_windows_wim_source(member)
             self.windows_options = options
+            self.windows_bootex = bootex_options
             dialog.accept()
             QTimer.singleShot(0, self.start_windows_wim_inspection)
 
@@ -8458,6 +8752,14 @@ class Window(QMainWindow):
 STYLE = """
 QWidget { color: #f5f6f8; font-size: 14px; }
 #root { background: #111318; color: #f5f6f8; }
+QScrollArea#mainWorkflowScrollArea { background: transparent; border: none; }
+QWidget#workflowContent, QWidget#workflowFooter { background: #111318; }
+QScrollBar:vertical { background: #111318; width: 10px; margin: 0; }
+QScrollBar:horizontal { background: #111318; height: 10px; margin: 0; }
+QScrollBar::handle { background: #3a3f4b; border-radius: 5px; min-height: 28px; min-width: 28px; }
+QScrollBar::handle:hover { background: #505664; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QLabel#eyebrow { color: #ff9f43; font-size: 13px; font-weight: 800; letter-spacing: 3px; }
 QLabel#title { font-size: 34px; font-weight: 750; }
 QLabel#subtitle, QLabel#muted { color: #a9adb7; font-size: 14px; }
@@ -8480,6 +8782,14 @@ QCheckBox { color: #d9dbe0; spacing: 9px; }
 LIGHT_STYLE = """
 QWidget { color: #20242b; font-size: 14px; }
 #root { background: #f5f6f8; color: #20242b; }
+QScrollArea#mainWorkflowScrollArea { background: transparent; border: none; }
+QWidget#workflowContent, QWidget#workflowFooter { background: #f5f6f8; }
+QScrollBar:vertical { background: #f5f6f8; width: 10px; margin: 0; }
+QScrollBar:horizontal { background: #f5f6f8; height: 10px; margin: 0; }
+QScrollBar::handle { background: #c7ccd5; border-radius: 5px; min-height: 28px; min-width: 28px; }
+QScrollBar::handle:hover { background: #aeb4bf; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QLabel#eyebrow { color: #bd5f08; font-size: 13px; font-weight: 800; letter-spacing: 3px; }
 QLabel#title { font-size: 34px; font-weight: 750; }
 QLabel#subtitle, QLabel#muted { color: #626975; font-size: 14px; }

@@ -15,13 +15,17 @@ separate consent.
 
 - Upstream source: Rufus [`src/wue.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/wue.c#L266-L468)
   at commit `2368e49a82e854d3e702f824648cc723953dbb53`
+- Boot-file mapping source: Rufus [`src/wue.c`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/src/wue.c#L1352-L1415)
+  at the same commit, cross-checked against Microsoft's
+  [`Make2023BootableMedia.ps1`](https://github.com/microsoft/secureboot_objects/blob/798cdc513e0c192fe90e99637105748ed3bb4ca5/scripts/windows/Make2023BootableMedia.ps1)
 - Copyright © 2022–2026 Pete Batard `<pete@akeo.ie>`
 - License: GPL-3.0-or-later; the upstream license text is available as
   [`LICENSE.txt`](https://github.com/pbatard/rufus/blob/2368e49a82e854d3e702f824648cc723953dbb53/LICENSE.txt)
 
 The fixed Windows 11 quality-of-life command selection, order, registry values,
 opaque `VisiblePlaces` payload, and installed-system `SkuSiPolicy.p7b` deployment
-effect in `isopropyl/windows.py` are adapted from that source. For the policy
+effect in `isopropyl/windows.py`, plus the reviewed `_EX` boot-file and font
+mapping in `isopropyl/windows_bootex.py`, are adapted from that source. For the policy
 deployment, ISOpropyl replaces Rufus's fixed `S:` mount with a unique directory
 and a `try/finally` cleanup sequence. ISOpropyl represents the manifest in
 Python, adds descriptions and noninteractive PowerShell switches, and surrounds

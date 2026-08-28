@@ -44,8 +44,13 @@ evidence.
 - Physically validate the implemented, separately acknowledged installed-system
   `SkuSiPolicy.p7b` workflow on supported Windows 11 25H2/26H1 x64/ARM64 systems,
   including missing-policy, copy-failure, recovery, and BitLocker scenarios.
-  Add CA 2023-signed installer bootloader replacement only after versioned
-  extraction, signature/architecture validation, and firmware fixtures. Track
+  Physically certify the implemented, default-off Windows 2023-generation
+  installer boot-file transform for the exact reviewed Windows 11 25H2 v2
+  English x64/ARM64 profiles. Its whole-ISO binding, literal bounded WIM
+  extraction, PE architecture/subsystem and structural certificate-table
+  checks, private atomic replacements, and read-back receipts are implemented;
+  certificate-chain/revocation/signing-time evaluation and firmware fixtures
+  remain. Track
   S Mode and post-24H2 online-account behavior without silently extending the
   current exact-build `BypassNRO` policy.
 - Keep the standalone Fast Startup switch and the implemented Windows 11
