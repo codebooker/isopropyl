@@ -75,6 +75,7 @@ raw_snapshot.py
 raw_workflow.py
 restore_device_helper.py
 restore_device_runner.py
+restore_workflow.py
 runtime_validation.py
 settings.py
 sources.py

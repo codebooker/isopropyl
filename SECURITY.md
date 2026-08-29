@@ -831,6 +831,55 @@ privileged writers. Installed-PolicyKit VM tests, hot-unplug/replacement tests,
 cache/power-loss tests, large-media performance measurements, and representative
 physical-device certification remain release gates.
 
+## Verified restore boundary
+
+Verified full overwrite + format is a distinct GUI and PolicyKit path, not a
+sequence of the ordinary Quick formatter and erase runner. It is offered only
+for an exact kernel-removable USB/MMC device with a stable serial or WWN, a known
+512/1024/2048/4096-byte logical sector, and an existing validated FAT32 or NTFS
+single-partition plan. Mounted volumes must first be unmounted. The unprivileged
+workflow binds the selected `Device` object, complete format plan, topology,
+major:minor, capacity, disk generation, random request identifier, partition
+geometry, and a serial/WWN-derived target phrase into process-local plan and
+confirmation receipts. It re-observes topology and disk generation during
+prepare, exact phrase confirmation, and the runner's final COMMIT callback.
+Cloned, mutated, stale, or cross-wired plans and confirmations are rejected.
+
+The dedicated v2 root helper accepts no source payload and has no Quick-format,
+shell, or `dd` fallback. Before PREPARED it resolves the authorized target by
+major:minor, rejects unsafe topology, opens the whole device once with
+`O_RDWR | O_EXCL | O_NOFOLLOW`, takes a nonblocking exclusive lock, and rechecks
+the descriptor, size, logical sector, read-only state, removability, holders,
+swap, mounts, and kernel disk generation. Only an authenticated COMMIT permits
+mutation. The helper scans every logical byte, skips only chunks whose bytes are
+all zero, overwrites every other chunk, flushes and invalidates caches, and then
+requires a complete all-zero read-back before partitioning.
+
+Partitioning uses one frozen MBR/GPT script and the retained whole-device
+descriptor. The helper discovers exactly child partition 1 from sysfs, verifies
+its parent, number, start, count, block identity, capacity, sector size, and
+read/write state, and retains both parent and child descriptors. FAT32 `mkfs.fat`
+and NTFS `mkntfs` receive explicit sector and hidden-partition-start arguments.
+After formatting, every sampled metadata range must read identically through
+the parent offset and child descriptor. FAT32 validation covers primary/backup
+BPBs, hidden start/count, FAT and cluster geometry, both FSInfo copies, and the
+root volume label. NTFS validation covers primary/backup BPBs, hidden
+start/count, cluster/MFT geometry, update-sequence fixups for MFT record 3, and
+the exact resident `$VOLUME_NAME`. The final receipt binds the request plan hash,
+exact child major:minor, partition geometry, filesystem, sector/cluster geometry,
+normalized label, and metadata SHA-256; the unprivileged runner and workflow
+validate every field before reporting success.
+
+Cancellation before COMMIT proves no target mutation. After COMMIT, cancellation
+is deferred while durability and verification complete. A post-COMMIT failure
+re-attests the retained target before durably zeroing and reading back its first
+and last 16 MiB; if that cleanup cannot be proved, the GUI reports the target
+state as unknown. This operation is logical overwrite plus ordinary filesystem
+creation, not ATA Secure Erase, NVMe Sanitize, cryptographic erasure, flash-spare
+erasure, bad-block testing, or Rufus/Windows slow filesystem checking. Installed
+PolicyKit VM fault/hot-swap tests and representative physical-media certification
+remain release-confidence gates.
+
 ## Boot-time corruption-check boundary
 
 The default-off boot-time option is deliberately narrower than its payload

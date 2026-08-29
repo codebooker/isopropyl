@@ -7,15 +7,15 @@
   <vendor_url>https://github.com/codebooker/isopropyl</vendor_url>
   <icon_name>io.github.codebooker.isopropyl</icon_name>
 
-  <action id="io.github.codebooker.isopropyl.restore-device">
-    <description>Fully erase and format a removable USB or SD drive</description>
-    <message>Authentication is required to fully erase, repartition, and format the selected removable USB or SD target</message>
+  <action id="io.github.codebooker.isopropyl.restore-device-v2">
+    <description>Logically overwrite and format a removable USB or SD drive</description>
+    <message>Authentication is required to logically overwrite, repartition, and format the selected removable USB or SD target</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/isopropyl-restore-device-helper</annotate>
-    <annotate key="org.freedesktop.policykit.exec.argv1">restore-device-v1</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">restore-device-v2</annotate>
   </action>
 </policyconfig>

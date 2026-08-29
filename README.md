@@ -58,7 +58,7 @@ identity, and require an explicit confirmation.
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, can generate a reviewed `autounattend.xml`, and offers a narrowly profiled Windows 2023-generation installer-boot update for exact supported Microsoft media. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
-| **Drive tools** | Backs up drives, restores ordinary filesystems with Quick format, captures optical discs, performs logical zeroing, and runs bad-block or fake-capacity tests. A non-GUI Verified zero + format prototype remains unreleased pending installed VM and physical-media certification; it is not Rufus/Windows slow formatting. |
+| **Drive tools** | Backs up drives, restores ordinary filesystems with Quick format, captures optical discs, performs logical zeroing, and runs bad-block or fake-capacity tests. Removable FAT32/NTFS targets can instead use **Verified full overwrite + format**: one authenticated transaction scans the complete drive, zeroes nonzero chunks, verifies every byte as zero, creates the filesystem, and independently parses its on-disk metadata. It is not hardware Secure Erase, sanitization, or Rufus/Windows slow filesystem formatting. |
 | **Linux image download** | Downloads the pinned Ubuntu LTS profile from distribution-owned infrastructure and verifies its signed checksum manifest. |
 | **Windows image download** | Acquires exact current Windows 11 25H2 v2 English x64 or ARM64 consumer media directly from Microsoft, checks the selected profile's live published hash row, resumes privately, and verifies the complete SHA-256 before use. |
 | **FreeDOS image download** | Downloads the official FreeDOS 1.4 LiteUSB or FullUSB archive at runtime, corroborates the project-pinned archive SHA-256 against FreeDOS's live verification page, validates the exact ZIP catalog and reviewed inner image hash, then loads the image into the guarded raw writer. |
@@ -272,18 +272,27 @@ logical erasure is required.
 ### Restore a drive as ordinary storage
 
 Open **Drive tools… → Restore drive…** and choose the filesystem, partition
-table, allocation or block size, and volume label. The released GUI performs
-Quick filesystem creation: it replaces the layout and filesystem metadata
-without overwriting every previous data byte.
+table, allocation or block size, volume label, and erase method. **Quick format**
+is the default and supports every listed filesystem; it replaces the layout and
+filesystem metadata without overwriting every previous data byte.
 
-Verified zero + format is not a released user workflow. Its non-GUI prototype
-combines a complete verified logical zero pass with later filesystem creation.
-A descriptor-bound privileged transaction and isolated PolicyKit endpoint now
-exist, but the desktop workflow and installed VM hot-swap/failure certification
-are not complete. It is not Rufus/Windows slow format, Secure Erase,
-sanitization, or a bad-block test. Normal users who need logical erasure should
-run **Erase drive with zeros**, wait for verified completion, and then run
-**Restore drive**.
+For a removable USB or SD/MMC target with a stable serial/WWN and a supported
+sector size, FAT32 and NTFS also offer **Verified full overwrite + format**.
+After a target-bound typed confirmation, one isolated PolicyKit transaction
+retains exclusive ownership while it:
+
+1. reads the complete device and zeroes every chunk that is not already zero;
+2. flushes and reads every logical byte back as zero;
+3. writes the exact MBR/GPT single-partition layout and runs ordinary `mkfs`; and
+4. independently reads FAT32 or NTFS metadata through both the retained whole
+   disk and exact child descriptors, returning a plan-bound receipt.
+
+Mounted volumes must be unmounted or ejected first. The operation can require
+two complete reads plus one complete write and may take many hours. It is a
+logical host overwrite—not Rufus/Windows slow filesystem checking, ATA Secure
+Erase, NVMe Sanitize, cryptographic erasure, or a bad-block test. Installed VM
+hot-swap/failure testing and representative physical-media certification remain
+release-confidence gates.
 
 ### Logically zero a drive
 

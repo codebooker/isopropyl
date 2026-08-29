@@ -157,6 +157,9 @@ class ProtocolTests(unittest.TestCase):
     def test_request_rejects_flags_padding_digest_and_geometry_changes(self) -> None:
         original = bytearray(protocol.pack_restore_device_request(request()))
         mutations = []
+        old_version = bytearray(original)
+        old_version[16] = 1
+        mutations.append(old_version)
         flags = bytearray(original)
         flags[18] = 1
         mutations.append(flags)
@@ -183,7 +186,8 @@ class ProtocolTests(unittest.TestCase):
         commit = protocol.pack_restore_control(REQUEST_ID, digest, commit=True)
         self.assertEqual(protocol._CONTROL.unpack(commit)[2], protocol.PACKET_COMMIT)
         prepared = protocol._CONTROL.pack(
-            protocol._WIRE_MAGIC, 1, protocol.PACKET_PREPARED, 0, REQUEST_ID,
+            protocol._WIRE_MAGIC, protocol._WIRE_VERSION,
+            protocol.PACKET_PREPARED, 0, REQUEST_ID,
             digest,
         )
         self.assertEqual(
@@ -199,7 +203,8 @@ class ProtocolTests(unittest.TestCase):
             commit[:-1],
             commit[:-1] + bytes((commit[-1] ^ 1,)),
             protocol._CONTROL.pack(
-                protocol._WIRE_MAGIC, 1, protocol.PACKET_COMMIT, 0,
+                protocol._WIRE_MAGIC, protocol._WIRE_VERSION,
+                protocol.PACKET_COMMIT, 0,
                 bytes(reversed(REQUEST_ID)), digest,
             ),
         ):
@@ -352,32 +357,73 @@ class FakeProcess:
 
     def send_prepared(self, value) -> None:
         self.channel.sendall(protocol._CONTROL.pack(
-            protocol._WIRE_MAGIC, 1, protocol.PACKET_PREPARED, 0, value.request_id,
+            protocol._WIRE_MAGIC, protocol._WIRE_VERSION,
+            protocol.PACKET_PREPARED, 0, value.request_id,
             value.plan_sha256,
         ))
 
     def send_progress(self, value, phase: int, done: int, total: int | None = None) -> None:
         self.channel.sendall(protocol._PROGRESS.pack(
-            protocol._WIRE_MAGIC, 1, protocol.PACKET_PROGRESS, 0,
+            protocol._WIRE_MAGIC, protocol._WIRE_VERSION,
+            protocol.PACKET_PROGRESS, 0,
             value.request_id, phase, done,
             value.expected_capacity if total is None else total,
         ))
 
+    def result_packet(self, value) -> bytes:
+        metadata_sha256 = b"m" * 32
+        sectors_per_cluster = 8
+        normalized_label = value.plan.label
+        receipt = protocol.FilesystemReceipt(
+            value.plan.filesystem,
+            "8:241",
+            value.partition_start_sector,
+            value.partition_sector_count,
+            value.logical_sector_size,
+            sectors_per_cluster,
+            value.logical_sector_size * sectors_per_cluster,
+            normalized_label,
+            metadata_sha256,
+            protocol._filesystem_receipt_digest(
+                value,
+                value.plan.filesystem,
+                "8:241",
+                sectors_per_cluster,
+                normalized_label,
+                metadata_sha256,
+            ),
+        )
+        result = protocol.RestoreDeviceResult(
+            value.request_id,
+            protocol.RESTORE_DEVICE_PROFILE,
+            value.plan.device_path,
+            value.expected_major_minor,
+            value.expected_disk_sequence,
+            value.expected_capacity,
+            value.logical_sector_size,
+            protocol.PartitionObservation(
+                "/dev/sdz1", os.makedev(8, 241), os.makedev(8, 240), 1,
+                value.partition_start_sector, value.partition_sector_count,
+            ),
+            value.expected_capacity,
+            value.expected_capacity // 2,
+            value.expected_capacity // 2,
+            value.expected_capacity,
+            value.plan.filesystem,
+            receipt,
+            True,
+            True,
+        )
+        return protocol.pack_restore_device_result(value, result)
+
     def send_result(self, value) -> None:
-        self.channel.sendall(protocol._RESULT.pack(
-            protocol._WIRE_MAGIC, 1, protocol.PACKET_RESULT, 0,
-            value.request_id, 8, 240, value.expected_disk_sequence,
-            value.expected_capacity, value.expected_capacity,
-            value.expected_capacity // 2, value.expected_capacity // 2,
-            value.expected_capacity, 8, 241,
-            value.partition_start_sector, value.partition_sector_count,
-            value.plan_sha256,
-        ))
+        self.channel.sendall(self.result_packet(value))
 
     def _serve(self) -> None:
         try:
             self.channel.sendall(protocol._HEADER.pack(
-                protocol._WIRE_MAGIC, 1, protocol.PACKET_READY, 0,
+                protocol._WIRE_MAGIC, protocol._WIRE_VERSION,
+                protocol.PACKET_READY, 0,
             ))
             incoming = self.channel.recv(protocol.MAX_PROTOCOL_PACKET)
             value = protocol.unpack_restore_device_request(
@@ -502,6 +548,13 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertTrue(worker.committed)
         self.assertEqual(result.verified_bytes, CAPACITY)
+        self.assertIs(result.filesystem, protocol.Filesystem.FAT32)
+        self.assertEqual(result.logical_sector_size, 512)
+        self.assertEqual(result.sectors_per_cluster, 8)
+        self.assertEqual(result.cluster_size, 4096)
+        self.assertEqual(result.normalized_label, "TEST")
+        self.assertEqual(len(result.metadata_sha256), 32)
+        self.assertEqual(len(result.filesystem_receipt_sha256), 32)
         self.assertEqual(progress, [
             ("zero-scan", CAPACITY, CAPACITY),
             ("zero-readback", CAPACITY, CAPACITY),
@@ -513,7 +566,8 @@ class RunnerTests(unittest.TestCase):
             def _serve(self) -> None:
                 try:
                     self.channel.sendall(protocol._HEADER.pack(
-                        protocol._WIRE_MAGIC, 1, protocol.PACKET_READY, 0,
+                        protocol._WIRE_MAGIC, protocol._WIRE_VERSION,
+                        protocol.PACKET_READY, 0,
                     ))
                     value = protocol.unpack_restore_device_request(
                         self.channel.recv(protocol.MAX_PROTOCOL_PACKET),
@@ -521,7 +575,7 @@ class RunnerTests(unittest.TestCase):
                     )
                     self.channel.sendall(protocol._CONTROL.pack(
                         protocol._WIRE_MAGIC,
-                        1,
+                        protocol._WIRE_VERSION,
                         protocol.PACKET_PREPARED,
                         0,
                         value.request_id,
@@ -641,6 +695,42 @@ class RunnerTests(unittest.TestCase):
                 self.assertTrue(worker.committed)
                 self.assertFalse(processes[0].terminated)
                 self.assertFalse(processes[0].killed)
+
+    def test_runner_rejects_forged_post_format_receipt_or_child(self) -> None:
+        def forged_digest(process, value):
+            process.send_progress(value, 1, value.expected_capacity)
+            process.send_progress(value, 2, value.expected_capacity)
+            packet = bytearray(process.result_packet(value))
+            packet[-1] ^= 1
+            process.channel.sendall(packet)
+
+        installation = runner.RestoreDeviceInstallation("p", "h", "s", "x")
+
+        def forged_child(process, value):
+            process.send_progress(value, 1, value.expected_capacity)
+            process.send_progress(value, 2, value.expected_capacity)
+            fields = list(protocol._RESULT.unpack(process.result_packet(value)))
+            fields[14] += 1
+            process.channel.sendall(protocol._RESULT.pack(*fields))
+
+        for name, script in (
+            ("digest", forged_digest),
+            ("child", forged_child),
+        ):
+            with self.subTest(forgery=name):
+                worker = runner.RestoreDeviceRunner(
+                    installation=lambda: installation,
+                    popen=lambda *args, **kwargs: FakeProcess(
+                        *args, script=script, **kwargs,
+                    ),
+                    timeout=2,
+                )
+                with self.assertRaisesRegex(
+                    runner.RestoreDeviceRunError,
+                    "filesystem receipt is invalid",
+                ):
+                    worker.run(request(), confirm_commit=lambda: True)
+                self.assertTrue(worker.committed)
 
     def test_progress_callback_failure_is_logged_and_ignored(self) -> None:
         installation = runner.RestoreDeviceInstallation("p", "h", "s", "x")

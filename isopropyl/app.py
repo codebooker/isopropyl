@@ -64,7 +64,7 @@ from .extraction import (
     ExtractionCancelled, SafeIsoExtractor, build_extraction_plan,
 )
 from .formatting import (
-    Filesystem as FormatFilesystem, FormatCancelled, FormatExecutor,
+    Filesystem as FormatFilesystem, FormatCancelled, FormatExecutor, FormatPlan,
     PartitionTable as FormatPartitionTable, create_format_plan,
     restore_allocation_unit_sizes, restore_filesystem_geometry_supported,
 )
@@ -129,6 +129,10 @@ from .raw_device_runner import RawDeviceWriteResult
 from .raw_workflow import (
     RawWorkflowCancelled, RawWorkflowError, RawWriteWorkflow,
 )
+from .restore_workflow import (
+    RestoreWorkflow, RestoreWorkflowCancelled, RestoreWorkflowError,
+    RestoreWorkflowPlan, RestoreWorkflowResult,
+)
 from .settings import (
     SettingsStore, application_settings, parse_application_arguments,
     portable_settings_path, settings_sync_error, settings_sync_was_committed,
@@ -186,6 +190,8 @@ from .zip_overlay import (
 
 
 FAST_ZERO_MODE = "fast-zero"
+RESTORE_METHOD_QUICK = "quick"
+RESTORE_METHOD_VERIFIED = "verified-overwrite"
 WINDOWS_DUAL_TRANSITIONAL_BLOCKER = (
     "BIOS construction is not enabled; choose UEFI-only or use DD mode."
 )
@@ -380,6 +386,8 @@ class Bridge(QObject):
     raw_execution_finished = pyqtSignal(object, object)
     fast_zero_preparation_finished = pyqtSignal(object, object)
     fast_zero_execution_finished = pyqtSignal(object, object)
+    restore_preparation_finished = pyqtSignal(object, object)
+    restore_execution_finished = pyqtSignal(object, object)
 
 
 class Window(QMainWindow):
@@ -424,6 +432,8 @@ class Window(QMainWindow):
         self.raw_confirmation_dialog: QDialog | None = None
         self.fast_zero_workflow: FastZeroWorkflow | None = None
         self.fast_zero_confirmation_dialog: QDialog | None = None
+        self.restore_workflow: RestoreWorkflow | None = None
+        self.restore_confirmation_dialog: QDialog | None = None
         self.imager: DriveImager | VirtualDriveImager | None = None
         self.formatter: FormatExecutor | None = None
         self.media_runner: MediaTestRunner | None = None
@@ -544,6 +554,12 @@ class Window(QMainWindow):
         )
         self.bridge.fast_zero_execution_finished.connect(
             self.on_fast_zero_execution_finished
+        )
+        self.bridge.restore_preparation_finished.connect(
+            self.on_restore_preparation_finished
+        )
+        self.bridge.restore_execution_finished.connect(
+            self.on_restore_execution_finished
         )
         QShortcut(QKeySequence.StandardKey.Open, self, activated=self.choose_image)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_devices)
@@ -2889,6 +2905,7 @@ class Window(QMainWindow):
         return any((
             self.raw_workflow,
             self.fast_zero_workflow,
+            self.restore_workflow,
             self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner,
             self.extractor,
@@ -3524,6 +3541,14 @@ class Window(QMainWindow):
 
     def on_progress(self, done: int, total: int, stage: str) -> None:
         if (
+            self.restore_workflow is not None
+            and self.restore_workflow.committed
+        ):
+            # The isolated helper deliberately completes its durability and
+            # read-back transaction after COMMIT.  A UI cancel is remembered,
+            # but must not terminate that privileged transaction halfway.
+            self.cancel_button.setEnabled(False)
+        if (
             (
                 self.syslinux_workflow is not None
                 or self.windows_device_runner is not None
@@ -3561,6 +3586,11 @@ class Window(QMainWindow):
         if fast_zero_workflow is not None:
             fast_zero_workflow.close()
         self.fast_zero_confirmation_dialog = None
+        restore_workflow = self.restore_workflow
+        self.restore_workflow = None
+        if restore_workflow is not None:
+            restore_workflow.close()
+        self.restore_confirmation_dialog = None
         self.imager = None
         self.formatter = None
         self.media_runner = None
@@ -3664,6 +3694,7 @@ class Window(QMainWindow):
         active = tuple(filter(None, (
             self.raw_workflow,
             self.fast_zero_workflow,
+            self.restore_workflow,
             self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner, self.extractor,
             self.iso_stager, self.constructed_writer,
@@ -3681,7 +3712,15 @@ class Window(QMainWindow):
             self.windows_downloader,
         )))
         if active:
-            self.status.setText("Stopping…")
+            restore_committed = bool(
+                self.restore_workflow is not None
+                and self.restore_workflow.committed
+            )
+            self.status.setText(
+                "Finishing the committed restore safely…"
+                if restore_committed
+                else "Stopping…"
+            )
             self.cancel_button.setEnabled(False)
             for operation in active:
                 operation.cancel()
@@ -3689,6 +3728,8 @@ class Window(QMainWindow):
                 self.raw_confirmation_dialog.reject()
             if self.fast_zero_confirmation_dialog is not None:
                 self.fast_zero_confirmation_dialog.reject()
+            if self.restore_confirmation_dialog is not None:
+                self.restore_confirmation_dialog.reject()
             if self.syslinux_confirmation_dialog is not None:
                 self.syslinux_confirmation_dialog.reject()
             if self.windows_dual_confirmation_dialog is not None:
@@ -4354,6 +4395,22 @@ class Window(QMainWindow):
         )
         notice.setWordWrap(True)
         layout.addWidget(notice)
+        layout.addWidget(QLabel("Erase method"))
+        method = QComboBox()
+        method.setObjectName("restoreEraseMethod")
+        method.addItem(
+            "Quick format — replace partition table and filesystem",
+            RESTORE_METHOD_QUICK,
+        )
+        layout.addWidget(method)
+        method_note = QLabel()
+        method_note.setObjectName("restoreEraseMethodNote")
+        method_note.setWordWrap(True)
+        method_note.setText(
+            "Quick format replaces filesystem metadata; old data in unwritten "
+            "areas may remain recoverable."
+        )
+        layout.addWidget(method_note)
         layout.addWidget(QLabel("Filesystem"))
         filesystem = QComboBox()
         filesystem.setObjectName("restoreFilesystem")
@@ -4407,6 +4464,62 @@ class Window(QMainWindow):
         allocation_note.setObjectName("muted")
         layout.addWidget(allocation_note)
 
+        def verified_restore_supported() -> bool:
+            return bool(
+                device.removable is True
+                and device.transport in {"usb", "mmc"}
+                and device.read_only is False
+                and device.logical_sector_size in {512, 1024, 2048, 4096}
+                and (device.serial or device.wwn)
+                and filesystem.currentData()
+                in {FormatFilesystem.FAT32, FormatFilesystem.NTFS}
+            )
+
+        def refresh_restore_method() -> None:
+            previous = method.currentData()
+            method.blockSignals(True)
+            method.clear()
+            method.addItem(
+                "Quick format — replace partition table and filesystem",
+                RESTORE_METHOD_QUICK,
+            )
+            if verified_restore_supported():
+                method.addItem(
+                    "Verified full overwrite + format — slowest, strongest check",
+                    RESTORE_METHOD_VERIFIED,
+                )
+            if previous == RESTORE_METHOD_VERIFIED and method.count() > 1:
+                method.setCurrentIndex(1)
+            else:
+                method.setCurrentIndex(0)
+            method.blockSignals(False)
+            method.setEnabled(method.count() > 1)
+            update_restore_method_note()
+
+        def update_restore_method_note() -> None:
+            if method.currentData() == RESTORE_METHOD_VERIFIED:
+                method_note.setText(
+                    "Reads the complete device, writes zeros to every nonzero "
+                    "chunk, reads every byte back as zero, then creates and "
+                    "independently verifies FAT32/NTFS metadata. This can require "
+                    "two complete reads plus one complete write and may take many "
+                    "hours. It is a logical overwrite, not hardware secure erase "
+                    "or sanitization. Unmount/eject mounted volumes first."
+                )
+            elif verified_restore_supported():
+                method_note.setText(
+                    "Quick format replaces filesystem metadata; old data in "
+                    "unwritten areas may remain recoverable. Choose Verified full "
+                    "overwrite for a complete zero read-back before formatting."
+                )
+            else:
+                method_note.setText(
+                    "Quick format replaces filesystem metadata; old data in "
+                    "unwritten areas may remain recoverable. Verified full overwrite "
+                    "requires removable USB/SD media with a stable serial or WWN, a "
+                    "known 512/1024/2048/4096-byte sector size, and FAT32 or NTFS."
+                )
+
         def refresh_allocation_units() -> None:
             selected_filesystem = filesystem.currentData()
             selected_table = table.currentData()
@@ -4443,6 +4556,7 @@ class Window(QMainWindow):
                 )
             allocation.blockSignals(False)
             allocation.setEnabled(allocation.count() > 1)
+            refresh_restore_method()
             review = buttons.button(QDialogButtonBox.StandardButton.Ok)
             review.setEnabled(filesystem.count() > 0 and allocation.count() > 0)
             if selected_filesystem in {
@@ -4532,6 +4646,7 @@ class Window(QMainWindow):
 
         filesystem.currentIndexChanged.connect(refresh_allocation_units)
         table.currentIndexChanged.connect(refresh_restore_geometry)
+        method.currentIndexChanged.connect(update_restore_method_note)
         refresh_restore_geometry()
         if filesystem.count() == 0:
             gpt_index = table.findData(FormatPartitionTable.GPT)
@@ -4560,6 +4675,9 @@ class Window(QMainWindow):
             )
             if fixed != QMessageBox.StandardButton.Yes:
                 return
+        if method.currentData() == RESTORE_METHOD_VERIFIED:
+            self.start_verified_restore(device, plan)
+            return
         answer = QMessageBox.warning(
             self, "Erase and restore this drive?",
             f"ALL DATA WILL BE ERASED\n\n{self.display_device(device)}\n"
@@ -4618,6 +4736,297 @@ class Window(QMainWindow):
                 self.bridge.finished.emit(False, str(error))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def start_verified_restore(self, device: Device, plan: FormatPlan) -> None:
+        """Prepare one authenticated full-overwrite-and-format transaction."""
+
+        if self.operation_active:
+            return
+        try:
+            workflow = RestoreWorkflow(device, plan)
+        except RestoreWorkflowError as error:
+            QMessageBox.warning(self, "Verified restore unavailable", str(error))
+            return
+        self.restore_workflow = workflow
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Preparing an exact verified-restore target plan…")
+
+        def work() -> None:
+            try:
+                prepared = workflow.prepare()
+            except BaseException as error:
+                self.bridge.restore_preparation_finished.emit(workflow, error)
+            else:
+                self.bridge.restore_preparation_finished.emit(workflow, prepared)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_restore_preparation_finished(
+        self,
+        workflow: RestoreWorkflow,
+        outcome: object,
+    ) -> None:
+        if workflow is not self.restore_workflow:
+            workflow.close()
+            return
+        if isinstance(outcome, RestoreWorkflowCancelled):
+            self.release_restore_workflow(
+                "Verified restore cancelled before target mutation.",
+                refresh=True,
+            )
+            return
+        if isinstance(outcome, BaseException):
+            self.logger.error("Verified-restore preparation failed: %s", outcome)
+            self.bridge.finished.emit(
+                False,
+                "Verified restore preparation failed before target mutation.\n\n"
+                f"{outcome}",
+            )
+            return
+        if type(outcome) is not RestoreWorkflowPlan or outcome is not workflow.plan:
+            self.bridge.finished.emit(
+                False,
+                "Verified restore preparation returned a non-authoritative plan; "
+                "the target was not mutated.",
+            )
+            return
+
+        phrase = self.confirm_restore_plan(outcome)
+        if phrase is None:
+            self.release_restore_workflow(
+                "Verified restore cancelled before target mutation.",
+                refresh=False,
+            )
+            return
+        try:
+            workflow.confirm(phrase)
+        except RestoreWorkflowCancelled:
+            self.release_restore_workflow(
+                "Verified restore cancelled before target mutation.",
+                refresh=True,
+            )
+            return
+        except RestoreWorkflowError as error:
+            self.bridge.finished.emit(
+                False,
+                "Verified restore confirmation failed before target mutation.\n\n"
+                f"{error}",
+            )
+            return
+
+        self.logger.info(
+            "Confirmed verified restore: plan=%s target=%s filesystem=%s table=%s",
+            outcome.plan_sha256,
+            outcome.device.identity,
+            outcome.format_plan.filesystem.value,
+            outcome.format_plan.partition_table.value,
+        )
+        self.status.setText("Starting the authenticated verified-restore transaction…")
+
+        def progress(stage: str, done: int, total: int) -> None:
+            label = {
+                "zero-scan": "Scanning and zeroing nonzero blocks",
+                "zero-readback": "Verifying every block is zero",
+            }.get(stage, stage.replace("-", " ").capitalize())
+            self.bridge.progress.emit(done, total, label)
+            if stage == "zero-readback" and done == total:
+                self.bridge.status_changed.emit(
+                    "Creating and independently verifying the filesystem…"
+                )
+
+        def work() -> None:
+            try:
+                result = workflow.execute(progress)
+            except BaseException as error:
+                self.bridge.restore_execution_finished.emit(workflow, error)
+            else:
+                self.bridge.restore_execution_finished.emit(workflow, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def confirm_restore_plan(self, plan: RestoreWorkflowPlan) -> str | None:
+        device = plan.device
+        model = " ".join(
+            part.strip() for part in (device.vendor, device.model) if part.strip()
+        ) or "not reported"
+        serial = device.serial or device.wwn or "not reported"
+        format_plan = plan.format_plan
+        request = plan.request
+
+        dialog = QDialog(self)
+        dialog.setObjectName("restoreConfirmationDialog")
+        dialog.setWindowTitle("Final verified-restore confirmation")
+        dialog.setMinimumWidth(740)
+        layout = QVBoxLayout(dialog)
+        warning = QLabel(
+            "ALL DATA ON THIS EXACT TARGET WILL BE OVERWRITTEN AND THE DRIVE "
+            "WILL BE REFORMATTED AFTER CONFIRMATION"
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
+        layout.addWidget(warning)
+
+        explanation = QLabel(
+            "ISOpropyl will scan the complete device, zero every nonzero chunk, "
+            "read the complete device back as zero, create the requested "
+            "filesystem, and independently parse its on-disk metadata. This is a "
+            "logical overwrite—not hardware secure erase or sanitization—and can "
+            "require two full reads plus one full write."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        details = QPlainTextEdit()
+        details.setObjectName("restoreConfirmationDetails")
+        details.setReadOnly(True)
+        allocation = (
+            "formatter default"
+            if format_plan.allocation_unit_size is None
+            else f"{format_plan.allocation_unit_size:,} bytes"
+        )
+        details.setPlainText(
+            f"Target path: {device.path}\n"
+            f"Target model: {model}\n"
+            f"Target serial/WWN: {serial}\n"
+            f"Target capacity: {self.display_size(device.size)} "
+            f"({device.size:,} bytes)\n"
+            f"Kernel identity: {device.major_minor}\n"
+            f"Logical sector: {device.logical_sector_size:,} bytes\n\n"
+            f"Partition table: {format_plan.partition_table.value.upper()}\n"
+            f"Filesystem: {format_plan.filesystem.value.upper()}\n"
+            f"Volume label: {format_plan.label or '(none)'}\n"
+            f"Allocation unit: {allocation}\n"
+            f"Partition start: sector {request.partition_start_sector:,}\n"
+            f"Partition length: {request.partition_sector_count:,} sectors\n\n"
+            f"Plan SHA-256: {plan.plan_sha256}"
+        )
+        details.setMinimumHeight(310)
+        layout.addWidget(details)
+
+        instruction = QLabel(
+            "Type the exact phrase below to authorize this one target:\n"
+            f"{plan.confirmation_phrase}"
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+        phrase = QLineEdit()
+        phrase.setObjectName("restoreConfirmationPhrase")
+        phrase.setPlaceholderText(plan.confirmation_phrase)
+        layout.addWidget(phrase)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        start = buttons.addButton(
+            "Overwrite and format",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        start.setObjectName("restoreConfirmButton")
+        start.setEnabled(False)
+        phrase.textChanged.connect(
+            lambda value: start.setEnabled(value == plan.confirmation_phrase)
+        )
+        start.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        self.restore_confirmation_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return phrase.text()
+        finally:
+            if self.restore_confirmation_dialog is dialog:
+                self.restore_confirmation_dialog = None
+
+    def _restore_accounting(self, result: RestoreWorkflowResult) -> str:
+        return (
+            f"scanned {self.display_size(result.scanned_bytes)} "
+            f"({result.scanned_bytes:,} bytes), wrote "
+            f"{self.display_size(result.written_bytes)} "
+            f"({result.written_bytes:,} bytes in nonzero chunks), skipped "
+            f"{self.display_size(result.skipped_bytes)} "
+            f"({result.skipped_bytes:,} already-zero bytes), and verified "
+            f"{self.display_size(result.verified_bytes)} "
+            f"({result.verified_bytes:,} bytes)"
+        )
+
+    @staticmethod
+    def _restore_unknown_state_message(reason: str) -> str:
+        return (
+            f"{reason}\n\nISOpropyl did not receive authoritative proof that the "
+            "committed overwrite, filesystem creation, and metadata verification "
+            "all completed. Keep the drive connected until activity stops, then "
+            "run Restore again before trusting or reusing it."
+        )
+
+    def on_restore_execution_finished(
+        self,
+        workflow: RestoreWorkflow,
+        outcome: object,
+    ) -> None:
+        if workflow is not self.restore_workflow:
+            workflow.close()
+            return
+        committed = workflow.committed
+        if isinstance(outcome, RestoreWorkflowCancelled):
+            if committed:
+                self.bridge.finished.emit(
+                    False,
+                    self._restore_unknown_state_message(
+                        "Verified restore was cancelled after COMMIT."
+                    ),
+                )
+            else:
+                self.release_restore_workflow(
+                    "Verified restore cancelled before target mutation.",
+                    refresh=True,
+                )
+            return
+        if isinstance(outcome, BaseException):
+            self.logger.error("Verified restore execution failed: %s", outcome)
+            message = (
+                self._restore_unknown_state_message(str(outcome))
+                if committed
+                else "Verified restore failed before target mutation.\n\n"
+                f"{outcome}"
+            )
+            self.bridge.finished.emit(False, message)
+            return
+        if type(outcome) is not RestoreWorkflowResult or outcome is not workflow.result:
+            self.bridge.finished.emit(
+                False,
+                self._restore_unknown_state_message(
+                    "The privileged restore returned a non-authoritative result."
+                ),
+            )
+            return
+        deferred = (
+            " A cancellation request arrived after COMMIT, so ISOpropyl deferred it "
+            "until the safety checks completed."
+            if outcome.cancellation_deferred
+            else ""
+        )
+        message = (
+            f"Verified restore complete: ISOpropyl {self._restore_accounting(outcome)}. "
+            f"The new {outcome.filesystem.upper()} filesystem uses "
+            f"{outcome.cluster_size:,}-byte clusters and its independently parsed "
+            f"metadata receipt is {outcome.filesystem_receipt_sha256.hex()}."
+            f"{deferred} Eject it with your desktop before unplugging it."
+        )
+        self.bridge.finished.emit(True, message)
+
+    def release_restore_workflow(self, message: str, *, refresh: bool) -> None:
+        workflow = self.restore_workflow
+        self.restore_workflow = None
+        if workflow is not None:
+            workflow.close()
+        self.restore_confirmation_dialog = None
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.set_busy(False)
+        self.status.setText(message)
+        if refresh:
+            self.refresh_devices()
 
     def erase_drive(self) -> None:
         device = self.selected_device()

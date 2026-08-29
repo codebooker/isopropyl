@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (
 )
 
 from isopropyl.app import (
-    FAST_ZERO_MODE, BackgroundPreparation, ChecksumToken,
+    FAST_ZERO_MODE, RESTORE_METHOD_QUICK, RESTORE_METHOD_VERIFIED,
+    BackgroundPreparation, ChecksumToken,
     FreeDosDownloadToken,
     IsoStagingPreparationRequest,
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
@@ -46,6 +47,7 @@ from isopropyl.dbx import (
 )
 from isopropyl.formatting import (
     Filesystem as FormatFilesystem, PartitionTable as FormatPartitionTable,
+    create_format_plan,
 )
 from isopropyl.fast_zero import (
     FastZeroCancelled, FastZeroHelperUnavailable, FastZeroPartialFailure,
@@ -77,6 +79,10 @@ from isopropyl.runtime_validation import (
 from isopropyl.raw_device import RawDeviceWritePlan
 from isopropyl.raw_device_runner import RawDeviceWriteResult
 from isopropyl.raw_workflow import RawWorkflowCancelled, RawWorkflowError
+from isopropyl.restore_workflow import (
+    RestoreWorkflowCancelled, RestoreWorkflowError, RestoreWorkflowPlan,
+    RestoreWorkflowResult,
+)
 from isopropyl.syslinux_workflow import SyslinuxWorkflowState
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.uefi_shell import UefiShellCancelled, UefiShellStage
@@ -297,6 +303,121 @@ class FakeRawWorkflow:
         ):
             self.progress_stages.append(stage)
             progress(stage, 4096, 4096)
+        return self.result
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def fake_restore_plan(target: Device | None = None) -> RestoreWorkflowPlan:
+    selected = target or device()
+    format_plan = create_format_plan(
+        selected,
+        FormatFilesystem.FAT32,
+        FormatPartitionTable.MBR,
+        "USB",
+    )
+    plan = object.__new__(RestoreWorkflowPlan)
+    values = {
+        "device": selected,
+        "format_plan": format_plan,
+        "observation": SimpleNamespace(disk_sequence=43),
+        "request": SimpleNamespace(
+            request_id=b"r" * 16,
+            partition_start_sector=2048,
+            partition_sector_count=(
+                selected.size // selected.logical_sector_size
+            ) - 2048,
+        ),
+        "stable_identity_digest": "A1B2C3D4E5F60708",
+        "confirmation_phrase": (
+            f"ERASE FORMAT {selected.path} {selected.size} ID-A1B2C3D4E5F60708"
+        ),
+        "plan_sha256": "a" * 64,
+    }
+    for name, value in values.items():
+        object.__setattr__(plan, name, value)
+    return plan
+
+
+def fake_restore_result(target: Device | None = None) -> RestoreWorkflowResult:
+    selected = target or device()
+    return RestoreWorkflowResult(
+        "a" * 64,
+        selected.identity,
+        b"r" * 16,
+        selected.major_minor,
+        "65:145",
+        43,
+        selected.size,
+        2048,
+        (selected.size // selected.logical_sector_size) - 2048,
+        selected.size,
+        4 * 1024**3,
+        selected.size - 4 * 1024**3,
+        selected.size,
+        selected.logical_sector_size,
+        "fat32",
+        8,
+        4096,
+        "USB",
+        b"m" * 32,
+        b"f" * 32,
+        False,
+    )
+
+
+class FakeRestoreWorkflow:
+    def __init__(
+        self,
+        target: Device | None = None,
+        *,
+        prepare_error: BaseException | None = None,
+        execute_error: BaseException | None = None,
+        committed: bool = False,
+    ) -> None:
+        self.device = target or device()
+        self.plan = fake_restore_plan(self.device)
+        self.result = fake_restore_result(self.device)
+        self.prepare_error = prepare_error
+        self.execute_error = execute_error
+        self.prepared = False
+        self.confirmed_phrase: str | None = None
+        self.executed = False
+        self.cancelled = False
+        self.closed = False
+        self.committed = committed
+        self.progress_stages: list[str] = []
+
+    def prepare(self) -> RestoreWorkflowPlan:
+        if self.cancelled:
+            raise RestoreWorkflowCancelled("cancelled")
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        self.prepared = True
+        return self.plan
+
+    def confirm(self, phrase: str) -> object:
+        if self.cancelled:
+            raise RestoreWorkflowCancelled("cancelled")
+        if phrase != self.plan.confirmation_phrase:
+            raise RestoreWorkflowError("confirmation mismatch")
+        self.confirmed_phrase = phrase
+        return object()
+
+    def execute(self, progress) -> RestoreWorkflowResult:
+        if self.cancelled and not self.committed:
+            raise RestoreWorkflowCancelled("cancelled")
+        self.executed = True
+        if self.execute_error is not None:
+            raise self.execute_error
+        self.committed = True
+        for stage in ("zero-scan", "zero-readback"):
+            self.progress_stages.append(stage)
+            progress(stage, self.device.size, self.device.size)
         return self.result
 
     def cancel(self) -> None:
@@ -847,6 +968,221 @@ class RestoreFilesystemDialogTests(unittest.TestCase):
         self.assertFalse(observed["udf_enabled"])
         self.assertEqual(observed["ext"], (None, 1024, 2048, 4096))
         self.assertIn("Filesystem block size", observed["labels"])
+
+
+class WindowVerifiedRestoreTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
+            self.window = Window()
+        self.window.size_unit_mode = SizeUnitMode.SI
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+
+    def tearDown(self) -> None:
+        self.window.restore_workflow = None
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+        self.settings_home.cleanup()
+
+    def test_selector_keeps_quick_default_and_removes_verified_for_ext4(self):
+        observed: dict[str, object] = {}
+
+        def inspect(dialog: QDialog) -> int:
+            filesystem = dialog.findChild(QComboBox, "restoreFilesystem")
+            method = dialog.findChild(QComboBox, "restoreEraseMethod")
+            note = dialog.findChild(QLabel, "restoreEraseMethodNote")
+            self.assertIsNotNone(filesystem)
+            self.assertIsNotNone(method)
+            self.assertIsNotNone(note)
+            observed["default"] = method.currentData()
+            observed["verified_index"] = method.findData(RESTORE_METHOD_VERIFIED)
+            observed["verified_note"] = note.text()
+            filesystem.setCurrentIndex(
+                filesystem.findData(FormatFilesystem.EXT4)
+            )
+            observed["ext_method"] = method.currentData()
+            observed["ext_count"] = method.count()
+            observed["ext_note"] = note.text()
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            self.window.format_drive()
+
+        self.assertEqual(observed["default"], RESTORE_METHOD_QUICK)
+        self.assertGreaterEqual(observed["verified_index"], 0)
+        self.assertIn("complete zero read-back", observed["verified_note"])
+        self.assertEqual(observed["ext_method"], RESTORE_METHOD_QUICK)
+        self.assertEqual(observed["ext_count"], 1)
+        self.assertIn("FAT32 or NTFS", observed["ext_note"])
+
+    def test_verified_path_exclusively_uses_authenticated_workflow(self):
+        workflow = FakeRestoreWorkflow(self.window.devices[0])
+        observed: dict[str, str] = {}
+        forbidden = AssertionError("ordinary FormatExecutor was reached")
+
+        def select_verified(dialog: QDialog) -> int:
+            method = dialog.findChild(QComboBox, "restoreEraseMethod")
+            note = dialog.findChild(QLabel, "restoreEraseMethodNote")
+            method.setCurrentIndex(method.findData(RESTORE_METHOD_VERIFIED))
+            observed["note"] = note.text()
+            return QDialog.DialogCode.Accepted
+
+        with (
+            patch("isopropyl.app.QDialog.exec", new=select_verified),
+            patch("isopropyl.app.RestoreWorkflow", return_value=workflow) as factory,
+            patch.object(
+                self.window,
+                "confirm_restore_plan",
+                return_value=workflow.plan.confirmation_phrase,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.FormatExecutor", side_effect=forbidden),
+            patch("isopropyl.app.QMessageBox.information") as information,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.format_drive()
+
+        factory.assert_called_once()
+        self.assertTrue(workflow.prepared)
+        self.assertEqual(
+            workflow.confirmed_phrase,
+            workflow.plan.confirmation_phrase,
+        )
+        self.assertTrue(workflow.executed)
+        self.assertEqual(workflow.progress_stages, ["zero-scan", "zero-readback"])
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertIn("two complete reads plus one complete write", observed["note"])
+        message = information.call_args.args[2]
+        self.assertIn("Verified restore complete", message)
+        self.assertIn("4,096-byte clusters", message)
+        self.assertIn((b"f" * 32).hex(), message)
+
+    def test_quick_path_never_constructs_verified_workflow(self):
+        executor = Mock()
+        executor.execute.return_value = "/dev/sdz1"
+        forbidden = AssertionError("verified workflow was reached")
+
+        with (
+            patch(
+                "isopropyl.app.QDialog.exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("isopropyl.app.FormatExecutor", return_value=executor),
+            patch("isopropyl.app.RestoreWorkflow", side_effect=forbidden),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.information"),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.format_drive()
+
+        executor.execute.assert_called_once()
+
+    def test_final_dialog_requires_exact_target_bound_phrase(self):
+        plan = fake_restore_plan()
+        observed: dict[str, object] = {}
+
+        def inspect(dialog: QDialog) -> int:
+            details = dialog.findChild(
+                QPlainTextEdit,
+                "restoreConfirmationDetails",
+            )
+            phrase = dialog.findChild(QLineEdit, "restoreConfirmationPhrase")
+            button = dialog.findChild(QPushButton, "restoreConfirmButton")
+            observed["details"] = details.toPlainText()
+            observed["initial"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase.lower())
+            observed["wrong"] = button.isEnabled()
+            phrase.setText(plan.confirmation_phrase)
+            observed["exact"] = button.isEnabled()
+            return QDialog.DialogCode.Accepted
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            phrase = self.window.confirm_restore_plan(plan)
+
+        self.assertEqual(phrase, plan.confirmation_phrase)
+        self.assertFalse(observed["initial"])
+        self.assertFalse(observed["wrong"])
+        self.assertTrue(observed["exact"])
+        details = str(observed["details"])
+        self.assertIn(plan.device.path, details)
+        self.assertIn(plan.device.major_minor, details)
+        self.assertIn(plan.plan_sha256, details)
+        self.assertIn("FAT32", details)
+
+    def test_precommit_cancel_reports_no_mutation(self):
+        workflow = FakeRestoreWorkflow(
+            self.window.devices[0],
+            execute_error=RestoreWorkflowCancelled("cancelled before COMMIT"),
+        )
+        with (
+            patch("isopropyl.app.RestoreWorkflow", return_value=workflow),
+            patch.object(
+                self.window,
+                "confirm_restore_plan",
+                return_value=workflow.plan.confirmation_phrase,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_verified_restore(
+                self.window.devices[0], workflow.plan.format_plan,
+            )
+
+        self.assertTrue(workflow.executed)
+        self.assertTrue(workflow.closed)
+        self.assertFalse(self.window.operation_active)
+        self.assertEqual(
+            self.window.status.text(),
+            "Verified restore cancelled before target mutation.",
+        )
+
+    def test_postcommit_failure_reports_unknown_target_state(self):
+        workflow = FakeRestoreWorkflow(
+            self.window.devices[0],
+            execute_error=RestoreWorkflowError("helper connection was lost"),
+            committed=True,
+        )
+        with (
+            patch("isopropyl.app.RestoreWorkflow", return_value=workflow),
+            patch.object(
+                self.window,
+                "confirm_restore_plan",
+                return_value=workflow.plan.confirmation_phrase,
+            ),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+            patch("isopropyl.app.QMessageBox.critical") as critical,
+            patch.object(self.window, "refresh_devices"),
+        ):
+            self.window.start_verified_restore(
+                self.window.devices[0], workflow.plan.format_plan,
+            )
+
+        message = critical.call_args.args[2]
+        self.assertIn("helper connection was lost", message)
+        self.assertIn("Keep the drive connected", message)
+        self.assertNotIn("before target mutation", message)
+        self.assertTrue(workflow.closed)
 
 
 class BootloaderCacheDialogTests(unittest.TestCase):

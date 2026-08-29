@@ -6,6 +6,8 @@ import fcntl
 import json
 import os
 import stat
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -35,18 +37,144 @@ def block_status(device_number: int) -> SimpleNamespace:
     return SimpleNamespace(st_mode=stat.S_IFBLK | 0o600, st_rdev=device_number)
 
 
-def plan(filesystem: Filesystem = Filesystem.FAT32) -> FormatPlan:
+def plan(
+    filesystem: Filesystem = Filesystem.FAT32,
+    *,
+    allocation_unit_size: int | None = None,
+) -> FormatPlan:
     return FormatPlan(
         "/dev/sdz",
         ("/dev/sdz", CAPACITY, "SERIAL", "", "Test USB", "8:240"),
         filesystem,
         PartitionTable.GPT,
         "TEST",
+        allocation_unit_size,
     )
 
 
+def fat32_metadata(request: restore.RestoreDeviceRequest) -> dict[int, bytes]:
+    sector = request.logical_sector_size
+    sectors_per_cluster = (
+        request.plan.allocation_unit_size // sector
+        if request.plan.allocation_unit_size is not None else 1
+    )
+    reserved = 32
+    fats = 2
+    sectors_per_fat = 1
+    while True:
+        clusters = (
+            request.partition_sector_count - reserved - fats * sectors_per_fat
+        ) // sectors_per_cluster
+        wanted = (clusters + 2) * 4
+        wanted = (wanted + sector - 1) // sector
+        if wanted == sectors_per_fat:
+            break
+        sectors_per_fat = wanted
+    boot = bytearray(sector)
+    boot[:3] = b"\xebX\x90"
+    boot[3:11] = b"mkfs.fat"
+    struct.pack_into("<H", boot, 11, sector)
+    boot[13] = sectors_per_cluster
+    struct.pack_into("<H", boot, 14, reserved)
+    boot[16] = fats
+    boot[21] = 0xF8
+    struct.pack_into("<I", boot, 28, request.partition_start_sector)
+    struct.pack_into("<I", boot, 32, request.partition_sector_count)
+    struct.pack_into("<I", boot, 36, sectors_per_fat)
+    struct.pack_into("<I", boot, 44, 2)
+    struct.pack_into("<H", boot, 48, 1)
+    struct.pack_into("<H", boot, 50, 6)
+    boot[64] = 0x80
+    boot[66] = 0x29
+    struct.pack_into("<I", boot, 67, 0x12345678)
+    label = (
+        request.plan.label.encode("ascii") if request.plan.label else b"NO NAME"
+    ).ljust(11, b" ")
+    boot[71:82] = label
+    boot[82:90] = b"FAT32   "
+    boot[510:512] = b"\x55\xaa"
+    fsinfo = bytearray(sector)
+    fsinfo[:4] = b"RRaA"
+    fsinfo[484:488] = b"rrAa"
+    struct.pack_into("<I", fsinfo, 488, 0xFFFFFFFF)
+    struct.pack_into("<I", fsinfo, 492, 0xFFFFFFFF)
+    fsinfo[510:512] = b"\x55\xaa"
+    root_offset = (reserved + fats * sectors_per_fat) * sector
+    root = bytearray(sector * sectors_per_cluster)
+    if request.plan.label:
+        root[:11] = label
+        root[11] = 0x08
+    return {
+        0: bytes(boot),
+        sector: bytes(fsinfo),
+        6 * sector: bytes(boot),
+        7 * sector: bytes(fsinfo),
+        root_offset: bytes(root),
+    }
+
+
+def ntfs_metadata(request: restore.RestoreDeviceRequest) -> dict[int, bytes]:
+    sector = request.logical_sector_size
+    sectors_per_cluster = (
+        request.plan.allocation_unit_size // sector
+        if request.plan.allocation_unit_size is not None else 8
+    )
+    cluster_size = sector * sectors_per_cluster
+    total_sectors = request.partition_sector_count - 1
+    cluster_count = (total_sectors + 1) // sectors_per_cluster
+    mft_cluster = 4
+    mirror_cluster = max(mft_cluster + 1, cluster_count // 2)
+    boot = bytearray(sector)
+    boot[:3] = b"\xebR\x90"
+    boot[3:11] = b"NTFS    "
+    struct.pack_into("<H", boot, 11, sector)
+    boot[13] = sectors_per_cluster
+    boot[21] = 0xF8
+    struct.pack_into("<I", boot, 28, request.partition_start_sector)
+    struct.pack_into("<Q", boot, 40, total_sectors)
+    struct.pack_into("<Q", boot, 48, mft_cluster)
+    struct.pack_into("<Q", boot, 56, mirror_cluster)
+    struct.pack_into("b", boot, 64, -10)
+    struct.pack_into("b", boot, 68, -12)
+    struct.pack_into("<Q", boot, 72, 0x0123456789ABCDEF)
+    boot[510:512] = b"\x55\xaa"
+
+    record = bytearray(1024)
+    record[:4] = b"FILE"
+    struct.pack_into("<HH", record, 4, 48, 3)
+    struct.pack_into("<H", record, 20, 56)
+    struct.pack_into("<H", record, 22, 1)
+    struct.pack_into("<I", record, 28, len(record))
+    struct.pack_into("<I", record, 44, 3)
+    sequence = b"\xa5Z"
+    record[48:50] = sequence
+    record[50:54] = b"\0\0\0\0"
+    record[510:512] = sequence
+    record[1022:1024] = sequence
+    label = request.plan.label.encode("utf-16-le")
+    attribute_length = (24 + len(label) + 7) & ~7
+    struct.pack_into("<II", record, 56, 0x60, attribute_length)
+    struct.pack_into("<I", record, 72, len(label))
+    struct.pack_into("<H", record, 76, 24)
+    record[80:80 + len(label)] = label
+    end = 56 + attribute_length
+    struct.pack_into("<I", record, end, 0xFFFFFFFF)
+    struct.pack_into("<I", record, 24, end + 8)
+    record_offset = mft_cluster * cluster_size + 3 * len(record)
+    return {
+        0: bytes(boot),
+        total_sectors * sector: bytes(boot),
+        record_offset: bytes(record),
+    }
+
+
 class Harness:
-    def __init__(self, filesystem: Filesystem = Filesystem.FAT32) -> None:
+    def __init__(
+        self,
+        filesystem: Filesystem = Filesystem.FAT32,
+        *,
+        allocation_unit_size: int | None = None,
+    ) -> None:
         self.target = tempfile.TemporaryFile()
         self.target.truncate(CAPACITY)
         self.target.seek(0)
@@ -64,12 +192,14 @@ class Harness:
         self.progress: list[tuple[str, int, int]] = []
         self.prepared_calls = 0
         self.request = restore.build_restore_device_request(
-            plan(filesystem),
+            plan(filesystem, allocation_unit_size=allocation_unit_size),
             request_id=bytes(range(16)),
             disk_sequence=DISK_SEQUENCE,
             logical_sector_size=SECTOR,
             chunk_size=1024 * 1024,
         )
+        self.partition.truncate(self.request.partition_sector_count * SECTOR)
+        self.metadata_mutator = None
 
     def close(self) -> None:
         self.target.close()
@@ -163,6 +293,21 @@ class Harness:
                 }],
             }}).encode("ascii")
             return restore.ChildResult(argv, payload)
+        if argv[0] in {"/usr/sbin/mkfs.fat", "/usr/sbin/mkntfs"}:
+            metadata = (
+                fat32_metadata(self.request)
+                if self.request.plan.filesystem is restore.Filesystem.FAT32
+                else ntfs_metadata(self.request)
+            )
+            for offset, payload in metadata.items():
+                os.pwrite(self.partition.fileno(), payload, offset)
+                os.pwrite(
+                    self.target.fileno(),
+                    payload,
+                    self.request.partition_start_sector * SECTOR + offset,
+                )
+            if self.metadata_mutator is not None:
+                self.metadata_mutator(self)
         return restore.ChildResult(argv, b"")
 
     def discover(self, parent: int, number: int) -> restore.PartitionObservation:
@@ -305,13 +450,21 @@ os._exit(0)
         self.assertEqual(result.scanned_bytes, CAPACITY)
         self.assertEqual(result.verified_bytes, CAPACITY)
         self.assertEqual(result.written_bytes + result.skipped_bytes, CAPACITY)
-        self.assertEqual(harness.target.seek(0), 0)
-        self.assertEqual(harness.target.read(), b"\0" * CAPACITY)
+        restore.validate_filesystem_receipt(harness.request, result.filesystem_receipt)
+        self.assertIs(result.filesystem, restore.Filesystem.FAT32)
+        self.assertEqual(result.filesystem_receipt.normalized_label, "TEST")
+        partition_offset = harness.request.partition_start_sector * SECTOR
+        self.assertEqual(
+            os.pread(harness.target.fileno(), SECTOR, partition_offset),
+            os.pread(harness.partition.fileno(), SECTOR, 0),
+        )
         self.assertEqual(len(harness.lock_calls), 1)
         self.assertEqual(harness.lock_calls[0][1], fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.assertEqual(len(harness.children), 5)
         sfdisk, udevadm, metadata_before, mkfs, metadata_after = harness.children
         retained_fd = sfdisk[2][0]
+        whole_flags = next(flags for path, flags in harness.open_flags if path == "/dev/sdz")
+        self.assertTrue(whole_flags & os.O_EXCL)
         self.assertIn(f"/proc/self/fd/{retained_fd}", sfdisk[0])
         self.assertEqual(sfdisk[0][0], "/usr/sbin/sfdisk")
         self.assertEqual(udevadm[0], ("/usr/bin/udevadm", "settle", "--timeout=30"))
@@ -408,13 +561,145 @@ os._exit(0)
             )
 
     def test_ntfs_formatter_is_fixed_mkntfs_with_inherited_procfd(self) -> None:
-        harness = Harness(Filesystem.NTFS)
+        harness = Harness(Filesystem.NTFS, allocation_unit_size=4096)
         self.addCleanup(harness.close)
         result = harness.execute()
         mkfs = harness.children[-2]
         self.assertEqual(mkfs[0][0], "/usr/sbin/mkntfs")
         self.assertIn("-f", mkfs[0])
+        self.assertIn("-s", mkfs[0])
+        self.assertIn("-p", mkfs[0])
+        self.assertIs(result.filesystem, restore.Filesystem.NTFS)
+        self.assertEqual(result.filesystem_receipt.cluster_size, 4096)
+        self.assertEqual(result.filesystem_receipt.normalized_label, "TEST")
+        restore.validate_filesystem_receipt(harness.request, result.filesystem_receipt)
         self.assertEqual(result.partition.device_number, PARTITION_NUMBER)
+
+    def test_post_format_metadata_must_match_parent_and_exact_child(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+
+        def poison_parent(value: Harness) -> None:
+            offset = value.request.partition_start_sector * SECTOR + 82
+            os.pwrite(value.target.fileno(), b"NOTFAT32", offset)
+
+        harness.metadata_mutator = poison_parent
+        with self.assertRaisesRegex(
+            restore.HelperVerificationError,
+            "Parent and child descriptors disagree",
+        ):
+            harness.execute()
+        self.assertEqual(harness.close_calls.count(next(iter(harness.target_fds))), 1)
+
+    def test_malformed_ntfs_volume_record_is_rejected_and_boundaries_cleaned(self) -> None:
+        harness = Harness(Filesystem.NTFS)
+        self.addCleanup(harness.close)
+
+        def poison_record(value: Harness) -> None:
+            metadata = ntfs_metadata(value.request)
+            record_offset = next(offset for offset in metadata if offset not in {
+                0, (value.request.partition_sector_count - 1) * SECTOR,
+            })
+            os.pwrite(value.partition.fileno(), b"FAIL", record_offset)
+            parent_offset = value.request.partition_start_sector * SECTOR + record_offset
+            os.pwrite(value.target.fileno(), b"FAIL", parent_offset)
+
+        harness.metadata_mutator = poison_record
+        with self.assertRaisesRegex(
+            restore.HelperVerificationError,
+            "NTFS volume record",
+        ):
+            harness.execute()
+        boundary = min(16 * 1024 * 1024, CAPACITY)
+        self.assertEqual(os.pread(harness.target.fileno(), boundary, 0), b"\0" * boundary)
+
+    def test_receipt_rejects_explicit_allocation_unit_forgery(self) -> None:
+        harness = Harness(allocation_unit_size=4096)
+        self.addCleanup(harness.close)
+        result = harness.execute()
+        receipt = replace(
+            result.filesystem_receipt,
+            sectors_per_cluster=1,
+            cluster_size=SECTOR,
+        )
+        receipt = replace(
+            receipt,
+            receipt_sha256=restore._filesystem_receipt_digest(
+                harness.request,
+                receipt.filesystem,
+                receipt.partition_major_minor,
+                receipt.sectors_per_cluster,
+                receipt.normalized_label,
+                receipt.metadata_sha256,
+            ),
+        )
+        with self.assertRaisesRegex(
+            restore.HelperVerificationError,
+            "receipt is inconsistent",
+        ):
+            restore.validate_filesystem_receipt(harness.request, receipt)
+
+    def test_real_host_formatters_produce_accepted_descriptor_metadata(self) -> None:
+        available = [
+            (restore.Filesystem.FAT32, "/usr/sbin/mkfs.fat"),
+            (restore.Filesystem.NTFS, "/usr/sbin/mkntfs"),
+        ]
+        available = [(filesystem, tool) for filesystem, tool in available if os.path.exists(tool)]
+        if not available:
+            self.skipTest("The fixed FAT32 and NTFS formatters are unavailable")
+        parent_size = 65 * 1024 * 1024
+        child_size = 64 * 1024 * 1024
+        for filesystem, tool in available:
+            with self.subTest(filesystem=filesystem.value), tempfile.TemporaryDirectory() as directory:
+                parent_path = os.path.join(directory, "parent.img")
+                child_path = os.path.join(directory, "child.img")
+                with open(parent_path, "w+b") as parent, open(child_path, "w+b") as child:
+                    parent.truncate(parent_size)
+                    child.truncate(child_size)
+                request = restore.build_restore_device_request(
+                    restore.FormatPlan(
+                        "/dev/sdz",
+                        ("/dev/sdz", parent_size, "", "", "", "8:240"),
+                        filesystem,
+                        restore.PartitionTable.MBR,
+                        "TEST",
+                    ),
+                    request_id=b"r" * 16,
+                    disk_sequence=1,
+                    logical_sector_size=SECTOR,
+                )
+                command = list(restore._formatter_argv(request, 9))
+                command[-1] = child_path
+                if filesystem is restore.Filesystem.NTFS:
+                    command.insert(2, "-F")
+                subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    timeout=30,
+                )
+                with open(child_path, "rb") as source, open(parent_path, "r+b") as target:
+                    target.seek(request.partition_start_sector * SECTOR)
+                    while block := source.read(4 * 1024 * 1024):
+                        target.write(block)
+                parent_fd = os.open(parent_path, os.O_RDONLY)
+                child_fd = os.open(child_path, os.O_RDONLY)
+                try:
+                    receipt = restore._post_format_receipt(
+                        parent_fd,
+                        child_fd,
+                        request,
+                        PARTITION_NUMBER,
+                        restore.RestoreOperations(pread=os.pread),
+                    )
+                finally:
+                    os.close(child_fd)
+                    os.close(parent_fd)
+                restore.validate_filesystem_receipt(request, receipt)
+                self.assertEqual(receipt.normalized_label, "TEST")
+                self.assertEqual(receipt.partition_major_minor, "8:241")
 
 
 if __name__ == "__main__":

@@ -23,11 +23,11 @@ PKEXEC_PATH = "/usr/bin/pkexec"
 HELPER_PATH = "/usr/libexec/isopropyl-restore-device-helper"
 HELPER_SCRIPT_PATH = "/usr/libexec/isopropyl/restore_device_helper.py"
 POLICY_PATH = "/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy"
-POLICY_ACTION = "io.github.codebooker.isopropyl.restore-device"
-POLICY_DESCRIPTION = "Fully erase and format a removable USB or SD drive"
+POLICY_ACTION = "io.github.codebooker.isopropyl.restore-device-v2"
+POLICY_DESCRIPTION = "Logically overwrite and format a removable USB or SD drive"
 POLICY_MESSAGE = (
-    "Authentication is required to fully erase, repartition, and format the "
-    "selected removable USB or SD target"
+    "Authentication is required to logically overwrite, repartition, and format "
+    "the selected removable USB or SD target"
 )
 STALL_TIMEOUT_SECONDS = 330.0
 MAX_STDERR = 8192
@@ -71,6 +71,13 @@ class RestoreDeviceRunResult:
     written_bytes: int
     skipped_bytes: int
     verified_bytes: int
+    logical_sector_size: int
+    filesystem: protocol.Filesystem
+    sectors_per_cluster: int
+    cluster_size: int
+    normalized_label: str
+    metadata_sha256: bytes
+    filesystem_receipt_sha256: bytes
 
 
 def _trusted_file(path: str, *, executable: bool, setuid: bool = False) -> None:
@@ -429,9 +436,29 @@ class RestoreDeviceRunner:
         (
             _kind, request_id, parent_major, parent_minor, diskseq, capacity,
             scanned, written, skipped, verified, part_major, part_minor,
-            start, count, plan_sha256,
+            start, count, plan_sha256, filesystem, logical_sector_size,
+            sectors_per_cluster, normalized_label, metadata_sha256,
+            filesystem_receipt_sha256,
         ) = packet
         major_minor = f"{parent_major}:{parent_minor}"
+        receipt = protocol.FilesystemReceipt(
+            filesystem,
+            f"{part_major}:{part_minor}",
+            start,
+            count,
+            logical_sector_size,
+            sectors_per_cluster,
+            logical_sector_size * sectors_per_cluster,
+            normalized_label,
+            metadata_sha256,
+            filesystem_receipt_sha256,
+        )
+        try:
+            protocol.validate_filesystem_receipt(request, receipt)
+        except protocol.HelperError as error:
+            raise RestoreDeviceRunError(
+                "The privileged restore filesystem receipt is invalid",
+            ) from error
         if (
             request_id != request.request_id
             or major_minor != request.expected_major_minor
@@ -443,6 +470,8 @@ class RestoreDeviceRunner:
             or start != request.partition_start_sector
             or count != request.partition_sector_count
             or plan_sha256 != request.plan_sha256
+            or filesystem is not request.plan.filesystem
+            or logical_sector_size != request.logical_sector_size
         ):
             raise RestoreDeviceRunError("The privileged restore receipt is incomplete or forged")
         return RestoreDeviceRunResult(
@@ -457,4 +486,11 @@ class RestoreDeviceRunner:
             written,
             skipped,
             verified,
+            logical_sector_size,
+            filesystem,
+            sectors_per_cluster,
+            receipt.cluster_size,
+            normalized_label,
+            metadata_sha256,
+            filesystem_receipt_sha256,
         )

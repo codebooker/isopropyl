@@ -4,11 +4,11 @@ from __future__ import annotations
 
 """One-lease privileged full-format transaction.
 
-This module is deliberately not wired to the desktop application.  It is the
-root side of an isolated PolicyKit prototype: one whole-disk
-descriptor is authenticated, locked, and retained from PREPARED through a
-verified full zero, deterministic partition creation, filesystem creation, and
-final attestations.  No command is executed through a shell.
+This module is the root side of the desktop application's isolated Verified
+full overwrite + format PolicyKit path.  One whole-disk descriptor is
+authenticated, locked, and retained from PREPARED through a verified full zero,
+deterministic partition creation, filesystem creation, and final attestations.
+No command is executed through a shell.
 """
 
 import array
@@ -28,6 +28,7 @@ import struct
 import sys
 import time
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -40,8 +41,11 @@ BLKFLSBUF = 0x1261
 BLKSSZGET = 0x1268
 BLKGETSIZE64 = 0x80081272
 BLKGETDISKSEQ = 0x80081280
-RESTORE_DEVICE_PROFILE = "io.github.codebooker.isopropyl/restore-device/v1"
-RESTORE_DEVICE_OPERATION = "restore-device-v1"
+RESTORE_DEVICE_PROFILE = "io.github.codebooker.isopropyl/restore-device/v2"
+RESTORE_DEVICE_OPERATION = "restore-device-v2"
+FILESYSTEM_RECEIPT_PROFILE = (
+    "io.github.codebooker.isopropyl/restore-device/post-format-receipt/v1"
+)
 INSTALLED_SCRIPT_PATH = "/usr/libexec/isopropyl/restore_device_helper.py"
 DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024
 MAX_CHILD_OUTPUT = 64 * 1024
@@ -69,8 +73,8 @@ _GPT_DATA_TYPE = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
 _MINIMUM_CAPACITY = 16 * 1024 * 1024
 _MAXIMUM_CAPACITY = 64 * 1024**4
 _MAX_TOPOLOGY_NODES = 4096
-_WIRE_MAGIC = b"ISOPROPYL-RST01!"
-_WIRE_VERSION = 1
+_WIRE_MAGIC = b"ISOPROPYL-RST02!"
+_WIRE_VERSION = 2
 PACKET_REQUEST = 1
 PACKET_READY = 2
 PACKET_PREPARED = 3
@@ -83,7 +87,7 @@ _HEADER = struct.Struct("!16sBBH")
 _REQUEST = struct.Struct("!16sBBH16sIIQQIQQIBBQH128s32s")
 _CONTROL = struct.Struct("!16sBBH16s32s")
 _PROGRESS = struct.Struct("!16sBBH16sB7xQQ")
-_RESULT = struct.Struct("!16sBBH16sIIQQQQQQIIQQ32s")
+_RESULT = struct.Struct("!16sBBH16sIIQQQQQQIIQQ32sBBHII128s32s32s")
 _ERROR = struct.Struct("!16sBBH16sI512s")
 MAX_PROTOCOL_PACKET = max(
     _REQUEST.size, _CONTROL.size, _PROGRESS.size, _RESULT.size, _ERROR.size,
@@ -268,6 +272,20 @@ class RestoreDeviceRequest:
 
 
 @dataclass(frozen=True)
+class FilesystemReceipt:
+    filesystem: Filesystem
+    partition_major_minor: str
+    partition_start_sector: int
+    partition_sector_count: int
+    logical_sector_size: int
+    sectors_per_cluster: int
+    cluster_size: int
+    normalized_label: str
+    metadata_sha256: bytes
+    receipt_sha256: bytes
+
+
+@dataclass(frozen=True)
 class PartitionObservation:
     path: str
     device_number: int
@@ -297,6 +315,8 @@ class RestoreDeviceResult:
     written_bytes: int
     skipped_bytes: int
     verified_bytes: int
+    filesystem: Filesystem
+    filesystem_receipt: FilesystemReceipt
     durable: bool
     cache_invalidated: bool
 
@@ -1163,6 +1183,475 @@ def _write_exact(
         written += count
 
 
+def _power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
+
+
+def _partition_readback(
+    whole: int,
+    partition: int,
+    request: RestoreDeviceRequest,
+    offset: int,
+    size: int,
+    operations: RestoreOperations,
+) -> bytes:
+    partition_bytes = request.partition_sector_count * request.logical_sector_size
+    if (
+        type(offset) is not int
+        or type(size) is not int
+        or offset < 0
+        or size <= 0
+        or offset > partition_bytes
+        or size > partition_bytes - offset
+    ):
+        raise HelperVerificationError("Filesystem metadata lies outside the frozen partition")
+    child = _read_exact(partition, size, offset, operations)
+    parent_offset = request.partition_start_sector * request.logical_sector_size + offset
+    parent = _read_exact(whole, size, parent_offset, operations)
+    if child != parent:
+        raise HelperVerificationError(
+            "Parent and child descriptors disagree about filesystem metadata",
+        )
+    return child
+
+
+def _filesystem_receipt_digest(
+    request: RestoreDeviceRequest,
+    filesystem: Filesystem,
+    partition_major_minor: str,
+    sectors_per_cluster: int,
+    normalized_label: str,
+    metadata_sha256: bytes,
+) -> bytes:
+    try:
+        label = normalized_label.encode("utf-8", "strict")
+        partition_device = _parse_major_minor(partition_major_minor)
+        canonical = struct.pack(
+            "!B3xIIQQIIH128s32s",
+            _FILESYSTEM_CODE[filesystem],
+            os.major(partition_device),
+            os.minor(partition_device),
+            request.partition_start_sector,
+            request.partition_sector_count,
+            request.logical_sector_size,
+            sectors_per_cluster,
+            len(label),
+            label.ljust(128, b"\0"),
+            metadata_sha256,
+        )
+    except (HelperTargetError, UnicodeError, OverflowError, struct.error) as error:
+        raise HelperVerificationError("The filesystem receipt fields are invalid") from error
+    return hashlib.sha256(
+        FILESYSTEM_RECEIPT_PROFILE.encode("ascii")
+        + b"\0"
+        + request.plan_sha256
+        + canonical
+    ).digest()
+
+
+def validate_filesystem_receipt(
+    request: RestoreDeviceRequest,
+    receipt: FilesystemReceipt,
+) -> None:
+    validate_restore_device_request(request)
+    if type(receipt) is not FilesystemReceipt:
+        raise HelperVerificationError("An exact post-format filesystem receipt is required")
+    try:
+        encoded_label = receipt.normalized_label.encode("utf-8", "strict")
+    except UnicodeError as error:
+        raise HelperVerificationError("The filesystem receipt label is invalid") from error
+    if (
+        type(receipt.filesystem) is not Filesystem
+        or receipt.filesystem is not request.plan.filesystem
+        or type(receipt.partition_major_minor) is not str
+        or _MAJOR_MINOR.fullmatch(receipt.partition_major_minor) is None
+        or receipt.partition_major_minor == request.expected_major_minor
+        or receipt.partition_start_sector != request.partition_start_sector
+        or receipt.partition_sector_count != request.partition_sector_count
+        or receipt.logical_sector_size != request.logical_sector_size
+        or type(receipt.sectors_per_cluster) is not int
+        or not _power_of_two(receipt.sectors_per_cluster)
+        or receipt.sectors_per_cluster > 128
+        or receipt.cluster_size
+        != receipt.logical_sector_size * receipt.sectors_per_cluster
+        or not _power_of_two(receipt.cluster_size)
+        or receipt.cluster_size > 2 * 1024 * 1024
+        or request.plan.allocation_unit_size is not None
+        and receipt.cluster_size != request.plan.allocation_unit_size
+        or len(encoded_label) > 128
+        or receipt.normalized_label != unicodedata.normalize(
+            "NFC", request.plan.label,
+        )
+        or type(receipt.metadata_sha256) is not bytes
+        or len(receipt.metadata_sha256) != 32
+        or type(receipt.receipt_sha256) is not bytes
+        or len(receipt.receipt_sha256) != 32
+        or receipt.receipt_sha256 != _filesystem_receipt_digest(
+            request,
+            receipt.filesystem,
+            receipt.partition_major_minor,
+            receipt.sectors_per_cluster,
+            receipt.normalized_label,
+            receipt.metadata_sha256,
+        )
+    ):
+        raise HelperVerificationError("The post-format filesystem receipt is inconsistent")
+
+
+def _receipt(
+    request: RestoreDeviceRequest,
+    filesystem: Filesystem,
+    partition_device_number: int,
+    sectors_per_cluster: int,
+    normalized_label: str,
+    metadata: bytes,
+) -> FilesystemReceipt:
+    metadata_sha256 = hashlib.sha256(metadata).digest()
+    result = FilesystemReceipt(
+        filesystem,
+        _dev_text(partition_device_number),
+        request.partition_start_sector,
+        request.partition_sector_count,
+        request.logical_sector_size,
+        sectors_per_cluster,
+        request.logical_sector_size * sectors_per_cluster,
+        normalized_label,
+        metadata_sha256,
+        _filesystem_receipt_digest(
+            request,
+            filesystem,
+            _dev_text(partition_device_number),
+            sectors_per_cluster,
+            normalized_label,
+            metadata_sha256,
+        ),
+    )
+    validate_filesystem_receipt(request, result)
+    return result
+
+
+def _fat32_receipt(
+    whole: int,
+    partition: int,
+    request: RestoreDeviceRequest,
+    partition_device_number: int,
+    operations: RestoreOperations,
+) -> FilesystemReceipt:
+    sector = request.logical_sector_size
+    boot = _partition_readback(whole, partition, request, 0, sector, operations)
+    bytes_per_sector = struct.unpack_from("<H", boot, 11)[0]
+    sectors_per_cluster = boot[13]
+    reserved_sectors = struct.unpack_from("<H", boot, 14)[0]
+    fat_count = boot[16]
+    root_entries = struct.unpack_from("<H", boot, 17)[0]
+    total_16 = struct.unpack_from("<H", boot, 19)[0]
+    sectors_per_fat_16 = struct.unpack_from("<H", boot, 22)[0]
+    hidden_sectors = struct.unpack_from("<I", boot, 28)[0]
+    total_32 = struct.unpack_from("<I", boot, 32)[0]
+    sectors_per_fat = struct.unpack_from("<I", boot, 36)[0]
+    filesystem_version = struct.unpack_from("<H", boot, 42)[0]
+    root_cluster = struct.unpack_from("<I", boot, 44)[0]
+    fsinfo_sector = struct.unpack_from("<H", boot, 48)[0]
+    backup_sector = struct.unpack_from("<H", boot, 50)[0]
+    total_sectors = total_16 or total_32
+    data_start = reserved_sectors + fat_count * sectors_per_fat
+    data_sectors = total_sectors - data_start
+    cluster_count = (
+        data_sectors // sectors_per_cluster if sectors_per_cluster else 0
+    )
+    fat_entries = sectors_per_fat * bytes_per_sector // 4 if bytes_per_sector else 0
+    cluster_size = bytes_per_sector * sectors_per_cluster
+    expected_label_field = (
+        request.plan.label.encode("ascii") if request.plan.label else b"NO NAME"
+    ).ljust(11, b" ")
+    if (
+        boot[:3] not in {b"\xebX\x90", b"\xe9\0\0"}
+        or bytes_per_sector != sector
+        or not _power_of_two(sectors_per_cluster)
+        or sectors_per_cluster > 128
+        or not _power_of_two(cluster_size)
+        or cluster_size > 64 * 1024
+        or request.plan.allocation_unit_size is not None
+        and cluster_size != request.plan.allocation_unit_size
+        or reserved_sectors < 8
+        or fat_count not in {1, 2}
+        or root_entries != 0
+        or total_16 != 0
+        or boot[21] not in {0xF0, 0xF8}
+        or sectors_per_fat_16 != 0
+        or hidden_sectors != request.partition_start_sector
+        or total_32 != request.partition_sector_count
+        or total_sectors <= data_start
+        or cluster_count <= 0
+        or cluster_count > 0x0FFFFFF5
+        or fat_entries < cluster_count + 2
+        or sectors_per_fat == 0
+        or filesystem_version != 0
+        or root_cluster < 2
+        or root_cluster >= cluster_count + 2
+        or fsinfo_sector <= 0
+        or fsinfo_sector >= reserved_sectors
+        or backup_sector <= 0
+        or backup_sector >= reserved_sectors
+        or backup_sector + fsinfo_sector >= reserved_sectors
+        or boot[65] != 0
+        or boot[66] != 0x29
+        or boot[71:82] != expected_label_field
+        or boot[82:90] != b"FAT32   "
+        or boot[510:512] != b"\x55\xaa"
+    ):
+        raise HelperVerificationError("The created FAT32 boot metadata is invalid")
+
+    backup = _partition_readback(
+        whole, partition, request, backup_sector * sector, sector, operations,
+    )
+    fsinfo = _partition_readback(
+        whole, partition, request, fsinfo_sector * sector, sector, operations,
+    )
+    backup_fsinfo = _partition_readback(
+        whole,
+        partition,
+        request,
+        (backup_sector + fsinfo_sector) * sector,
+        sector,
+        operations,
+    )
+    free_cluster_count = struct.unpack_from("<I", fsinfo, 488)[0]
+    next_free_cluster = struct.unpack_from("<I", fsinfo, 492)[0]
+    if (
+        backup != boot
+        or fsinfo != backup_fsinfo
+        or fsinfo[:4] != b"RRaA"
+        or fsinfo[484:488] != b"rrAa"
+        or fsinfo[510:512] != b"\x55\xaa"
+        or free_cluster_count != 0xFFFFFFFF
+        and free_cluster_count > cluster_count
+        or (
+            next_free_cluster != 0xFFFFFFFF
+            and not 2 <= next_free_cluster < cluster_count + 2
+        )
+    ):
+        raise HelperVerificationError("The created FAT32 backup metadata is invalid")
+
+    root_offset = (
+        data_start + (root_cluster - 2) * sectors_per_cluster
+    ) * sector
+    root = _partition_readback(
+        whole, partition, request, root_offset, cluster_size, operations,
+    )
+    labels: list[bytes] = []
+    for offset in range(0, len(root), 32):
+        entry = root[offset:offset + 32]
+        if entry[0] == 0:
+            break
+        if entry[0] == 0xE5 or entry[11] == 0x0F:
+            continue
+        if entry[11] & 0x08:
+            if entry[11] != 0x08:
+                raise HelperVerificationError("The created FAT32 root metadata is invalid")
+            labels.append(entry[:11])
+    expected_labels = [expected_label_field] if request.plan.label else []
+    if labels != expected_labels:
+        raise HelperVerificationError("The created FAT32 volume label is invalid")
+    return _receipt(
+        request,
+        Filesystem.FAT32,
+        partition_device_number,
+        sectors_per_cluster,
+        unicodedata.normalize("NFC", request.plan.label),
+        boot + backup + fsinfo + backup_fsinfo + root,
+    )
+
+
+def _ntfs_record_size(encoded: int, cluster_size: int) -> int:
+    if encoded == 0:
+        return 0
+    size = 1 << -encoded if encoded < 0 else encoded * cluster_size
+    return size if 512 <= size <= 64 * 1024 and _power_of_two(size) else 0
+
+
+def _ntfs_volume_label(
+    raw_record: bytes,
+    bytes_per_sector: int,
+    expected_label: str,
+) -> str:
+    record = bytearray(raw_record)
+    if len(record) < 64 or record[:4] != b"FILE":
+        raise HelperVerificationError("The NTFS volume record is invalid")
+    usa_offset, usa_count = struct.unpack_from("<HH", record, 4)
+    expected_usa_count = len(record) // bytes_per_sector + 1
+    if (
+        len(record) % bytes_per_sector
+        or usa_count != expected_usa_count
+        or usa_offset < 8
+        or usa_offset + usa_count * 2 > len(record)
+    ):
+        raise HelperVerificationError("The NTFS volume-record fixup is invalid")
+    sequence = bytes(record[usa_offset:usa_offset + 2])
+    for index in range(1, usa_count):
+        end = index * bytes_per_sector
+        if bytes(record[end - 2:end]) != sequence:
+            raise HelperVerificationError("The NTFS volume-record fixup does not match")
+        replacement = record[usa_offset + index * 2:usa_offset + index * 2 + 2]
+        record[end - 2:end] = replacement
+
+    first_attribute = struct.unpack_from("<H", record, 20)[0]
+    flags = struct.unpack_from("<H", record, 22)[0]
+    used_bytes = struct.unpack_from("<I", record, 24)[0]
+    allocated_bytes = struct.unpack_from("<I", record, 28)[0]
+    record_number = struct.unpack_from("<I", record, 44)[0]
+    if (
+        not flags & 1
+        or allocated_bytes != len(record)
+        or used_bytes > allocated_bytes
+        or first_attribute < 48
+        or first_attribute & 7
+        or first_attribute >= used_bytes
+        or usa_offset + usa_count * 2 > first_attribute
+        or record_number != 3
+    ):
+        raise HelperVerificationError("The NTFS volume record header is invalid")
+
+    volume_names: list[bytes] = []
+    offset = first_attribute
+    ended = False
+    while offset + 8 <= used_bytes:
+        attribute_type, length = struct.unpack_from("<II", record, offset)
+        if attribute_type == 0xFFFFFFFF:
+            ended = True
+            break
+        if length < 24 or length & 7 or length > used_bytes - offset:
+            raise HelperVerificationError("The NTFS volume attribute list is invalid")
+        nonresident = record[offset + 8]
+        name_length = record[offset + 9]
+        if attribute_type == 0x60:
+            value_length = struct.unpack_from("<I", record, offset + 16)[0]
+            value_offset = struct.unpack_from("<H", record, offset + 20)[0]
+            if (
+                nonresident != 0
+                or name_length != 0
+                or value_length > 128
+                or value_length & 1
+                or value_offset < 24
+                or value_offset > length
+                or value_length > length - value_offset
+            ):
+                raise HelperVerificationError("The NTFS volume-name attribute is invalid")
+            volume_names.append(bytes(
+                record[offset + value_offset:offset + value_offset + value_length]
+            ))
+        offset += length
+    expected = expected_label.encode("utf-16-le", "strict")
+    if not ended or volume_names != [expected]:
+        raise HelperVerificationError("The created NTFS volume label is invalid")
+    try:
+        decoded = volume_names[0].decode("utf-16-le", "strict")
+    except UnicodeError as error:
+        raise HelperVerificationError("The created NTFS volume label is invalid") from error
+    return unicodedata.normalize("NFC", decoded)
+
+
+def _ntfs_receipt(
+    whole: int,
+    partition: int,
+    request: RestoreDeviceRequest,
+    partition_device_number: int,
+    operations: RestoreOperations,
+) -> FilesystemReceipt:
+    sector = request.logical_sector_size
+    boot = _partition_readback(whole, partition, request, 0, sector, operations)
+    bytes_per_sector = struct.unpack_from("<H", boot, 11)[0]
+    sectors_per_cluster = boot[13]
+    hidden_sectors = struct.unpack_from("<I", boot, 28)[0]
+    total_sectors = struct.unpack_from("<Q", boot, 40)[0]
+    mft_cluster = struct.unpack_from("<Q", boot, 48)[0]
+    mft_mirror_cluster = struct.unpack_from("<Q", boot, 56)[0]
+    cluster_size = bytes_per_sector * sectors_per_cluster
+    cluster_count = (
+        (total_sectors + 1) // sectors_per_cluster if sectors_per_cluster else 0
+    )
+    file_record_size = _ntfs_record_size(
+        struct.unpack_from("b", boot, 64)[0], cluster_size,
+    )
+    index_record_size = _ntfs_record_size(
+        struct.unpack_from("b", boot, 68)[0], cluster_size,
+    )
+    if (
+        boot[:3] not in {b"\xebR\x90", b"\xeb[\x90"}
+        or boot[3:11] != b"NTFS    "
+        or bytes_per_sector != sector
+        or not _power_of_two(sectors_per_cluster)
+        or sectors_per_cluster > 128
+        or not _power_of_two(cluster_size)
+        or cluster_size > 2 * 1024 * 1024
+        or request.plan.allocation_unit_size is not None
+        and cluster_size != request.plan.allocation_unit_size
+        or boot[14:21] != b"\0" * 7
+        or boot[21] != 0xF8
+        or boot[22:24] != b"\0\0"
+        or hidden_sectors != request.partition_start_sector
+        or total_sectors + 1 != request.partition_sector_count
+        or cluster_count <= 0
+        or mft_cluster >= cluster_count
+        or mft_mirror_cluster >= cluster_count
+        or mft_cluster == mft_mirror_cluster
+        or not file_record_size
+        or not index_record_size
+        or boot[510:512] != b"\x55\xaa"
+    ):
+        raise HelperVerificationError("The created NTFS boot metadata is invalid")
+    backup = _partition_readback(
+        whole,
+        partition,
+        request,
+        total_sectors * sector,
+        sector,
+        operations,
+    )
+    if backup != boot:
+        raise HelperVerificationError("The created NTFS backup boot sector is invalid")
+    volume_record_offset = mft_cluster * cluster_size + 3 * file_record_size
+    raw_volume_record = _partition_readback(
+        whole,
+        partition,
+        request,
+        volume_record_offset,
+        file_record_size,
+        operations,
+    )
+    normalized_label = _ntfs_volume_label(
+        raw_volume_record,
+        bytes_per_sector,
+        request.plan.label,
+    )
+    return _receipt(
+        request,
+        Filesystem.NTFS,
+        partition_device_number,
+        sectors_per_cluster,
+        normalized_label,
+        boot + backup + raw_volume_record,
+    )
+
+
+def _post_format_receipt(
+    whole: int,
+    partition: int,
+    request: RestoreDeviceRequest,
+    partition_device_number: int,
+    operations: RestoreOperations,
+) -> FilesystemReceipt:
+    if request.plan.filesystem is Filesystem.FAT32:
+        return _fat32_receipt(
+            whole, partition, request, partition_device_number, operations,
+        )
+    if request.plan.filesystem is Filesystem.NTFS:
+        return _ntfs_receipt(
+            whole, partition, request, partition_device_number, operations,
+        )
+    raise HelperVerificationError("The post-format filesystem is unsupported")
+
+
 def _zero_and_verify(
     descriptor: int,
     request: RestoreDeviceRequest,
@@ -1203,13 +1692,21 @@ def _formatter_argv(
     filesystem = plan.filesystem
     argv = [_MKFS[filesystem]]
     if filesystem is Filesystem.FAT32:
-        argv += ["-F", filesystem.value.removeprefix("fat")]
+        argv += [
+            "-F", filesystem.value.removeprefix("fat"),
+            "-S", str(request.logical_sector_size),
+            "-h", str(request.partition_start_sector),
+        ]
         if plan.allocation_unit_size is not None:
             argv += ["-s", str(plan.allocation_unit_size // request.logical_sector_size)]
         if plan.label:
             argv += ["-n", plan.label]
     else:
-        argv.append("-f")
+        argv += [
+            "-f",
+            "-s", str(request.logical_sector_size),
+            "-p", str(request.partition_start_sector),
+        ]
         if plan.allocation_unit_size is not None:
             argv += ["-c", str(plan.allocation_unit_size)]
         if plan.label:
@@ -1317,6 +1814,7 @@ def execute_restore_device_transaction(
     try:
         flags = (
             os.O_RDWR
+            | os.O_EXCL
             | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
@@ -1394,6 +1892,10 @@ def execute_restore_device_transaction(
             ).output,
             request,
         )
+        filesystem_receipt = _post_format_receipt(
+            whole, partition, request, observed.device_number, operations,
+        )
+        validate_filesystem_receipt(request, filesystem_receipt)
         return RestoreDeviceResult(
             request.request_id,
             RESTORE_DEVICE_PROFILE,
@@ -1407,6 +1909,8 @@ def execute_restore_device_transaction(
             written,
             skipped,
             verified,
+            request.plan.filesystem,
+            filesystem_receipt,
             True,
             True,
         )
@@ -1471,6 +1975,70 @@ def pack_restore_device_request(request: RestoreDeviceRequest) -> bytes:
         len(label),
         label.ljust(128, b"\0"),
         request.plan_sha256,
+    )
+
+
+def pack_restore_device_result(
+    request: RestoreDeviceRequest,
+    result: RestoreDeviceResult,
+) -> bytes:
+    validate_restore_device_request(request)
+    if type(result) is not RestoreDeviceResult:
+        raise HelperVerificationError("An exact restore result is required")
+    validate_filesystem_receipt(request, result.filesystem_receipt)
+    receipt = result.filesystem_receipt
+    if (
+        result.request_id != request.request_id
+        or result.profile != RESTORE_DEVICE_PROFILE
+        or result.target_path != request.plan.device_path
+        or result.expected_major_minor != request.expected_major_minor
+        or result.disk_sequence != request.expected_disk_sequence
+        or result.capacity != request.expected_capacity
+        or result.logical_sector_size != request.logical_sector_size
+        or type(result.partition) is not PartitionObservation
+        or _dev_text(result.partition.parent_device_number)
+        != request.expected_major_minor
+        or result.partition.start_sector != request.partition_start_sector
+        or result.partition.sector_count != request.partition_sector_count
+        or result.scanned_bytes != request.expected_capacity
+        or result.written_bytes + result.skipped_bytes != request.expected_capacity
+        or result.verified_bytes != request.expected_capacity
+        or result.filesystem is not request.plan.filesystem
+        or receipt.filesystem is not result.filesystem
+        or receipt.partition_major_minor
+        != _dev_text(result.partition.device_number)
+        or result.durable is not True
+        or result.cache_invalidated is not True
+    ):
+        raise HelperVerificationError("The restore result is incomplete or inconsistent")
+    label = receipt.normalized_label.encode("utf-8", "strict")
+    return _RESULT.pack(
+        _WIRE_MAGIC,
+        _WIRE_VERSION,
+        PACKET_RESULT,
+        0,
+        result.request_id,
+        os.major(result.partition.parent_device_number),
+        os.minor(result.partition.parent_device_number),
+        result.disk_sequence,
+        result.capacity,
+        result.scanned_bytes,
+        result.written_bytes,
+        result.skipped_bytes,
+        result.verified_bytes,
+        os.major(result.partition.device_number),
+        os.minor(result.partition.device_number),
+        result.partition.start_sector,
+        result.partition.sector_count,
+        request.plan_sha256,
+        _FILESYSTEM_CODE[result.filesystem],
+        1,
+        len(label),
+        receipt.logical_sector_size,
+        receipt.sectors_per_cluster,
+        label.ljust(128, b"\0"),
+        receipt.metadata_sha256,
+        receipt.receipt_sha256,
     )
 
 
@@ -1610,7 +2178,30 @@ def unpack_restore_server_packet(packet: bytes) -> tuple[object, ...]:
         return ("progress", fields[4], phase, fields[6], fields[7])
     if packet_type == PACKET_RESULT and len(packet) == _RESULT.size:
         fields = _RESULT.unpack(packet)
-        return ("result", *fields[4:])
+        filesystem_code = fields[18]
+        label_size = fields[20]
+        label_field = fields[23]
+        if (
+            filesystem_code not in _FILESYSTEM_FROM_CODE
+            or fields[19] != 1
+            or label_size > len(label_field)
+            or any(label_field[label_size:])
+        ):
+            raise HelperTargetError("The restore result receipt header is invalid")
+        try:
+            label = label_field[:label_size].decode("utf-8", "strict")
+        except UnicodeError as error:
+            raise HelperTargetError("The restore result receipt label is invalid") from error
+        return (
+            "result",
+            *fields[4:18],
+            _FILESYSTEM_FROM_CODE[filesystem_code],
+            fields[21],
+            fields[22],
+            label,
+            fields[24],
+            fields[25],
+        )
     if packet_type == PACKET_ERROR and len(packet) == _ERROR.size:
         fields = _ERROR.unpack(packet)
         message = fields[6].split(b"\0", 1)[0].decode("utf-8", "replace")
@@ -1800,26 +2391,7 @@ def serve_restore_device_channel(channel: socket.socket, *, invoking_uid: int) -
             prepared=prepared,
             progress=progress,
         )
-        _send_packet(channel, _RESULT.pack(
-            _WIRE_MAGIC,
-            _WIRE_VERSION,
-            PACKET_RESULT,
-            0,
-            result.request_id,
-            os.major(result.partition.parent_device_number),
-            os.minor(result.partition.parent_device_number),
-            result.disk_sequence,
-            result.capacity,
-            result.scanned_bytes,
-            result.written_bytes,
-            result.skipped_bytes,
-            result.verified_bytes,
-            os.major(result.partition.device_number),
-            os.minor(result.partition.device_number),
-            result.partition.start_sector,
-            result.partition.sector_count,
-            request.plan_sha256,
-        ))
+        _send_packet(channel, pack_restore_device_result(request, result))
         return 0
     except BaseException as error:
         message = str(error).replace("\0", "").encode("utf-8", "replace")[:512]
