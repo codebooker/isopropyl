@@ -38,6 +38,8 @@ from isopropyl.private_fat32 import (
     PrivateFat32Error,
     PrivateFat32State,
 )
+from isopropyl.wim import WimEdition, WimSelection
+from isopropyl.windows import WindowsCustomization
 from isopropyl.windows_bios_pbr import MODERN_BOOTMGR_ENTRY_STUB, STAGE_SECTOR
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.windows_iso_fat32 import (
@@ -53,6 +55,7 @@ from tests.test_iso_staging import (
     SEVEN_ZIP,
     fake_catalog_scanner,
     fake_split_plan,
+    inspected_wim,
 )
 
 
@@ -103,6 +106,21 @@ def windows_write_plan(total_bytes: int) -> WritePlan:
     )
 
 
+def install_wim_selection(source_size: int) -> WimSelection:
+    edition = WimEdition(
+        index=3,
+        name="Windows 11 Pro",
+        description="Professional desktop",
+        edition_id="Professional",
+        architecture="amd64",
+        major_version=10,
+        minor_version=0,
+        build=26100,
+        service_pack_build=0,
+    )
+    return WimSelection("sources/install.wim", source_size, (edition,), 3)
+
+
 def populate_extracted_tree(root: Path) -> None:
     bootmgr = root / "bootmgr"
     if bootmgr.exists():
@@ -131,6 +149,9 @@ class WindowsIsoFat32Tests(unittest.TestCase):
         *,
         mutate=populate_extracted_tree,
         splitter=None,
+        wim_inspector=None,
+        windows_customization: WindowsCustomization | None = None,
+        windows_architecture: str = "amd64",
     ):
         root = Path(directory)
         workspace = Path(directory) / "workspace"
@@ -147,13 +168,19 @@ class WindowsIsoFat32Tests(unittest.TestCase):
                 entries,
                 write_plan,
                 seven_zip=SEVEN_ZIP,
+                windows_customization=windows_customization,
+                windows_architecture=windows_architecture,
             )
+        executor_options = {}
+        if wim_inspector is not None:
+            executor_options["wim_inspector"] = wim_inspector
         staging_result = IsoStagingExecutor(
             extractor=FakeExtractor(
                 mutate=lambda destination, _image: mutate(destination),
             ),
             wim_splitter=splitter,
             split_plan_builder=fake_split_plan,
+            **executor_options,
         ).execute(iso_plan)
         self.assertIsNotNone(staging_result.tree_manifest)
         return iso_plan, staging_result, workspace
@@ -379,9 +406,7 @@ class WindowsIsoFat32Tests(unittest.TestCase):
             root = Path(directory)
             image = root / "source.iso"
             image.write_bytes(b"ISO placeholder")
-            for field in (
-                "overlay", "embedded_fat", "windows_customization", "windows_bootex",
-            ):
+            for field in ("overlay", "embedded_fat", "windows_bootex"):
                 with self.subTest(field=field), patch(
                     "isopropyl.iso_staging.scan_image_contents",
                     fake_catalog_scanner(entries),
@@ -417,13 +442,268 @@ class WindowsIsoFat32Tests(unittest.TestCase):
             ):
                 validate_iso_staging_plan(forged)
 
+            with patch(
+                "isopropyl.iso_staging.scan_image_contents",
+                fake_catalog_scanner(entries),
+            ):
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError, "requires amd64 customization",
+                ):
+                    build_iso_staging_plan(
+                        image,
+                        root / "staging-arm64",
+                        entries,
+                        write_plan,
+                        seven_zip=SEVEN_ZIP,
+                        windows_customization=WindowsCustomization(
+                            hide_online_account=True,
+                        ),
+                        windows_architecture="arm64",
+                    )
+
+    def test_composes_exact_generated_customization_and_binds_options(self) -> None:
+        customization = WindowsCustomization(
+            hide_online_account=True,
+            reduce_data_collection=True,
+        )
+        entries = (
+            ArchiveEntry("bootmgr", 0x400),
+            ArchiveEntry("Boot/BCD", 100),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
+            ArchiveEntry("sources/boot.wim", 3 * 1024),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            iso_plan, staging_result, workspace = self.publish(
+                directory,
+                entries,
+                windows_write_plan(sum(item.size for item in entries)),
+                windows_customization=customization,
+            )
+            answer = staging_result.destination / "autounattend.xml"
+            answer_bytes = answer.read_bytes()
+            self.assertEqual(
+                hashlib.sha256(answer_bytes).hexdigest(),
+                iso_plan.autounattend_sha256,
+            )
+            self.assertTrue(staging_result.autounattend_added)
+            self.assertEqual(
+                tuple(
+                    (item.path, item.size, item.sha256)
+                    for item in staging_result.tree_manifest.files
+                    if item.path.casefold() == "autounattend.xml"
+                ),
+                ((
+                    "autounattend.xml",
+                    len(answer_bytes),
+                    iso_plan.autounattend_sha256,
+                ),),
+            )
+            plan = build_windows_iso_fat32_plan(
+                iso_plan,
+                staging_result,
+                workspace,
+                image_size=IMAGE_SIZE,
+            )
+            self.assertEqual(plan.windows_customization, customization)
+            self.assertIsNone(plan.wim_selection)
+            self.assertEqual(
+                plan.autounattend_sha256, iso_plan.autounattend_sha256,
+            )
+            validate_windows_iso_fat32_plan(plan)
+            with self.assertRaisesRegex(WindowsIsoFat32Error, "receipt"):
+                validate_windows_iso_fat32_plan(replace(
+                    plan, autounattend_sha256="0" * 64,
+                ))
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "answer-file digest",
+            ):
+                validate_iso_staging_plan(replace(
+                    iso_plan, autounattend_sha256="0" * 64,
+                ))
+
+    def test_disabled_gui_customization_is_normalized_to_absent(self) -> None:
+        entries = (
+            ArchiveEntry("bootmgr", 0x400),
+            ArchiveEntry("Boot/BCD", 100),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
+            ArchiveEntry("sources/boot.wim", 3 * 1024),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            iso_plan, staging_result, workspace = self.publish(
+                directory,
+                entries,
+                windows_write_plan(sum(item.size for item in entries)),
+                windows_customization=WindowsCustomization(),
+            )
+            self.assertIsNone(iso_plan.windows_customization)
+            self.assertIsNone(iso_plan.windows_architecture)
+            self.assertIsNone(iso_plan.autounattend_xml)
+            self.assertIsNone(iso_plan.autounattend_sha256)
+            self.assertFalse(staging_result.autounattend_added)
+            plan = build_windows_iso_fat32_plan(
+                iso_plan,
+                staging_result,
+                workspace,
+                image_size=IMAGE_SIZE,
+            )
+            self.assertIsNone(plan.windows_customization)
+            self.assertIsNone(plan.autounattend_sha256)
+            validate_windows_iso_fat32_plan(plan)
+
+    def test_composes_selected_install_esd_into_final_dual_image(self) -> None:
+        entries = (
+            ArchiveEntry("bootmgr", 0x400),
+            ArchiveEntry("Boot/BCD", 100),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
+            ArchiveEntry("sources/boot.wim", 3 * 1024),
+            ArchiveEntry("sources/install.esd", 7),
+        )
+        selection = replace(
+            install_wim_selection(7), source_name="sources/install.esd",
+        )
+        customization = WindowsCustomization(install_image=selection)
+        with tempfile.TemporaryDirectory() as directory:
+            iso_plan, staging_result, workspace = self.publish(
+                directory,
+                entries,
+                windows_write_plan(sum(item.size for item in entries)),
+                wim_inspector=lambda path, *_: inspected_wim(
+                    path, selection.editions,
+                ),
+                windows_customization=customization,
+            )
+            plan = build_windows_iso_fat32_plan(
+                iso_plan,
+                staging_result,
+                workspace,
+                image_size=IMAGE_SIZE,
+            )
+            paths = {
+                item.path.casefold(): item
+                for item in staging_result.tree_manifest.files
+            }
+            self.assertIn("sources/install.esd", paths)
+            self.assertIn("autounattend.xml", paths)
+            self.assertEqual(plan.wim_selection, selection)
+            self.assertEqual(plan.windows_customization, customization)
+            validate_windows_iso_fat32_plan(plan)
+
+    def test_composes_explicit_nested_selection_and_preserves_other_wim(self) -> None:
+        entries = (
+            ArchiveEntry("bootmgr", 0x400),
+            ArchiveEntry("Boot/BCD", 100),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
+            ArchiveEntry("sources/boot.wim", 3 * 1024),
+            ArchiveEntry("x64/sources/install.wim", 7),
+            ArchiveEntry("x86/sources/install.wim", 9),
+        )
+        selection = replace(
+            install_wim_selection(7), source_name="x64/sources/install.wim",
+        )
+        customization = WindowsCustomization(
+            install_image=selection,
+            install_image_path=selection.source_name,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            iso_plan, staging_result, workspace = self.publish(
+                directory,
+                entries,
+                windows_write_plan(sum(item.size for item in entries)),
+                wim_inspector=lambda path, *_: inspected_wim(
+                    path, selection.editions,
+                ),
+                windows_customization=customization,
+            )
+            plan = build_windows_iso_fat32_plan(
+                iso_plan,
+                staging_result,
+                workspace,
+                image_size=IMAGE_SIZE,
+            )
+            paths = {
+                item.path.casefold(): item
+                for item in staging_result.tree_manifest.files
+            }
+            self.assertIn("x64/sources/install.wim", paths)
+            self.assertIn("x86/sources/install.wim", paths)
+            answer = (staging_result.destination / "autounattend.xml").read_text()
+            self.assertIn(r"x64\sources\install.wim", answer)
+            self.assertEqual(plan.wim_selection, selection)
+            self.assertEqual(plan.windows_customization, customization)
+            validate_windows_iso_fat32_plan(plan)
+
+    def test_customization_collision_is_rejected_before_extraction(self) -> None:
+        customization = WindowsCustomization(hide_online_account=True)
+        entries = (
+            ArchiveEntry("bootmgr", 0x400),
+            ArchiveEntry("Boot/BCD", 100),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
+            ArchiveEntry("sources/boot.wim", 3 * 1024),
+            ArchiveEntry("AutoUnattend.XML", 4),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "source.iso"
+            image.write_bytes(b"ISO placeholder")
+            with (
+                patch(
+                    "isopropyl.iso_staging.scan_image_contents",
+                    fake_catalog_scanner(entries),
+                ),
+                self.assertRaisesRegex(IsoStagingSafetyError, "already contains"),
+            ):
+                build_iso_staging_plan(
+                    image,
+                    root / "staging",
+                    entries,
+                    windows_write_plan(sum(item.size for item in entries)),
+                    seven_zip=SEVEN_ZIP,
+                    windows_customization=customization,
+                )
+
+    def test_missing_or_tampered_published_answer_file_is_rejected(self) -> None:
+        customization = WindowsCustomization(hide_online_account=True)
+        entries = (
+            ArchiveEntry("bootmgr", 0x400),
+            ArchiveEntry("Boot/BCD", 100),
+            ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
+            ArchiveEntry("sources/boot.wim", 3 * 1024),
+        )
+        for mutation in ("missing", "tampered"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                iso_plan, staging_result, workspace = self.publish(
+                    directory,
+                    entries,
+                    windows_write_plan(sum(item.size for item in entries)),
+                    windows_customization=customization,
+                )
+                answer = staging_result.destination / "autounattend.xml"
+                if mutation == "missing":
+                    answer.unlink()
+                else:
+                    payload = answer.read_bytes()
+                    answer.write_bytes(b"X" + payload[1:])
+                with self.assertRaises(WindowsIsoFat32Error):
+                    build_windows_iso_fat32_plan(
+                        iso_plan,
+                        staging_result,
+                        workspace,
+                        image_size=IMAGE_SIZE,
+                    )
+
     def test_witnessed_split_tree_may_be_smaller_than_original_catalog(self) -> None:
         with tempfile.TemporaryDirectory(dir=LARGE_TEMP_PARENT) as directory:
+            install_size = 4 * 1024**3
             entries = (
                 ArchiveEntry("bootmgr", 0x400),
                 ArchiveEntry("Boot/BCD", 100),
                 ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
-                ArchiveEntry("sources/install.wim", (4 * 1024**3)),
+                ArchiveEntry("sources/install.wim", install_size),
+            )
+            selection = install_wim_selection(install_size)
+            customization = WindowsCustomization(
+                hide_online_account=True,
+                install_image=selection,
             )
             write_plan = windows_write_plan(sum(item.size for item in entries))
             write_plan = replace(
@@ -438,6 +718,10 @@ class WindowsIsoFat32Tests(unittest.TestCase):
                 entries,
                 write_plan,
                 splitter=FakeSplitter(),
+                wim_inspector=lambda path, *_: inspected_wim(
+                    path, selection.editions,
+                ),
+                windows_customization=customization,
             )
             self.assertLess(staging_result.bytes_staged, write_plan.minimum_content_bytes)
             image_size = (write_plan.minimum_target_bytes + 511) // 512 * 512
@@ -450,6 +734,19 @@ class WindowsIsoFat32Tests(unittest.TestCase):
             self.assertEqual(
                 plan.source_manifest_sha256,
                 staging_result.tree_manifest.manifest_sha256,
+            )
+            self.assertEqual(plan.windows_customization, customization)
+            self.assertEqual(plan.wim_selection, selection)
+            self.assertEqual(
+                plan.autounattend_sha256, iso_plan.autounattend_sha256,
+            )
+            self.assertNotIn(
+                "sources/install.wim",
+                {item.path.casefold() for item in staging_result.tree_manifest.files},
+            )
+            self.assertIn(
+                "autounattend.xml",
+                {item.path.casefold() for item in staging_result.tree_manifest.files},
             )
 
     def test_rejects_bootmgr_that_the_bios_stage_cannot_transfer(self) -> None:

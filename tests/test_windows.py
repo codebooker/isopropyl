@@ -499,6 +499,14 @@ class WindowsCustomizationTests(unittest.TestCase):
         ))
         root = ET.fromstring(xml)
         self.assertIn("BypassTPMCheck", xml)
+        self.assertEqual(
+            root.findtext(".//u:UserData/u:AcceptEula", namespaces=NS),
+            "true",
+        )
+        blank_key = root.find(".//u:UserData/u:ProductKey/u:Key", NS)
+        self.assertIsNotNone(blank_key)
+        assert blank_key is not None
+        self.assertIn(blank_key.text, (None, ""))
         self.assertIsNotNone(root.find(".//u:HideOnlineAccountScreens", NS))
         self.assertIsNotNone(root.find(".//u:HideWirelessSetupInOOBE", NS))
         self.assertEqual(root.findtext(".//u:ProtectYourPC", namespaces=NS), "3")
@@ -530,6 +538,15 @@ class WindowsCustomizationTests(unittest.TestCase):
         root = ET.fromstring(xml)
         self.assertEqual(answer_file_install_index(xml), 6)
         self.assertEqual(
+            root.findtext(".//u:UserData/u:AcceptEula", namespaces=NS),
+            "true",
+        )
+        self.assertEqual(len(root.findall(".//u:UserData", NS)), 1)
+        blank_key = root.find(".//u:UserData/u:ProductKey/u:Key", NS)
+        self.assertIsNotNone(blank_key)
+        assert blank_key is not None
+        self.assertIn(blank_key.text, (None, ""))
+        self.assertEqual(
             root.findtext(".//u:InstallFrom/u:MetaData/u:Key", namespaces=NS),
             "/IMAGE/INDEX",
         )
@@ -543,8 +560,21 @@ class WindowsCustomizationTests(unittest.TestCase):
             if item.attrib.get("name") == "Microsoft-Windows-Setup"
         ]
         self.assertEqual(len(setup_components), 1)
+        self.assertEqual(
+            setup_components[0][0].tag,
+            f"{{{UNATTEND_NS}}}UserData",
+        )
         self.assertIsNone(root.find(".//u:InstallTo", NS))
         self.assertIsNone(root.find(".//u:WillWipeDisk", NS))
+
+    def test_specialize_only_profile_does_not_create_windows_pe_user_data(self):
+        root = ET.fromstring(generate_autounattend(WindowsCustomization(
+            disable_fast_startup=True,
+        )))
+        self.assertIsNone(root.find(".//u:UserData", NS))
+        self.assertIsNone(root.find(
+            ".//u:component[@name='Microsoft-Windows-Setup']", NS,
+        ))
 
     def test_explicit_relative_install_wim_path_is_emitted_with_the_index(self):
         options = WindowsCustomization(

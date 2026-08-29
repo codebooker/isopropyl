@@ -34,6 +34,7 @@ MAX_EXTRACT_PATH_BYTES = 4096
 MAX_EXTRACT_PATH_COMPONENTS = 32
 MAX_EXTRACT_FILES = 8192
 MAX_EXTRACT_BYTES = 512 * MIB
+MAX_EDITION_TEXT_CHARACTERS = 256
 _TRUSTED_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _TRUSTED_TOOL_DIRECTORIES = frozenset(_TRUSTED_TOOL_PATH.split(":"))
 _PART_NAME = re.compile(r"install(?:(?P<number>[2-9][0-9]*))?\.swm", re.IGNORECASE)
@@ -606,10 +607,10 @@ _ARCHITECTURES = {
 
 def validate_wim_editions(editions: tuple[WimEdition, ...]) -> None:
     if (
-        not isinstance(editions, tuple)
+        type(editions) is not tuple
         or not editions
         or len(editions) > MAX_IMAGES
-        or any(not isinstance(item, WimEdition) for item in editions)
+        or any(type(item) is not WimEdition for item in editions)
     ):
         raise WimMetadataError("WIM metadata contains no images or too many images")
     indexes: set[int] = set()
@@ -618,7 +619,7 @@ def validate_wim_editions(editions: tuple[WimEdition, ...]) -> None:
             item.index, item.major_version, item.minor_version, item.build,
             item.service_pack_build, item.expanded_bytes,
         )
-        if any(not isinstance(value, int) or isinstance(value, bool) for value in integer_values):
+        if any(type(value) is not int for value in integer_values):
             raise WimMetadataError("WIM edition contains invalid numeric metadata")
         if (
             item.index <= 0 or item.index in indexes or item.major_version < 0
@@ -629,8 +630,20 @@ def validate_wim_editions(editions: tuple[WimEdition, ...]) -> None:
             raise WimMetadataError("WIM edition contains ambiguous or invalid numeric metadata")
         indexes.add(item.index)
         text_values = (item.name, item.description, item.edition_id, item.architecture)
-        if any(not isinstance(value, str) or len(value) > 1024 for value in text_values):
+        if any(
+            type(value) is not str or len(value) > MAX_EDITION_TEXT_CHARACTERS
+            for value in text_values
+        ):
             raise WimMetadataError("WIM edition contains invalid text metadata")
+        if any(
+            unicodedata.category(character).startswith("C")
+            or unicodedata.category(character) in {"Zl", "Zp"}
+            for value in text_values
+            for character in value
+        ):
+            raise WimMetadataError(
+                "WIM edition text contains control, formatting, or invalid characters"
+            )
         if not item.edition_id or item.architecture not in _ARCHITECTURES.values():
             raise WimMetadataError("WIM edition has an invalid edition or architecture")
     if tuple(item.index for item in editions) != tuple(sorted(indexes)):
@@ -638,7 +651,7 @@ def validate_wim_editions(editions: tuple[WimEdition, ...]) -> None:
 
 
 def validate_wim_selection(selection: WimSelection) -> None:
-    if not isinstance(selection, WimSelection):
+    if type(selection) is not WimSelection:
         raise WimValidationError("A WIM image selection is required")
     try:
         validate_install_image_member_path(selection.source_name)
@@ -647,8 +660,7 @@ def validate_wim_selection(selection: WimSelection) -> None:
             "The selection must name a safe */sources/install.wim or canonical install.esd"
         ) from error
     if (
-        not isinstance(selection.source_size, int)
-        or isinstance(selection.source_size, bool)
+        type(selection.source_size) is not int
         or selection.source_size <= 0
     ):
         raise WimValidationError("The selected WIM/ESD has an invalid catalog size")
@@ -657,8 +669,7 @@ def validate_wim_selection(selection: WimSelection) -> None:
     except WimMetadataError as error:
         raise WimValidationError(str(error)) from error
     if (
-        not isinstance(selection.selected_index, int)
-        or isinstance(selection.selected_index, bool)
+        type(selection.selected_index) is not int
         or sum(
             item.index == selection.selected_index for item in selection.editions
         ) != 1

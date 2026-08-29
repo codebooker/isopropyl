@@ -21,7 +21,7 @@ import stat
 import array
 import socket
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from .fat_image import FatImageError, RegularFat32Image, inspect_regular_fat32_image
 from .iso import (
@@ -55,6 +55,8 @@ from .private_fat32 import (
 from .staging_tree import (
     StagingTreeManifest,
 )
+from .wim import WimSelection
+from .windows import WindowsCustomization
 from .windows_bios_pbr import (
     Fat32BootmgrPbrPlan,
     WindowsBootmgrBiosProfile,
@@ -108,6 +110,9 @@ class WindowsIsoFat32Plan:
     bootmgr_sha256: str
     bcd_sha256: str
     bootx64_sha256: str
+    windows_customization: WindowsCustomization | None
+    wim_selection: WimSelection | None
+    autounattend_sha256: str | None
     plan_sha256: str
     _receipt: _CompositeReceipt | None = field(
         init=False, default=None, repr=False, compare=False,
@@ -376,6 +381,15 @@ def _plan_digest(plan: WindowsIsoFat32Plan) -> str:
                 "boot/bcd": plan.bcd_sha256,
                 "efi/boot/bootx64.efi": plan.bootx64_sha256,
             },
+            "windows_customization": (
+                asdict(plan.windows_customization)
+                if plan.windows_customization is not None else None
+            ),
+            "wim_selection": (
+                asdict(plan.wim_selection)
+                if plan.wim_selection is not None else None
+            ),
+            "autounattend_sha256": plan.autounattend_sha256,
         }
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -392,6 +406,9 @@ def _snapshot(plan: WindowsIsoFat32Plan) -> tuple[object, ...]:
         plan.bootmgr_sha256,
         plan.bcd_sha256,
         plan.bootx64_sha256,
+        plan.windows_customization,
+        plan.wim_selection,
+        plan.autounattend_sha256,
         plan.plan_sha256,
     )
 
@@ -423,6 +440,14 @@ def _validate_relationships(
     ):
         if type(digest) is not str or _SHA256.fullmatch(digest) is None:
             raise WindowsIsoFat32Error("A Windows FAT32 plan digest is invalid")
+    if (
+        plan.autounattend_sha256 is not None
+        and (
+            type(plan.autounattend_sha256) is not str
+            or _SHA256.fullmatch(plan.autounattend_sha256) is None
+        )
+    ):
+        raise WindowsIsoFat32Error("The Windows answer-file digest is invalid")
     try:
         manifest = validate_published_windows_staging(
             plan.iso_plan,
@@ -450,6 +475,9 @@ def _validate_relationships(
         or tuple(item.sha256 for item in manifest.files)
         != tuple(item.sha256 for item in plan.private_plan.files)
         or manifest.total_bytes != plan.private_plan.total_content_bytes
+        or plan.windows_customization != plan.iso_plan.windows_customization
+        or plan.wim_selection != plan.iso_plan.wim_selection
+        or plan.autounattend_sha256 != plan.iso_plan.autounattend_sha256
         or _required_file_digests(manifest)
         != (plan.bootmgr_sha256, plan.bcd_sha256, plan.bootx64_sha256)
         or not hmac.compare_digest(_plan_digest(plan), plan.plan_sha256)
@@ -490,24 +518,30 @@ def build_windows_iso_fat32_plan(
     except PrivateFat32Error as error:
         raise WindowsIsoFat32Error(str(error)) from error
     candidate = WindowsIsoFat32Plan(
-        iso_plan,
-        staging_result,
-        private_plan,
-        source_manifest.manifest_sha256,
-        bootmgr,
-        bcd,
-        bootx64,
-        "",
+        iso_plan=iso_plan,
+        staging_result=staging_result,
+        private_plan=private_plan,
+        source_manifest_sha256=source_manifest.manifest_sha256,
+        bootmgr_sha256=bootmgr,
+        bcd_sha256=bcd,
+        bootx64_sha256=bootx64,
+        windows_customization=iso_plan.windows_customization,
+        wim_selection=iso_plan.wim_selection,
+        autounattend_sha256=iso_plan.autounattend_sha256,
+        plan_sha256="",
     )
     plan = WindowsIsoFat32Plan(
-        candidate.iso_plan,
-        candidate.staging_result,
-        candidate.private_plan,
-        candidate.source_manifest_sha256,
-        candidate.bootmgr_sha256,
-        candidate.bcd_sha256,
-        candidate.bootx64_sha256,
-        _plan_digest(candidate),
+        iso_plan=candidate.iso_plan,
+        staging_result=candidate.staging_result,
+        private_plan=candidate.private_plan,
+        source_manifest_sha256=candidate.source_manifest_sha256,
+        bootmgr_sha256=candidate.bootmgr_sha256,
+        bcd_sha256=candidate.bcd_sha256,
+        bootx64_sha256=candidate.bootx64_sha256,
+        windows_customization=candidate.windows_customization,
+        wim_selection=candidate.wim_selection,
+        autounattend_sha256=candidate.autounattend_sha256,
+        plan_sha256=_plan_digest(candidate),
     )
     object.__setattr__(
         plan,

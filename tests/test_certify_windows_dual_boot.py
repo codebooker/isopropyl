@@ -232,6 +232,47 @@ class WindowsDualBootCertificationTests(unittest.TestCase):
         with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["windows.iso", "--run", "--timeout", "1"])
 
+    def test_parser_exposes_only_the_fixed_generated_customization_profile(self) -> None:
+        args = certification.build_parser().parse_args([
+            "windows.iso", "--run", "--with-generated-customization",
+        ])
+        self.assertTrue(args.with_generated_customization)
+        xml = certification.generate_autounattend(
+            certification.CUSTOMIZATION_OPTIONS,
+            "amd64",
+        )
+        self.assertTrue(certification.CUSTOMIZATION_OPTIONS.enabled)
+        self.assertIn("HiberbootEnabled", xml)
+        self.assertNotIn("DiskConfiguration", xml)
+        self.assertNotIn("WillWipeDisk", xml)
+        help_text = " ".join(certification.build_parser().format_help().split())
+        self.assertIn("does not install Windows", help_text)
+        self.assertIn("verify the specialize effect", help_text)
+
+    def test_customization_evidence_serializes_the_narrow_smoke_scope(self) -> None:
+        self.assertEqual(
+            certification.customization_verification_evidence(
+                certification.CUSTOMIZATION_PROFILE,
+            ),
+            {
+                "customization_verification_scope": (
+                    "composition-and-initial-setup-boot-only"
+                ),
+                "customization_effect_executed_or_verified": False,
+            },
+        )
+        self.assertEqual(
+            certification.customization_verification_evidence(None),
+            {
+                "customization_verification_scope": None,
+                "customization_effect_executed_or_verified": None,
+            },
+        )
+        with self.assertRaisesRegex(
+            certification.BootCertificationError, "profile is invalid",
+        ):
+            certification.customization_verification_evidence("forged")
+
     def test_kvm_is_rejected_before_pipeline_when_device_is_unavailable(self) -> None:
         with patch.object(certification.os, "geteuid", return_value=1000), patch.object(
             certification.os, "access", return_value=False,
@@ -292,17 +333,26 @@ class WindowsDualBootCertificationTests(unittest.TestCase):
                     certification,
                     "build_iso_staging_plan",
                     return_value=SimpleNamespace(image_identity=wrong),
-                ), self.assertRaisesRegex(
+                ) as staging_builder, self.assertRaisesRegex(
                     certification.BootCertificationError,
                     "different source image",
                 ):
                     certification.prepare_certification_pipeline(
                         source,
                         root / "workspace",
+                        with_generated_customization=True,
                     )
                 inspect.assert_called_once_with(
                     source.path,
                     expected_identity=expected,
+                )
+                self.assertEqual(
+                    staging_builder.call_args.kwargs["windows_customization"],
+                    certification.CUSTOMIZATION_OPTIONS,
+                )
+                self.assertEqual(
+                    staging_builder.call_args.kwargs["windows_architecture"],
+                    "amd64",
                 )
 
 

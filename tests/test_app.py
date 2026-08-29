@@ -3,6 +3,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import os
+import hashlib
 import tempfile
 import threading
 import unittest
@@ -27,7 +28,7 @@ from isopropyl.app import (
     FreeDosDownloadToken,
     IsoStagingPreparationRequest,
     IsoStagingPreparationToken, PendingIsoWrite, PendingUefiShell,
-    PreparedSyslinuxWrite, STYLE,
+    PreparedSyslinuxWrite, PreparedWindowsDualWrite, STYLE,
     StagedDbxConfirmation,
     UefiShellPreparationToken, Window, WindowsMetadataToken,
     WindowsDownloadToken, ZipOverlayPlanningToken,
@@ -618,6 +619,16 @@ def fake_iso_staging_plan(
     content_bytes = sum(
         entry.size for entry in effective_entries if entry.kind is EntryKind.FILE
     )
+    bound_customization = (
+        windows_customization
+        if windows_customization and windows_customization.enabled else None
+    )
+    answer = (
+        app_module.generate_autounattend(
+            bound_customization, windows_architecture,
+        )
+        if bound_customization is not None else None
+    )
     digest = "a" * 64
     return IsoStagingPlan(
         image=image,
@@ -635,13 +646,17 @@ def fake_iso_staging_plan(
         content_bytes=content_bytes,
         required_free_bytes=content_bytes + 64 * 1024**2,
         wim_source=None,
-        wim_selection=None,
-        wimlib_imagex=None,
-        autounattend_xml=None,
-        windows_customization=(
-            windows_customization if windows_customization and windows_customization.enabled
-            else None
+        wim_selection=(
+            bound_customization.install_image
+            if bound_customization is not None else None
         ),
+        wimlib_imagex=None,
+        autounattend_xml=answer,
+        autounattend_sha256=(
+            hashlib.sha256(answer.encode("utf-8")).hexdigest()
+            if answer is not None else None
+        ),
+        windows_customization=bound_customization,
         windows_architecture=(
             windows_architecture
             if windows_customization and windows_customization.enabled else None
@@ -4799,7 +4814,95 @@ class WindowWindowsDualRoutingTests(unittest.TestCase):
             FirmwareTarget.UEFI_ONLY,
         )
 
-    def test_dual_route_normalizes_disabled_windows_options_before_staging(self):
+    def test_dual_customization_gate_requires_exact_regenerated_amd64_xml(self):
+        source = Path(self.settings_home.name) / "customized-source.iso"
+        source.write_bytes(b"test image")
+        recommendation = self.recommendation()
+        assert recommendation.iso_plan is not None
+        base = fake_iso_staging_plan(
+            source,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            recommendation.iso_plan,
+        )
+        self.assertTrue(app_module.exact_windows_dual_customization(base))
+
+        options = WindowsCustomization(disable_fast_startup=True)
+        xml = app_module.generate_autounattend(options, "amd64")
+        customized = replace(
+            base,
+            windows_customization=options,
+            windows_architecture="amd64",
+            autounattend_xml=xml,
+            autounattend_sha256=hashlib.sha256(xml.encode("utf-8")).hexdigest(),
+        )
+        self.assertTrue(app_module.exact_windows_dual_customization(customized))
+        self.assertFalse(app_module.exact_windows_dual_customization(
+            replace(customized, windows_architecture="arm64"),
+        ))
+        self.assertFalse(app_module.exact_windows_dual_customization(
+            replace(customized, autounattend_xml=xml + " "),
+        ))
+
+    def test_windows_customization_summary_names_only_selected_effects(self):
+        options = WindowsCustomization(
+            bypass_hardware_requirements=True,
+            disable_fast_startup=True,
+            input_locale="en-US",
+            timezone="UTC",
+        )
+        summary = app_module.windows_customization_summary(options)
+        rendered = "\n".join(summary)
+        self.assertIn("RAM, Secure Boot, and TPM", rendered)
+        self.assertIn("license terms", rendered)
+        self.assertIn("product key blank", rendered)
+        self.assertIn("Fast Startup", rendered)
+        self.assertIn("Keyboard/input locale: en-US", rendered)
+        self.assertIn("Time zone: UTC", rendered)
+        self.assertNotIn("BitLocker", rendered)
+        self.assertEqual(
+            app_module.windows_customization_summary(WindowsCustomization()),
+            ("None",),
+        )
+
+        account = "\n".join(app_module.windows_customization_summary(
+            WindowsCustomization(local_username="Jack"),
+        ))
+        self.assertIn("initially blank password", account)
+        self.assertIn("password change at first logon", account)
+        self.assertIn("password to never expire", account)
+
+        expiring_account = "\n".join(app_module.windows_customization_summary(
+            WindowsCustomization(
+                local_username="Jack",
+                local_password_never_expires=False,
+            ),
+        ))
+        self.assertIn("normal local-account password-expiration policy", expiring_account)
+
+        detailed = "\n".join(app_module.windows_customization_summary(
+            WindowsCustomization(
+                quality_of_life=True,
+                acknowledge_quality_of_life_limitations=True,
+                input_locale="0409:00000409",
+                system_locale="en-US",
+                ui_language="en-US",
+                user_locale="en-CA",
+                timezone="Eastern Standard Time",
+            ),
+        ))
+        for expected in (
+            "remove OneDrive, Outlook, and Teams",
+            "Fast Startup, Copilot",
+            "Keyboard/input locale: 0409:00000409",
+            "System locale: en-US",
+            "UI language: en-US",
+            "User locale: en-CA",
+            "Time zone: Eastern Standard Time",
+        ):
+            self.assertIn(expected, detailed)
+
+    def test_dual_route_preserves_generated_windows_options_for_staging(self):
         inspection = optical_windows_dual_inspection()
         source = Path(self.settings_home.name) / "source.iso"
         source.write_bytes(b"test image")
@@ -4814,11 +4917,17 @@ class WindowWindowsDualRoutingTests(unittest.TestCase):
         self.window.image = source
         self.window.inspection = inspection
         self.window.inspection_identity = identity
+        self.window.windows_options = WindowsCustomization(
+            bypass_hardware_requirements=True,
+        )
         continuation = Mock()
         self.window._continue_prepared_iso_write = continuation
 
         def builder(*args, **kwargs):
-            self.assertIsNone(kwargs["windows_customization"])
+            self.assertIs(
+                kwargs["windows_customization"],
+                self.window.windows_options,
+            )
             self.assertIsNone(kwargs["windows_bootex"])
             self.assertIsNone(kwargs["embedded_fat"])
             return fake_iso_staging_plan(*args, **kwargs)
@@ -4852,6 +4961,107 @@ class WindowWindowsDualRoutingTests(unittest.TestCase):
         pending = continuation.call_args.args[0]
         self.assertTrue(pending.windows_dual_enabled)
         pending.workspace.cleanup()
+
+    def test_dual_staging_completion_rejects_changed_windows_options(self):
+        inspection = optical_windows_dual_inspection()
+        source = Path(self.settings_home.name) / "source.iso"
+        source.write_bytes(b"test image")
+        status = source.stat()
+        identity = (
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+        )
+        original = WindowsCustomization(bypass_hardware_requirements=True)
+        self.window.image = source
+        self.window.inspection = inspection
+        self.window.inspection_identity = identity
+        self.window.windows_options = original
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+
+        def builder(*args, **kwargs):
+            plan = fake_iso_staging_plan(*args, **kwargs)
+            self.window.windows_options = WindowsCustomization(
+                disable_fast_startup=True,
+            )
+            return plan
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL": "1"},
+            ),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=identity),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as warning,
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch("isopropyl.app.build_iso_staging_plan", side_effect=builder),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            recommendation = self.recommendation()
+            assert recommendation.iso_plan is not None
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), recommendation.iso_plan,
+            )
+
+        continuation.assert_not_called()
+        self.assertIn("changed during preparation", warning.call_args.args[2])
+
+    def test_dual_confirmation_discloses_exact_generated_customization(self):
+        options = WindowsCustomization(
+            bypass_hardware_requirements=True,
+            disable_fast_startup=True,
+        )
+        composite = SimpleNamespace(
+            windows_customization=options,
+            autounattend_sha256="a" * 64,
+        )
+        plan = SimpleNamespace(
+            composite_plan=composite,
+            source_manifest_sha256="b" * 64,
+            composite_plan_sha256="c" * 64,
+            device=device(),
+            image_size=device().size,
+            logical_sector_size=512,
+            confirmation_phrase="WRITE WINDOWS DUAL /dev/sdz 65:144",
+        )
+        workspace = Mock()
+        pending = SimpleNamespace(workspace=workspace)
+        runner = Mock()
+        prepared = PreparedWindowsDualWrite(pending, runner, plan)
+        self.window.windows_device_runner = runner
+        self.window.prepared_windows_dual = prepared
+        self.window.pending_iso_write = pending
+        observed = {}
+
+        def inspect(dialog: QDialog) -> int:
+            details = dialog.findChild(
+                QPlainTextEdit, "windowsDualConfirmationDetails",
+            )
+            assert details is not None
+            observed["details"] = details.toPlainText()
+            return QDialog.DialogCode.Rejected
+
+        with patch("isopropyl.app.QDialog.exec", new=inspect):
+            self.window.prompt_windows_dual_confirmation(prepared)
+
+        text = observed["details"]
+        self.assertIn("a" * 64, text)
+        self.assertIn("RAM, Secure Boot, and TPM", text)
+        self.assertIn("Disable Windows Fast Startup", text)
+        self.assertNotIn("BitLocker", text)
+        runner.cancel.assert_called_once_with()
+        workspace.cleanup.assert_called_once_with()
 
     def test_prepared_dual_plan_dispatches_only_to_windows_backend(self):
         inspection = optical_windows_dual_inspection()
@@ -4969,6 +5179,10 @@ class WindowWindowsDualRoutingTests(unittest.TestCase):
             with (
                 patch(
                     "isopropyl.app.resolve_windows_helper_installation"
+                ),
+                patch(
+                    "isopropyl.app.exact_windows_dual_customization",
+                    return_value=True,
                 ),
                 patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
                 patch(
@@ -6314,6 +6528,42 @@ class WindowRuntimeValidationTests(unittest.TestCase):
         self.assertIn("disable OneDrive synchronization", confirmation)
         self.assertIn("Outlook and Teams packages", confirmation)
         self.assertIn("Package or policy steps may partially fail", confirmation)
+        workspace.cleanup.assert_called_once_with()
+
+    def test_final_uefi_confirmation_discloses_setup_eula_and_blank_key(self):
+        plan = self.window.write_recommendation.iso_plan
+        assert plan is not None
+        customization = WindowsCustomization(
+            bypass_hardware_requirements=True,
+        )
+        workspace = Mock()
+        workspace.name = self.settings_home.name
+        staging = fake_iso_staging_plan(
+            self.window.image,
+            Path(self.settings_home.name) / "ready-media",
+            self.window.archive_entries(),
+            plan,
+            windows_customization=customization,
+        )
+        pending = PendingIsoWrite(
+            self.window.image, self.window.inspection, self.window.devices[0],
+            plan, workspace, staging,
+        )
+        with (
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ) as warning,
+        ):
+            self.window.confirm_and_start_iso_write(pending, None, None)
+
+        confirmation = warning.call_args.args[2]
+        self.assertIn("Generated answer-file SHA-256", confirmation)
+        self.assertIn(staging.autounattend_sha256, confirmation)
+        self.assertIn("license terms", confirmation)
+        self.assertIn("product key blank", confirmation)
+        self.assertIn("RAM, Secure Boot, and TPM", confirmation)
         workspace.cleanup.assert_called_once_with()
 
     def test_final_confirmation_discloses_secure_boot_policy_recovery_risk(self):

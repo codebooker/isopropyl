@@ -594,6 +594,16 @@ def generate_autounattend(options: WindowsCustomization, architecture: str = "am
         if found is None:
             found = _component(_settings(root, passes, pass_name), name, architecture)
             components[key] = found
+            if key == ("windowsPE", "Microsoft-Windows-Setup"):
+                # Windows Setup requires AcceptEula in an unattended windowsPE
+                # answer. Rufus also emits an explicitly blank product key
+                # before its other Setup settings. This leaves activation and
+                # edition licensing to the supplied media instead of inventing
+                # or collecting a key here.
+                user_data = ET.SubElement(found, "UserData")
+                ET.SubElement(user_data, "AcceptEula").text = "true"
+                product_key = ET.SubElement(user_data, "ProductKey")
+                ET.SubElement(product_key, "Key").text = ""
         return found
 
     if options.bypass_hardware_requirements:

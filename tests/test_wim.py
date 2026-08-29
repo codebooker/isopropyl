@@ -22,9 +22,11 @@ from isopropyl.wim import (
     WimCancelled,
     WimCommandError,
     WimExtractExecutor,
+    WimEdition,
     WimInfo,
     WimMetadataError,
     WimSplitExecutor,
+    WimSelection,
     WimToolUnavailable,
     WimValidationError,
     _stop_process,
@@ -213,6 +215,52 @@ class WimInfoTests(unittest.TestCase):
         nested = replace(selection, source_name="x64/sources/install.wim")
         validate_wim_selection(nested)
         self.assertEqual(nested.source_name, "x64/sources/install.wim")
+
+    def test_selection_rejects_subclasses_and_display_control_characters(self):
+        editions = parse_wim_info_xml(INFO_XML)
+        selection = WimSelection("sources/install.esd", 123, editions, 2)
+
+        class ForgedSelection(WimSelection):
+            @property
+            def edition(self):
+                return WimEdition(
+                    2, "forged", "forged", "Professional", "amd64",
+                    10, 0, 26100, 0,
+                )
+
+        class ForgedEdition(WimEdition):
+            pass
+
+        forged_selection = ForgedSelection(
+            selection.source_name,
+            selection.source_size,
+            selection.editions,
+            selection.selected_index,
+        )
+        with self.assertRaisesRegex(WimValidationError, "selection"):
+            validate_wim_selection(forged_selection)
+
+        forged_edition = ForgedEdition(**editions[1].__dict__)
+        with self.assertRaisesRegex(WimValidationError, "metadata"):
+            validate_wim_selection(replace(
+                selection, editions=(editions[0], forged_edition),
+            ))
+
+        for text in (
+            "Windows 11 Pro\nTarget: /dev/sda",
+            "Windows 11 Pro\u202e",
+            "Windows 11 Pro\u2066certified\u2069",
+            "Windows 11 Pro\u2028Target: /dev/sda",
+            "Windows 11 Pro\u2029Status: certified",
+            "Windows 11 Pro\ud800",
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                WimValidationError, "control|formatting|invalid",
+            ):
+                validate_wim_selection(replace(
+                    selection,
+                    editions=(editions[0], replace(editions[1], name=text)),
+                ))
 
     def test_inspection_rejects_source_identity_change_during_command(self):
         with tempfile.TemporaryDirectory() as temporary:

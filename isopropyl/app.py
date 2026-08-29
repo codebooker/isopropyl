@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import hashlib
 import threading
 import logging
 import shutil
@@ -195,6 +196,102 @@ RESTORE_METHOD_VERIFIED = "verified-overwrite"
 WINDOWS_DUAL_TRANSITIONAL_BLOCKER = (
     "BIOS construction is not enabled; choose UEFI-only or use DD mode."
 )
+
+
+def windows_customization_summary(
+    options: WindowsCustomization | None,
+) -> tuple[str, ...]:
+    """Render only the fixed effects carried by one generated answer file."""
+
+    if options is None:
+        return ("None",)
+    if type(options) is not WindowsCustomization or not options.enabled:
+        return ("None",)
+    effects: list[str] = []
+    if options.install_image is not None:
+        edition = options.install_image.edition
+        effects.append(
+            f"Preselect Windows image {options.install_image.selected_index}: "
+            f"{edition.name or edition.edition_id} · {edition.edition_id} · "
+            f"build {edition.version} · {edition.architecture.upper()}"
+        )
+    if options.install_image is not None or options.bypass_hardware_requirements:
+        effects.append(
+            "Accept the Windows Setup license terms for unattended windowsPE "
+            "processing and leave the product key blank"
+        )
+    if options.bypass_hardware_requirements:
+        effects.append("Bypass Windows 11 RAM, Secure Boot, and TPM setup checks")
+    if options.hide_online_account:
+        effects.append("Hide the online Microsoft-account screen")
+    if options.bypass_online_account_requirement:
+        effects.append("Enable the reviewed Windows 11 offline-account path")
+    if options.local_username:
+        effects.append(
+            f"Create local administrator {options.local_username!r} with an "
+            "initially blank password and require a password change at first logon"
+        )
+        effects.append(
+            "Set the local account password to never expire"
+            if options.local_password_never_expires
+            else "Keep the normal local-account password-expiration policy"
+        )
+    if options.reduce_data_collection:
+        effects.append("Reduce Setup data collection")
+    if options.disable_automatic_bitlocker:
+        effects.append("Prevent automatic BitLocker device encryption")
+    if options.disable_fast_startup:
+        effects.append("Disable Windows Fast Startup")
+    if options.quality_of_life:
+        effects.append(
+            "Apply the fixed quality-of-life bundle: disable OneDrive sync; "
+            "remove OneDrive, Outlook, and Teams; disable Fast Startup, Copilot, "
+            "recommendations, search suggestions, feeds, and chat; adjust Start, "
+            "Edge first-run, device metadata, and the context menu"
+        )
+    if options.apply_secure_boot_revocation_policy:
+        effects.append("Apply the installed system's Secure Boot revocation policy")
+    for label, value in (
+        ("Keyboard/input locale", options.input_locale),
+        ("System locale", options.system_locale),
+        ("UI language", options.ui_language),
+        ("User locale", options.user_locale),
+        ("Time zone", options.timezone),
+    ):
+        if value:
+            effects.append(f"Set {label}: {value}")
+    return tuple(effects) or ("None",)
+
+
+def exact_windows_dual_customization(plan: IsoStagingPlan) -> bool:
+    """Admit only absent options or ISOpropyl's regenerated amd64 answer file."""
+
+    if type(plan) is not IsoStagingPlan:
+        return False
+    options = plan.windows_customization
+    if options is None:
+        return all(value is None for value in (
+            plan.windows_architecture,
+            plan.wim_selection,
+            plan.autounattend_xml,
+            plan.autounattend_sha256,
+        ))
+    if (
+        type(options) is not WindowsCustomization
+        or not options.enabled
+        or plan.windows_architecture != "amd64"
+        or plan.wim_selection != options.install_image
+    ):
+        return False
+    try:
+        expected = generate_autounattend(options, "amd64")
+        expected_digest = hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    except (ValueError, UnicodeEncodeError):
+        return False
+    return bool(
+        plan.autounattend_xml == expected
+        and plan.autounattend_sha256 == expected_digest
+    )
 
 
 class BackgroundPreparation:
@@ -2751,7 +2848,10 @@ class Window(QMainWindow):
             reason=(
                 "Developer opt-in: the exact Windows x64 FAT32 profile will build "
                 "BIOS + UEFI media through the anonymous, descriptor-only writer. "
-                "VM and physical-media certification are still outstanding."
+                "The uncustomized pipeline for one Windows 11 LTSC image is "
+                "VM-certified under SeaBIOS and non-Secure-Boot OVMF; generated "
+                "customization, physical media, Secure Boot, and broader firmware "
+                "certification remain outstanding."
             ),
             iso_plan=dual,
             iso_unavailable_reason="",
@@ -6658,8 +6758,6 @@ class Window(QMainWindow):
             incompatibilities = []
             if self.zip_overlay_plan is not None:
                 incompatibilities.append("remove the ZIP overlay")
-            if self.windows_options.enabled:
-                incompatibilities.append("disable Windows customization")
             if self.windows_bootex.enabled:
                 incompatibilities.append("disable the BootEx replacement")
             if self.selected_persistence_bytes():
@@ -6685,16 +6783,22 @@ class Window(QMainWindow):
             warning = QMessageBox.warning(
                 self,
                 "Experimental Windows BIOS + UEFI write",
-                "This developer-only path has passed automated backend checks, "
-                "but VM, physical USB-media, and broad firmware certification "
-                "are still pending. A failed result may "
+                "This developer-only path's uncustomized pipeline has reached "
+                "Windows Setup with one Windows 11 LTSC image under SeaBIOS and "
+                "non-Secure-Boot OVMF. Generated customization has composition "
+                "tests but no retained install-through observation. "
+                "The privileged device transaction, physical USB media, Secure "
+                "Boot, other Windows releases, and broad firmware remain "
+                "uncertified. A failed result may "
                 "not boot even after a successful write.\n\n"
                 "ISOpropyl will use only the strict x64 Windows Boot Manager "
-                "profile: safe ISO staging, optional install.wim splitting, an "
-                "anonymous full-device FAT32 image, the project-authored BIOS "
-                "loader, MBR-last activation, and mandatory complete SHA-256 "
-                "read-back through the fixed PolicyKit helper. There is no "
-                "formatter/mount or generic-writer fallback.\n\n"
+                "profile: safe ISO staging, optional install.wim splitting, "
+                "optional exact generated Windows customization, an anonymous "
+                "full-device FAT32 image, the project-authored BIOS loader, "
+                "MBR-last activation, and mandatory complete SHA-256 read-back "
+                "through the fixed PolicyKit helper. ISOpropyl never accepts a "
+                "caller-supplied answer file here. There is no formatter/mount "
+                "or generic-writer fallback.\n\n"
                 "Continue to choose private working space?",
                 QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
                 QMessageBox.StandardButton.Cancel,
@@ -7010,11 +7114,7 @@ class Window(QMainWindow):
                         else request.inspection.embedded_uefi_fat
                     ),
                     cancel_check=check_cancelled,
-                    windows_customization=(
-                        None
-                        if request.windows_dual_enabled
-                        else request.windows_customization
-                    ),
+                    windows_customization=request.windows_customization,
                     windows_architecture=request.windows_architecture,
                     windows_bootex=(
                         None
@@ -7086,6 +7186,7 @@ class Window(QMainWindow):
                 and self.inspection == request.inspection
                 and self.selected_device() == request.device
                 and self.zip_overlay_plan == request.overlay
+                and self.windows_options == request.windows_customization
                 and self.windows_bootex == request.windows_bootex
                 and (
                     not request.windows_dual_enabled
@@ -7369,7 +7470,7 @@ class Window(QMainWindow):
             or pending.runtime_validation is not None
             or pending.staging_plan.overlay is not None
             or pending.staging_plan.embedded_fat is not None
-            or pending.staging_plan.windows_customization is not None
+            or not exact_windows_dual_customization(pending.staging_plan)
             or pending.staging_plan.windows_bootex_options is not None
             or self.windows_device_runner is not None
         ):
@@ -7486,6 +7587,14 @@ class Window(QMainWindow):
         prepared: PreparedWindowsDualWrite,
     ) -> None:
         plan = prepared.plan
+        composite = plan.composite_plan
+        customization_effects = windows_customization_summary(
+            composite.windows_customization,
+        )
+        customization_text = "\n".join(
+            f"  • {effect}" for effect in customization_effects
+        )
+        answer_digest = composite.autounattend_sha256 or "not added"
         dialog = QDialog(self)
         self.windows_dual_confirmation_dialog = dialog
         dialog.setWindowTitle("Confirm experimental Windows BIOS + UEFI write")
@@ -7503,9 +7612,14 @@ class Window(QMainWindow):
         details.setPlainText(
             "EVERYTHING ON THIS DEVICE WILL BE PERMANENTLY ERASED\n\n"
             "Profile: Windows x64 · BIOS + UEFI · active MBR FAT32\n"
-            "Status: developer-only; VM and physical-media certification pending\n"
+            "Status: developer-only; one uncustomized LTSC image VM-certified; "
+            "customized install-through, physical, Secure-Boot, and broad-firmware "
+            "certification pending\n"
             f"Source tree SHA-256: {plan.source_manifest_sha256}\n"
             f"Composite plan SHA-256: {plan.composite_plan_sha256}\n"
+            f"Generated autounattend.xml SHA-256: {answer_digest}\n"
+            "Windows customization effects:\n"
+            f"{customization_text}\n"
             f"Target: {plan.device.path}\n"
             f"Model: {plan.device.vendor} {plan.device.model}\n"
             f"Serial/WWN: {plan.device.serial or plan.device.wwn or 'not reported'}\n"
@@ -8234,10 +8348,19 @@ class Window(QMainWindow):
             )
             return
 
-        customization = (
-            "\nWindows customization: autounattend.xml will be added."
-            if staging_plan.windows_customization is not None else ""
-        )
+        customization = ""
+        if staging_plan.windows_customization is not None:
+            effects = windows_customization_summary(
+                staging_plan.windows_customization,
+            )
+            customization = (
+                "\nWindows customization: exact generated autounattend.xml "
+                "will be added."
+                f"\nGenerated answer-file SHA-256: "
+                f"{staging_plan.autounattend_sha256}."
+                "\nSelected effects:\n"
+                + "\n".join(f"  • {effect}" for effect in effects)
+            )
         if (
             staging_plan.windows_customization is not None
             and staging_plan.windows_customization.quality_of_life
@@ -8263,12 +8386,6 @@ class Window(QMainWindow):
                 "media and any BitLocker recovery key available; ISOpropyl "
                 "cannot verify the image's update level or that the first-logon "
                 "command succeeds."
-            )
-        if staging_plan.wim_selection is not None:
-            customization += (
-                "\nWindows image: "
-                f"{staging_plan.wim_selection.display_label} from "
-                f"{staging_plan.wim_selection.source_name}."
             )
         if staging_plan.windows_bootex_source is not None:
             bootex_source = staging_plan.windows_bootex_source

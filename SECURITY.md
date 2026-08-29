@@ -354,8 +354,11 @@ issue requesting a private contact channel without disclosing the vulnerability.
   never proxies or redistributes Microsoft media, automates account/subscription
   access, or claims that a download grants a Windows license; Microsoft terms
   apply and ISOpropyl is unaffiliated with Microsoft.
-- Windows customization can be injected only through the UEFI ISO staging path;
-  an existing answer file is never overwritten. A selected WIM/ESD index is
+- Windows customization can be injected only through reviewed ISO staging
+  paths; an existing answer file is never overwritten. Ordinary exposure uses
+  UEFI ISO mode. The environment-gated x64 Windows BIOS+UEFI profile admits the
+  same generator only when overlays, embedded images, BootEx, Syslinux,
+  persistence, and the boot-time wrapper are absent. A selected WIM/ESD index is
   re-inspected through one inherited no-follow descriptor and bound to its exact
   source catalog path, size, architecture, edition set, ctime, and link count
   before `/IMAGE/INDEX` metadata is emitted. Nested or multi-source WIM answer
@@ -364,7 +367,20 @@ issue requesting a private contact channel without disclosing the vulnerability.
   The staging plan retains the frozen typed customization and generator
   architecture, regenerates the complete answer file before extraction, and
   requires exact UTF-8 byte equality; structurally valid extra commands,
-  comments, or whitespace changes are rejected. The fixed `BypassNRO` command
+  comments, or whitespace changes are rejected. The dual-firmware path also
+  binds the answer-file SHA-256, requires exactly lowercase root
+  `autounattend.xml` with the planned size and digest in the final published-tree
+  manifest, and freezes the typed options, optional WIM selection, and digest in
+  the anonymous-image composite plan. Its final destructive confirmation names
+  every selected effect and the digest. The opt-in certification harness accepts
+  only one fixed generated profile and no arbitrary XML; that option proves
+  composition plus initial Setup launch, not installation or execution of the
+  later `specialize` effect. The retained VM observation remains uncustomized.
+  Whenever hardware-bypass commands or image selection create a
+  `Microsoft-Windows-Setup` windowsPE component, the generator also emits
+  `AcceptEula=true` and an explicitly blank product key. The dual-mode final
+  confirmation discloses both; ISOpropyl never invents or collects a key.
+  The fixed `BypassNRO` command
   contains no user-derived text and is enabled only for an explicitly selected,
   recognized non-Home x64/ARM64 Windows 11 build in the 21H2–24H2 allowlist.
   Home, x86, newer, unknown, and obvious normalized English S-mode/cloud markers

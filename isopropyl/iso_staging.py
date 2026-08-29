@@ -242,6 +242,7 @@ class IsoStagingPlan:
     wim_selection: WimSelection | None
     wimlib_imagex: str | None
     autounattend_xml: str | None
+    autounattend_sha256: str | None = None
     archive_namespace: SevenZipNamespace = SevenZipNamespace.UDF
     windows_customization: WindowsCustomization | None = None
     windows_architecture: str | None = None
@@ -737,18 +738,36 @@ def _validate_transitional_windows_staging_scope(
     overlay: object,
     embedded_fat: object,
     windows_customization: object,
+    windows_architecture: object,
     windows_bootex: object,
     syslinux_c32_bundle: object,
     syslinux_payload_bundle: object,
 ) -> None:
     """Keep the legacy blocked-plan exception inside its reviewed profile."""
 
-    if _is_transitional_windows_plan(write_plan) and any(
+    if not _is_transitional_windows_plan(write_plan):
+        return
+    if (
+        windows_customization is not None
+        and type(windows_customization) is not WindowsCustomization
+    ):
+        raise IsoStagingSafetyError(
+            "The transitional Windows BIOS+UEFI profile requires exact generated "
+            "Windows customization inputs",
+        )
+    if (
+        windows_customization is not None
+        and windows_customization.enabled
+        and windows_architecture != "amd64"
+    ):
+        raise IsoStagingSafetyError(
+            "The Windows BIOS+UEFI FAT32 profile requires amd64 customization"
+        )
+    if any(
         value is not None
         for value in (
             overlay,
             embedded_fat,
-            windows_customization,
             windows_bootex,
             syslinux_c32_bundle,
             syslinux_payload_bundle,
@@ -756,7 +775,7 @@ def _validate_transitional_windows_staging_scope(
     ):
         raise IsoStagingSafetyError(
             "The transitional Windows BIOS+UEFI profile does not compose with "
-            "overlays, customization, embedded images, BootEx, or Syslinux",
+            "overlays, embedded images, BootEx, or Syslinux",
         )
 
 
@@ -965,6 +984,155 @@ def _validate_wim_selection_catalog(
     if source.size != selection.source_size:
         raise IsoStagingSafetyError(
             "The selected Windows image is not bound to this ISO catalog"
+        )
+
+
+def _validate_bound_windows_customization(
+    plan: IsoStagingPlan,
+    effective_entries: Sequence[ArchiveEntry],
+) -> None:
+    """Validate one exact generated answer file and all of its frozen inputs."""
+
+    answer_file = plan.autounattend_xml
+    answer_digest = plan.autounattend_sha256
+    answer_bytes: bytes | None = None
+    if answer_file is None:
+        if answer_digest is not None:
+            raise IsoStagingSafetyError(
+                "The staging plan has an unbound Windows answer-file digest"
+            )
+    else:
+        if type(answer_file) is not str:
+            raise IsoStagingSafetyError("The Windows answer file must be text")
+        try:
+            answer_bytes = answer_file.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise IsoStagingSafetyError(
+                "The Windows answer file is not valid UTF-8 text"
+            ) from error
+        _validate_answer_file(answer_file)
+        try:
+            answer_index = answer_file_install_index(
+                answer_file,
+                (
+                    plan.wim_selection.edition.architecture
+                    if plan.wim_selection is not None else None
+                ),
+            )
+        except ValueError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        expected_index = (
+            plan.wim_selection.selected_index
+            if plan.wim_selection is not None else None
+        )
+        if answer_index != expected_index:
+            raise IsoStagingSafetyError(
+                "The answer file image index does not match the staging plan"
+            )
+        try:
+            answer_path = answer_file_install_path(
+                answer_file,
+                (
+                    plan.wim_selection.edition.architecture
+                    if plan.wim_selection is not None else None
+                ),
+            )
+        except ValueError as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        install_source_count = sum(
+            entry.kind is EntryKind.FILE and (
+                _is_install_wim_path(entry.path)
+                or entry.path.casefold() == "sources/install.esd"
+            )
+            for entry in effective_entries
+        )
+        if plan.wim_selection is not None:
+            selected_is_wim = _is_install_wim_path(
+                plan.wim_selection.source_name,
+            )
+            if answer_path is not None and answer_path != plan.wim_selection.source_name:
+                raise IsoStagingSafetyError(
+                    "The answer-file WIM path does not match the staging plan"
+                )
+            if (
+                selected_is_wim
+                and (
+                    install_source_count > 1
+                    or plan.wim_selection.source_name.casefold()
+                    != "sources/install.wim"
+                )
+                and answer_path is None
+            ):
+                raise IsoStagingSafetyError(
+                    "The staging plan does not bind its nested or multi-source WIM path"
+                )
+        existing_answer_file = _existing_windows_answer_file(effective_entries)
+        if existing_answer_file is not None:
+            raise IsoStagingSafetyError(
+                f"The generated answer file conflicts with existing ISO content at "
+                f"{existing_answer_file}"
+            )
+    if answer_file is None and plan.wim_selection is not None:
+        raise IsoStagingSafetyError(
+            "A selected Windows image requires a bound answer file"
+        )
+    if plan.windows_customization is None:
+        if (
+            plan.windows_architecture is not None
+            or answer_file is not None
+            or answer_digest is not None
+        ):
+            raise IsoStagingSafetyError(
+                "The staging plan does not bind its Windows customization inputs"
+            )
+        return
+    if type(plan.windows_customization) is not WindowsCustomization:
+        raise IsoStagingSafetyError(
+            "The staging plan contains invalid Windows customization inputs"
+        )
+    if not plan.windows_customization.enabled:
+        raise IsoStagingSafetyError(
+            "The staging plan contains an empty Windows customization"
+        )
+    if plan.windows_customization.install_image != plan.wim_selection:
+        raise IsoStagingSafetyError(
+            "The staging plan Windows image selection is inconsistent"
+        )
+    if type(plan.windows_architecture) is not str:
+        raise IsoStagingSafetyError(
+            "The staging plan does not bind its Windows answer-file architecture"
+        )
+    if (
+        _is_transitional_windows_plan(plan.write_plan)
+        and plan.windows_architecture != "amd64"
+    ):
+        raise IsoStagingSafetyError(
+            "The Windows BIOS+UEFI FAT32 profile requires amd64 customization"
+        )
+    try:
+        expected_answer_file = generate_autounattend(
+            plan.windows_customization, plan.windows_architecture,
+        )
+        expected_bytes = expected_answer_file.encode("utf-8")
+    except ValueError as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    except UnicodeEncodeError as error:
+        raise IsoStagingSafetyError(
+            "The generated Windows answer file is not valid UTF-8 text"
+        ) from error
+    if answer_bytes is None or not hmac.compare_digest(answer_bytes, expected_bytes):
+        raise IsoStagingSafetyError(
+            "The Windows answer file does not match its bound customization exactly"
+        )
+    if (
+        type(answer_digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", answer_digest) is None
+        or not hmac.compare_digest(
+            hashlib.sha256(answer_bytes).hexdigest(), answer_digest,
+        )
+    ):
+        raise IsoStagingSafetyError(
+            "The Windows answer-file digest does not match its bound customization"
         )
 
 
@@ -1253,6 +1421,7 @@ def build_iso_staging_plan(
         overlay=overlay,
         embedded_fat=embedded_fat,
         windows_customization=windows_customization,
+        windows_architecture=windows_architecture,
         windows_bootex=windows_bootex,
         syslinux_c32_bundle=syslinux_c32_bundle,
         syslinux_payload_bundle=syslinux_payload_bundle,
@@ -1495,6 +1664,10 @@ def build_iso_staging_plan(
         windows_customization=bound_windows_customization,
         windows_architecture=bound_windows_architecture,
         autounattend_xml=answer_file,
+        autounattend_sha256=(
+            hashlib.sha256(answer_file.encode("utf-8")).hexdigest()
+            if answer_file is not None else None
+        ),
         archive_namespace=extraction.archive_namespace,
         overlay=overlay,
         effective_entries=effective_entries,
@@ -1543,6 +1716,7 @@ def validate_iso_staging_plan(
         overlay=plan.overlay,
         embedded_fat=plan.embedded_fat,
         windows_customization=plan.windows_customization,
+        windows_architecture=plan.windows_architecture,
         windows_bootex=plan.windows_bootex_options,
         syslinux_c32_bundle=plan.syslinux_c32_bundle,
         syslinux_payload_bundle=plan.syslinux_payload_bundle,
@@ -1711,117 +1885,7 @@ def validate_iso_staging_plan(
             raise IsoStagingSafetyError(
                 "The Windows BootEx ISO binding changed"
             )
-    if plan.autounattend_xml is not None and not isinstance(
-        plan.autounattend_xml, str,
-    ):
-        raise IsoStagingSafetyError("The Windows answer file must be text")
-    if plan.autounattend_xml is not None:
-        _validate_answer_file(plan.autounattend_xml)
-        try:
-            answer_index = answer_file_install_index(
-                plan.autounattend_xml,
-                (
-                    plan.wim_selection.edition.architecture
-                    if plan.wim_selection is not None else None
-                ),
-            )
-        except ValueError as error:
-            raise IsoStagingSafetyError(str(error)) from error
-        expected_index = (
-            plan.wim_selection.selected_index
-            if plan.wim_selection is not None else None
-        )
-        if answer_index != expected_index:
-            raise IsoStagingSafetyError(
-                "The answer file image index does not match the staging plan"
-            )
-        try:
-            answer_path = answer_file_install_path(
-                plan.autounattend_xml,
-                (
-                    plan.wim_selection.edition.architecture
-                    if plan.wim_selection is not None else None
-                ),
-            )
-        except ValueError as error:
-            raise IsoStagingSafetyError(str(error)) from error
-        install_source_count = sum(
-            entry.kind is EntryKind.FILE and (
-                _is_install_wim_path(entry.path)
-                or entry.path.casefold() == "sources/install.esd"
-            )
-            for entry in effective_entries
-        )
-        if plan.wim_selection is not None:
-            selected_is_wim = _is_install_wim_path(plan.wim_selection.source_name)
-            if answer_path is not None and answer_path != plan.wim_selection.source_name:
-                raise IsoStagingSafetyError(
-                    "The answer-file WIM path does not match the staging plan"
-                )
-            if (
-                selected_is_wim
-                and (
-                    install_source_count > 1
-                    or plan.wim_selection.source_name.casefold()
-                    != "sources/install.wim"
-                )
-                and answer_path is None
-            ):
-                raise IsoStagingSafetyError(
-                    "The staging plan does not bind its nested or multi-source WIM path"
-                )
-        existing_answer_file = _existing_windows_answer_file(effective_entries)
-        if existing_answer_file is not None:
-            raise IsoStagingSafetyError(
-                f"The generated answer file conflicts with existing ISO content at "
-                f"{existing_answer_file}"
-            )
-    elif plan.wim_selection is not None:
-        raise IsoStagingSafetyError(
-            "A selected Windows image requires a bound answer file"
-        )
-    if plan.windows_customization is None:
-        if plan.windows_architecture is not None or plan.autounattend_xml is not None:
-            raise IsoStagingSafetyError(
-                "The staging plan does not bind its Windows customization inputs"
-            )
-    else:
-        if not isinstance(plan.windows_customization, WindowsCustomization):
-            raise IsoStagingSafetyError(
-                "The staging plan contains invalid Windows customization inputs"
-            )
-        if not plan.windows_customization.enabled:
-            raise IsoStagingSafetyError(
-                "The staging plan contains an empty Windows customization"
-            )
-        if plan.windows_customization.install_image != plan.wim_selection:
-            raise IsoStagingSafetyError(
-                "The staging plan Windows image selection is inconsistent"
-            )
-        if not isinstance(plan.windows_architecture, str):
-            raise IsoStagingSafetyError(
-                "The staging plan does not bind its Windows answer-file architecture"
-            )
-        try:
-            expected_answer_file = generate_autounattend(
-                plan.windows_customization, plan.windows_architecture,
-            )
-        except ValueError as error:
-            raise IsoStagingSafetyError(str(error)) from error
-        try:
-            exact_match = (
-                plan.autounattend_xml is not None
-                and plan.autounattend_xml.encode("utf-8")
-                == expected_answer_file.encode("utf-8")
-            )
-        except UnicodeEncodeError as error:
-            raise IsoStagingSafetyError(
-                "The Windows answer file is not valid UTF-8 text"
-            ) from error
-        if not exact_match:
-            raise IsoStagingSafetyError(
-                "The Windows answer file does not match its bound customization exactly"
-            )
+    _validate_bound_windows_customization(plan, effective_entries)
     witness = plan._catalog_witness
     if (
         type(witness) is not _CatalogWitness
@@ -2069,9 +2133,10 @@ def validate_published_windows_staging(
 
     The result receipt is created only after extraction, optional split-WIM
     replacement, full descriptor-safe manifesting, atomic publication, and a
-    second manifest comparison.  This first composition profile deliberately
-    excludes overlays and Windows customization/BootEx so the only admitted
-    catalog mutation is the witnessed conventional install.wim split.
+    second manifest comparison.  This profile admits only the exact generated
+    root answer file (with optional image selection), plus the witnessed
+    conventional install.wim split.  Overlays, BootEx, embedded images, and
+    Syslinux remain outside the reviewed composition.
     """
 
     if cancel_check is not None:
@@ -2133,22 +2198,21 @@ def validate_published_windows_staging(
         plan.syslinux_staging is not None,
         plan.syslinux_c32_bundle is not None,
         plan.syslinux_payload_bundle is not None,
-        plan.wim_selection is not None,
-        plan.autounattend_xml is not None,
-        plan.windows_customization is not None,
-        plan.windows_architecture is not None,
         plan.windows_bootex_options is not None,
         plan.windows_bootex_source is not None,
         plan.windows_boot_wim_source is not None,
     )):
         raise IsoStagingSafetyError(
             "The initial Windows dual-firmware profile does not compose with "
-            "overlays or customization",
+            "overlays, embedded images, BootEx, or Syslinux",
         )
+    _validate_wim_selection_catalog(plan.effective_entries, plan.wim_selection)
+    _validate_bound_windows_customization(plan, plan.effective_entries)
     wim_source = _validate_write_plan(plan.write_plan, plan.effective_entries)
     if wim_source != plan.wim_source:
         raise IsoStagingSafetyError("The published split-WIM binding is inconsistent")
     expected_split = wim_source is not None
+    expected_answer = plan.autounattend_xml is not None
     if (
         result.destination != plan.destination
         or result.image_identity != plan.image_identity
@@ -2161,7 +2225,7 @@ def validate_published_windows_staging(
         or result.bytes_staged <= 0
         or type(result.wim_parts) is not tuple
         or bool(result.wim_parts) != expected_split
-        or result.autounattend_added is not False
+        or result.autounattend_added is not expected_answer
         or result.windows_bootex is not None
         or type(result.tree_manifest) is not StagingTreeManifest
     ):
@@ -2183,6 +2247,29 @@ def validate_published_windows_staging(
         raise IsoStagingSafetyError(
             "The published Windows tree does not match its authenticated manifest",
         )
+    answer_files = tuple(
+        item for item in manifest.files
+        if item.path.casefold() == "autounattend.xml"
+    )
+    if not expected_answer:
+        if answer_files:
+            raise IsoStagingSafetyError(
+                "The published Windows tree contains an unplanned answer file",
+            )
+    else:
+        assert plan.autounattend_xml is not None
+        assert plan.autounattend_sha256 is not None
+        if (
+            len(answer_files) != 1
+            or answer_files[0].path != "autounattend.xml"
+            or answer_files[0].size != len(plan.autounattend_xml.encode("utf-8"))
+            or not hmac.compare_digest(
+                answer_files[0].sha256, plan.autounattend_sha256,
+            )
+        ):
+            raise IsoStagingSafetyError(
+                "The published Windows answer file is missing or changed",
+            )
     if cancel_check is not None:
         cancel_check()
     return manifest

@@ -2096,6 +2096,10 @@ class IsoStagingTests(unittest.TestCase):
             plan = self.make_plan(root, windows_customization=customization)
             self.assertEqual(plan.windows_customization, customization)
             self.assertEqual(plan.windows_architecture, "amd64")
+            self.assertEqual(
+                plan.autounattend_sha256,
+                hashlib.sha256((plan.autounattend_xml or "").encode()).hexdigest(),
+            )
             result = IsoStagingExecutor(extractor=FakeExtractor()).execute(plan)
             answer = result.destination / "autounattend.xml"
             self.assertTrue(result.autounattend_added)
@@ -2229,6 +2233,9 @@ class IsoStagingTests(unittest.TestCase):
                 replace(plan, windows_architecture=None),
                 replace(plan, windows_customization=WindowsCustomization()),
                 replace(plan, autounattend_xml=None),
+                replace(plan, autounattend_sha256=None),
+                replace(plan, autounattend_sha256="0" * 64),
+                replace(plan, autounattend_sha256="not-a-digest"),
                 replace(
                     plan,
                     windows_customization=replace(

@@ -54,10 +54,11 @@ from isopropyl.windows_iso_fat32 import (
     build_windows_iso_fat32_plan,
     prepare_windows_iso_fat32,
 )
+from isopropyl.windows import WindowsCustomization, generate_autounattend
 from tools import certify_freedos_boot as _hardened_qemu
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_TIMEOUT = 360
 MIN_TIMEOUT = 30
 MAX_TIMEOUT = 900
@@ -90,6 +91,8 @@ WINDOWS_DETAIL_GROUPS = (
     ("KEYBOARD OR INPUT METHOD",),
     ("REPAIR YOUR COMPUTER",),
 )
+CUSTOMIZATION_PROFILE = "generated-disable-fast-startup-v1"
+CUSTOMIZATION_OPTIONS = WindowsCustomization(disable_fast_startup=True)
 
 BootCertificationError = _hardened_qemu.BootCertificationError
 FileIdentity = _hardened_qemu.FileIdentity
@@ -138,6 +141,8 @@ class PipelineEvidence:
     catalog_members: int
     staging_catalog_sha256: str
     staging_manifest_sha256: str
+    customization_profile: str | None
+    autounattend_sha256: str | None
     composite_plan_sha256: str
     private_plan_sha256: str
     pbr_plan_sha256: str
@@ -147,6 +152,26 @@ class PipelineEvidence:
     files_verified: int
     directories_verified: int
     bytes_verified: int
+
+
+def customization_verification_evidence(
+    profile: str | None,
+) -> dict[str, str | bool | None]:
+    """Describe exactly what the optional customization smoke run proves."""
+
+    if profile not in {None, CUSTOMIZATION_PROFILE}:
+        raise BootCertificationError(
+            "The Windows certification customization profile is invalid"
+        )
+    return {
+        "customization_verification_scope": (
+            "composition-and-initial-setup-boot-only"
+            if profile is not None else None
+        ),
+        "customization_effect_executed_or_verified": (
+            False if profile is not None else None
+        ),
+    }
 
 
 def _identity(status: os.stat_result) -> FileIdentity:
@@ -279,6 +304,7 @@ def prepare_certification_pipeline(
     workspace: Path,
     *,
     image_size: int | None = None,
+    with_generated_customization: bool = False,
 ) -> tuple[PreparedWindowsIsoFat32, PipelineEvidence]:
     """Run the real strict Windows staging and anonymous composition pipeline."""
 
@@ -322,10 +348,33 @@ def prepare_certification_pipeline(
         workspace / "staged-media",
         entries,
         write_plan,
+        windows_customization=(
+            CUSTOMIZATION_OPTIONS if with_generated_customization else None
+        ),
+        windows_architecture="amd64",
     )
     if staging_plan.image_identity != expected_iso_identity:
         raise BootCertificationError(
             "The ISO staging plan belongs to a different source image"
+        )
+    expected_answer = (
+        generate_autounattend(CUSTOMIZATION_OPTIONS, "amd64")
+        if with_generated_customization else None
+    )
+    expected_answer_sha256 = (
+        hashlib.sha256(expected_answer.encode("utf-8")).hexdigest()
+        if expected_answer is not None else None
+    )
+    if (
+        staging_plan.windows_customization
+        != (CUSTOMIZATION_OPTIONS if with_generated_customization else None)
+        or staging_plan.windows_architecture
+        != ("amd64" if with_generated_customization else None)
+        or staging_plan.autounattend_xml != expected_answer
+        or staging_plan.autounattend_sha256 != expected_answer_sha256
+    ):
+        raise BootCertificationError(
+            "The Windows certification customization was not frozen exactly"
         )
     verify_bound_regular_file(iso, description="source Windows ISO")
     staging_result = IsoStagingExecutor().execute(staging_plan)
@@ -334,6 +383,26 @@ def prepare_certification_pipeline(
     if manifest is None:
         raise BootCertificationError(
             "The Windows staging result has no authenticated tree manifest"
+        )
+    if staging_result.autounattend_added is not with_generated_customization:
+        raise BootCertificationError(
+            "The staged Windows answer-file result does not match the certification profile"
+        )
+    answer_files = tuple(
+        item for item in manifest.files
+        if item.path.casefold() == "autounattend.xml"
+    )
+    if (
+        (with_generated_customization and (
+            len(answer_files) != 1
+            or answer_files[0].path != "autounattend.xml"
+            or answer_files[0].size != len(expected_answer.encode("utf-8"))
+            or answer_files[0].sha256 != expected_answer_sha256
+        ))
+        or (not with_generated_customization and answer_files)
+    ):
+        raise BootCertificationError(
+            "The staged Windows answer file is missing, duplicated, or changed"
         )
     final_size = (
         _recommended_image_size(write_plan.minimum_target_bytes, manifest.total_bytes)
@@ -357,6 +426,8 @@ def prepare_certification_pipeline(
             len(entries),
             staging_result.catalog_digest,
             manifest.manifest_sha256,
+            CUSTOMIZATION_PROFILE if with_generated_customization else None,
+            expected_answer_sha256,
             result.plan_sha256,
             result.private_plan_sha256,
             result.pbr_plan_sha256,
@@ -875,6 +946,7 @@ def certify_windows_dual_boot(
     interval: int = DEFAULT_CAPTURE_INTERVAL,
     memory_mib: int = DEFAULT_MEMORY_MIB,
     image_size: int | None = None,
+    with_generated_customization: bool = False,
 ) -> dict[str, object]:
     if os.geteuid() == 0:
         raise BootCertificationError("Windows certification refuses to run as root")
@@ -901,7 +973,10 @@ def certify_windows_dual_boot(
         qemu_version = query_qemu_version(qemu)
         workspace = Path(temporary)
         prepared, pipeline = prepare_certification_pipeline(
-            iso, workspace, image_size=image_size,
+            iso,
+            workspace,
+            image_size=image_size,
+            with_generated_customization=with_generated_customization,
         )
         with prepared:
             source_fd = _duplicate_prepared_descriptor(prepared)
@@ -964,6 +1039,11 @@ def certify_windows_dual_boot(
             "pipeline": {
                 "staging_catalog_sha256": pipeline.staging_catalog_sha256,
                 "staging_manifest_sha256": pipeline.staging_manifest_sha256,
+                "customization_profile": pipeline.customization_profile,
+                "autounattend_sha256": pipeline.autounattend_sha256,
+                **customization_verification_evidence(
+                    pipeline.customization_profile,
+                ),
                 "composite_plan_sha256": pipeline.composite_plan_sha256,
                 "private_plan_sha256": pipeline.private_plan_sha256,
                 "pbr_plan_sha256": pipeline.pbr_plan_sha256,
@@ -1067,6 +1147,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-size", type=_image_size,
         help="advanced exact anonymous disk size in bytes; default adds bounded headroom",
     )
+    parser.add_argument(
+        "--with-generated-customization",
+        action="store_true",
+        help=(
+            "smoke-check composition and initial Setup boot with one fixed "
+            "generated disable-Fast-Startup answer file; this does not install "
+            "Windows or verify the specialize effect, and no caller-supplied "
+            "XML or option text is accepted"
+        ),
+    )
     return parser
 
 
@@ -1090,6 +1180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             interval=args.capture_interval,
             memory_mib=args.memory_mib,
             image_size=args.image_size,
+            with_generated_customization=args.with_generated_customization,
         )
     except (BootCertificationError, OSError, ValueError) as error:
         print(f"certification failed: {error}", file=sys.stderr)

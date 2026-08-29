@@ -38,7 +38,13 @@ evidence.
 
 - Continue refining the implemented first-class ISO/DD selector as new executable
   firmware profiles become available; never silently change the user's choice.
-- Add BIOS and dual BIOS+UEFI construction with exact, provenance-bound boot code.
+- Broaden the implemented, default-off x64 Windows BIOS+UEFI construction only
+  after the current exact FAT32/active-MBR profile is physically certified. Its
+  project-authored boot code, anonymous-image transaction, and exact generated
+  answer-file composition are implemented; retain a customized KVM/SeaBIOS+OVMF
+  observation before promoting customization coverage, then add BIOS-only,
+  NTFS/UEFI:NTFS dual-firmware, and other architectures behind equally narrow
+  provenance and firmware evidence.
 - Expand the implemented UEFI:NTFS path beyond 512-byte logical sectors only
   after upstream payload and firmware evidence supports it.
 - Physically validate the implemented, separately acknowledged installed-system
