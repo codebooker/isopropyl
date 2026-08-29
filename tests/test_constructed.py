@@ -36,7 +36,7 @@ from isopropyl.formatting import (
 )
 from isopropyl.timestamps import (
     FAT_MTIME_TOLERANCE_NS, MIN_PORTABLE_ARCHIVE_MTIME_NS,
-    NTFS_MTIME_TOLERANCE_NS,
+    NTFS_MTIME_TOLERANCE_NS, TimestampPreservationError,
     apply_descriptor_mtime, mtime_matches,
 )
 
@@ -455,12 +455,48 @@ class ExecutorTests(unittest.TestCase):
                 mountpoint, FakeFormatExecutor(), [],
             ).execute(plan)
 
-            for source in (staging, *staging.rglob("*")):
+            # FAT does not store its root timestamp in an ordinary directory
+            # entry, so only files and actual subdirectories can preserve it.
+            for source in staging.rglob("*"):
                 target = mountpoint / source.relative_to(staging)
                 self.assertLessEqual(
                     abs(target.stat().st_mtime_ns - source.stat().st_mtime_ns),
                     2_000_000_000,
                 )
+
+    def test_fat32_skips_the_unrepresentable_root_directory_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            staging = make_staging(base)
+            mountpoint = base / "mount"
+            mountpoint.mkdir()
+            target_root = mountpoint.stat()
+            plan = build_plan(staging)
+            real_apply = apply_descriptor_mtime
+
+            def reject_synthetic_root(descriptor, modified_ns, *, tolerance_ns):
+                identity = os.fstat(descriptor)
+                if (
+                    identity.st_dev == target_root.st_dev
+                    and identity.st_ino == target_root.st_ino
+                ):
+                    raise TimestampPreservationError(
+                        "FAT root timestamp is synthetic",
+                    )
+                return real_apply(
+                    descriptor, modified_ns, tolerance_ns=tolerance_ns,
+                )
+
+            with patch(
+                "isopropyl.constructed.apply_descriptor_mtime",
+                side_effect=reject_synthetic_root,
+            ):
+                result = self.make_executor(
+                    mountpoint, FakeFormatExecutor(), [],
+                ).execute(plan)
+
+            self.assertEqual(result.files_copied, len(plan.files))
+            self.assertTrue((mountpoint / "EFI" / "BOOT" / "BOOTX64.EFI").is_file())
 
     def test_timestamp_normalization_excludes_an_adjacent_filesystem_tick(self):
         expected = 1_709_210_096_000_000_000

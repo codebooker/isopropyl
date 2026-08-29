@@ -988,6 +988,16 @@ class ConstructedMediaExecutor:
             plan.directories, key=lambda item: len(item.parts), reverse=True,
         ):
             self._check_cancelled()
+            # FAT12/16 have a fixed root-directory region and FAT32 represents
+            # its root through a filesystem header cluster rather than an
+            # ordinary parent directory entry.  Linux consequently exposes a
+            # synthetic root mtime that may ignore or substantially normalize
+            # utime(2).  Files and real subdirectories still have representable
+            # directory entries and retain the strict timestamp/read-back
+            # checks below.  The staged root's identity also remains bound and
+            # re-attested separately before and after the copy.
+            if plan.filesystem is Filesystem.FAT32 and not directory.parts:
+                continue
             descriptor = _open_directory_chain(
                 destination_root_fd, directory.parts,
                 destination_device=destination_device,
