@@ -243,8 +243,10 @@ issue requesting a private contact channel without disclosing the vulnerability.
   pinned core has no `normal.mod`, menu, or configuration, successful boot is
   intentionally limited to `grub rescue>`. The opt-in certificate passes only a
   sealed read-only descriptor to networkless snapshot QEMU inside fresh user
-  and network namespaces. No GUI, helper, or physical-device caller consumes
-  this profile. A pure, non-destructive Syslinux consumer independently re-pins the two enabled
+  and network namespaces. A separate environment-gated GUI/device caller now
+  consumes only this exact rescue profile under the dedicated boundary described
+  below; the certificate does not cover that transaction. A pure,
+  non-destructive Syslinux consumer independently re-pins the two enabled
   payload pairs. A backend-only private-tree planner consumes caller-bound bytes
   as inert data, but no production BIOS executor or GUI path consumes them. The
   UEFI Shell backend independently
@@ -729,10 +731,70 @@ emulator binary. This is not device-helper, UEFI, operating-system, or
 physical-media certification. Until the remaining gates close,
 hybrid media should use verified DD mode to preserve their existing layout.
 
+## Experimental GRUB 2.14 rescue-device boundary
+
+The blank GRUB rescue workflow is unreachable in an ordinary GUI launch and is
+exposed only when the process starts with the exact
+`ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1` environment opt-in. It accepts only a
+writable, kernel-removable USB or MMC disk, exactly 512-byte logical sectors,
+sector-aligned capacity, and no more than 128 GiB. Before acquiring payloads it
+requires explicit consent and explains that the result contains no operating
+system, installer, kernel, boot menu, `normal.mod`, or UEFI loader and will stop
+at `grub rescue>`. Preparation uses owner-only staging and workspace directories,
+requires free space for a fully allocated private image exactly equal to the
+target plus a 64 MiB reserve, and rejects target-resident source or workspace
+topology.
+
+The device plan binds the authentic backend result, exact discovered `Device`
+object, current major:minor and kernel disk-generation sequence, capacity,
+512-byte geometry, complete image/MBR/FAT manifest hashes, mandatory
+preactivation and final read-back, and the exact case-sensitive
+`WRITE GRUB RESCUE /dev/… major:minor` phrase. Confirmation, unmounting, and
+authorization revalidate those bindings. The prepared image has a fail-closed,
+one-shot descriptor transfer and cannot be streamed again after a transfer
+attempt.
+
+This workflow uses the separate
+`io.github.codebooker.isopropyl.write-grub-rescue-image` PolicyKit action,
+`write-grub-2.14-rescue-image-v1` protocol operation, and
+`io.github.codebooker.isopropyl/grub-2.14-rescue-device-helper/v1` helper
+profile. The coordinator resolves that exact installed integration before any
+download. It has no formatter, mount, Syslinux, Windows, or generic/raw writer
+fallback. The authenticated PREPARED → COMMIT/CANCEL exchange passes the
+already-open image descriptor while the privileged helper resolves the target
+from major:minor and independently repeats namespace, credentials, source,
+topology, removability, read-only, geometry, capacity, and disk-generation
+checks.
+
+The helper independently parses the exact target-sized blank MBR/FAT32 layout,
+pinned 432-byte bootstrap, 42,742-byte core and diskboot blocklist, LBA-2048
+active FAT32 partition, mirrored filesystem metadata, sole volume-label entry,
+and zero empty remainder. During device mutation it first keeps sectors zero and
+one inactive, writes and verifies bytes from offset 512 through the end (including
+the embedded core), flushes and invalidates caches, and only then writes sector
+zero. A second durability/cache barrier and complete physical-device SHA-256
+read-back are mandatory. Post-activation failures attempt same-generation MBR
+deactivation; cancellation after COMMIT is deferred through recovery and
+verification. If progress or the authenticated result channel is lost after
+COMMIT, the unprivileged runner keeps the UI and target quarantined until the
+privileged helper process actually exits; it does not detach a background
+reaper and announce completion. A missing verified result leaves the medium in
+an explicitly unknown state and requires removal, reinsertion, inspection, and
+a complete rewrite or restore before it can be trusted.
+
+The retained QEMU TCG/SeaBIOS observation certifies only that the sealed exact
+image reaches the intentional rescue prompt. It does not certify the PolicyKit
+transaction, installed packaging, USB transport, physical BIOS firmware, or
+physical media. The Python helper remains provisional: a native hardened helper,
+installed-integration and hot-swap/unplug/failure tests, and representative
+physical-media write and boot evidence remain mandatory before ordinary GUI
+exposure.
+
 ## GUI and CLI raw/DD broker boundary
 
-The generic raw profile is separate from the default-off Syslinux developer profile and
-is the GUI and CLI's sole DD/raw executor. It has no legacy writer fallback. Every
+The generic raw profile is separate from the default-off Syslinux and GRUB
+rescue developer profiles and is the GUI and CLI's sole DD/raw executor. It has
+no legacy writer fallback. Every
 plain, compressed, VTSI, virtual, or compressed-virtual input is bound through
 one already-open outer-source descriptor and expanded into one stable private
 `0700` snapshot workspace. Planning binds source device, inode, size, mtime,

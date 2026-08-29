@@ -74,6 +74,15 @@ from .fast_zero import (
     FastZeroPartialResult, FastZeroPlan, FastZeroResult, FastZeroRunError,
     FastZeroWorkflow,
 )
+from .grub_rescue_device import (
+    MAX_TARGET_BYTES as MAX_GRUB_RESCUE_TARGET_BYTES,
+    GrubRescueDeviceWritePlan,
+)
+from .grub_rescue_device_runner import GrubRescueDeviceWriteResult
+from .grub_rescue_workflow import (
+    GrubRescueWorkflowCancelled, GrubRescueWorkflowState,
+    GrubRescueWriteWorkflow,
+)
 from .images import (
     ChecksumCancelled, ImageInspection, ImageInspectionCancelled,
     calculate_checksums, classify_windows_installer_members,
@@ -414,6 +423,12 @@ class UefiShellPreparationToken:
 
 
 @dataclass(frozen=True)
+class GrubRescuePreparationToken:
+    workflow: GrubRescueWriteWorkflow
+    device_identity: tuple[str, int, str, str, str, str]
+
+
+@dataclass(frozen=True)
 class LinuxDownloadToken:
     generation: int
     operation: LinuxIsoDownloader
@@ -474,6 +489,8 @@ class Bridge(QObject):
     windows_metadata_finished = pyqtSignal(object, object, object)
     uefi_preparation_finished = pyqtSignal(object, object, object)
     uefi_shell_preparation_finished = pyqtSignal(object, object, object)
+    grub_rescue_preparation_finished = pyqtSignal(object, object)
+    grub_rescue_execution_finished = pyqtSignal(object, object)
     casper_preparation_finished = pyqtSignal(object, object, object)
     device_refresh_finished = pyqtSignal(object, object)
     linux_download_finished = pyqtSignal(object, object, object)
@@ -550,6 +567,9 @@ class Window(QMainWindow):
         self.uefi_shell_preparer: BackgroundPreparation | None = None
         self.uefi_shell_token: UefiShellPreparationToken | None = None
         self.uefi_shell_workspace: tempfile.TemporaryDirectory[str] | None = None
+        self.grub_rescue_workflow: GrubRescueWriteWorkflow | None = None
+        self.grub_rescue_token: GrubRescuePreparationToken | None = None
+        self.grub_rescue_confirmation_dialog: QDialog | None = None
         self.casper_preparer: BackgroundPreparation | None = None
         self.casper_stager: CasperStagingExecutor | None = None
         self.casper_writer: CasperMediaExecutor | None = None
@@ -626,6 +646,12 @@ class Window(QMainWindow):
         )
         self.bridge.uefi_shell_preparation_finished.connect(
             self.on_uefi_shell_preparation_finished
+        )
+        self.bridge.grub_rescue_preparation_finished.connect(
+            self.on_grub_rescue_preparation_finished
+        )
+        self.bridge.grub_rescue_execution_finished.connect(
+            self.on_grub_rescue_execution_finished
         )
         self.bridge.casper_preparation_finished.connect(
             self.on_casper_preparation_finished
@@ -1082,13 +1108,16 @@ class Window(QMainWindow):
         utility_primary.addStretch()
         log_button = QPushButton("View log")
         log_button.clicked.connect(self.show_log)
-        self.uefi_shell_button = QPushButton("Create UEFI Shell…")
-        self.uefi_shell_button.setToolTip(
-            "Download hash-pinned upstream UEFI Shell applications and create "
-            "multi-architecture GPT/FAT32 boot media."
+        self.boot_media_button = QPushButton("Create boot media…")
+        self.boot_media_button.setToolTip(
+            "Create a multi-architecture UEFI Shell or an explicitly enabled "
+            "GRUB 2.14 blank legacy-BIOS rescue disk."
         )
-        self.uefi_shell_button.clicked.connect(self.create_uefi_shell_media)
-        utility_primary.addWidget(self.uefi_shell_button)
+        self.boot_media_button.clicked.connect(self.choose_boot_media)
+        # Preserve the internal name for downstream integrations while the
+        # formerly dedicated top-level action becomes a compact chooser.
+        self.uefi_shell_button = self.boot_media_button
+        utility_primary.addWidget(self.boot_media_button)
         self.tools_button = QPushButton("Drive tools…")
         self.tools_button.clicked.connect(self.show_drive_tools)
         utility_primary.addWidget(self.tools_button)
@@ -3006,6 +3035,7 @@ class Window(QMainWindow):
             self.raw_workflow,
             self.fast_zero_workflow,
             self.restore_workflow,
+            self.grub_rescue_workflow,
             self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner,
             self.extractor,
@@ -3523,7 +3553,7 @@ class Window(QMainWindow):
         dialog = QDialog(self)
         dialog.setObjectName("rawWriteConfirmationDialog")
         dialog.setWindowTitle("Final authenticated raw-write confirmation")
-        dialog.setMinimumWidth(720)
+        dialog.setMinimumWidth(680)
         layout = QVBoxLayout(dialog)
         retained_gap = max(
             0,
@@ -3649,6 +3679,13 @@ class Window(QMainWindow):
             # but must not terminate that privileged transaction halfway.
             self.cancel_button.setEnabled(False)
         if (
+            self.grub_rescue_workflow is not None
+            and self.grub_rescue_workflow.committed
+        ):
+            # The runner keeps the target quarantined until the committed root
+            # helper exits, including after protocol loss or a progress stall.
+            self.cancel_button.setEnabled(False)
+        if (
             (
                 self.syslinux_workflow is not None
                 or self.windows_device_runner is not None
@@ -3691,6 +3728,12 @@ class Window(QMainWindow):
         if restore_workflow is not None:
             restore_workflow.close()
         self.restore_confirmation_dialog = None
+        grub_rescue_workflow = self.grub_rescue_workflow
+        self.grub_rescue_workflow = None
+        self.grub_rescue_token = None
+        if grub_rescue_workflow is not None:
+            grub_rescue_workflow.close()
+        self.grub_rescue_confirmation_dialog = None
         self.imager = None
         self.formatter = None
         self.media_runner = None
@@ -3757,7 +3800,7 @@ class Window(QMainWindow):
         self.runtime_validation.setEnabled(False)
         self.show_external.setEnabled(not busy)
         self.tools_button.setEnabled(not busy and self.selected_device() is not None)
-        self.uefi_shell_button.setEnabled(
+        self.boot_media_button.setEnabled(
             not busy and self.selected_device() is not None
             and not self.device_refresh_busy
         )
@@ -3795,6 +3838,7 @@ class Window(QMainWindow):
             self.raw_workflow,
             self.fast_zero_workflow,
             self.restore_workflow,
+            self.grub_rescue_workflow,
             self.imager, self.formatter, self.media_runner, self.eraser,
             self.optical_runner, self.extractor,
             self.iso_stager, self.constructed_writer,
@@ -3816,8 +3860,14 @@ class Window(QMainWindow):
                 self.restore_workflow is not None
                 and self.restore_workflow.committed
             )
+            grub_rescue_committed = bool(
+                self.grub_rescue_workflow is not None
+                and self.grub_rescue_workflow.committed
+            )
             self.status.setText(
-                "Finishing the committed restore safely…"
+                "Finishing the committed GRUB rescue write safely…"
+                if grub_rescue_committed
+                else "Finishing the committed restore safely…"
                 if restore_committed
                 else "Stopping…"
             )
@@ -3830,6 +3880,8 @@ class Window(QMainWindow):
                 self.fast_zero_confirmation_dialog.reject()
             if self.restore_confirmation_dialog is not None:
                 self.restore_confirmation_dialog.reject()
+            if self.grub_rescue_confirmation_dialog is not None:
+                self.grub_rescue_confirmation_dialog.reject()
             if self.syslinux_confirmation_dialog is not None:
                 self.syslinux_confirmation_dialog.reject()
             if self.windows_dual_confirmation_dialog is not None:
@@ -3852,10 +3904,20 @@ class Window(QMainWindow):
                 self.zip_overlay_preparer.cancel()
             event.accept()
             return
+        grub_committed = bool(
+            self.grub_rescue_workflow is not None
+            and self.grub_rescue_workflow.committed
+        )
         answer = QMessageBox.warning(
             self, "An operation is still in progress",
-            "Closing now will cancel the operation and may leave an incomplete result. "
-            "Keep the drive connected until ISOpropyl confirms it has stopped.",
+            (
+                "The GRUB rescue transaction has committed and can no longer be "
+                "cancelled safely. ISOpropyl will keep finishing durability and full "
+                "read-back; keep the drive connected. Request closing after it finishes?"
+                if grub_committed else
+                "Closing now will cancel the operation and may leave an incomplete result. "
+                "Keep the drive connected until ISOpropyl confirms it has stopped."
+            ),
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
         )
@@ -4056,6 +4118,333 @@ class Window(QMainWindow):
                 "Could not remove rejected UEFI Shell workspace",
                 exc_info=True,
             )
+
+    @staticmethod
+    def grub_rescue_developer_enabled() -> bool:
+        return os.environ.get("ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE") == "1"
+
+    @staticmethod
+    def grub_rescue_ineligibility(device: Device) -> str:
+        if device.removable is not True or device.transport not in {"usb", "mmc"}:
+            return "Select kernel-removable USB or SD/MMC media."
+        if device.read_only:
+            return "The selected GRUB rescue target is read-only."
+        if device.logical_sector_size != 512:
+            return "GRUB rescue media requires a 512-byte logical sector size."
+        if device.size <= 2_048 * 512 or device.size % 512:
+            return "The selected GRUB rescue target has unsupported capacity geometry."
+        if device.size > MAX_GRUB_RESCUE_TARGET_BYTES:
+            return "GRUB rescue media is limited to targets of 128 GiB or less."
+        return ""
+
+    def choose_boot_media(self) -> None:
+        if self.operation_active or self.device_refresh_busy:
+            return
+        chooser = QDialog(self)
+        chooser.setObjectName("bootMediaChooserDialog")
+        chooser.setWindowTitle("Create boot media")
+        chooser.setMinimumWidth(560)
+        layout = QVBoxLayout(chooser)
+        explanation = QLabel(
+            "Choose one purpose-built boot-media profile. Each profile has its "
+            "own safety checks and final destructive confirmation."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        uefi = QPushButton("Create multi-architecture UEFI Shell…")
+        uefi.setObjectName("createUefiShellChoice")
+        grub = QPushButton("Create GRUB 2.14 blank BIOS rescue media…")
+        grub.setObjectName("createGrubRescueChoice")
+        grub.setEnabled(self.grub_rescue_developer_enabled())
+        if not grub.isEnabled():
+            grub.setToolTip(
+                "Developer preview: set ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1 "
+                "before starting ISOpropyl."
+            )
+        choice: list[str] = []
+
+        def select(value: str) -> None:
+            choice.append(value)
+            chooser.accept()
+
+        uefi.clicked.connect(lambda: select("uefi"))
+        grub.clicked.connect(lambda: select("grub"))
+        layout.addWidget(uefi)
+        layout.addWidget(grub)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        buttons.rejected.connect(chooser.reject)
+        layout.addWidget(buttons)
+        if chooser.exec() != QDialog.DialogCode.Accepted or not choice:
+            return
+        if choice[0] == "uefi":
+            self.create_uefi_shell_media()
+        elif choice[0] == "grub":
+            self.create_grub_rescue_media()
+
+    def create_grub_rescue_media(self) -> None:
+        if not self.grub_rescue_developer_enabled():
+            QMessageBox.information(
+                self,
+                "GRUB rescue developer preview disabled",
+                "Start ISOpropyl with ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1 "
+                "to expose this unfinished developer workflow.",
+            )
+            return
+        device = self.selected_device()
+        if device is None or self.operation_active or self.device_refresh_busy:
+            return
+        reason = self.grub_rescue_ineligibility(device)
+        if reason:
+            QMessageBox.warning(self, "GRUB rescue target is not eligible", reason)
+            return
+        consent = QMessageBox.question(
+            self,
+            "Prepare exact GRUB 2.14 blank BIOS rescue media?",
+            "ISOpropyl may download the exact size- and SHA-256-pinned GRUB 2.14 "
+            "boot.img and core.img artifacts. Those boot payloads are validated "
+            "and are never executed on Linux. Source reproduction has not been "
+            "verified or claimed.\n\n"
+            "This creates blank legacy-BIOS rescue media that intentionally stops "
+            "at `grub rescue>`. It is not an operating system, installer, kernel, "
+            "boot menu, normal.mod environment, or UEFI image. It will erase the "
+            f"selected target {device.path}.\n\nContinue with preparation?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if consent != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            workspace = tempfile.TemporaryDirectory(
+                prefix=".isopropyl-grub-rescue-",
+            )
+            workflow = GrubRescueWriteWorkflow(device, workspace)
+        except Exception as error:
+            if "workspace" in locals():
+                try:
+                    workspace.cleanup()
+                except OSError:
+                    pass
+            QMessageBox.warning(self, "GRUB rescue preparation unavailable", str(error))
+            return
+        token = GrubRescuePreparationToken(workflow, device.identity)
+        self.grub_rescue_workflow = workflow
+        self.grub_rescue_token = token
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Preparing exact GRUB 2.14 blank BIOS rescue media…")
+
+        def work() -> None:
+            try:
+                plan = workflow.prepare(
+                    lambda stage, done, total: self.bridge.progress.emit(
+                        done,
+                        total,
+                        f"Preparing GRUB 2.14 rescue media · {stage}",
+                    ),
+                )
+                self.bridge.grub_rescue_preparation_finished.emit(token, plan)
+            except Exception as error:
+                self.bridge.grub_rescue_preparation_finished.emit(token, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_grub_rescue_preparation_finished(
+        self,
+        token_object: object,
+        result: object,
+    ) -> None:
+        if not isinstance(token_object, GrubRescuePreparationToken):
+            return
+        token = token_object
+        workflow = token.workflow
+        if (
+            token is not self.grub_rescue_token
+            or workflow is not self.grub_rescue_workflow
+        ):
+            workflow.close()
+            return
+        self.progress.setRange(0, 1000)
+        if isinstance(result, BaseException):
+            self.grub_rescue_token = None
+            self.grub_rescue_workflow = None
+            workflow.close()
+            self.set_busy(False)
+            if isinstance(result, GrubRescueWorkflowCancelled):
+                self.status.setText("GRUB rescue preparation cancelled before target mutation")
+            else:
+                self.status.setText("GRUB rescue media is not active")
+                QMessageBox.warning(
+                    self, "GRUB rescue preparation unavailable", str(result),
+                )
+            return
+        if (
+            type(result) is not GrubRescueDeviceWritePlan
+            or workflow.state is not GrubRescueWorkflowState.PREPARED
+            or workflow.plan is not result
+            or result.device is not workflow.device
+            or result.device.identity != token.device_identity
+        ):
+            self.grub_rescue_token = None
+            self.grub_rescue_workflow = None
+            workflow.close()
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "GRUB rescue preparation unavailable",
+                "The background result no longer matches the selected workflow and target.",
+            )
+            return
+        self._confirm_and_write_grub_rescue(token, result)
+
+    def _confirm_and_write_grub_rescue(
+        self,
+        token: GrubRescuePreparationToken,
+        plan: GrubRescueDeviceWritePlan,
+    ) -> None:
+        workflow = token.workflow
+        device = plan.device
+        dialog = QDialog(self)
+        self.grub_rescue_confirmation_dialog = dialog
+        dialog.setObjectName("grubRescueConfirmationDialog")
+        dialog.setWindowTitle("Final GRUB 2.14 rescue-media confirmation")
+        dialog.setMinimumWidth(720)
+        layout = QVBoxLayout(dialog)
+        model = " ".join(value for value in (device.vendor, device.model) if value).strip()
+        warning = QLabel(
+            "ALL DATA ON THIS TARGET WILL BE ERASED\n\n"
+            "Purpose: blank legacy-BIOS rescue media; intentionally stops at `grub rescue>`\n"
+            "Contains: no OS, installer, kernel, boot menu, normal.mod, or UEFI loader\n\n"
+            f"Target: {model or 'removable drive'}\n"
+            f"Serial: {device.serial or device.wwn or 'not reported'}\n"
+            f"Path: {device.path}\n"
+            f"Kernel identity: {device.major_minor}\n"
+            f"Disk sequence: {plan.disk_sequence}\n"
+            f"Capacity: {self.display_size(plan.image_size)} ({plan.image_size} bytes)\n"
+            f"Image SHA-256: {plan.final_image_sha256}\n\n"
+            "Layout: active MBR / one FAT32-LBA partition at LBA 2048 / BIOS-only\n"
+            "Verification: preactivation proof plus mandatory complete "
+            "whole-device SHA-256 read-back\n"
+            "Boot evidence: exact rescue prompt certified in QEMU TCG/SeaBIOS; "
+            "physical-device boot validation remains pending."
+        )
+        warning.setObjectName("grubRescueDisclosure")
+        warning.setWordWrap(True)
+        warning.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
+        layout.addWidget(warning)
+        instruction = QLabel(
+            f"Type the exact plan phrase below:\n{plan.confirmation_phrase}"
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+        phrase = QLineEdit()
+        phrase.setObjectName("grubRescueConfirmationPhrase")
+        phrase.setPlaceholderText(plan.confirmation_phrase)
+        layout.addWidget(phrase)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        start = buttons.addButton(
+            "Write blank GRUB rescue media",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        start.setObjectName("grubRescueWriteButton")
+        start.setEnabled(False)
+        phrase.textChanged.connect(
+            lambda value: start.setEnabled(value == plan.confirmation_phrase)
+        )
+        start.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self.grub_rescue_confirmation_dialog = None
+        if not accepted:
+            self.grub_rescue_token = None
+            self.grub_rescue_workflow = None
+            workflow.close()
+            self.set_busy(False)
+            self.status.setText("GRUB rescue media is not active")
+            return
+        entered_phrase = phrase.text()
+        self.progress.setValue(0)
+        self.status.setText("Confirming the exact GRUB rescue target…")
+
+        def work() -> None:
+            try:
+                workflow.confirm(entered_phrase)
+
+                def report(stage: str, done: int, total: int) -> None:
+                    if workflow.committed:
+                        self.bridge.status_changed.emit(
+                            "Finishing the committed GRUB rescue write safely…"
+                        )
+                    self.bridge.progress.emit(
+                        done, total, f"GRUB rescue device transaction · {stage}",
+                    )
+
+                result = workflow.execute(report)
+                self.bridge.grub_rescue_execution_finished.emit(token, result)
+            except Exception as error:
+                self.bridge.grub_rescue_execution_finished.emit(token, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_grub_rescue_execution_finished(
+        self,
+        token_object: object,
+        result: object,
+    ) -> None:
+        if not isinstance(token_object, GrubRescuePreparationToken):
+            return
+        token = token_object
+        workflow = token.workflow
+        if (
+            token is not self.grub_rescue_token
+            or workflow is not self.grub_rescue_workflow
+        ):
+            workflow.close()
+            return
+        plan = workflow.plan
+        if isinstance(result, BaseException):
+            committed = workflow.committed
+            message = (
+                "The committed GRUB rescue transaction ended without a verified "
+                "result. Its privileged helper has now exited, but the target state "
+                "is unknown. Keep the drive disconnected from normal use; remove and "
+                "reinsert it, inspect it, then rewrite or restore the entire device "
+                "before trusting it. Technical detail: "
+                if committed else
+                "GRUB rescue creation was cancelled before target mutation: "
+                if isinstance(result, GrubRescueWorkflowCancelled) else
+                "GRUB rescue creation failed before completion: "
+            ) + str(result)
+            self.bridge.finished.emit(False, message)
+            return
+        if (
+            type(result) is not GrubRescueDeviceWriteResult
+            or plan is None
+            or workflow.state is not GrubRescueWorkflowState.COMPLETED
+            or workflow.result is not result
+            or result.target_path != plan.device.path
+            or result.major_minor != plan.device.major_minor
+            or result.disk_sequence != plan.disk_sequence
+            or result.image_size != plan.image_size
+            or result.image_sha256 != plan.final_image_sha256
+            or result.mandatory_readback is not True
+        ):
+            self.bridge.finished.emit(
+                False,
+                "The GRUB rescue result did not match the exact confirmed target and image.",
+            )
+            return
+        self.bridge.finished.emit(
+            True,
+            "GRUB 2.14 blank legacy-BIOS rescue media is ready on "
+            f"{result.target_path}. It contains no OS, installer, kernel, menu, "
+            "normal.mod, or UEFI loader and intentionally stops at `grub rescue>`. "
+            "The mandatory complete whole-device SHA-256 read-back matched "
+            f"{result.image_sha256}. QEMU TCG/SeaBIOS rescue-prompt certification "
+            "passed; physical-device boot validation remains pending.",
+        )
 
     def create_uefi_shell_media(self) -> None:
         device = self.selected_device()

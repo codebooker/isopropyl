@@ -74,11 +74,21 @@ evidence.
   an empty anonymous MBR/FAT32 image, validates the pinned bootstrap/core and
   diskboot blocklist, writes the core first, preserves a zero embedding gap,
   activates the bootstrap last, and performs complete post-activation
-  reattestation. A sealed device-free image reaches the intentional
-  `grub rescue>` prompt under isolated QEMU/SeaBIOS. Next, add a distinct typed,
-  target-bound privileged transaction and physical BIOS evidence. Any future
-  normal/menu-mode profile requires a self-contained, matching module closure;
-  never combine the pinned core with host GRUB modules.
+  reattestation. A distinct environment-gated device workflow now binds that
+  target-sized private image to writable, kernel-removable USB/MMC media with
+  512-byte logical sectors and no more than 128 GiB capacity. It reserves the
+  target size plus 64 MiB in private workspace, requires the exact target-bound
+  typed phrase, and uses a dedicated PolicyKit/helper profile with no generic/raw
+  fallback. The root transaction verifies the canonical rescue layout, copies
+  the core-containing non-activation bytes before sector zero, activates the MBR
+  last, and requires matching whole-device SHA-256 read-back. A sealed
+  device-free image reaches the intentional `grub rescue>` prompt under isolated
+  QEMU/SeaBIOS, but that certifies neither the privileged transaction nor a
+  physical device. Remaining gates are a native hardened helper, installed
+  integration and hot-swap/failure testing, representative physical-media
+  writes, and physical BIOS evidence. Any future normal/menu-mode profile
+  requires a self-contained, matching module closure; never combine the pinned
+  core with host GRUB modules.
 - Certify and package the narrowly scoped Syslinux MBR/FAT installer. The exact ADV,
   extent, checksum, FAT32 VBR merge, descriptor-only FAT mapping, partition
   offset binding, regular-file before/after read-back harness, and exact
@@ -126,9 +136,11 @@ evidence.
   an installed PolicyKit/SCM_RIGHTS VM test,
   OVMF retained-UEFI coverage, hot-swap/failure tests, and physical certification.
   Keep the general BIOS planner blocker and normal GUI exposure intact until those
-  gates pass. Keep the GRUB rescue backend device-free until a typed helper,
-  confirmation, cancellation/recovery contract, installed-integration tests,
-  and representative physical BIOS evidence pass independently.
+  gates pass. Keep the GRUB rescue device workflow behind
+  `ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1` until its provisional helper is replaced
+  or hardened and its installed PolicyKit/SCM_RIGHTS, cancellation/recovery,
+  hot-swap/failure, representative physical-media, and physical BIOS evidence
+  pass independently.
 - Do not treat the implemented bounded El Torito FAT parser as an Ubuntu
   persistence solution: official Ubuntu 20.04.6, 22.04.5, and 24.04.4 embedded
   EFI images contain EFI binaries but no recognized text `grub.cfg`, and the

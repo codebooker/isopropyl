@@ -4,8 +4,9 @@ from __future__ import annotations
 
 """Root-side versioned device transactions.
 
-This module is the narrow privileged half of the Syslinux, generic raw/DD, and
-target-only fast-zero pipelines.  It does not trust unprivileged plans or their
+This module is the narrow privileged half of the Syslinux, exact GRUB rescue,
+generic raw/DD, and target-only fast-zero pipelines.  It does not trust
+unprivileged plans or their
 serialized target observations.  Image-writing callers transfer one already
 prepared anonymous regular file; fast-zero accepts no source descriptor at all.
 The selected exact protocol derives safety properties from the opened block
@@ -38,6 +39,9 @@ from pathlib import Path
 
 HELPER_PROFILE = "io.github.codebooker.isopropyl/syslinux-device-helper/v1"
 WINDOWS_HELPER_PROFILE = "io.github.codebooker.isopropyl/windows-device-helper/v1"
+GRUB_RESCUE_HELPER_PROFILE = (
+    "io.github.codebooker.isopropyl/grub-2.14-rescue-device-helper/v1"
+)
 RAW_HELPER_PROFILE = "io.github.codebooker.isopropyl/raw-device-helper/v1"
 FAST_ZERO_HELPER_PROFILE = "io.github.codebooker.isopropyl/fast-zero-device-helper/v1"
 SECTOR_SIZE = 512
@@ -60,6 +64,17 @@ WINDOWS_STAGE0_SHA256 = (
 WINDOWS_STAGE2_SHA256 = (
     "127a6e7eda4545ba329c43af810ae9e85587302a9a588fafa05c06b8d6dd3a60"
 )
+GRUB_BOOTSTRAP_SIZE = 432
+GRUB_BOOTSTRAP_SHA256 = (
+    "82d8879ed51b42cab56ad071eb3b0d28d60cd83d57f24fe788014a639940e41e"
+)
+GRUB_CORE_OFFSET = SECTOR_SIZE
+GRUB_CORE_SIZE = 42_742
+GRUB_CORE_SHA256 = (
+    "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809"
+)
+GRUB_CORE_BLOCKLIST_OFFSET = 0x1F4
+GRUB_CORE_BLOCKLIST = bytes.fromhex("020000000000000053002008")
 WINDOWS_BOOTMGR_ENTRY_STUB = b"\xe9\xd5\x01\xeb\x04\x90"
 WINDOWS_BOOTMGR_MIN_SIZE = 0x1D9
 WINDOWS_BOOTMGR_MAX_SIZE = 0x7E000
@@ -80,6 +95,7 @@ MIN_FAT32_CLUSTERS = 65_525
 
 PROTOCOL_MAGIC = b"ISOPROPYL-SYSLX1"
 WINDOWS_PROTOCOL_MAGIC = b"ISOPROPYL-WIN001"
+GRUB_RESCUE_PROTOCOL_MAGIC = b"ISOPROPYL-GRUB14"
 RAW_PROTOCOL_MAGIC = b"ISOPROPYL-RAW001"
 FAST_ZERO_PROTOCOL_MAGIC = b"ISOPROPYL-ZERO01"
 PROTOCOL_VERSION = 1
@@ -95,6 +111,7 @@ PACKET_PARTIAL_CANCEL = 9
 PACKET_PARTIAL_FAILURE = 10
 OPERATION = "write-image-v1"
 WINDOWS_OPERATION = "write-windows-image-v1"
+GRUB_RESCUE_OPERATION = "write-grub-2.14-rescue-image-v1"
 RAW_OPERATION = "write-raw-image-v1"
 FAST_ZERO_OPERATION = "fast-zero-drive-v1"
 FAST_ZERO_FAILURE_NONE = 0
@@ -212,6 +229,38 @@ class KernelTargetObservation:
 
 @dataclass(frozen=True)
 class HelperResult:
+    request_id: bytes
+    profile: str
+    target_path: str
+    major_minor: str
+    disk_sequence: int
+    bytes_written: int
+    source_sha256: str
+    written_sha256: str
+    readback_sha256: str
+    logical_sector_size: int
+    disk_signature: int
+    volume_id: int
+    exclusive_open: bool
+    cache_invalidated: bool
+
+
+@dataclass(frozen=True)
+class GrubRescueHelperRequest:
+    request_id: bytes
+    profile: str
+    target_path: str
+    expected_major_minor: str
+    expected_disk_sequence: int
+    expected_size: int
+    expected_sector_size: int
+    expected_disk_signature: int
+    expected_volume_id: int
+    expected_sha256: str
+
+
+@dataclass(frozen=True)
+class GrubRescueHelperResult:
     request_id: bytes
     profile: str
     target_path: str
@@ -746,6 +795,29 @@ def validate_helper_request(request: HelperRequest) -> None:
         raise HelperRequestError("The expected image digest is invalid")
 
 
+def validate_grub_rescue_helper_request(request: GrubRescueHelperRequest) -> None:
+    """Validate the distinct exact GRUB 2.14 rescue-device request."""
+
+    if type(request) is not GrubRescueHelperRequest:
+        raise HelperRequestError("An exact GRUB rescue helper request is required")
+    if request.profile != GRUB_RESCUE_HELPER_PROFILE:
+        raise HelperRequestError("The GRUB rescue helper profile is unsupported")
+    # The wire fields deliberately match the hardened private-image transaction,
+    # but the protocol/request types do not.  Reuse only its scalar validation.
+    validate_helper_request(HelperRequest(
+        request.request_id,
+        HELPER_PROFILE,
+        request.target_path,
+        request.expected_major_minor,
+        request.expected_disk_sequence,
+        request.expected_size,
+        request.expected_sector_size,
+        request.expected_disk_signature,
+        request.expected_volume_id,
+        request.expected_sha256,
+    ))
+
+
 def validate_raw_helper_request(request: RawHelperRequest) -> None:
     if type(request) is not RawHelperRequest:
         raise HelperRequestError("An exact raw-device helper request is required")
@@ -1107,6 +1179,238 @@ def _validate_syslinux_image_layout(
         or next_free != expected_next_free
     ):
         raise HelperSourceError("The FAT32 allocation metadata is not canonical")
+    return mbr
+
+
+def _require_zero_source_range(
+    descriptor: int,
+    start: int,
+    end: int,
+    *,
+    read_at: Callable[[int, int, int], bytes],
+    label: str,
+) -> None:
+    if not 0 <= start <= end:
+        raise HelperSourceError(f"The {label} range is invalid")
+    offset = start
+    while offset < end:
+        size = min(COPY_BYTES, end - offset)
+        block = _read_exact_at(
+            descriptor,
+            offset,
+            size,
+            read_at=read_at,
+            label=label,
+        )
+        if any(block):
+            raise HelperSourceError(f"The {label} is not empty")
+        offset += len(block)
+
+
+def _grub_empty_boot_sector(
+    *,
+    partition_sectors: int,
+    sectors_per_cluster: int,
+    sectors_per_fat: int,
+    volume_id: int,
+) -> bytes:
+    result = bytearray(SECTOR_SIZE)
+    result[:3] = b"\xeb\x58\x90"
+    result[3:11] = b"ISOPROPY"
+    struct.pack_into("<H", result, 11, SECTOR_SIZE)
+    result[13] = sectors_per_cluster
+    struct.pack_into("<H", result, 14, RESERVED_SECTORS)
+    result[16] = FAT_COUNT
+    result[21] = 0xF8
+    struct.pack_into("<H", result, 24, 63)
+    struct.pack_into("<H", result, 26, 255)
+    struct.pack_into("<I", result, 28, PARTITION_START_SECTOR)
+    struct.pack_into("<I", result, 32, partition_sectors)
+    struct.pack_into("<I", result, 36, sectors_per_fat)
+    struct.pack_into("<I", result, 44, 2)
+    struct.pack_into("<H", result, 48, 1)
+    struct.pack_into("<H", result, 50, 6)
+    result[64] = 0x80
+    result[66] = 0x29
+    struct.pack_into("<I", result, 67, volume_id)
+    result[71:82] = b"ISOPROPYL  "
+    result[82:90] = b"FAT32   "
+    result[510:512] = b"\x55\xaa"
+    return bytes(result)
+
+
+def _validate_grub_rescue_image_layout(
+    descriptor: int,
+    request: GrubRescueHelperRequest,
+    *,
+    read_at: Callable[[int, int, int], bytes],
+) -> bytes:
+    """Require the exact GRUB 2.14 bootstrap/core and empty private FAT32."""
+
+    if request.expected_size > MAX_IMAGE_BYTES:
+        raise HelperSourceError("The GRUB rescue image exceeds 128 GiB")
+    (
+        partition_sectors,
+        sectors_per_cluster,
+        sectors_per_fat,
+        cluster_count,
+    ) = _canonical_fat32_geometry(request.expected_size)
+    bootstrap = _read_exact_at(
+        descriptor,
+        0,
+        GRUB_BOOTSTRAP_SIZE,
+        read_at=read_at,
+        label="GRUB 2.14 bootstrap",
+    )
+    if (
+        hashlib.sha256(bootstrap).hexdigest() != GRUB_BOOTSTRAP_SHA256
+        or struct.unpack_from("<Q", bootstrap, 0x5C)[0] != 1
+        or bootstrap[0x64] != 0xFF
+        or bootstrap[0x66:0x68] != b"\x90\x90"
+    ):
+        raise HelperSourceError("The source lacks the exact GRUB 2.14 bootstrap")
+    expected_mbr = bytearray(SECTOR_SIZE)
+    expected_mbr[:GRUB_BOOTSTRAP_SIZE] = bootstrap
+    struct.pack_into("<I", expected_mbr, 440, request.expected_disk_signature)
+    expected_partition = bytearray(16)
+    expected_partition[:8] = b"\x80\x20\x21\x00\x0c\xfe\xff\xff"
+    struct.pack_into("<I", expected_partition, 8, PARTITION_START_SECTOR)
+    struct.pack_into("<I", expected_partition, 12, partition_sectors)
+    expected_mbr[446:462] = expected_partition
+    expected_mbr[510:512] = b"\x55\xaa"
+    mbr = _read_exact_at(
+        descriptor,
+        0,
+        SECTOR_SIZE,
+        read_at=read_at,
+        label="GRUB rescue MBR",
+    )
+    if mbr != bytes(expected_mbr):
+        raise HelperSourceError(
+            "The source is not the bound active single-partition GRUB rescue MBR",
+        )
+
+    core = _read_exact_at(
+        descriptor,
+        GRUB_CORE_OFFSET,
+        GRUB_CORE_SIZE,
+        read_at=read_at,
+        label="GRUB 2.14 core image",
+    )
+    if (
+        hashlib.sha256(core).hexdigest() != GRUB_CORE_SHA256
+        or core[
+            GRUB_CORE_BLOCKLIST_OFFSET:
+            GRUB_CORE_BLOCKLIST_OFFSET + len(GRUB_CORE_BLOCKLIST)
+        ] != GRUB_CORE_BLOCKLIST
+    ):
+        raise HelperSourceError("The source lacks the exact GRUB 2.14 core image")
+    volume_offset = PARTITION_START_SECTOR * SECTOR_SIZE
+    _require_zero_source_range(
+        descriptor,
+        GRUB_CORE_OFFSET + GRUB_CORE_SIZE,
+        volume_offset,
+        read_at=read_at,
+        label="GRUB embedding gap",
+    )
+
+    expected_boot = _grub_empty_boot_sector(
+        partition_sectors=partition_sectors,
+        sectors_per_cluster=sectors_per_cluster,
+        sectors_per_fat=sectors_per_fat,
+        volume_id=request.expected_volume_id,
+    )
+    primary_boot = _read_exact_at(
+        descriptor, volume_offset, SECTOR_SIZE,
+        read_at=read_at, label="primary empty FAT32 boot sector",
+    )
+    backup_boot = _read_exact_at(
+        descriptor, volume_offset + 6 * SECTOR_SIZE, SECTOR_SIZE,
+        read_at=read_at, label="backup empty FAT32 boot sector",
+    )
+    if primary_boot != expected_boot or backup_boot != expected_boot:
+        raise HelperSourceError("The GRUB rescue FAT32 boot sectors are not canonical")
+
+    expected_fsinfo = bytearray(SECTOR_SIZE)
+    struct.pack_into("<I", expected_fsinfo, 0, 0x41615252)
+    struct.pack_into("<I", expected_fsinfo, 484, 0x61417272)
+    struct.pack_into("<I", expected_fsinfo, 488, cluster_count - 1)
+    struct.pack_into("<I", expected_fsinfo, 492, 3)
+    struct.pack_into("<I", expected_fsinfo, 508, 0xAA550000)
+    primary_fsinfo = _read_exact_at(
+        descriptor, volume_offset + SECTOR_SIZE, SECTOR_SIZE,
+        read_at=read_at, label="primary empty FAT32 FSInfo",
+    )
+    backup_fsinfo = _read_exact_at(
+        descriptor, volume_offset + 7 * SECTOR_SIZE, SECTOR_SIZE,
+        read_at=read_at, label="backup empty FAT32 FSInfo",
+    )
+    if primary_fsinfo != bytes(expected_fsinfo) or backup_fsinfo != bytes(expected_fsinfo):
+        raise HelperSourceError("The GRUB rescue FAT32 allocation metadata is not canonical")
+    _require_zero_source_range(
+        descriptor, volume_offset + 2 * SECTOR_SIZE,
+        volume_offset + 6 * SECTOR_SIZE,
+        read_at=read_at, label="empty FAT32 primary reserved area",
+    )
+    _require_zero_source_range(
+        descriptor, volume_offset + 8 * SECTOR_SIZE,
+        volume_offset + RESERVED_SECTORS * SECTOR_SIZE,
+        read_at=read_at, label="empty FAT32 reserved area",
+    )
+
+    fat_bytes = sectors_per_fat * SECTOR_SIZE
+    expected_fat_prefix = struct.pack("<III", 0x0FFFFFF8, 0x0FFFFFFF, 0x0FFFFFFF)
+    for index in range(FAT_COUNT):
+        fat_offset = volume_offset + (RESERVED_SECTORS * SECTOR_SIZE) + index * fat_bytes
+        prefix = _read_exact_at(
+            descriptor, fat_offset, len(expected_fat_prefix),
+            read_at=read_at, label=f"empty FAT32 copy {index + 1}",
+        )
+        if prefix != expected_fat_prefix:
+            raise HelperSourceError("The GRUB rescue FAT32 allocation table is not empty")
+        _require_zero_source_range(
+            descriptor, fat_offset + len(expected_fat_prefix), fat_offset + fat_bytes,
+            read_at=read_at, label=f"empty FAT32 copy {index + 1}",
+        )
+
+    data_offset = volume_offset + (
+        RESERVED_SECTORS + FAT_COUNT * sectors_per_fat
+    ) * SECTOR_SIZE
+    label_entry = _read_exact_at(
+        descriptor, data_offset, 32,
+        read_at=read_at, label="empty FAT32 root volume-label entry",
+    )
+    masked_label = bytearray(label_entry)
+    masked_label[13:20] = b"\0" * 7
+    masked_label[22:26] = b"\0" * 4
+    expected_label = bytearray(32)
+    expected_label[:11] = b"ISOPROPYL  "
+    expected_label[11] = 0x08
+    created_time = struct.unpack_from("<H", label_entry, 14)[0]
+    created_date = struct.unpack_from("<H", label_entry, 16)[0]
+    valid_time = (
+        (created_time >> 11) < 24
+        and ((created_time >> 5) & 0x3F) < 60
+        and (created_time & 0x1F) < 30
+    )
+    valid_date = (
+        1 <= ((created_date >> 5) & 0x0F) <= 12
+        and 1 <= (created_date & 0x1F) <= 31
+    )
+    if (
+        masked_label != expected_label
+        or label_entry[13] > 199
+        or not valid_time
+        or not valid_date
+        or label_entry[14:16] != label_entry[22:24]
+        or label_entry[16:18] != label_entry[18:20]
+        or label_entry[16:18] != label_entry[24:26]
+    ):
+        raise HelperSourceError("The GRUB rescue FAT32 root is not canonical and empty")
+    _require_zero_source_range(
+        descriptor, data_offset + 32, request.expected_size,
+        read_at=read_at, label="GRUB rescue empty FAT32 data region",
+    )
     return mbr
 
 
@@ -1477,7 +1781,7 @@ def _require_opened_target_identity(
 
 
 def execute_helper_transaction(
-    request: HelperRequest,
+    request: HelperRequest | GrubRescueHelperRequest,
     *,
     source_descriptor: int = 0,
     invoking_uid: int,
@@ -1485,10 +1789,13 @@ def execute_helper_transaction(
     progress: Progress = lambda _phase, _done, _total: None,
     mutation_started: Callable[[], None] = lambda: None,
     precommit_cancel: Callable[[], None] = lambda: None,
-) -> HelperResult:
+) -> HelperResult | GrubRescueHelperResult:
     """Execute one fail-closed, same-target-descriptor disk transaction."""
 
-    validate_helper_request(request)
+    if type(request) is GrubRescueHelperRequest:
+        validate_grub_rescue_helper_request(request)
+    else:
+        validate_helper_request(request)
     if type(source_descriptor) is not int or isinstance(source_descriptor, bool) or source_descriptor < 0:
         raise HelperSourceError("The privileged source descriptor is invalid")
     if type(invoking_uid) is not int or isinstance(invoking_uid, bool) or invoking_uid < 0:
@@ -1528,7 +1835,13 @@ def execute_helper_transaction(
         )
 
     source_mbr = (
-        _validate_windows_image_layout(
+        _validate_grub_rescue_image_layout(
+            source_descriptor,
+            request,
+            read_at=source_read_at,
+        )
+        if type(request) is GrubRescueHelperRequest
+        else _validate_windows_image_layout(
             source_descriptor,
             request,
             read_at=source_read_at,
@@ -1885,7 +2198,12 @@ def execute_helper_transaction(
             or final_read_only != 0
         ):
             raise HelperVerificationError("The target identity or geometry changed after verification")
-        return HelperResult(
+        result_type = (
+            GrubRescueHelperResult
+            if type(request) is GrubRescueHelperRequest
+            else HelperResult
+        )
+        return result_type(
             request.request_id,
             request.profile,
             request.target_path,
@@ -3231,6 +3549,115 @@ def unpack_windows_helper_request(
     return request
 
 
+def pack_grub_rescue_helper_request(
+    request_id: bytes,
+    major_number: int,
+    minor_number: int,
+    disk_sequence: int,
+    size: int,
+    sector_size: int,
+    disk_signature: int,
+    volume_id: int,
+    sha256_hex: str,
+) -> bytes:
+    packet = pack_helper_request(
+        request_id, major_number, minor_number, disk_sequence, size,
+        sector_size, disk_signature, volume_id, sha256_hex,
+    )
+    return GRUB_RESCUE_PROTOCOL_MAGIC + packet[len(PROTOCOL_MAGIC):]
+
+
+def unpack_grub_rescue_helper_request(
+    packet: bytes,
+    *,
+    sys_root: Path = Path("/sys"),
+) -> GrubRescueHelperRequest:
+    if type(packet) is not bytes or len(packet) != _REQUEST_PACKET.size:
+        raise HelperRequestError("The GRUB rescue request packet has the wrong size")
+    if packet[:len(GRUB_RESCUE_PROTOCOL_MAGIC)] != GRUB_RESCUE_PROTOCOL_MAGIC:
+        raise HelperRequestError("The GRUB rescue request packet is unsupported")
+    generic = unpack_helper_request(
+        PROTOCOL_MAGIC + packet[len(GRUB_RESCUE_PROTOCOL_MAGIC):],
+        sys_root=sys_root,
+    )
+    request = GrubRescueHelperRequest(
+        generic.request_id,
+        GRUB_RESCUE_HELPER_PROFILE,
+        generic.target_path,
+        generic.expected_major_minor,
+        generic.expected_disk_sequence,
+        generic.expected_size,
+        generic.expected_sector_size,
+        generic.expected_disk_signature,
+        generic.expected_volume_id,
+        generic.expected_sha256,
+    )
+    validate_grub_rescue_helper_request(request)
+    return request
+
+
+def pack_grub_rescue_helper_result(result: GrubRescueHelperResult) -> bytes:
+    """Encode only a fully verified result from the exact GRUB transaction."""
+
+    if (
+        type(result) is not GrubRescueHelperResult
+        or result.profile != GRUB_RESCUE_HELPER_PROFILE
+        or type(result.request_id) is not bytes
+        or len(result.request_id) != 16
+        or type(result.target_path) is not str
+        or _TARGET_PATH.fullmatch(result.target_path) is None
+        or type(result.disk_sequence) is not int
+        or isinstance(result.disk_sequence, bool)
+        or not 0 < result.disk_sequence <= 0xFFFFFFFFFFFFFFFF
+        or type(result.bytes_written) is not int
+        or isinstance(result.bytes_written, bool)
+        or not SECTOR_SIZE <= result.bytes_written <= MAX_IMAGE_BYTES
+        or result.bytes_written % SECTOR_SIZE
+        or result.logical_sector_size != SECTOR_SIZE
+        or type(result.disk_signature) is not int
+        or not 0 < result.disk_signature < 0xFFFFFFFF
+        or type(result.volume_id) is not int
+        or not 0 < result.volume_id < 0xFFFFFFFF
+        or result.volume_id == result.disk_signature
+        or type(result.source_sha256) is not str
+        or _SHA256.fullmatch(result.source_sha256) is None
+        or result.written_sha256 != result.source_sha256
+        or result.readback_sha256 != result.source_sha256
+        or result.exclusive_open is not True
+        or result.cache_invalidated is not True
+    ):
+        raise HelperRequestError("The GRUB rescue helper result cannot be encoded")
+    try:
+        major_text, minor_text = result.major_minor.split(":", 1)
+        major_number = int(major_text)
+        minor_number = int(minor_text)
+        device_number = os.makedev(major_number, minor_number)
+    except (AttributeError, OverflowError, TypeError, ValueError) as error:
+        raise HelperRequestError("The GRUB rescue result target identity is invalid") from error
+    if (
+        _MAJOR_MINOR.fullmatch(result.major_minor) is None
+        or _dev_text(device_number) != result.major_minor
+    ):
+        raise HelperRequestError("The GRUB rescue result target identity is invalid")
+    return _SUCCESS_PACKET.pack(
+        GRUB_RESCUE_PROTOCOL_MAGIC,
+        PROTOCOL_VERSION,
+        PACKET_SUCCESS,
+        0,
+        result.request_id,
+        major_number,
+        minor_number,
+        result.disk_sequence,
+        result.bytes_written,
+        result.logical_sector_size,
+        result.disk_signature,
+        result.volume_id,
+        bytes.fromhex(result.source_sha256),
+        bytes.fromhex(result.written_sha256),
+        bytes.fromhex(result.readback_sha256),
+    )
+
+
 def pack_raw_helper_request(
     request_id: bytes,
     major_number: int,
@@ -3517,6 +3944,18 @@ def unpack_windows_server_packet(packet: bytes) -> tuple[object, ...]:
     )
 
 
+def unpack_grub_rescue_server_packet(packet: bytes) -> tuple[object, ...]:
+    """Strictly decode one exact GRUB rescue helper packet."""
+
+    if type(packet) is not bytes or len(packet) < _HEADER.size:
+        raise HelperRequestError("The GRUB rescue helper response is truncated")
+    if packet[:len(GRUB_RESCUE_PROTOCOL_MAGIC)] != GRUB_RESCUE_PROTOCOL_MAGIC:
+        raise HelperRequestError("The GRUB rescue helper response is unsupported")
+    return unpack_server_packet(
+        PROTOCOL_MAGIC + packet[len(GRUB_RESCUE_PROTOCOL_MAGIC):],
+    )
+
+
 def unpack_raw_server_packet(packet: bytes) -> tuple[object, ...]:
     """Strictly decode one raw-device helper packet for its runner."""
 
@@ -3763,6 +4202,11 @@ def pack_windows_helper_control(request_id: bytes, *, commit: bool) -> bytes:
     return WINDOWS_PROTOCOL_MAGIC + packet[len(PROTOCOL_MAGIC):]
 
 
+def pack_grub_rescue_helper_control(request_id: bytes, *, commit: bool) -> bytes:
+    packet = pack_helper_control(request_id, commit=commit)
+    return GRUB_RESCUE_PROTOCOL_MAGIC + packet[len(PROTOCOL_MAGIC):]
+
+
 def pack_raw_helper_control(request_id: bytes, *, commit: bool) -> bytes:
     if type(request_id) is not bytes or len(request_id) != 16 or type(commit) is not bool:
         raise HelperRequestError("The privileged raw control decision cannot be encoded")
@@ -3807,6 +4251,7 @@ class _ProtocolProgress:
         if protocol_magic not in {
             PROTOCOL_MAGIC,
             WINDOWS_PROTOCOL_MAGIC,
+            GRUB_RESCUE_PROTOCOL_MAGIC,
             RAW_PROTOCOL_MAGIC,
             FAST_ZERO_PROTOCOL_MAGIC,
         }:
@@ -4251,6 +4696,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(arguments) != 1 or arguments[0] not in {
             OPERATION,
             WINDOWS_OPERATION,
+            GRUB_RESCUE_OPERATION,
             RAW_OPERATION,
             FAST_ZERO_OPERATION,
         }:
@@ -4259,6 +4705,7 @@ def main(argv: list[str] | None = None) -> int:
         protocol_magic = {
             OPERATION: PROTOCOL_MAGIC,
             WINDOWS_OPERATION: WINDOWS_PROTOCOL_MAGIC,
+            GRUB_RESCUE_OPERATION: GRUB_RESCUE_PROTOCOL_MAGIC,
             RAW_OPERATION: RAW_PROTOCOL_MAGIC,
             FAST_ZERO_OPERATION: FAST_ZERO_PROTOCOL_MAGIC,
         }[operation]
@@ -4272,7 +4719,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if operation == FAST_ZERO_OPERATION:
             packet = _receive_target_only_request(channel, expected_uid=invoking_uid)
-            request: HelperRequest | RawHelperRequest | FastZeroHelperRequest = (
+            request: (
+                HelperRequest | GrubRescueHelperRequest
+                | RawHelperRequest | FastZeroHelperRequest
+            ) = (
                 unpack_fast_zero_helper_request(packet)
             )
         else:
@@ -4285,6 +4735,8 @@ def main(argv: list[str] | None = None) -> int:
                 if operation == OPERATION
                 else unpack_windows_helper_request(packet)
                 if operation == WINDOWS_OPERATION
+                else unpack_grub_rescue_helper_request(packet)
+                if operation == GRUB_RESCUE_OPERATION
                 else unpack_raw_helper_request(packet)
             )
         progress = _ProtocolProgress(
@@ -4309,8 +4761,11 @@ def main(argv: list[str] | None = None) -> int:
             _defer_ordinary_termination()
             progress.begin_mutation()
 
-        result: HelperResult | RawHelperResult | FastZeroHelperResult
-        if type(request) is HelperRequest:
+        result: (
+            HelperResult | GrubRescueHelperResult
+            | RawHelperResult | FastZeroHelperResult
+        )
+        if type(request) in {HelperRequest, GrubRescueHelperRequest}:
             result = execute_helper_transaction(
                 request,
                 source_descriptor=source_descriptor,
@@ -4345,7 +4800,9 @@ def main(argv: list[str] | None = None) -> int:
             int(part) for part in result.major_minor.split(":", 1)
         )
         try:
-            if type(result) is HelperResult:
+            if type(result) is GrubRescueHelperResult:
+                response = pack_grub_rescue_helper_result(result)
+            elif type(result) is HelperResult:
                 response = _SUCCESS_PACKET.pack(
                     (
                         WINDOWS_PROTOCOL_MAGIC

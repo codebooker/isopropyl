@@ -43,6 +43,7 @@ install-host-helper:
 	install -Dm644 data/io.github.codebooker.isopropyl.raw-write.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy
 	install -Dm644 data/io.github.codebooker.isopropyl.fast-zero.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy
 	install -Dm644 data/io.github.codebooker.isopropyl.windows-write.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.windows-write.policy
+	install -Dm644 data/io.github.codebooker.isopropyl.grub-rescue-write.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.grub-rescue-write.policy
 	install -Dm755 helper/isopropyl-restore-device-helper $(DESTDIR)/usr/libexec/isopropyl-restore-device-helper
 	install -Dm644 isopropyl/restore_device_helper.py $(DESTDIR)/usr/libexec/isopropyl/restore_device_helper.py
 	install -Dm644 data/io.github.codebooker.isopropyl.restore-device.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy
@@ -58,4 +59,5 @@ uninstall-host-helper:
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.windows-write.policy
+	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.grub-rescue-write.policy
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy

@@ -5,11 +5,12 @@ version-specific boot payload bundles below are not part of the Python package;
 the package contains their pinned catalog metadata. The exception is the small
 MIT-licensed Syslinux 6.02 MBR bootstrap embedded in `isopropyl/syslinux.py` and
 documented in its own section below. UEFI:NTFS and the optional boot-time
-corruption validator are obtained only after explicit user consent. GRUB entries
-remain dormant preparation inputs. Syslinux bundles have a private-tree/device
-consumer, but ordinary writes do not download them; only the explicitly
-environment-gated developer preview can request both exact bundle roles after
-separate consent.
+corruption validator are obtained only after explicit user consent. GRUB 2.06
+and 2.12 entries remain dormant preparation inputs; the exact GRUB 2.14 rescue
+bundle and Syslinux bundles have narrow private-image/device consumers, but
+ordinary writes do not download them. Only their explicitly environment-gated
+developer previews can request the exact applicable bundle roles after separate
+consent.
 
 ## Rufus Windows experience command manifest
 
@@ -354,9 +355,23 @@ embedding gap stays zero, and the exact bootstrap is activated last while the
 disk signature and partition table are preserved. The filesystem is deliberately
 empty. Because this build does not embed or install `normal.mod`, a successful
 boot intentionally stops at `grub rescue>`; it has no menu, configuration,
-kernel, or operating system. No ordinary GUI or physical-device transaction can
-consume this profile yet. The source-tree certification harness is the only
-current caller that requests the bundle, and does so only after `--run` consent.
+kernel, operating system, or UEFI loader.
+
+An ordinary GUI launch still cannot consume this profile. The exact
+`ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1` developer opt-in exposes a separate
+workflow for writable, kernel-removable USB/MMC targets with 512-byte logical
+sectors and capacity at or below 128 GiB. After explicit download consent it
+creates a target-sized private image with a 64 MiB workspace reserve, requires
+the exact typed target phrase, and transfers the image through a dedicated
+PolicyKit action, protocol operation, and helper profile. That root transaction
+independently revalidates the pinned artifacts and canonical empty layout, writes
+the core-containing non-activation bytes before activating the MBR, and requires
+matching whole-device SHA-256 read-back; it has no generic/raw fallback. The
+source-tree certification harness remains a separate caller and requests the
+bundle only after `--run` consent. Its QEMU/SeaBIOS observation certifies the
+intentional rescue prompt only, not the privileged transaction or physical
+media. Native-helper hardening, installed integration, hot-swap/failure testing,
+and representative physical write/BIOS evidence remain pending.
 
 These images are not generic replacements for a distribution's GRUB build.
 ISOpropyl never mixes them with host modules or truncates a downstream build

@@ -681,6 +681,7 @@ class InstallationTests(unittest.TestCase):
             "data/io.github.codebooker.isopropyl.policy",
             "data/io.github.codebooker.isopropyl.raw-write.policy",
             "data/io.github.codebooker.isopropyl.fast-zero.policy",
+            "data/io.github.codebooker.isopropyl.grub-rescue-write.policy",
         ):
             self.assertIn(asset, host_install)
         self.assertIn(
@@ -689,6 +690,10 @@ class InstallationTests(unittest.TestCase):
         )
         self.assertIn(
             "io.github.codebooker.isopropyl.fast-zero.policy",
+            host_uninstall,
+        )
+        self.assertIn(
+            "io.github.codebooker.isopropyl.grub-rescue-write.policy",
             host_uninstall,
         )
 
@@ -847,6 +852,7 @@ class InstallationTests(unittest.TestCase):
                 root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy": 0o644,
                 root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy": 0o644,
                 root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy": 0o644,
+                root / "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.grub-rescue-write.policy": 0o644,
             }
             for path, mode in expected.items():
                 with self.subTest(path=path):

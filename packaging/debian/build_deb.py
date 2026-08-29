@@ -59,6 +59,9 @@ fat_image.py
 formatting.py
 freedos_downloads.py
 grub_rescue.py
+grub_rescue_device.py
+grub_rescue_device_runner.py
+grub_rescue_workflow.py
 images.py
 iso.py
 iso_staging.py
@@ -235,6 +238,11 @@ PAYLOAD_FILES: tuple[tuple[str, str, int], ...] = (
     (
         "data/io.github.codebooker.isopropyl.windows-write.policy",
         "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.windows-write.policy",
+        0o644,
+    ),
+    (
+        "data/io.github.codebooker.isopropyl.grub-rescue-write.policy",
+        "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.grub-rescue-write.policy",
         0o644,
     ),
     (

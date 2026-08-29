@@ -54,7 +54,7 @@ identity, and require an explicit confirmation.
 | **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and a second typed warning for fixed USB disks or risky image profiles. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
 | **Syslinux BIOS developer preview** | For exact supported Syslinux 6.03/6.04 images, an explicit environment-gated preview can add a legacy-BIOS path while retaining the source UEFI files. It uses hash-pinned payloads, a target-bound typed confirmation, MBR-last activation, and mandatory full-device SHA-256 read-back. The normal GUI keeps it hidden pending a native hardened helper and physical-media certification. |
-| **GRUB 2.14 rescue-media backend** | Reproduces Rufus's exact blank BIOS rescue profile in a private anonymous MBR/FAT32 image. It validates the pinned `boot.img` and `core.img`, writes the core at byte 512, proves the embedding gap remains zero, activates the 432-byte bootstrap last, and reattests the complete image. A sealed copy has reached the intentional `grub rescue>` prompt under isolated QEMU/SeaBIOS. This backend does not contain a menu, configuration, `normal.mod`, kernel, or operating system, and no GUI or physical-device transaction exposes it yet. |
+| **GRUB 2.14 rescue-media developer preview** | `ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1` exposes Rufus's exact blank legacy-BIOS rescue profile for tightly restricted removable media. ISOpropyl validates the pinned `boot.img` and `core.img`, builds a target-sized private MBR/FAT32 image with the core at byte 512 and a zero embedding gap, and activates the 432-byte bootstrap last. A separate target-bound PolicyKit transaction copies non-activation bytes before the MBR, requires the exact typed target phrase, and performs mandatory whole-device SHA-256 read-back without a generic/raw fallback. A sealed image has reached the intentional `grub rescue>` prompt under isolated QEMU/SeaBIOS; the profile contains no menu, configuration, `normal.mod`, kernel, operating system, or UEFI loader, and physical-media validation remains pending. |
 | **Windows BIOS + UEFI developer preview** | `ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL=1` admits only the strict x64 Windows Boot Manager FAT32/active-MBR profile. It stages and witnesses the complete tree, can add ISOpropyl's exact regenerated `autounattend.xml`, splits the sole conventional oversized `install.wim`, builds an anonymous full-device image with the project-authored BIOS loader, and uses a separate typed, target-bound PolicyKit transaction with MBR-last activation and mandatory full SHA-256 read-back. The final confirmation names each selected customization and the answer-file digest. There is no formatter/mount or generic-writer fallback. An uncustomized Windows 11 image has reached Setup under both KVM/SeaBIOS and non-Secure-Boot OVMF; physical-media and customized-install certification remain release gates. |
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, can generate a reviewed `autounattend.xml`, and offers a narrowly profiled Windows 2023-generation installer-boot update for exact supported Microsoft media. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
@@ -145,6 +145,30 @@ image equal to the target capacity. Do not treat the successful SeaBIOS
 certificate as physical-device or firmware certification; a native hardened
 replacement for the provisional Python helper and installed
 VM/OVMF/physical-media coverage remain release gates.
+
+The exact GRUB 2.14 blank BIOS rescue workflow is also an unfinished developer
+preview. After installing the exact host helper, an experienced tester with an
+expendable drive can opt in for one process:
+
+```bash
+ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1 ./isopropyl-gui
+```
+
+The target must be writable, kernel-removable USB or SD/MMC media with 512-byte
+logical sectors and no more than 128 GiB capacity. Preparation creates a fully
+allocated private image exactly equal to that capacity and requires another
+64 MiB of workspace reserve. After separately consenting to any download of the
+exact size- and SHA-256-pinned `boot.img` and `core.img`, the final dialog names
+the target and image digest and accepts only its exact
+`WRITE GRUB RESCUE /dev/… major:minor` phrase. A dedicated PolicyKit/helper
+profile writes the core-containing non-activation region before sector zero,
+activates the MBR last, and requires a matching whole-device SHA-256 read-back;
+there is no generic/raw fallback. The result is deliberately blank legacy-BIOS
+rescue media that stops at `grub rescue>`, not an OS, installer, kernel, menu,
+`normal.mod` environment, or UEFI image. QEMU/SeaBIOS certifies only that exact
+rescue prompt. A native hardened helper, installed-integration and hot-swap
+testing, representative physical-media writing, and physical BIOS boot evidence
+remain release gates.
 
 The Windows x64 BIOS + UEFI path is also hidden from ordinary launches. For
 maintainer testing only, start the current source/package with:
@@ -467,7 +491,9 @@ anonymous snapshot to a fixed root-owned helper. They support images shorter
 than the target, mandatory pre-activation verification, optional complete final
 verification, and stale physical-tail sanitation. The same provisional helper
 also contains separate, default-off developer transactions for narrowly
-supported Syslinux and Windows FAT32 images.
+supported Syslinux, GRUB 2.14 rescue, and Windows FAT32 images. The GRUB
+transaction has its own PolicyKit action, protocol operation, and exact helper
+profile; it cannot fall back to the generic raw writer.
 These privileged paths are:
 
 - not installed by `pip install` or the ordinary `make install` target;
@@ -480,7 +506,7 @@ These privileged paths are:
   still gated on native-helper hardening, installed PolicyKit integration,
   hot-swap/failure coverage, and representative physical media.
 
-Distribution integrators can stage the isolated launcher, helper, and five
+Distribution integrators can stage the isolated launcher, helper, and six
 exact PolicyKit policies with `make install-host-helper PREFIX=/usr`. Source testers
 must invoke it with root privileges as shown above. It does not make alpha media
 writes risk-free; test with expendable media and keep verification enabled.
@@ -513,9 +539,9 @@ ISOpropyl is an ambitious alpha. Automated tests cover the non-destructive logic
 and mocked destructive boundaries, but CI does not write physical media. Broad
 distribution, desktop, Wayland/X11, firmware, Secure Boot, card-reader, and
 hardware testing is still required. BIOS controls remain hidden in ordinary
-launches; the narrowly scoped Syslinux and Windows dual-firmware developer
-previews each require an explicit per-process environment opt-in and expendable
-media.
+launches; the narrowly scoped Syslinux, GRUB rescue, and Windows dual-firmware
+developer previews each require an explicit per-process environment opt-in and
+expendable media.
 
 The honest capability audit lives in [FEATURE_MATRIX.md](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md);
 planned work and release gates live in [ROADMAP.md](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md).

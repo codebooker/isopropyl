@@ -12,12 +12,14 @@ first-stage and core have been installed, made durable, read back, and the
 complete FAT tree and image have been independently re-attested.
 """
 
+import array
 import fcntl
 import hashlib
 import hmac
 import json
 import os
 import re
+import socket
 import stat
 import struct
 from collections.abc import Callable, Iterator
@@ -530,7 +532,7 @@ def _expected_unpatched_mbr(plan: PrivateFat32Plan) -> bytes:
 class PreparedGrubRescueImage:
     """Opaque owner of one fully patched and re-attested rescue image."""
 
-    __slots__ = ("_image", "_plan", "_result", "_witness")
+    __slots__ = ("_image", "_plan", "_result", "_witness", "_transferred")
 
     def __init__(
         self,
@@ -553,6 +555,7 @@ class PreparedGrubRescueImage:
         self._plan = plan
         self._result = result
         self._witness = witness
+        self._transferred = False
 
     @property
     def plan(self) -> GrubRescuePlan:
@@ -565,11 +568,19 @@ class PreparedGrubRescueImage:
     @property
     def state(self) -> PrivateFat32State:
         image = self._image
-        return PrivateFat32State.CLOSED if image is None else image.state
+        return (
+            PrivateFat32State.CLOSED
+            if image is None or self._transferred
+            else image.state
+        )
 
     def chunks(self, chunk_bytes: int = COPY_BLOCK_BYTES) -> Iterator[bytes]:
         image = self._image
-        if image is None or self._witness is not _OWNER_WITNESS:
+        if (
+            image is None
+            or self._witness is not _OWNER_WITNESS
+            or self._transferred
+        ):
             raise GrubRescueError("The prepared GRUB rescue image is closed")
         return image.chunks(chunk_bytes)
 
@@ -578,9 +589,80 @@ class PreparedGrubRescueImage:
         cancel_check: CancelCheck | None = None,
     ) -> tuple[int, int]:
         image = self._image
-        if image is None or self._witness is not _OWNER_WITNESS:
+        if (
+            image is None
+            or self._witness is not _OWNER_WITNESS
+            or self._transferred
+        ):
             raise GrubRescueError("The prepared GRUB rescue image is closed")
         return image._duplicate_attested_descriptor(cancel_check)
+
+    def _send_to_privileged_helper(
+        self,
+        channel: socket.socket,
+        request_packet: bytes,
+        *,
+        cancel_check: CancelCheck | None = None,
+    ) -> None:
+        """Atomically transfer one re-attested duplicate to the root helper.
+
+        This bridge deliberately keeps the anonymous descriptor inside the
+        prepared owner.  Both the request and descriptor remain untrusted to
+        the privileged helper, which independently validates their identity,
+        layout, and complete digest before requesting a write commit.
+        """
+
+        image = self._image
+        if (
+            image is None
+            or self._witness is not _OWNER_WITNESS
+            or self._transferred
+        ):
+            raise GrubRescueError("The prepared GRUB rescue image is closed")
+        if (
+            type(channel) is not socket.socket
+            or channel.family != socket.AF_UNIX
+            or channel.type & 0xF != socket.SOCK_SEQPACKET
+            or type(request_packet) is not bytes
+            or not request_packet
+            or len(request_packet) > 4_096
+        ):
+            raise GrubRescueError("The privileged GRUB helper channel is invalid")
+        # Consuming the owner before descriptor duplication makes even an
+        # exceptional/ambiguous send attempt one-shot.  Closing remains safe,
+        # but no caller can retry or concurrently stream the same image.
+        self._transferred = True
+        try:
+            descriptor, image_size = image._duplicate_attested_descriptor(
+                cancel_check,
+            )
+        except PrivateFat32Error as error:
+            raise GrubRescueError(str(error)) from error
+        try:
+            if image_size != self._result.image_size:
+                raise GrubRescueError(
+                    "The prepared GRUB rescue image size changed before helper transfer",
+                )
+            rights = array.array("i", [descriptor])
+            try:
+                sent = channel.sendmsg(
+                    [request_packet],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                )
+            except OSError as error:
+                raise GrubRescueError(
+                    "Could not transfer the anonymous GRUB rescue image to the "
+                    "privileged helper",
+                ) from error
+            if sent != len(request_packet):
+                raise GrubRescueError(
+                    "The privileged GRUB helper request was not transferred atomically",
+                )
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
     def close(self) -> None:
         image = self._image
