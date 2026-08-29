@@ -30,6 +30,7 @@ import socket
 import stat
 import struct
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -341,6 +342,8 @@ class HelperOperations:
     inspect_raw_target: Callable[[int], KernelTargetObservation] = lambda device_number: (
         inspect_kernel_target(device_number, allow_fixed_usb=True)
     )
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
 
 
 def _bounded(value: object, fallback: str) -> str:
@@ -350,45 +353,125 @@ def _bounded(value: object, fallback: str) -> str:
     return rendered[-MAX_DIAGNOSTIC_BYTES:]
 
 
-def _retry(call: Callable[[], object], label: str) -> object:
+_POSITIONAL_RETRY_DELAYS = (0.1, 0.5, 2.0)
+_POSITIONAL_RETRY_ERRNOS = frozenset({errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK})
+_POSITIONAL_MAX_SYSCALLS = 1024
+_RETRY_WAIT_QUANTUM = 0.05
+
+
+def _call_once(call: Callable[[], object], label: str) -> object:
+    """Call a non-repeatable durability or ioctl operation exactly once."""
+
+    try:
+        return call()
+    except OSError as error:
+        raise HelperError(_bounded(error, label)) from error
+
+
+def _wait_for_positional_retry(
+    delay: float,
+    *,
+    operations: HelperOperations,
+    cancel_check: Callable[[], None],
+) -> None:
+    deadline = operations.monotonic() + delay
     while True:
+        cancel_check()
+        remaining = deadline - operations.monotonic()
+        if remaining <= 0:
+            return
+        operations.sleep(min(_RETRY_WAIT_QUANTUM, remaining))
+
+
+def _retry_positional_call(
+    call: Callable[[], object],
+    *,
+    operations: HelperOperations,
+    retry_guard: Callable[[], None],
+    cancel_check: Callable[[], None] = lambda: None,
+) -> object:
+    """Retry only a known-offset syscall that reported zero progress."""
+
+    failures = 0
+    syscalls = 0
+    cancel_check()
+    while True:
+        syscalls += 1
         try:
             return call()
-        except InterruptedError:
-            continue
         except OSError as error:
-            if error.errno == errno.EINTR:
+            error_number = errno.EINTR if isinstance(error, InterruptedError) else error.errno
+            if error_number not in _POSITIONAL_RETRY_ERRNOS:
+                raise
+            retry_guard()
+            if error_number == errno.EINTR:
+                if syscalls >= _POSITIONAL_MAX_SYSCALLS:
+                    raise
+                cancel_check()
+                retry_guard()
                 continue
-            raise HelperError(_bounded(error, label)) from error
+            failures += 1
+            if failures >= 4:
+                raise
+            _wait_for_positional_retry(
+                _POSITIONAL_RETRY_DELAYS[failures - 1],
+                operations=operations,
+                cancel_check=cancel_check,
+            )
+            cancel_check()
+            retry_guard()
+
+
+def _pread_with_retry(
+    descriptor: int,
+    size: int,
+    offset: int,
+    *,
+    operations: HelperOperations,
+    retry_guard: Callable[[], None],
+    cancel_check: Callable[[], None] = lambda: None,
+) -> bytes:
+    value = _retry_positional_call(
+        lambda: operations.pread(descriptor, size, offset),
+        operations=operations,
+        retry_guard=retry_guard,
+        cancel_check=cancel_check,
+    )
+    return value  # type: ignore[return-value]
+
+
+def _pwrite_with_retry(
+    descriptor: int,
+    data: bytes,
+    offset: int,
+    *,
+    operations: HelperOperations,
+    retry_guard: Callable[[], None],
+    cancel_check: Callable[[], None] = lambda: None,
+) -> int:
+    value = _retry_positional_call(
+        lambda: operations.pwrite(descriptor, data, offset),
+        operations=operations,
+        retry_guard=retry_guard,
+        cancel_check=cancel_check,
+    )
+    return value  # type: ignore[return-value]
 
 
 def _ioctl_uint(descriptor: int, request: int) -> int:
     value = array.array("I", [0])
-    while True:
-        try:
-            fcntl.ioctl(descriptor, request, value, True)
-            return int(value[0])
-        except InterruptedError:
-            continue
+    fcntl.ioctl(descriptor, request, value, True)
+    return int(value[0])
 
 
 def _ioctl_u64(descriptor: int, request: int) -> int:
     value = array.array("Q", [0])
-    while True:
-        try:
-            fcntl.ioctl(descriptor, request, value, True)
-            return int(value[0])
-        except InterruptedError:
-            continue
+    fcntl.ioctl(descriptor, request, value, True)
+    return int(value[0])
 
 
 def _ioctl_void(descriptor: int, request: int) -> None:
-    while True:
-        try:
-            fcntl.ioctl(descriptor, request)
-            return
-        except InterruptedError:
-            continue
+    fcntl.ioctl(descriptor, request)
 
 
 def _dev_text(device_number: int) -> str:
@@ -770,6 +853,20 @@ def _status_snapshot(status: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _require_source_snapshot(
+    descriptor: int,
+    expected: tuple[int, ...],
+    operations: HelperOperations,
+    label: str,
+) -> None:
+    try:
+        current = operations.fstat(descriptor)
+    except OSError as error:
+        raise HelperSourceError(f"The {label} disappeared before an I/O retry") from error
+    if _status_snapshot(current) != expected:
+        raise HelperSourceError(f"The {label} changed before an I/O retry")
+
+
 def _validate_source_status(
     status: os.stat_result,
     request: HelperRequest,
@@ -817,8 +914,6 @@ def _read_exact_at(
     while consumed < size:
         try:
             block = read_at(descriptor, size - consumed, offset + consumed)
-        except InterruptedError:
-            continue
         except OSError as error:
             raise HelperSourceError(_bounded(error, f"Could not read {label}")) from error
         if type(block) is not bytes or not block or len(block) > size - consumed:
@@ -1295,8 +1390,6 @@ def _hash_descriptor(
         wanted = min(COPY_BYTES, size - offset)
         try:
             block = read_at(descriptor, wanted, offset)
-        except InterruptedError:
-            continue
         except OSError as error:
             raise HelperError(_bounded(error, f"Could not read during {phase}")) from error
         if type(block) is not bytes or not block or len(block) > wanted:
@@ -1318,8 +1411,6 @@ def _write_exact(
     while written < len(data):
         try:
             count = write_at(descriptor, data[written:], offset + written)
-        except InterruptedError:
-            continue
         except OSError as error:
             raise HelperError(_bounded(error, "The target write failed")) from error
         if (
@@ -1393,6 +1484,7 @@ def execute_helper_transaction(
     operations: HelperOperations = HelperOperations(),
     progress: Progress = lambda _phase, _done, _total: None,
     mutation_started: Callable[[], None] = lambda: None,
+    precommit_cancel: Callable[[], None] = lambda: None,
 ) -> HelperResult:
     """Execute one fail-closed, same-target-descriptor disk transaction."""
 
@@ -1413,23 +1505,45 @@ def execute_helper_transaction(
         operations.flock(source_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
         raise HelperSourceError("The anonymous source image is not exclusively owned") from error
+    source_snapshot = _status_snapshot(source_before)
+
+    def source_retry_guard() -> None:
+        _require_source_snapshot(
+            source_descriptor,
+            source_snapshot,
+            operations,
+            "anonymous source image",
+        )
+
+    def source_read_at(descriptor: int, size: int, offset: int) -> bytes:
+        if descriptor != source_descriptor:
+            raise HelperSourceError("The source retry descriptor changed")
+        return _pread_with_retry(
+            descriptor,
+            size,
+            offset,
+            operations=operations,
+            retry_guard=source_retry_guard,
+            cancel_check=precommit_cancel,
+        )
+
     source_mbr = (
         _validate_windows_image_layout(
             source_descriptor,
             request,
-            read_at=operations.pread,
+            read_at=source_read_at,
         )
         if request.profile == WINDOWS_HELPER_PROFILE
         else _validate_syslinux_image_layout(
             source_descriptor,
             request,
-            read_at=operations.pread,
+            read_at=source_read_at,
         )
     )
     source_sha256 = _hash_descriptor(
         source_descriptor,
         request.expected_size,
-        read_at=operations.pread,
+        read_at=source_read_at,
         progress=progress,
         phase="source-validation",
     )
@@ -1522,6 +1636,44 @@ def execute_helper_transaction(
         if _status_snapshot(source_before_write) != _status_snapshot(source_before):
             raise HelperSourceError("The anonymous source image changed before writing")
 
+        def target_retry_guard() -> None:
+            _require_opened_target_identity(
+                target_descriptor,
+                request,
+                expected_device_number,
+                operations,
+                verification=True,
+            )
+            _validate_target_observation(
+                operations.inspect_target(expected_device_number),
+                request,
+                expected_device_number,
+                operations.active_devices(),
+                source_before.st_dev,
+            )
+
+        def target_read_at(descriptor: int, size: int, offset: int) -> bytes:
+            if descriptor != target_descriptor:
+                raise HelperVerificationError("The target retry descriptor changed")
+            return _pread_with_retry(
+                descriptor,
+                size,
+                offset,
+                operations=operations,
+                retry_guard=target_retry_guard,
+            )
+
+        def target_write_at(descriptor: int, data: bytes, offset: int) -> int:
+            if descriptor != target_descriptor:
+                raise HelperVerificationError("The target retry descriptor changed")
+            return _pwrite_with_retry(
+                descriptor,
+                data,
+                offset,
+                operations=operations,
+                retry_guard=target_retry_guard,
+            )
+
         # From this point ordinary cancellation is deferred until durability
         # and verification complete.  SIGKILL or hardware removal can still
         # interrupt the transaction, so sector-zero-last remains essential.
@@ -1563,9 +1715,9 @@ def execute_helper_transaction(
             target_descriptor,
             b"\x00" * (2 * SECTOR_SIZE),
             0,
-            write_at=operations.pwrite,
+            write_at=target_write_at,
         )
-        _retry(
+        _call_once(
             lambda: operations.fsync(target_descriptor),
             "Could not durably deactivate the primary boot metadata",
         )
@@ -1576,9 +1728,9 @@ def execute_helper_transaction(
             target_descriptor,
             b"\x00" * SECTOR_SIZE,
             request.expected_size - SECTOR_SIZE,
-            write_at=operations.pwrite,
+            write_at=target_write_at,
         )
-        _retry(
+        _call_once(
             lambda: operations.fsync(target_descriptor),
             "Could not durably deactivate the backup GPT header",
         )
@@ -1589,9 +1741,7 @@ def execute_helper_transaction(
         while offset < request.expected_size:
             wanted = min(COPY_BYTES, request.expected_size - offset)
             try:
-                block = operations.pread(source_descriptor, wanted, offset)
-            except InterruptedError:
-                continue
+                block = source_read_at(source_descriptor, wanted, offset)
             except OSError as error:
                 raise HelperSourceError(_bounded(error, "Could not read the anonymous source")) from error
             if type(block) is not bytes or not block or len(block) > wanted:
@@ -1601,7 +1751,7 @@ def execute_helper_transaction(
                 target_descriptor,
                 block,
                 offset,
-                write_at=operations.pwrite,
+                write_at=target_write_at,
             )
             offset += len(block)
             progress("writing", offset, request.expected_size)
@@ -1616,7 +1766,7 @@ def execute_helper_transaction(
             raise HelperSourceError("The anonymous source changed while the target was being written")
 
         try:
-            _retry(lambda: operations.fsync(target_descriptor), "Could not make the target durable")
+            _call_once(lambda: operations.fsync(target_descriptor), "Could not make the target durable")
             operations.ioctl_void(target_descriptor, BLKFLSBUF)
         except HelperError:
             raise
@@ -1635,9 +1785,7 @@ def execute_helper_transaction(
         while offset < request.expected_size:
             wanted = min(COPY_BYTES, request.expected_size - offset)
             try:
-                block = operations.pread(target_descriptor, wanted, offset)
-            except InterruptedError:
-                continue
+                block = target_read_at(target_descriptor, wanted, offset)
             except OSError as error:
                 raise HelperVerificationError(
                     _bounded(error, "The pre-activation target read-back failed"),
@@ -1673,13 +1821,11 @@ def execute_helper_transaction(
         while len(inactive_mbr) < SECTOR_SIZE:
             wanted = SECTOR_SIZE - len(inactive_mbr)
             try:
-                block = operations.pread(
+                block = target_read_at(
                     target_descriptor,
                     wanted,
                     len(inactive_mbr),
                 )
-            except InterruptedError:
-                continue
             except OSError as error:
                 raise HelperVerificationError(
                     _bounded(error, "The inactive target MBR read-back failed"),
@@ -1700,10 +1846,10 @@ def execute_helper_transaction(
             target_descriptor,
             source_mbr,
             0,
-            write_at=operations.pwrite,
+            write_at=target_write_at,
         )
         try:
-            _retry(lambda: operations.fsync(target_descriptor), "Could not durably activate the target")
+            _call_once(lambda: operations.fsync(target_descriptor), "Could not durably activate the target")
             operations.ioctl_void(target_descriptor, BLKFLSBUF)
         except HelperError:
             raise
@@ -1714,7 +1860,7 @@ def execute_helper_transaction(
         readback_sha256 = _hash_descriptor(
             target_descriptor,
             request.expected_size,
-            read_at=operations.pread,
+            read_at=target_read_at,
             progress=progress,
             phase="readback",
         )
@@ -1779,9 +1925,9 @@ def execute_helper_transaction(
                     target_descriptor,
                     b"\x00" * SECTOR_SIZE,
                     0,
-                    write_at=operations.pwrite,
+                    write_at=target_write_at,
                 )
-                _retry(
+                _call_once(
                     lambda: operations.fsync(target_descriptor),
                     "Could not durably deactivate the failed target",
                 )
@@ -1874,14 +2020,14 @@ def _read_raw_target_exact(
     *,
     operations: HelperOperations,
     label: str,
+    read_at: Callable[[int, int, int], bytes] | None = None,
 ) -> bytes:
     blocks: list[bytes] = []
     consumed = 0
+    reader = operations.pread if read_at is None else read_at
     while consumed < size:
         try:
-            block = operations.pread(descriptor, size - consumed, offset + consumed)
-        except InterruptedError:
-            continue
+            block = reader(descriptor, size - consumed, offset + consumed)
         except OSError as error:
             raise HelperVerificationError(_bounded(error, f"Could not read {label}")) from error
         if type(block) is not bytes or not block or len(block) > size - consumed:
@@ -1909,13 +2055,16 @@ def _zero_raw_regions(
     descriptor: int,
     request: RawHelperRequest,
     operations: HelperOperations,
+    *,
+    write_at: Callable[[int, bytes, int], int] | None = None,
 ) -> None:
+    writer = operations.pwrite if write_at is None else write_at
     for offset, size in _raw_deactivation_regions(request):
         _write_exact(
             descriptor,
             b"\0" * size,
             offset,
-            write_at=operations.pwrite,
+            write_at=writer,
         )
 
 
@@ -1927,6 +2076,7 @@ def execute_raw_helper_transaction(
     operations: HelperOperations = HelperOperations(),
     progress: Progress = lambda _phase, _done, _total: None,
     mutation_started: Callable[[], None] = lambda: None,
+    precommit_cancel: Callable[[], None] = lambda: None,
 ) -> RawHelperResult:
     """Write one anonymous raw snapshot under a same-FD disk-generation lease."""
 
@@ -1954,10 +2104,32 @@ def execute_raw_helper_transaction(
     except OSError as error:
         raise HelperSourceError("The anonymous raw source is not exclusively owned") from error
 
+    source_snapshot = _status_snapshot(source_before)
+
+    def source_retry_guard() -> None:
+        _require_source_snapshot(
+            source_descriptor,
+            source_snapshot,
+            operations,
+            "anonymous raw source",
+        )
+
+    def source_read_at(descriptor: int, size: int, offset: int) -> bytes:
+        if descriptor != source_descriptor:
+            raise HelperSourceError("The raw-source retry descriptor changed")
+        return _pread_with_retry(
+            descriptor,
+            size,
+            offset,
+            operations=operations,
+            retry_guard=source_retry_guard,
+            cancel_check=precommit_cancel,
+        )
+
     source_sha256 = _hash_descriptor(
         source_descriptor,
         request.source_size,
-        read_at=operations.pread,
+        read_at=source_read_at,
         progress=progress,
         phase="source-validation",
     )
@@ -1977,14 +2149,14 @@ def execute_raw_helper_transaction(
         source_descriptor,
         0,
         guard_size,
-        read_at=operations.pread,
+        read_at=source_read_at,
         label="raw activation guard",
     )
     source_tail = _read_exact_at(
         source_descriptor,
         source_tail_offset,
         SECTOR_SIZE,
-        read_at=operations.pread,
+        read_at=source_read_at,
         label="raw source tail sector",
     )
 
@@ -2058,6 +2230,44 @@ def execute_raw_helper_transaction(
         if _status_snapshot(source_before_commit) != _status_snapshot(source_before):
             raise HelperSourceError("The anonymous raw source changed before commit")
 
+        def target_retry_guard() -> None:
+            _require_raw_opened_target_identity(
+                target_descriptor,
+                request,
+                expected_device_number,
+                operations,
+                verification=True,
+            )
+            _validate_raw_target_observation(
+                operations.inspect_raw_target(expected_device_number),
+                request,
+                expected_device_number,
+                operations.active_devices(),
+                source_before.st_dev,
+            )
+
+        def target_read_at(descriptor: int, size: int, offset: int) -> bytes:
+            if descriptor != target_descriptor:
+                raise HelperVerificationError("The raw-target retry descriptor changed")
+            return _pread_with_retry(
+                descriptor,
+                size,
+                offset,
+                operations=operations,
+                retry_guard=target_retry_guard,
+            )
+
+        def target_write_at(descriptor: int, data: bytes, offset: int) -> int:
+            if descriptor != target_descriptor:
+                raise HelperVerificationError("The raw-target retry descriptor changed")
+            return _pwrite_with_retry(
+                descriptor,
+                data,
+                offset,
+                operations=operations,
+                retry_guard=target_retry_guard,
+            )
+
         mutation_started()
         _require_raw_opened_target_identity(
             target_descriptor,
@@ -2099,9 +2309,9 @@ def execute_raw_helper_transaction(
             target_descriptor,
             b"\0" * guard_size,
             0,
-            write_at=operations.pwrite,
+            write_at=target_write_at,
         )
-        _retry(
+        _call_once(
             lambda: operations.fsync(target_descriptor),
             "Could not durably deactivate the raw target front guard",
         )
@@ -2110,9 +2320,9 @@ def execute_raw_helper_transaction(
                 target_descriptor,
                 b"\0" * SECTOR_SIZE,
                 offset,
-                write_at=operations.pwrite,
+                write_at=target_write_at,
             )
-        _retry(
+        _call_once(
             lambda: operations.fsync(target_descriptor),
             "Could not durably sanitize the raw target tail metadata",
         )
@@ -2123,9 +2333,7 @@ def execute_raw_helper_transaction(
         while offset < source_tail_offset:
             wanted = min(COPY_BYTES, source_tail_offset - offset)
             try:
-                block = operations.pread(source_descriptor, wanted, offset)
-            except InterruptedError:
-                continue
+                block = source_read_at(source_descriptor, wanted, offset)
             except OSError as error:
                 raise HelperSourceError(_bounded(error, "Could not read the raw source")) from error
             if type(block) is not bytes or not block or len(block) > wanted:
@@ -2135,7 +2343,7 @@ def execute_raw_helper_transaction(
                 target_descriptor,
                 block,
                 offset,
-                write_at=operations.pwrite,
+                write_at=target_write_at,
             )
             offset += len(block)
             progress("writing", offset, request.source_size)
@@ -2151,7 +2359,7 @@ def execute_raw_helper_transaction(
             raise HelperSourceError("The anonymous raw source changed while writing")
 
         try:
-            _retry(
+            _call_once(
                 lambda: operations.fsync(target_descriptor),
                 "Could not make the raw target bulk data durable",
             )
@@ -2175,6 +2383,7 @@ def execute_raw_helper_transaction(
                 wanted,
                 operations=operations,
                 label="raw pre-activation read-back",
+                read_at=target_read_at,
             )
             preactivation_digest.update(block)
             offset += len(block)
@@ -2190,6 +2399,7 @@ def execute_raw_helper_transaction(
             guard_size,
             operations=operations,
             label="inactive raw front guard",
+            read_at=target_read_at,
         ) != b"\0" * guard_size:
             raise HelperVerificationError(
                 "The raw front guard activation region is not inactive",
@@ -2200,6 +2410,7 @@ def execute_raw_helper_transaction(
             SECTOR_SIZE,
             operations=operations,
             label="inactive raw source tail",
+            read_at=target_read_at,
         ) != b"\0" * SECTOR_SIZE:
             raise HelperVerificationError("The raw source-tail activation sector is not inactive")
         if target_tail_offset != source_tail_offset and _read_raw_target_exact(
@@ -2208,6 +2419,7 @@ def execute_raw_helper_transaction(
             SECTOR_SIZE,
             operations=operations,
             label="sanitized physical target tail",
+            read_at=target_read_at,
         ) != b"\0" * SECTOR_SIZE:
             raise HelperVerificationError("The stale physical target tail was not sanitized")
 
@@ -2222,9 +2434,9 @@ def execute_raw_helper_transaction(
             target_descriptor,
             source_tail,
             source_tail_offset,
-            write_at=operations.pwrite,
+            write_at=target_write_at,
         )
-        _retry(
+        _call_once(
             lambda: operations.fsync(target_descriptor),
             "Could not durably write the raw source tail",
         )
@@ -2232,10 +2444,10 @@ def execute_raw_helper_transaction(
             target_descriptor,
             source_front,
             0,
-            write_at=operations.pwrite,
+            write_at=target_write_at,
         )
         try:
-            _retry(
+            _call_once(
                 lambda: operations.fsync(target_descriptor),
                 "Could not durably activate the raw target",
             )
@@ -2254,6 +2466,7 @@ def execute_raw_helper_transaction(
             guard_size,
             operations=operations,
             label="activated raw front guard",
+            read_at=target_read_at,
         ) != source_front:
             raise HelperVerificationError("The activated raw front guard failed read-back")
         if _read_raw_target_exact(
@@ -2262,6 +2475,7 @@ def execute_raw_helper_transaction(
             SECTOR_SIZE,
             operations=operations,
             label="activated raw source tail",
+            read_at=target_read_at,
         ) != source_tail:
             raise HelperVerificationError("The activated raw source tail failed read-back")
         if target_tail_offset != source_tail_offset and _read_raw_target_exact(
@@ -2270,6 +2484,7 @@ def execute_raw_helper_transaction(
             SECTOR_SIZE,
             operations=operations,
             label="final sanitized physical target tail",
+            read_at=target_read_at,
         ) != b"\0" * SECTOR_SIZE:
             raise HelperVerificationError("The physical target tail sanitation did not persist")
 
@@ -2278,7 +2493,7 @@ def execute_raw_helper_transaction(
             readback_sha256 = _hash_descriptor(
                 target_descriptor,
                 request.source_size,
-                read_at=operations.pread,
+                read_at=target_read_at,
                 progress=progress,
                 phase="readback",
             )
@@ -2346,8 +2561,13 @@ def execute_raw_helper_transaction(
                     f"{original}; emergency raw deactivation was skipped because {identity}",
                 ) from error
             try:
-                _zero_raw_regions(target_descriptor, request, operations)
-                _retry(
+                _zero_raw_regions(
+                    target_descriptor,
+                    request,
+                    operations,
+                    write_at=target_write_at,
+                )
+                _call_once(
                     lambda: operations.fsync(target_descriptor),
                     "Could not durably deactivate the failed raw target",
                 )
@@ -2450,7 +2670,7 @@ def _invalidate_fast_zero_cache(
     label: str,
 ) -> None:
     try:
-        _retry(lambda: operations.ioctl_void(descriptor, BLKFLSBUF), label)
+        _call_once(lambda: operations.ioctl_void(descriptor, BLKFLSBUF), label)
     except HelperError as error:
         raise HelperVerificationError(_bounded(error, label)) from error
 
@@ -2545,13 +2765,44 @@ def _cleanup_fast_zero_boundaries(
         device_number,
         operations,
     )
+
+    def retry_guard() -> None:
+        _require_fast_zero_cleanup_identity(
+            descriptor,
+            request,
+            device_number,
+            operations,
+        )
+
+    def read_at(retained: int, size: int, offset: int) -> bytes:
+        if retained != descriptor:
+            raise HelperVerificationError("The cleanup retry descriptor changed")
+        return _pread_with_retry(
+            retained,
+            size,
+            offset,
+            operations=operations,
+            retry_guard=retry_guard,
+        )
+
+    def write_at(retained: int, data: bytes, offset: int) -> int:
+        if retained != descriptor:
+            raise HelperVerificationError("The cleanup retry descriptor changed")
+        return _pwrite_with_retry(
+            retained,
+            data,
+            offset,
+            operations=operations,
+            retry_guard=retry_guard,
+        )
+
     regions = _fast_zero_boundary_regions(request.expected_target_size)
     total = sum(size for _offset, size in regions)
     progress("cleanup", 0, total)
     zeros = b"\0" * min(FAST_ZERO_BOUNDARY_BYTES, request.expected_target_size)
     for offset, size in regions:
-        _write_exact(descriptor, zeros[:size], offset, write_at=operations.pwrite)
-    _retry(
+        _write_exact(descriptor, zeros[:size], offset, write_at=write_at)
+    _call_once(
         lambda: operations.fsync(descriptor),
         "Could not make fast-zero boundary cleanup durable",
     )
@@ -2568,6 +2819,7 @@ def _cleanup_fast_zero_boundaries(
             size,
             operations=operations,
             label="fast-zero boundary cleanup read-back",
+            read_at=read_at,
         ) != zeros[:size]:
             raise HelperVerificationError("The fast-zero boundary cleanup failed read-back")
         verified += size
@@ -2648,6 +2900,45 @@ def execute_fast_zero_helper_transaction(
         if not stat.S_ISBLK(current_path.st_mode) or current_path.st_rdev != expected_device_number:
             raise HelperTargetError("The fast-zero target path was replaced after exclusive open")
 
+        def target_retry_guard() -> None:
+            _require_fast_zero_opened_target_identity(
+                target_descriptor,
+                request,
+                expected_device_number,
+                operations,
+                verification=True,
+            )
+            _validate_fast_zero_target_observation(
+                operations.inspect_target(expected_device_number),
+                request,
+                expected_device_number,
+                operations.active_devices(),
+            )
+
+        def target_read_at(descriptor: int, size: int, offset: int) -> bytes:
+            if descriptor != target_descriptor:
+                raise HelperVerificationError("The fast-zero retry descriptor changed")
+            return _pread_with_retry(
+                descriptor,
+                size,
+                offset,
+                operations=operations,
+                retry_guard=target_retry_guard,
+                cancel_check=postcommit_cancel,
+            )
+
+        def target_write_at(descriptor: int, data: bytes, offset: int) -> int:
+            if descriptor != target_descriptor:
+                raise HelperVerificationError("The fast-zero retry descriptor changed")
+            return _pwrite_with_retry(
+                descriptor,
+                data,
+                offset,
+                operations=operations,
+                retry_guard=target_retry_guard,
+                cancel_check=postcommit_cancel,
+            )
+
         mutation_started()
         committed = True
         _require_fast_zero_opened_target_identity(
@@ -2679,6 +2970,7 @@ def execute_fast_zero_helper_transaction(
                 wanted,
                 operations=operations,
                 label="fast-zero target scan",
+                read_at=target_read_at,
             )
             if block == zeros[:wanted]:
                 skipped_bytes += wanted
@@ -2691,7 +2983,7 @@ def execute_fast_zero_helper_transaction(
                     operations,
                     verification=False,
                 )
-                _write_exact(target_descriptor, zeros[:wanted], offset, write_at=operations.pwrite)
+                _write_exact(target_descriptor, zeros[:wanted], offset, write_at=target_write_at)
                 written_bytes += wanted
                 written_chunks += 1
             scanned_bytes += wanted
@@ -2699,7 +2991,7 @@ def execute_fast_zero_helper_transaction(
             offset += wanted
             progress("scanning", offset, request.expected_target_size)
         postcommit_cancel()
-        _retry(lambda: operations.fsync(target_descriptor), "Could not make fast-zero writes durable")
+        _call_once(lambda: operations.fsync(target_descriptor), "Could not make fast-zero writes durable")
         _invalidate_fast_zero_cache(
             target_descriptor,
             operations,
@@ -2717,6 +3009,7 @@ def execute_fast_zero_helper_transaction(
                 wanted,
                 operations=operations,
                 label="fast-zero full read-back",
+                read_at=target_read_at,
             )
             if block != zeros[:wanted]:
                 raise HelperVerificationError("The fast-zero target failed full zero read-back")
@@ -3525,15 +3818,19 @@ class _ProtocolProgress:
         self._connected = True
         self._mutation_started = False
 
+    def poll_precommit_cancel(self) -> None:
+        if not self._mutation_started:
+            _poll_cancel(
+                self._channel,
+                expected_uid=self._expected_uid,
+                request_id=self._request_id,
+                protocol_magic=self._protocol_magic,
+            )
+
     def prepare_mutation(self) -> None:
         if self._mutation_started:
             raise HelperError("The privileged mutation boundary was repeated")
-        _poll_cancel(
-            self._channel,
-            expected_uid=self._expected_uid,
-            request_id=self._request_id,
-            protocol_magic=self._protocol_magic,
-        )
+        self.poll_precommit_cancel()
         _send_packet(
             self._channel,
             _CONTROL_PACKET.pack(
@@ -3575,12 +3872,7 @@ class _ProtocolProgress:
         if phase_code is None or type(done) is not int or type(total) is not int:
             raise HelperError("The privileged transaction emitted invalid progress")
         if not self._mutation_started:
-            _poll_cancel(
-                self._channel,
-                expected_uid=self._expected_uid,
-                request_id=self._request_id,
-                protocol_magic=self._protocol_magic,
-            )
+            self.poll_precommit_cancel()
         if self._connected:
             try:
                 _send_packet(
@@ -4025,6 +4317,7 @@ def main(argv: list[str] | None = None) -> int:
                 invoking_uid=invoking_uid,
                 progress=progress,
                 mutation_started=begin_mutation,
+                precommit_cancel=progress.poll_precommit_cancel,
             )
         elif type(request) is RawHelperRequest:
             result = execute_raw_helper_transaction(
@@ -4033,6 +4326,7 @@ def main(argv: list[str] | None = None) -> int:
                 invoking_uid=invoking_uid,
                 progress=progress,
                 mutation_started=begin_mutation,
+                precommit_cancel=progress.poll_precommit_cancel,
             )
         elif type(request) is FastZeroHelperRequest:
             result = execute_fast_zero_helper_transaction(

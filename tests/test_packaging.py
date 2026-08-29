@@ -50,6 +50,7 @@ class SourceInstallTests(unittest.TestCase):
             )
 
             self.assertTrue((package / "app.py").is_file())
+            self.assertTrue((package / "descriptor_io.py").is_file())
             self.assertTrue((package / "freedos_downloads.py").is_file())
             self.assertTrue((package / "restore_workflow.py").is_file())
             self.assertTrue((data / "freedos-images-v1.json").is_file())

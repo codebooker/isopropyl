@@ -47,6 +47,7 @@ data/linux-images-v1.json
 data/microsoft-dbx-authenticode-v1.json
 data/windows-images-v2.json
 dbx.py
+descriptor_io.py
 devices.py
 diagnostics.py
 distro_policies.py

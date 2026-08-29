@@ -3,6 +3,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import hashlib
+import errno
 import os
 import tempfile
 import unittest
@@ -158,17 +159,40 @@ class WindowsDeviceHelperTests(unittest.TestCase):
             harness = syslinux_fixtures.TransactionHarness(image)
             self.addCleanup(harness.close)
             mutations: list[bool] = []
+            now = 0.0
+            transient = True
+
+            def monotonic() -> float:
+                return now
+
+            def sleep(delay: float) -> None:
+                nonlocal now
+                now += delay
+
+            def pwrite(fd: int, data: bytes, offset: int) -> int:
+                nonlocal transient
+                if transient:
+                    transient = False
+                    raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+                return harness.pwrite(fd, data, offset)
+
             receipt = helper.execute_helper_transaction(
                 request,
                 source_descriptor=harness.source.fileno(),
                 invoking_uid=os.geteuid(),
-                operations=harness.operations(),
+                operations=harness.operations(
+                    pwrite=pwrite,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                ),
                 progress=lambda phase, done, total: harness.progress.append(
                     (phase, done, total),
                 ),
                 mutation_started=lambda: mutations.append(True),
             )
             self.assertEqual(receipt.profile, WINDOWS_HELPER_PROFILE)
+            self.assertFalse(transient)
+            self.assertAlmostEqual(now, 0.1)
             self.assertEqual(receipt.readback_sha256, request.expected_sha256)
             self.assertEqual(mutations, [True])
             self.assertEqual(harness.write_calls[-1][2], 0)

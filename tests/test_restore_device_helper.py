@@ -3,6 +3,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import fcntl
+import errno
 import json
 import os
 import stat
@@ -357,6 +358,36 @@ class Harness:
 
 
 class RestoreDeviceHelperTests(unittest.TestCase):
+    def retry_context(
+        self,
+        harness: Harness,
+        operations: restore.RestoreOperations,
+        *,
+        child: bool = False,
+    ) -> tuple[restore._IoRetryContext, int, int]:
+        whole = harness.open("/dev/sdz", os.O_RDWR)
+        partition = -1
+        observation = None
+        if child:
+            harness.partition_created = True
+            observation = harness.discover(DEVICE_NUMBER, 1)
+            partition = harness.open(observation.path, os.O_RDWR)
+        self.addCleanup(lambda: os.close(whole))
+        if partition >= 0:
+            self.addCleanup(lambda: os.close(partition))
+        return (
+            restore._IoRetryContext(
+                harness.request,
+                whole,
+                DEVICE_NUMBER,
+                operations,
+                partition,
+                observation,
+            ),
+            whole,
+            partition,
+        )
+
     @staticmethod
     def _assert_process_absent(process_id: int) -> None:
         with unittest.TestCase().assertRaises(ProcessLookupError):
@@ -475,6 +506,399 @@ os._exit(0)
         self.assertIn((retained_fd, restore.BLKRRPART), harness.flushes)
         self.assertIn((retained_fd, BLKFLSBUF), harness.flushes)
         self.assertIn(retained_fd, harness.close_calls)
+
+    def test_verified_zero_retries_only_eagain_with_exact_backoff_and_offsets(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        read_calls: list[tuple[int, int, int]] = []
+        write_calls: list[tuple[int, bytes, int]] = []
+        waits: list[float] = []
+        injected = {"scan": False, "write": False, "readback": False}
+
+        def pread(descriptor: int, size: int, offset: int) -> bytes:
+            read_calls.append((descriptor, size, offset))
+            if not injected["scan"]:
+                injected["scan"] = True
+                raise BlockingIOError(errno.EAGAIN, "scan not ready")
+            # Sixteen successful scan reads precede the first read-back call.
+            successful = len(read_calls) - 1
+            if successful == CAPACITY // harness.request.chunk_size and not injected["readback"]:
+                injected["readback"] = True
+                raise BlockingIOError(errno.EWOULDBLOCK, "read-back not ready")
+            return os.pread(descriptor, size, offset)
+
+        def pwrite(descriptor: int, data: bytes, offset: int) -> int:
+            write_calls.append((descriptor, data, offset))
+            if not injected["write"]:
+                injected["write"] = True
+                raise BlockingIOError(errno.EAGAIN, "write not ready")
+            return os.pwrite(descriptor, data, offset)
+
+        operations = replace(base, pread=pread, pwrite=pwrite, sleep=waits.append)
+        context, whole, _partition = self.retry_context(harness, operations)
+        result = restore._zero_and_verify(
+            whole,
+            harness.request,
+            operations,
+            lambda _phase, _done, _total: None,
+            context,
+        )
+
+        self.assertEqual(result[0], CAPACITY)
+        self.assertEqual(result[3], CAPACITY)
+        self.assertEqual(injected, {"scan": True, "write": True, "readback": True})
+        self.assertEqual(read_calls[0], read_calls[1])
+        self.assertEqual(write_calls[0], write_calls[1])
+        self.assertAlmostEqual(sum(waits), 0.3)
+        self.assertTrue(all(0 < delay <= 0.05 for delay in waits))
+
+    def test_eintr_is_immediate_and_partial_progress_resets_eagain_budget(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        waits: list[float] = []
+        values: list[int | BaseException] = [
+            InterruptedError(errno.EINTR, "one"),
+            InterruptedError(errno.EINTR, "two"),
+            BlockingIOError(errno.EAGAIN, "before progress"),
+            2,
+            BlockingIOError(errno.EAGAIN, "after progress one"),
+            BlockingIOError(errno.EAGAIN, "after progress two"),
+            BlockingIOError(errno.EAGAIN, "after progress three"),
+            4,
+        ]
+        calls: list[tuple[int, bytes, int]] = []
+
+        def pwrite(descriptor: int, data: bytes, offset: int) -> int:
+            calls.append((descriptor, data, offset))
+            value = values.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        operations = replace(base, pwrite=pwrite, sleep=waits.append)
+        context, whole, _partition = self.retry_context(harness, operations)
+        restore._write_exact(whole, b"abcdef", 4096, operations, context)
+
+        self.assertEqual([call[2] for call in calls[:4]], [4096] * 4)
+        self.assertEqual(calls[4][1:], (b"cdef", 4098))
+        self.assertEqual(calls[-1][1:], (b"cdef", 4098))
+        self.assertAlmostEqual(sum(waits), 0.1 + 0.1 + 0.5 + 2.0)
+        self.assertEqual(values, [])
+
+    def test_read_eintr_exhausts_at_independent_bound_without_sleep(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        calls = 0
+        waits: list[float] = []
+
+        def pread(_descriptor: int, _size: int, _offset: int) -> bytes:
+            nonlocal calls
+            calls += 1
+            raise InterruptedError(errno.EINTR, "interrupted")
+
+        operations = replace(base, pread=pread, sleep=waits.append)
+        context, whole, _partition = self.retry_context(harness, operations)
+        with self.assertRaisesRegex(
+            restore.HelperVerificationError,
+            "Interrupted retained-target I/O failed after 1024 attempts",
+        ):
+            restore._read_exact(whole, 1, 0, operations, context)
+
+        self.assertEqual(restore._IO_EINTR_ATTEMPTS, 1024)
+        self.assertEqual(calls, restore._IO_EINTR_ATTEMPTS)
+        self.assertEqual(waits, [])
+
+    def test_write_eintr_exhausts_at_independent_bound_without_sleep(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        calls = 0
+        waits: list[float] = []
+
+        def pwrite(_descriptor: int, _data: bytes, _offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            raise InterruptedError(errno.EINTR, "interrupted")
+
+        operations = replace(base, pwrite=pwrite, sleep=waits.append)
+        context, whole, _partition = self.retry_context(harness, operations)
+        with self.assertRaisesRegex(
+            restore.HelperVerificationError,
+            "Interrupted retained-target I/O failed after 1024 attempts",
+        ):
+            restore._write_exact(whole, b"x", 0, operations, context)
+
+        self.assertEqual(calls, restore._IO_EINTR_ATTEMPTS)
+        self.assertEqual(waits, [])
+
+    def test_eintr_bound_resets_after_positive_read_progress(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        calls = 0
+        phase_interruptions = 0
+        waits: list[float] = []
+
+        def pread(_descriptor: int, _size: int, _offset: int) -> bytes:
+            nonlocal calls, phase_interruptions
+            calls += 1
+            if phase_interruptions < restore._IO_EINTR_ATTEMPTS - 1:
+                phase_interruptions += 1
+                raise InterruptedError(errno.EINTR, "interrupted")
+            phase_interruptions = 0
+            return b"a" if calls <= restore._IO_EINTR_ATTEMPTS else b"b"
+
+        operations = replace(base, pread=pread, sleep=waits.append)
+        context, whole, _partition = self.retry_context(harness, operations)
+        self.assertEqual(
+            restore._read_exact(whole, 2, 0, operations, context),
+            b"ab",
+        )
+
+        self.assertEqual(calls, restore._IO_EINTR_ATTEMPTS * 2)
+        self.assertEqual(waits, [])
+
+    def test_fourth_eagain_exhausts_and_fatal_errnos_never_retry(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+
+        calls = 0
+        waits: list[float] = []
+
+        def exhausted(_descriptor: int, _size: int, _offset: int) -> bytes:
+            nonlocal calls
+            calls += 1
+            raise BlockingIOError(errno.EAGAIN, "again")
+
+        operations = replace(base, pread=exhausted, sleep=waits.append)
+        context, whole, _partition = self.retry_context(harness, operations)
+        with self.assertRaisesRegex(restore.HelperVerificationError, "after 4 attempts"):
+            restore._read_exact(whole, 1, 0, operations, context)
+        self.assertEqual(calls, 4)
+        self.assertEqual(restore._IO_RETRY_BACKOFF_SECONDS, (0.1, 0.5, 2.0))
+        self.assertAlmostEqual(sum(waits), 0.1 + 0.5 + 2.0)
+
+        for error_number in (
+            errno.EIO,
+            errno.EREMOTEIO,
+            errno.ETIMEDOUT,
+            errno.ENODEV,
+            errno.ENXIO,
+            errno.ESTALE,
+            errno.EBUSY,
+            errno.ENOSPC,
+            errno.EROFS,
+            errno.EACCES,
+            errno.EPERM,
+            errno.EINVAL,
+            errno.EBADF,
+        ):
+            fatal_calls = 0
+
+            def fatal(_descriptor: int, _data: bytes, _offset: int) -> int:
+                nonlocal fatal_calls
+                fatal_calls += 1
+                raise OSError(error_number, "fatal")
+
+            fatal_waits: list[float] = []
+            fatal_operations = replace(base, pwrite=fatal, sleep=fatal_waits.append)
+            fatal_context = replace(context, operations=fatal_operations)
+            with self.subTest(error_number=error_number), self.assertRaises(
+                restore.HelperError,
+            ):
+                restore._write_exact(
+                    whole, b"x", 0, fatal_operations, fatal_context,
+                )
+            self.assertEqual(fatal_calls, 1)
+            self.assertEqual(fatal_waits, [])
+
+    def test_retry_rechecks_whole_identity_before_second_io(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        changed = False
+        calls = 0
+
+        def pread(_descriptor: int, _size: int, _offset: int) -> bytes:
+            nonlocal calls, changed
+            calls += 1
+            changed = True
+            raise BlockingIOError(errno.EAGAIN, "again")
+
+        def ioctl_u64(descriptor: int, operation: int) -> int:
+            if operation == BLKGETDISKSEQ and changed:
+                return DISK_SEQUENCE + 1
+            return harness.ioctl_u64(descriptor, operation)
+
+        operations = replace(
+            base,
+            pread=pread,
+            ioctl_u64=ioctl_u64,
+            sleep=lambda _delay: None,
+        )
+        context, whole, _partition = self.retry_context(harness, operations)
+        with self.assertRaisesRegex(
+            restore.HelperVerificationError,
+            "authorized disk generation",
+        ):
+            restore._read_exact(whole, 1, 0, operations, context)
+        self.assertEqual(calls, 1)
+
+    def test_retry_rechecks_whole_identity_again_after_backoff(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        changed_during_wait = False
+        calls = 0
+
+        def pread(_descriptor: int, _size: int, _offset: int) -> bytes:
+            nonlocal calls
+            calls += 1
+            raise BlockingIOError(errno.EAGAIN, "again")
+
+        def sleep(_delay: float) -> None:
+            nonlocal changed_during_wait
+            changed_during_wait = True
+
+        def ioctl_u64(descriptor: int, operation: int) -> int:
+            if operation == BLKGETDISKSEQ and changed_during_wait:
+                return DISK_SEQUENCE + 1
+            return harness.ioctl_u64(descriptor, operation)
+
+        operations = replace(
+            base,
+            pread=pread,
+            ioctl_u64=ioctl_u64,
+            sleep=sleep,
+        )
+        context, whole, _partition = self.retry_context(harness, operations)
+        with self.assertRaisesRegex(
+            restore.HelperVerificationError,
+            "authorized disk generation",
+        ):
+            restore._read_exact(whole, 1, 0, operations, context)
+        self.assertTrue(changed_during_wait)
+        self.assertEqual(calls, 1)
+
+    def test_fat32_and_ntfs_receipt_reads_retry_parent_and_exact_child(self) -> None:
+        for filesystem in (Filesystem.FAT32, Filesystem.NTFS):
+            with self.subTest(filesystem=filesystem):
+                harness = Harness(filesystem)
+                self.addCleanup(harness.close)
+                harness.partition_created = True
+                harness.run_child(
+                    (("/usr/sbin/mkfs.fat" if filesystem is Filesystem.FAT32 else "/usr/sbin/mkntfs"),),
+                    None,
+                    (),
+                    1.0,
+                )
+                base = harness.operations()
+                waits: list[float] = []
+                failed_descriptors: set[int] = set()
+
+                def pread(descriptor: int, size: int, offset: int) -> bytes:
+                    if descriptor not in failed_descriptors:
+                        failed_descriptors.add(descriptor)
+                        raise BlockingIOError(errno.EAGAIN, "metadata not ready")
+                    return os.pread(descriptor, size, offset)
+
+                operations = replace(base, pread=pread, sleep=waits.append)
+                context, whole, partition = self.retry_context(
+                    harness, operations, child=True,
+                )
+                receipt = restore._post_format_receipt(
+                    whole,
+                    partition,
+                    harness.request,
+                    PARTITION_NUMBER,
+                    operations,
+                    context,
+                )
+                restore.validate_filesystem_receipt(harness.request, receipt)
+                self.assertEqual(failed_descriptors, {whole, partition})
+                self.assertAlmostEqual(sum(waits), 0.2)
+
+    def test_child_geometry_change_blocks_metadata_retry(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        harness.partition_created = True
+        base = harness.operations()
+        calls = 0
+
+        def pread(_descriptor: int, _size: int, _offset: int) -> bytes:
+            nonlocal calls
+            calls += 1
+            raise BlockingIOError(errno.EAGAIN, "again")
+
+        def changed_partition(parent: int, number: int) -> restore.PartitionObservation:
+            return replace(
+                harness.discover(parent, number),
+                start_sector=harness.request.partition_start_sector + 1,
+            )
+
+        operations = replace(
+            base,
+            pread=pread,
+            discover_partition=changed_partition,
+            sleep=lambda _delay: None,
+        )
+        context, whole, partition = self.retry_context(harness, base, child=True)
+        context = replace(context, operations=operations)
+        with self.assertRaises(restore.HelperVerificationError):
+            restore._partition_readback(
+                whole, partition, harness.request, 0, SECTOR, operations, context,
+            )
+        self.assertEqual(calls, 1)
+
+    def test_emergency_boundary_cleanup_retries_eagain_on_retained_whole_fd(self) -> None:
+        harness = Harness()
+        self.addCleanup(harness.close)
+        base = harness.operations()
+        failed = False
+        injected = False
+        calls: list[tuple[int, bytes, int]] = []
+        waits: list[float] = []
+
+        def run_child(*_args) -> restore.ChildResult:
+            nonlocal failed
+            failed = True
+            raise restore.HelperError("injected partition failure")
+
+        def pwrite(descriptor: int, data: bytes, offset: int) -> int:
+            nonlocal injected
+            if failed:
+                calls.append((descriptor, data, offset))
+                if not injected:
+                    injected = True
+                    raise BlockingIOError(errno.EAGAIN, "cleanup not ready")
+            return os.pwrite(descriptor, data, offset)
+
+        operations = replace(
+            base,
+            run_child=run_child,
+            pwrite=pwrite,
+            sleep=waits.append,
+        )
+        with self.assertRaisesRegex(restore.HelperError, "partition failure"):
+            restore.execute_restore_device_transaction(
+                harness.request,
+                await_commit=lambda: True,
+                operations=operations,
+                require_root=False,
+            )
+        self.assertTrue(injected)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertAlmostEqual(sum(waits), 0.1)
+        boundary = min(16 * 1024 * 1024, CAPACITY)
+        self.assertEqual(
+            os.pread(harness.target.fileno(), boundary, 0),
+            b"\0" * boundary,
+        )
 
     def test_cancel_before_commit_never_zeroes_or_dispatches_child(self) -> None:
         harness = Harness()

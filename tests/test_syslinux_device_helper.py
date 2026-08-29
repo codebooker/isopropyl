@@ -27,6 +27,7 @@ from isopropyl.syslinux_device_helper import (
     BLKROGET,
     BLKSSZGET,
     HELPER_PROFILE,
+    HelperCancelled,
     HelperError,
     HelperOperations,
     HelperRequest,
@@ -377,6 +378,35 @@ class HelperTransactionTests(unittest.TestCase):
         result = self.harness.execute(operations=operations)
         self.assertEqual(result.readback_sha256, hashlib.sha256(self.image).hexdigest())
         self.assertFalse(interrupted)
+
+    def test_target_eagain_retries_same_descriptor_and_offset_after_reattest(self):
+        now = 0.0
+        sleeps: list[float] = []
+        calls: list[tuple[int, int]] = []
+
+        def monotonic() -> float:
+            return now
+
+        def sleep(delay: float) -> None:
+            nonlocal now
+            sleeps.append(delay)
+            now += delay
+
+        def pwrite(fd: int, data: bytes, offset: int) -> int:
+            calls.append((fd, offset))
+            if len(calls) == 1:
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return self.harness.pwrite(fd, data, offset)
+
+        result = self.harness.execute(operations=self.harness.operations(
+            pwrite=pwrite,
+            monotonic=monotonic,
+            sleep=sleep,
+        ))
+        self.assertEqual(result.readback_sha256, hashlib.sha256(self.image).hexdigest())
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertAlmostEqual(sum(sleeps), 0.1)
 
     def test_all_source_failures_happen_before_target_open(self):
         candidates = (
@@ -1075,7 +1105,63 @@ class FastZeroTransactionTests(unittest.TestCase):
         self.assertGreater(reads, 3)
         self.assertGreater(writes, 1)
 
-    def test_interrupted_cache_invalidation_is_retried(self):
+    def test_eagain_backoff_polls_cancel_and_enters_verified_cleanup(self):
+        now = 0.0
+        writes = 0
+
+        def monotonic() -> float:
+            return now
+
+        def sleep(delay: float) -> None:
+            nonlocal now
+            now += delay
+
+        def pwrite(fd: int, data: bytes, offset: int) -> int:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return self.harness.pwrite(fd, data, offset)
+
+        def cancel() -> None:
+            if now >= 0.05:
+                raise HelperCancelled("cancelled during retry backoff")
+
+        result = self.harness.execute(
+            operations=self.harness.operations(
+                pwrite=pwrite,
+                monotonic=monotonic,
+                sleep=sleep,
+            ),
+            postcommit_cancel=cancel,
+        )
+        self.assertEqual(result.outcome, "partial-cancel")
+        self.assertEqual(result.failure_code, helper.FAST_ZERO_FAILURE_CANCELLED)
+        self.assertTrue(result.cleanup_verified)
+        self.assertAlmostEqual(now, 0.05)
+
+    def test_eagain_target_generation_drift_prevents_retry(self):
+        writes = 0
+
+        def pwrite(fd: int, data: bytes, offset: int) -> int:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                self.harness.observation = replace(
+                    self.harness.observation,
+                    disk_sequence=DISK_SEQUENCE + 1,
+                )
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return self.harness.pwrite(fd, data, offset)
+
+        with self.assertRaisesRegex(
+            HelperVerificationError,
+            "boundary cleanup also failed",
+        ):
+            self.harness.execute(operations=self.harness.operations(pwrite=pwrite))
+        self.assertEqual(writes, 1)
+
+    def test_interrupted_cache_invalidation_is_not_retried_as_the_same_stage(self):
         calls = 0
 
         def interrupted_flush(fd: int, operation: int) -> None:
@@ -1090,7 +1176,11 @@ class FastZeroTransactionTests(unittest.TestCase):
         result = self.harness.execute(
             operations=self.harness.operations(ioctl_void=interrupted_flush),
         )
-        self.assertEqual(result.outcome, "success")
+        self.assertEqual(result.outcome, "partial-failure")
+        self.assertEqual(result.failure_code, helper.FAST_ZERO_FAILURE_VERIFICATION)
+        self.assertTrue(result.cleanup_verified)
+        # The second call belongs to verified emergency cleanup; the failed
+        # cache-invalidation stage itself was not replayed.
         self.assertEqual(calls, 2)
 
     def test_zero_io_progress_fails_closed(self):

@@ -788,6 +788,63 @@ large-media, and physical boot tests remain mandatory for release confidence.
 All GUI and CLI raw, compressed, virtual, and VTSI inputs now use this broker, and a
 failed or unavailable broker transaction never falls back to the legacy DD path.
 
+## Positional I/O retry boundary
+
+ISOpropyl retries only fixed-offset `pread`/`pwrite` operations whose Linux
+error contract proves that the failed syscall transferred no bytes. The policy
+is active in the privileged Syslinux, Windows dual-firmware, authenticated
+raw/DD, fast-zero, verified-restore, emergency-cleanup, and post-format receipt
+paths, and in the anonymous raw-snapshot materializer. It never reopens a source
+or target pathname. Every replay uses the same retained descriptor, the same
+absolute offset, and only the exact untransferred suffix after a positive short
+result.
+
+`EINTR` is retried immediately without sleeping or consuming the transient-stall
+budget. The reusable snapshot primitive and Syslinux-family helper permit at
+most 1,024 positional syscall attempts per retry unit; the verified-restore
+helper independently caps a consecutive `EINTR` run at 1,024 attempts.
+`EAGAIN` and `EWOULDBLOCK` receive four total consecutive attempts with 0.1,
+0.5, and 2.0 second backoffs, and those calls consume the total syscall cap where
+one applies. Backoff sleeps are divided into at most 50 ms slices so the
+operation can apply its boundary-specific cancellation policy. Positive I/O
+progress resets the consecutive stall bounds. The reusable unprivileged
+primitive also enforces a cooperative elapsed-time deadline and immutable
+accounting; a blocking kernel syscall cannot be preempted by that deadline, and
+a successful late return remains authoritative.
+
+Immediately after an allowlisted failure and immediately before another syscall,
+the caller-specific guard runs again. Anonymous sources must retain their bound
+file identity. Anonymous snapshots must retain the same device/inode object,
+owner-only mode, exact size, read/write non-append access, and full allocation.
+Their modification/change timestamps and reported block count are deliberately
+not compared with the pristine receipt because successful writes can alter
+those fields; the allocation invariant is revalidated separately. A physical
+target must retain its block `rdev`, capacity, logical-sector size, writable
+state, kernel disk generation, topology, holders, and active-device evidence.
+Verified filesystem receipt reads additionally require the exact retained child
+descriptor, parent, partition number, start/count geometry, and fresh partition
+discovery. A guard failure prevents the retry.
+
+ISOpropyl does not retry `EIO`, `EREMOTEIO`, `ETIMEDOUT`, `ENODEV`, `ENXIO`,
+`ESTALE`, `EBUSY`, space/quota/read-only errors, permission/policy errors,
+unexpected EOF, zero/invalid progress, verification mismatch, or any other
+ambiguous/permanent failure. It also never applies this policy to `open`,
+`flock`, `fsync`, cache/partition ioctls, COMMIT/control messages, unmounting,
+partitioning, formatting, publication, or high-level child commands. Those
+operations execute once and enter their existing fail-closed cleanup path on
+error. Syslinux/Windows/raw cancellation remains deferred after COMMIT; fast-zero
+cancellation during a retry enters its authenticated boundary cleanup; verified
+restore records post-COMMIT cancellation as deferred while the helper completes
+durability and read-back.
+
+This is narrower than Rufus's broad four-attempt write retry: ISOpropyl does not
+replay whole short writes, retry arbitrary errors, repeat a formatter, weaken
+exclusive access, or accept zero-byte writes. Installed-PolicyKit VM fault,
+hot-unplug/replacement, and representative physical-device tests remain release
+confidence gates. Mounted constructed-media and backup/optical paths remain
+outside this policy until their exact positional and identity invariants are
+proved separately.
+
 ## Fast-zero boundary
 
 Fast zero is a separate target-only privileged protocol. It accepts no source

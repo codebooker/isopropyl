@@ -1038,10 +1038,9 @@ class RawHelperTransactionTests(unittest.TestCase):
             self.harness.image[:RAW_FRONT_GUARD_BYTES],
         )
 
-    def test_short_and_interrupted_reads_writes_and_fsyncs_make_progress(self):
+    def test_short_and_interrupted_reads_and_writes_make_progress(self):
         read_interrupt = True
         write_interrupt = True
-        fsync_interrupt = True
 
         def short_pread(descriptor: int, size: int, offset: int) -> bytes:
             nonlocal read_interrupt
@@ -1057,23 +1056,58 @@ class RawHelperTransactionTests(unittest.TestCase):
                 raise InterruptedError(errno.EINTR, "interrupted write")
             return self.harness.pwrite(descriptor, data[: min(len(data), 983)], offset)
 
-        def interrupted_fsync(descriptor: int) -> None:
-            nonlocal fsync_interrupt
-            if fsync_interrupt:
-                fsync_interrupt = False
-                raise InterruptedError(errno.EINTR, "interrupted fsync")
-            self.harness.fsync(descriptor)
-
         result = self.harness.execute(operations=self.harness.operations(
             pread=short_pread,
             pwrite=short_pwrite,
-            fsync=interrupted_fsync,
         ))
         self.assertEqual(result.readback_sha256, hashlib.sha256(self.harness.image).hexdigest())
         self.assertEqual(self.harness.target_bytes(SOURCE_SIZE), self.harness.image)
         self.assertFalse(read_interrupt)
         self.assertFalse(write_interrupt)
-        self.assertFalse(fsync_interrupt)
+
+    def test_target_eagain_retries_same_descriptor_and_offset(self):
+        now = 0.0
+        sleeps: list[float] = []
+        calls: list[tuple[int, int]] = []
+
+        def monotonic() -> float:
+            return now
+
+        def sleep(delay: float) -> None:
+            nonlocal now
+            sleeps.append(delay)
+            now += delay
+
+        def pwrite(fd: int, data: bytes, offset: int) -> int:
+            calls.append((fd, offset))
+            if len(calls) == 1:
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return self.harness.pwrite(fd, data, offset)
+
+        result = self.harness.execute(operations=self.harness.operations(
+            pwrite=pwrite,
+            monotonic=monotonic,
+            sleep=sleep,
+        ))
+        self.assertEqual(result.readback_sha256, hashlib.sha256(self.harness.image).hexdigest())
+        self.assertEqual(calls[0], calls[1])
+        self.assertAlmostEqual(sum(sleeps), 0.1)
+
+    def test_source_eagain_revalidates_anonymous_source_before_retry(self):
+        calls = 0
+
+        def changed_source(descriptor: int, size: int, offset: int) -> bytes:
+            nonlocal calls
+            calls += 1
+            if descriptor == self.harness.source.fileno() and calls == 1:
+                os.pwrite(descriptor, b"X", 0)
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return self.harness.pread(descriptor, size, offset)
+
+        with self.assertRaisesRegex(HelperSourceError, "changed before an I/O retry"):
+            self.harness.execute(operations=self.harness.operations(pread=changed_source))
+        self.assertEqual(calls, 1)
+        self.assertEqual(self.harness.open_flags, [])
 
     def test_invalid_short_io_progress_fails_closed(self):
         for value in (b"", bytearray(b"x"), None):

@@ -48,6 +48,11 @@ FILESYSTEM_RECEIPT_PROFILE = (
 )
 INSTALLED_SCRIPT_PATH = "/usr/libexec/isopropyl/restore_device_helper.py"
 DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024
+_IO_RETRY_BACKOFF_SECONDS = (0.1, 0.5, 2.0)
+_IO_RETRY_ATTEMPTS = len(_IO_RETRY_BACKOFF_SECONDS) + 1
+_IO_EINTR_ATTEMPTS = 1024
+_IO_RETRY_WAIT_SLICE_SECONDS = 0.05
+_IO_RETRY_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK})
 MAX_CHILD_OUTPUT = 64 * 1024
 CHILD_TIMEOUT_SECONDS = 300.0
 _CHILD_TERM_GRACE_SECONDS = 0.5
@@ -939,6 +944,7 @@ class RestoreOperations:
     discover_partition: Callable[[int, int], PartitionObservation] = discover_single_partition
     run_child: Callable[[tuple[str, ...], bytes | None, tuple[int, ...], float], ChildResult] = run_exact_child
     monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
 
 
 def _parse_major_minor(value: str) -> int:
@@ -1142,23 +1148,173 @@ def _require_topology(
         raise HelperTargetError("The restore target topology is unsafe or changed")
 
 
+@dataclass(frozen=True)
+class _IoRetryContext:
+    """Authoritative descriptors and geometry required before replaying I/O."""
+
+    request: RestoreDeviceRequest
+    whole_descriptor: int
+    whole_device_number: int
+    operations: RestoreOperations
+    partition_descriptor: int = -1
+    partition_observation: PartitionObservation | None = None
+
+
+def _require_retry_descriptor(
+    descriptor: int,
+    operations: RestoreOperations,
+    context: _IoRetryContext | None,
+) -> None:
+    if context is None:
+        return
+    allowed = {context.whole_descriptor}
+    if context.partition_descriptor >= 0:
+        allowed.add(context.partition_descriptor)
+    if context.operations is not operations or descriptor not in allowed:
+        raise HelperVerificationError(
+            "The I/O retry context does not own the retained descriptor",
+        )
+
+
+def _require_retry_identity(context: _IoRetryContext) -> None:
+    """Re-attest every identity invariant immediately before an I/O retry."""
+
+    if type(context) is not _IoRetryContext:
+        raise HelperVerificationError("The retained target retry context is invalid")
+    _require_target(
+        context.whole_descriptor,
+        context.request,
+        context.whole_device_number,
+        context.operations,
+        verification=True,
+    )
+    _require_topology(
+        context.request,
+        context.whole_device_number,
+        context.operations,
+    )
+    observation = context.partition_observation
+    if observation is None:
+        if context.partition_descriptor != -1:
+            raise HelperVerificationError("The retained child retry context is incomplete")
+        return
+    if context.partition_descriptor < 0:
+        raise HelperVerificationError("The retained child retry descriptor is invalid")
+    _validate_partition(
+        observation,
+        context.request,
+        context.whole_device_number,
+    )
+    _validate_partition_descriptor(
+        context.partition_descriptor,
+        observation,
+        context.request,
+        context.operations,
+    )
+    if context.operations.discover_partition(
+        context.whole_device_number,
+        1,
+    ) != observation:
+        raise HelperVerificationError("The partition changed before an I/O retry")
+
+
+def _cooperative_retry_wait(delay: float, operations: RestoreOperations) -> None:
+    """Wait in short signal-processing slices; cancellation is deferred post-COMMIT."""
+
+    remaining = delay
+    while remaining > 1e-12:
+        interval = min(_IO_RETRY_WAIT_SLICE_SECONDS, remaining)
+        # This helper performs target I/O only after COMMIT.  The channel owner
+        # never signals it after that boundary, and ordinary termination signals
+        # are ignored, so processing signals between slices cannot abort the
+        # committed durability/read-back transaction.
+        operations.sleep(interval)
+        remaining = max(0.0, remaining - interval)
+
+
+def _retry_after_io_error(
+    error: OSError,
+    consecutive_eagain_attempts: int,
+    consecutive_eintr_attempts: int,
+    context: _IoRetryContext | None,
+) -> tuple[int, int]:
+    """Apply independent bounded EINTR/EAGAIN policies."""
+
+    error_number = error.errno
+    if isinstance(error, InterruptedError) or error_number == errno.EINTR:
+        if context is None:
+            raise HelperVerificationError(
+                "Interrupted retained-target I/O has no retry attestation",
+            ) from error
+        _require_retry_identity(context)
+        interrupted = consecutive_eintr_attempts + 1
+        if interrupted >= _IO_EINTR_ATTEMPTS:
+            raise HelperVerificationError(
+                f"Interrupted retained-target I/O failed after {interrupted} attempts",
+            ) from error
+        return consecutive_eagain_attempts, interrupted
+    if error_number not in _IO_RETRY_ERRNOS:
+        raise error
+    attempt = consecutive_eagain_attempts + 1
+    if context is None:
+        raise HelperVerificationError(
+            "Transient retained-target I/O has no retry attestation",
+        ) from error
+    # Guard immediately after every transient error, including terminal
+    # exhaustion, so an identity change always takes precedence.
+    _require_retry_identity(context)
+    if attempt >= _IO_RETRY_ATTEMPTS:
+        raise HelperVerificationError(
+            f"Transient retained-target I/O failed after {attempt} attempts",
+        ) from error
+    # Guard both sides of the wait: an already-changed target must not be
+    # granted a grace period, and a target changed during backoff must not
+    # receive the next syscall.
+    _cooperative_retry_wait(
+        _IO_RETRY_BACKOFF_SECONDS[attempt - 1],
+        context.operations,
+    )
+    _require_retry_identity(context)
+    return attempt, consecutive_eintr_attempts
+
+
 def _read_exact(
     descriptor: int,
     size: int,
     offset: int,
     operations: RestoreOperations,
+    retry_context: _IoRetryContext | None = None,
 ) -> bytes:
+    _require_retry_descriptor(descriptor, operations, retry_context)
     chunks: list[bytes] = []
     consumed = 0
+    consecutive_eagain_attempts = 0
+    consecutive_eintr_attempts = 0
     while consumed < size:
         try:
             chunk = operations.pread(descriptor, size - consumed, offset + consumed)
-        except InterruptedError:
-            continue
         except OSError as error:
-            raise HelperVerificationError("The retained target read failed") from error
+            try:
+                (
+                    consecutive_eagain_attempts,
+                    consecutive_eintr_attempts,
+                ) = _retry_after_io_error(
+                    error,
+                    consecutive_eagain_attempts,
+                    consecutive_eintr_attempts,
+                    retry_context,
+                )
+            except HelperError:
+                raise
+            except OSError as fatal:
+                raise HelperVerificationError(
+                    "The retained target read failed",
+                ) from fatal
+            continue
         if type(chunk) is not bytes or not chunk or len(chunk) > size - consumed:
             raise HelperVerificationError("The retained target made invalid read progress")
+        consecutive_eagain_attempts = 0
+        consecutive_eintr_attempts = 0
         chunks.append(chunk)
         consumed += len(chunk)
     return b"".join(chunks)
@@ -1169,17 +1325,35 @@ def _write_exact(
     data: bytes,
     offset: int,
     operations: RestoreOperations,
+    retry_context: _IoRetryContext | None = None,
 ) -> None:
+    _require_retry_descriptor(descriptor, operations, retry_context)
     written = 0
+    consecutive_eagain_attempts = 0
+    consecutive_eintr_attempts = 0
     while written < len(data):
         try:
             count = operations.pwrite(descriptor, data[written:], offset + written)
-        except InterruptedError:
-            continue
         except OSError as error:
-            raise HelperError("The retained target write failed") from error
+            try:
+                (
+                    consecutive_eagain_attempts,
+                    consecutive_eintr_attempts,
+                ) = _retry_after_io_error(
+                    error,
+                    consecutive_eagain_attempts,
+                    consecutive_eintr_attempts,
+                    retry_context,
+                )
+            except HelperError:
+                raise
+            except OSError as fatal:
+                raise HelperError("The retained target write failed") from fatal
+            continue
         if type(count) is not int or count <= 0 or count > len(data) - written:
             raise HelperError("The retained target made invalid write progress")
+        consecutive_eagain_attempts = 0
+        consecutive_eintr_attempts = 0
         written += count
 
 
@@ -1194,6 +1368,7 @@ def _partition_readback(
     offset: int,
     size: int,
     operations: RestoreOperations,
+    retry_context: _IoRetryContext | None = None,
 ) -> bytes:
     partition_bytes = request.partition_sector_count * request.logical_sector_size
     if (
@@ -1205,9 +1380,21 @@ def _partition_readback(
         or size > partition_bytes - offset
     ):
         raise HelperVerificationError("Filesystem metadata lies outside the frozen partition")
-    child = _read_exact(partition, size, offset, operations)
+    child = _read_exact(
+        partition,
+        size,
+        offset,
+        operations,
+        retry_context,
+    )
     parent_offset = request.partition_start_sector * request.logical_sector_size + offset
-    parent = _read_exact(whole, size, parent_offset, operations)
+    parent = _read_exact(
+        whole,
+        size,
+        parent_offset,
+        operations,
+        retry_context,
+    )
     if child != parent:
         raise HelperVerificationError(
             "Parent and child descriptors disagree about filesystem metadata",
@@ -1336,9 +1523,12 @@ def _fat32_receipt(
     request: RestoreDeviceRequest,
     partition_device_number: int,
     operations: RestoreOperations,
+    retry_context: _IoRetryContext | None = None,
 ) -> FilesystemReceipt:
     sector = request.logical_sector_size
-    boot = _partition_readback(whole, partition, request, 0, sector, operations)
+    boot = _partition_readback(
+        whole, partition, request, 0, sector, operations, retry_context,
+    )
     bytes_per_sector = struct.unpack_from("<H", boot, 11)[0]
     sectors_per_cluster = boot[13]
     reserved_sectors = struct.unpack_from("<H", boot, 14)[0]
@@ -1404,9 +1594,11 @@ def _fat32_receipt(
 
     backup = _partition_readback(
         whole, partition, request, backup_sector * sector, sector, operations,
+        retry_context,
     )
     fsinfo = _partition_readback(
         whole, partition, request, fsinfo_sector * sector, sector, operations,
+        retry_context,
     )
     backup_fsinfo = _partition_readback(
         whole,
@@ -1415,6 +1607,7 @@ def _fat32_receipt(
         (backup_sector + fsinfo_sector) * sector,
         sector,
         operations,
+        retry_context,
     )
     free_cluster_count = struct.unpack_from("<I", fsinfo, 488)[0]
     next_free_cluster = struct.unpack_from("<I", fsinfo, 492)[0]
@@ -1438,6 +1631,7 @@ def _fat32_receipt(
     ) * sector
     root = _partition_readback(
         whole, partition, request, root_offset, cluster_size, operations,
+        retry_context,
     )
     labels: list[bytes] = []
     for offset in range(0, len(root), 32):
@@ -1557,9 +1751,12 @@ def _ntfs_receipt(
     request: RestoreDeviceRequest,
     partition_device_number: int,
     operations: RestoreOperations,
+    retry_context: _IoRetryContext | None = None,
 ) -> FilesystemReceipt:
     sector = request.logical_sector_size
-    boot = _partition_readback(whole, partition, request, 0, sector, operations)
+    boot = _partition_readback(
+        whole, partition, request, 0, sector, operations, retry_context,
+    )
     bytes_per_sector = struct.unpack_from("<H", boot, 11)[0]
     sectors_per_cluster = boot[13]
     hidden_sectors = struct.unpack_from("<I", boot, 28)[0]
@@ -1607,6 +1804,7 @@ def _ntfs_receipt(
         total_sectors * sector,
         sector,
         operations,
+        retry_context,
     )
     if backup != boot:
         raise HelperVerificationError("The created NTFS backup boot sector is invalid")
@@ -1618,6 +1816,7 @@ def _ntfs_receipt(
         volume_record_offset,
         file_record_size,
         operations,
+        retry_context,
     )
     normalized_label = _ntfs_volume_label(
         raw_volume_record,
@@ -1640,14 +1839,17 @@ def _post_format_receipt(
     request: RestoreDeviceRequest,
     partition_device_number: int,
     operations: RestoreOperations,
+    retry_context: _IoRetryContext | None = None,
 ) -> FilesystemReceipt:
     if request.plan.filesystem is Filesystem.FAT32:
         return _fat32_receipt(
             whole, partition, request, partition_device_number, operations,
+            retry_context,
         )
     if request.plan.filesystem is Filesystem.NTFS:
         return _ntfs_receipt(
             whole, partition, request, partition_device_number, operations,
+            retry_context,
         )
     raise HelperVerificationError("The post-format filesystem is unsupported")
 
@@ -1657,18 +1859,23 @@ def _zero_and_verify(
     request: RestoreDeviceRequest,
     operations: RestoreOperations,
     progress: Progress,
+    retry_context: _IoRetryContext,
 ) -> tuple[int, int, int, int]:
     zeros = b"\0" * request.chunk_size
     scanned = written = skipped = 0
     progress("zero-scan", 0, request.expected_capacity)
     for offset in range(0, request.expected_capacity, request.chunk_size):
         wanted = min(request.chunk_size, request.expected_capacity - offset)
-        block = _read_exact(descriptor, wanted, offset, operations)
+        block = _read_exact(
+            descriptor, wanted, offset, operations, retry_context,
+        )
         scanned += wanted
         if block == zeros[:wanted]:
             skipped += wanted
         else:
-            _write_exact(descriptor, zeros[:wanted], offset, operations)
+            _write_exact(
+                descriptor, zeros[:wanted], offset, operations, retry_context,
+            )
             written += wanted
         progress("zero-scan", scanned, request.expected_capacity)
     operations.fsync(descriptor)
@@ -1677,7 +1884,9 @@ def _zero_and_verify(
     progress("zero-readback", 0, request.expected_capacity)
     for offset in range(0, request.expected_capacity, request.chunk_size):
         wanted = min(request.chunk_size, request.expected_capacity - offset)
-        if _read_exact(descriptor, wanted, offset, operations) != zeros[:wanted]:
+        if _read_exact(
+            descriptor, wanted, offset, operations, retry_context,
+        ) != zeros[:wanted]:
             raise HelperVerificationError("The full zero read-back failed")
         verified += wanted
         progress("zero-readback", verified, request.expected_capacity)
@@ -1832,9 +2041,15 @@ def execute_restore_device_transaction(
         committed = True
         _require_target(whole, request, device_number, operations, verification=False)
         _require_topology(request, device_number, operations)
+        whole_retry_context = _IoRetryContext(
+            request,
+            whole,
+            device_number,
+            operations,
+        )
 
         scanned, written, skipped, verified = _zero_and_verify(
-            whole, request, operations, progress,
+            whole, request, operations, progress, whole_retry_context,
         )
         _require_target(whole, request, device_number, operations, verification=True)
         _require_topology(request, device_number, operations)
@@ -1893,7 +2108,19 @@ def execute_restore_device_transaction(
             request,
         )
         filesystem_receipt = _post_format_receipt(
-            whole, partition, request, observed.device_number, operations,
+            whole,
+            partition,
+            request,
+            observed.device_number,
+            operations,
+            _IoRetryContext(
+                request,
+                whole,
+                device_number,
+                operations,
+                partition,
+                observed,
+            ),
         )
         validate_filesystem_receipt(request, filesystem_receipt)
         return RestoreDeviceResult(
@@ -1929,12 +2156,34 @@ def execute_restore_device_transaction(
                     offset = 0
                     while offset < boundary:
                         block = zeros[: min(len(zeros), boundary - offset)]
-                        _write_exact(whole, block, start + offset, operations)
+                        _write_exact(
+                            whole,
+                            block,
+                            start + offset,
+                            operations,
+                            _IoRetryContext(
+                                request,
+                                whole,
+                                device_number,
+                                operations,
+                            ),
+                        )
                         offset += len(block)
                 operations.fsync(whole)
                 operations.ioctl_void(whole, BLKFLSBUF)
                 for start in {0, request.expected_capacity - boundary}:
-                    if _read_exact(whole, boundary, start, operations) != b"\0" * boundary:
+                    if _read_exact(
+                        whole,
+                        boundary,
+                        start,
+                        operations,
+                        _IoRetryContext(
+                            request,
+                            whole,
+                            device_number,
+                            operations,
+                        ),
+                    ) != b"\0" * boundary:
                         raise HelperVerificationError("Emergency boundary cleanup failed")
                 operations.ioctl_void(whole, BLKRRPART)
             except BaseException as cleanup_error:

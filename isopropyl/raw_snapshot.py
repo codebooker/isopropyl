@@ -28,11 +28,16 @@ import os
 import socket
 import stat
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from .descriptor_io import (
+    DescriptorIoError, read_exact_at as retry_read_exact_at,
+    write_all_at as retry_write_all_at,
+)
 from .sources import ImageSource, ImageSourceError
 
 
@@ -1064,30 +1069,36 @@ def _read_exact(
     offset: int,
     length: int,
     *,
+    retry_guard: Callable[[], None],
+    cancel_check: CancelCheck | None = None,
     read_at: Callable[[int, int, int], bytes] = os.pread,
+    monotonic: Callable[[], float] = time.monotonic,
+    wait: Callable[[float], None] = time.sleep,
 ) -> bytes:
-    result = bytearray()
-    while len(result) < length:
-        try:
-            block = read_at(
-                descriptor,
-                length - len(result),
-                offset + len(result),
-            )
-        except InterruptedError:
-            continue
-        if type(block) is not bytes or not block or len(block) > length - len(result):
-            raise RawSnapshotError("A raw snapshot read made invalid progress")
-        result.extend(block)
-    return bytes(result)
+    try:
+        return retry_read_exact_at(
+            descriptor,
+            length,
+            offset,
+            retry_guard=retry_guard,
+            cancel_check=cancel_check,
+            pread=read_at,
+            monotonic=monotonic,
+            wait=wait,
+        ).data
+    except DescriptorIoError as error:
+        raise RawSnapshotError(str(error)) from error
 
 
 def _hash_descriptor(
     descriptor: int,
     size: int,
     *,
+    retry_guard: Callable[[], None],
     cancel_check: CancelCheck | None = None,
     read_at: Callable[[int, int, int], bytes] = os.pread,
+    monotonic: Callable[[], float] = time.monotonic,
+    wait: Callable[[float], None] = time.sleep,
 ) -> str:
     digest = hashlib.sha256()
     offset = 0
@@ -1098,7 +1109,11 @@ def _hash_descriptor(
             descriptor,
             offset,
             min(COPY_BYTES, size - offset),
+            retry_guard=retry_guard,
+            cancel_check=cancel_check,
             read_at=read_at,
+            monotonic=monotonic,
+            wait=wait,
         )
         digest.update(block)
         offset += len(block)
@@ -1172,9 +1187,20 @@ class PreparedRawSnapshot:
                     os.fstat(duplicate),
                     self._result.image_size,
                 )
+
+                def retry_guard() -> None:
+                    if _snapshot_identity(
+                        os.fstat(duplicate),
+                        self._result.image_size,
+                    ) != before:
+                        raise RawSnapshotError(
+                            "The anonymous raw snapshot changed before an I/O retry",
+                        )
+
                 digest = _hash_descriptor(
                     duplicate,
                     self._result.image_size,
+                    retry_guard=retry_guard,
                     cancel_check=cancel_check,
                 )
                 after = _snapshot_identity(
@@ -1299,6 +1325,8 @@ class RawSnapshotOperations:
     pwrite: Callable[[int, bytes, int], int] = os.pwrite
     preallocate: Callable[[int, int, int], None] = os.posix_fallocate
     fsync: Callable[[int], None] = os.fsync
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
 
 
 class RawSnapshotBuilder:
@@ -1321,48 +1349,52 @@ class RawSnapshotBuilder:
             external()
 
     def _preallocate_exact(self, descriptor: int, size: int) -> None:
-        while True:
-            try:
-                self._operations.preallocate(descriptor, 0, size)
-                return
-            except InterruptedError:
-                continue
+        try:
+            self._operations.preallocate(descriptor, 0, size)
+        except OSError as error:
+            raise RawSnapshotError(
+                "The anonymous snapshot could not be fully allocated",
+            ) from error
 
-    def _write_exact(self, descriptor: int, data: bytes, offset: int) -> None:
-        written = 0
-        while written < len(data):
-            try:
-                count = self._operations.pwrite(
-                    descriptor,
-                    data[written:],
-                    offset + written,
-                )
-            except InterruptedError:
-                continue
-            if (
-                type(count) is not int
-                or count <= 0
-                or count > len(data) - written
-            ):
-                raise RawSnapshotError("The anonymous snapshot write made invalid progress")
-            written += count
+    def _write_exact(
+        self,
+        descriptor: int,
+        data: bytes,
+        offset: int,
+        *,
+        retry_guard: Callable[[], None],
+        cancel_check: CancelCheck | None,
+    ) -> None:
+        try:
+            retry_write_all_at(
+                descriptor,
+                data,
+                offset,
+                retry_guard=retry_guard,
+                cancel_check=cancel_check,
+                pwrite=self._operations.pwrite,
+                monotonic=self._operations.monotonic,
+                wait=self._operations.sleep,
+            )
+        except DescriptorIoError as error:
+            raise RawSnapshotError(str(error)) from error
 
     def _sync_exact(self, descriptor: int) -> None:
-        while True:
-            try:
-                self._operations.fsync(descriptor)
-                return
-            except InterruptedError:
-                continue
+        try:
+            self._operations.fsync(descriptor)
+        except OSError as error:
+            raise RawSnapshotError(
+                "The anonymous snapshot durability check failed",
+            ) from error
 
     @staticmethod
     def _truncate_exact(descriptor: int, size: int) -> None:
-        while True:
-            try:
-                os.ftruncate(descriptor, size)
-                return
-            except InterruptedError:
-                continue
+        try:
+            os.ftruncate(descriptor, size)
+        except OSError as error:
+            raise RawSnapshotError(
+                "The anonymous snapshot size could not be fixed",
+            ) from error
 
     @staticmethod
     def _open_anonymous(workspace_descriptor: int) -> int:
@@ -1502,8 +1534,11 @@ class RawSnapshotBuilder:
             first_sha256 = _hash_descriptor(
                 snapshot_descriptor,
                 plan.image_size,
+                retry_guard=check_continuity,
                 cancel_check=check_continuity,
                 read_at=self._operations.pread,
+                monotonic=self._operations.monotonic,
+                wait=self._operations.sleep,
             )
             snapshot_middle = _snapshot_identity(
                 os.fstat(snapshot_descriptor),
@@ -1513,8 +1548,11 @@ class RawSnapshotBuilder:
             second_sha256 = _hash_descriptor(
                 snapshot_descriptor,
                 plan.image_size,
+                retry_guard=check_continuity,
                 cancel_check=check_continuity,
                 read_at=self._operations.pread,
+                monotonic=self._operations.monotonic,
+                wait=self._operations.sleep,
             )
             snapshot_after = _snapshot_identity(
                 os.fstat(snapshot_descriptor),
@@ -1606,6 +1644,10 @@ class RawSnapshotBuilder:
             self._preallocate_exact(snapshot_descriptor, plan.image_size)
             os.ftruncate(snapshot_descriptor, plan.image_size)
             _snapshot_identity(os.fstat(snapshot_descriptor), plan.image_size)
+            initial_snapshot_object = _snapshot_object_identity(
+                snapshot_descriptor,
+                expected_size=plan.image_size,
+            )
             _require_bound_inputs_unchanged(
                 plan,
                 source,
@@ -1613,6 +1655,25 @@ class RawSnapshotBuilder:
                 snapshot_descriptor=snapshot_descriptor,
             )
             self._check_cancelled(cancel_check)
+
+            def snapshot_retry_guard() -> None:
+                self._check_cancelled(cancel_check)
+                _require_bound_inputs_unchanged(
+                    plan,
+                    source,
+                    workspace_descriptor,
+                    snapshot_descriptor=snapshot_descriptor,
+                )
+                _require_snapshot_object(
+                    snapshot_descriptor,
+                    initial_snapshot_object,
+                    expected_size=plan.image_size,
+                )
+                # Writes through this retained descriptor legitimately change
+                # timestamps and can change the reported block count.  Recheck
+                # full allocation without comparing those mutable fields to
+                # the pristine pre-copy receipt.
+                _snapshot_identity(os.fstat(snapshot_descriptor), plan.image_size)
 
             copied = 0
             digest = hashlib.sha256()
@@ -1641,7 +1702,13 @@ class RawSnapshotBuilder:
                         workspace_descriptor,
                         snapshot_descriptor=snapshot_descriptor,
                     )
-                    self._write_exact(snapshot_descriptor, block, copied)
+                    self._write_exact(
+                        snapshot_descriptor,
+                        block,
+                        copied,
+                        retry_guard=snapshot_retry_guard,
+                        cancel_check=lambda: self._check_cancelled(cancel_check),
+                    )
                     digest.update(block)
                     copied += len(block)
                     progress(copied, plan.image_size)
@@ -1670,8 +1737,11 @@ class RawSnapshotBuilder:
             snapshot_sha256 = _hash_descriptor(
                 snapshot_descriptor,
                 plan.image_size,
+                retry_guard=snapshot_retry_guard,
                 cancel_check=lambda: self._check_cancelled(cancel_check),
                 read_at=self._operations.pread,
+                monotonic=self._operations.monotonic,
+                wait=self._operations.sleep,
             )
             snapshot_after = _snapshot_identity(
                 os.fstat(snapshot_descriptor),
@@ -1775,7 +1845,42 @@ class RawSnapshotBuilder:
             self._preallocate_exact(snapshot_descriptor, plan.image_size)
             os.ftruncate(snapshot_descriptor, plan.image_size)
             _snapshot_identity(os.fstat(snapshot_descriptor), plan.image_size)
+            initial_snapshot_object = _snapshot_object_identity(
+                snapshot_descriptor,
+                expected_size=plan.image_size,
+            )
             self._check_cancelled(cancel_check)
+
+            def require_source_unchanged_for_retry() -> None:
+                self._check_cancelled(cancel_check)
+                try:
+                    descriptor_status = os.fstat(source_descriptor)
+                    path_status = os.lstat(plan.source_path)
+                except OSError as error:
+                    raise RawSnapshotError(
+                        "The selected raw image disappeared before an I/O retry",
+                    ) from error
+                if (
+                    not _source_status_matches(
+                        descriptor_status, plan.source_identity,
+                    )
+                    or not _source_status_matches(path_status, plan.source_identity)
+                ):
+                    raise RawSnapshotError(
+                        "The selected raw image changed before an I/O retry",
+                    )
+
+            def require_snapshot_unchanged_for_retry() -> None:
+                require_source_unchanged_for_retry()
+                _require_snapshot_object(
+                    snapshot_descriptor,
+                    initial_snapshot_object,
+                    expected_size=plan.image_size,
+                )
+                # Expected writes mutate timestamps and may alter st_blocks.
+                # Validate the allocation invariant independently while the
+                # stable object receipt prevents descriptor substitution.
+                _snapshot_identity(os.fstat(snapshot_descriptor), plan.image_size)
 
             copied = 0
             digest = hashlib.sha256()
@@ -1787,7 +1892,11 @@ class RawSnapshotBuilder:
                     source_descriptor,
                     copied,
                     wanted,
+                    retry_guard=require_source_unchanged_for_retry,
+                    cancel_check=lambda: self._check_cancelled(cancel_check),
                     read_at=self._operations.pread,
+                    monotonic=self._operations.monotonic,
+                    wait=self._operations.sleep,
                 )
                 # No bytes obtained after a metadata change reach the private
                 # snapshot.  ctime makes a same-size/mtime restoration fail.
@@ -1796,7 +1905,13 @@ class RawSnapshotBuilder:
                     plan.source_identity,
                 ):
                     raise RawSnapshotError("The selected raw image changed while copying")
-                self._write_exact(snapshot_descriptor, block, copied)
+                self._write_exact(
+                    snapshot_descriptor,
+                    block,
+                    copied,
+                    retry_guard=require_snapshot_unchanged_for_retry,
+                    cancel_check=lambda: self._check_cancelled(cancel_check),
+                )
                 digest.update(block)
                 copied += len(block)
                 progress(copied, plan.image_size)
@@ -1820,8 +1935,11 @@ class RawSnapshotBuilder:
             snapshot_sha256 = _hash_descriptor(
                 snapshot_descriptor,
                 plan.image_size,
+                retry_guard=require_snapshot_unchanged_for_retry,
                 cancel_check=lambda: self._check_cancelled(cancel_check),
                 read_at=self._operations.pread,
+                monotonic=self._operations.monotonic,
+                wait=self._operations.sleep,
             )
             snapshot_after = _snapshot_identity(
                 os.fstat(snapshot_descriptor),

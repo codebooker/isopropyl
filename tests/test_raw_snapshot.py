@@ -3,6 +3,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import array
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -429,7 +430,7 @@ class RawSnapshotTests(unittest.TestCase):
 
     def test_interrupted_and_short_io_are_retried_exactly(self):
         plan = self.plan()
-        calls = {"pread": 0, "pwrite": 0, "preallocate": 0, "fsync": 0}
+        calls = {"pread": 0, "pwrite": 0}
 
         def interrupted_pread(fd: int, length: int, offset: int) -> bytes:
             calls["pread"] += 1
@@ -443,33 +444,149 @@ class RawSnapshotTests(unittest.TestCase):
                 raise InterruptedError()
             return os.pwrite(fd, data[:max(1, len(data) // 2)], offset)
 
-        def interrupted_preallocate(fd: int, offset: int, size: int) -> None:
-            calls["preallocate"] += 1
-            if calls["preallocate"] == 1:
-                raise InterruptedError()
-            os.posix_fallocate(fd, offset, size)
-
-        def interrupted_fsync(fd: int) -> None:
-            calls["fsync"] += 1
-            if calls["fsync"] == 1:
-                raise InterruptedError()
-            os.fsync(fd)
-
         operations = RawSnapshotOperations(
             pread=interrupted_pread,
             pwrite=interrupted_pwrite,
-            preallocate=interrupted_preallocate,
-            fsync=interrupted_fsync,
         )
         prepared = RawSnapshotBuilder(operations=operations).execute(plan)
         try:
             self.assertEqual(prepared.result.image_sha256, hashlib.sha256(self.payload).hexdigest())
             self.assertGreater(calls["pread"], 2)
             self.assertGreater(calls["pwrite"], 2)
-            self.assertEqual(calls["preallocate"], 2)
-            self.assertEqual(calls["fsync"], 2)
         finally:
             prepared.close()
+
+    def test_nonpositional_snapshot_operations_are_never_replayed(self):
+        plan = self.plan()
+        for field, message in (
+            ("preallocate", "fully allocated"),
+            ("fsync", "durability check"),
+        ):
+            with self.subTest(field=field):
+                calls = 0
+
+                def interrupted(*_args) -> None:
+                    nonlocal calls
+                    calls += 1
+                    raise InterruptedError()
+
+                operations = RawSnapshotOperations(**{field: interrupted})
+                with self.assertRaisesRegex(RawSnapshotError, message):
+                    RawSnapshotBuilder(operations=operations).execute(plan)
+                self.assertEqual(calls, 1)
+                self.assertEqual(os.listdir(self.workspace), [])
+
+    def test_transient_positional_io_retries_without_reopening(self):
+        plan = self.plan()
+        calls = {"pread": 0, "pwrite": 0}
+        clock = [100.0]
+        waits: list[float] = []
+
+        def transient_pread(fd: int, length: int, offset: int) -> bytes:
+            calls["pread"] += 1
+            if calls["pread"] == 1:
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return os.pread(fd, length, offset)
+
+        def transient_pwrite(fd: int, data: bytes, offset: int) -> int:
+            calls["pwrite"] += 1
+            if calls["pwrite"] == 1:
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return os.pwrite(fd, data, offset)
+
+        def sleep(duration: float) -> None:
+            waits.append(duration)
+            clock[0] += duration
+
+        operations = RawSnapshotOperations(
+            pread=transient_pread,
+            pwrite=transient_pwrite,
+            monotonic=lambda: clock[0],
+            sleep=sleep,
+        )
+        prepared = RawSnapshotBuilder(operations=operations).execute(plan)
+        try:
+            self.assertEqual(
+                prepared.result.image_sha256,
+                hashlib.sha256(self.payload).hexdigest(),
+            )
+            self.assertGreater(calls["pread"], 1)
+            self.assertGreater(calls["pwrite"], 1)
+            self.assertAlmostEqual(sum(waits), 0.2)
+            self.assertTrue(all(0 < delay <= 0.05 for delay in waits))
+        finally:
+            prepared.close()
+
+    def test_transient_write_after_positive_progress_retries_exact_remainder(self):
+        plan = self.plan()
+        calls: list[tuple[int, int]] = []
+        transient_raised = False
+        clock = [100.0]
+
+        def partial_then_transient(fd: int, data: bytes, offset: int) -> int:
+            nonlocal transient_raised
+            calls.append((offset, len(data)))
+            if len(calls) == 1:
+                portion = max(1, len(data) // 2)
+                return os.pwrite(fd, data[:portion], offset)
+            if not transient_raised:
+                transient_raised = True
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return os.pwrite(fd, data, offset)
+
+        operations = RawSnapshotOperations(
+            pwrite=partial_then_transient,
+            monotonic=lambda: clock[0],
+            sleep=lambda duration: clock.__setitem__(0, clock[0] + duration),
+        )
+        with RawSnapshotBuilder(operations=operations).execute(plan) as prepared:
+            self.assertTrue(transient_raised)
+            self.assertEqual(calls[1], calls[2])
+            self.assertEqual(
+                prepared.result.image_sha256,
+                hashlib.sha256(self.payload).hexdigest(),
+            )
+
+    def test_bound_source_retry_accepts_earlier_snapshot_progress(self):
+        calls = 0
+        clock = [100.0]
+
+        def later_transient(fd: int, data: bytes, offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+            return os.pwrite(fd, data, offset)
+
+        operations = RawSnapshotOperations(
+            pwrite=later_transient,
+            monotonic=lambda: clock[0],
+            sleep=lambda duration: clock.__setitem__(0, clock[0] + duration),
+        )
+        with open_image_source(self.source) as source:
+            plan = self.image_plan(source, len(self.payload), "plain")
+            with RawSnapshotBuilder(operations=operations).execute(plan) as prepared:
+                self.assertGreaterEqual(calls, 3)
+                self.assertEqual(
+                    prepared.result.image_sha256,
+                    hashlib.sha256(self.payload).hexdigest(),
+                )
+
+    def test_ambiguous_snapshot_write_error_is_not_retried(self):
+        plan = self.plan()
+        calls = 0
+
+        def failing_pwrite(_fd: int, _data: bytes, _offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            raise OSError(errno.EIO, "device I/O error")
+
+        with self.assertRaisesRegex(RawSnapshotError, "write failed"):
+            RawSnapshotBuilder(
+                operations=RawSnapshotOperations(pwrite=failing_pwrite),
+            ).execute(plan)
+        self.assertEqual(calls, 1)
+        self.assertEqual(os.listdir(self.workspace), [])
 
     def test_invalid_io_progress_fails_closed(self):
         plan = self.plan()
