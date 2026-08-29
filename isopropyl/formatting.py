@@ -1806,6 +1806,11 @@ class FormatExecutor:
                 process.terminate()
             except ProcessLookupError:
                 pass
+            except OSError:
+                # The worker retains ownership and will retry/observe the child
+                # through _stop_process; cancellation must not unlock the UI
+                # merely because signalling was denied or transiently failed.
+                pass
 
     def _check_cancelled(self) -> None:
         if self._cancelled.is_set():
@@ -1930,6 +1935,8 @@ class FormatExecutor:
                 process.terminate()
             except ProcessLookupError:
                 return
+            except OSError:
+                pass
         try:
             process.communicate(timeout=self._stop_grace)
             return
@@ -1939,12 +1946,22 @@ class FormatExecutor:
             process.kill()
         except ProcessLookupError:
             return
-        try:
-            process.communicate(timeout=self._stop_grace)
-        except subprocess.TimeoutExpired as error:
-            raise FormattingError(
-                "A formatting child did not stop after termination and kill"
-            ) from error
+        except OSError:
+            # We still must not surrender ownership.  Continue waiting below;
+            # a helper/policy boundary may finish naturally even when direct
+            # signalling was denied.
+            pass
+        # Do not surrender lifecycle ownership while a destructive child may
+        # still be alive.  SIGKILL normally makes this immediate; an
+        # uninterruptible kernel I/O wait can delay exit.  In that exceptional
+        # case the worker deliberately remains active (and the GUI remains
+        # locked) until process absence is proven by communicate().
+        while True:
+            try:
+                process.communicate(timeout=self._stop_grace)
+                return
+            except subprocess.TimeoutExpired:
+                continue
 
     def _run_process(self, argv: Sequence[str], input_data: bytes | None = None) -> None:
         self._check_cancelled()

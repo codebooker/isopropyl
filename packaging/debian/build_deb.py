@@ -71,6 +71,8 @@ raw_device.py
 raw_device_runner.py
 raw_snapshot.py
 raw_workflow.py
+restore_device_helper.py
+restore_device_runner.py
 runtime_validation.py
 settings.py
 sources.py
@@ -162,6 +164,16 @@ PAYLOAD_FILES: tuple[tuple[str, str, int], ...] = (
         0o644,
     ),
     (
+        "helper/isopropyl-restore-device-helper",
+        "usr/libexec/isopropyl-restore-device-helper",
+        0o755,
+    ),
+    (
+        "isopropyl/restore_device_helper.py",
+        "usr/libexec/isopropyl/restore_device_helper.py",
+        0o644,
+    ),
+    (
         "packaging/debian/io.github.codebooker.isopropyl.desktop",
         "usr/share/applications/io.github.codebooker.isopropyl.desktop",
         0o644,
@@ -209,6 +221,11 @@ PAYLOAD_FILES: tuple[tuple[str, str, int], ...] = (
     (
         "data/io.github.codebooker.isopropyl.fast-zero.policy",
         "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy",
+        0o644,
+    ),
+    (
+        "data/io.github.codebooker.isopropyl.restore-device.policy",
+        "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy",
         0o644,
     ),
     (

@@ -57,7 +57,7 @@ identity, and require an explicit confirmation.
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, can generate a reviewed `autounattend.xml`, and offers a narrowly profiled Windows 2023-generation installer-boot update for exact supported Microsoft media. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
-| **Drive tools** | Backs up drives, restores ordinary filesystems, captures optical discs, performs full or scan-and-skip logical zeroing, and runs bad-block or fake-capacity tests in separate warned workflows. |
+| **Drive tools** | Backs up drives, restores ordinary filesystems with Quick format, captures optical discs, performs logical zeroing, and runs bad-block or fake-capacity tests. A non-GUI Verified zero + format prototype remains unreleased pending installed VM and physical-media certification; it is not Rufus/Windows slow formatting. |
 | **Linux image download** | Downloads the pinned Ubuntu LTS profile from distribution-owned infrastructure and verifies its signed checksum manifest. |
 | **Windows image download** | Acquires exact current Windows 11 25H2 v2 English x64 or ARM64 consumer media directly from Microsoft, checks the selected profile's live published hash row, resumes privately, and verifies the complete SHA-256 before use. |
 | **FreeDOS image download** | Downloads the official FreeDOS 1.4 LiteUSB or FullUSB archive at runtime, corroborates the project-pinned archive SHA-256 against FreeDOS's live verification page, validates the exact ZIP catalog and reviewed inner image hash, then loads the image into the guarded raw writer. |
@@ -250,6 +250,22 @@ writer sanitizes the physical final sector, but middle bytes beyond the 32 MiB
 LiteUSB or 1 GiB FullUSB image are not erased and may retain previous data. Use
 **Drive tools… → Erase drive with zeros… → Full zero pass** first if complete
 logical erasure is required.
+
+### Restore a drive as ordinary storage
+
+Open **Drive tools… → Restore drive…** and choose the filesystem, partition
+table, allocation or block size, and volume label. The released GUI performs
+Quick filesystem creation: it replaces the layout and filesystem metadata
+without overwriting every previous data byte.
+
+Verified zero + format is not a released user workflow. Its non-GUI prototype
+combines a complete verified logical zero pass with later filesystem creation.
+A descriptor-bound privileged transaction and isolated PolicyKit endpoint now
+exist, but the desktop workflow and installed VM hot-swap/failure certification
+are not complete. It is not Rufus/Windows slow format, Secure Erase,
+sanitization, or a bad-block test. Normal users who need logical erasure should
+run **Erase drive with zeros**, wait for verified completion, and then run
+**Restore drive**.
 
 ### Logically zero a drive
 

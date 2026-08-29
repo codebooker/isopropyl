@@ -158,6 +158,7 @@ class DebianPackageTests(unittest.TestCase):
             "usr/bin/isopropyl-validate-windows-bcd-capture",
             "usr/bin/isopropyl-import-windows-bcd-capture",
             "usr/libexec/isopropyl-device-helper",
+            "usr/libexec/isopropyl-restore-device-helper",
         }
         for name, (member, _content) in self.data.items():
             with self.subTest(path=name):
@@ -186,9 +187,11 @@ class DebianPackageTests(unittest.TestCase):
             "usr/share/doc/isopropyl/examples/capture_windows_bcd_oracle.ps1",
             "usr/lib/isopropyl-tools/validate_windows_bcd_capture.py",
             "usr/libexec/isopropyl/syslinux_device_helper.py",
+            "usr/libexec/isopropyl/restore_device_helper.py",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy",
+            "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy",
             "usr/share/man/man1/isopropyl.1.gz",
             "usr/share/man/man1/isopropyl-cli.1.gz",
             "usr/share/doc/isopropyl/changelog.Debian.gz",
@@ -275,6 +278,12 @@ class DebianPackageTests(unittest.TestCase):
             "usr/lib/python3/dist-packages/isopropyl/syslinux_device_helper.py"
         ][1]
         self.assertEqual(packaged_helper, public_helper)
+        self.assertEqual(
+            self.data["usr/libexec/isopropyl/restore_device_helper.py"][1],
+            self.data[
+                "usr/lib/python3/dist-packages/isopropyl/restore_device_helper.py"
+            ][1],
+        )
 
     def test_python_and_license_payloads_match_explicit_source_allowlists(self):
         builder = runpy.run_path(os.fspath(BUILDER))

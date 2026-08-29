@@ -42,12 +42,18 @@ install-host-helper:
 	install -Dm644 data/io.github.codebooker.isopropyl.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy
 	install -Dm644 data/io.github.codebooker.isopropyl.raw-write.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy
 	install -Dm644 data/io.github.codebooker.isopropyl.fast-zero.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy
+	install -Dm755 helper/isopropyl-restore-device-helper $(DESTDIR)/usr/libexec/isopropyl-restore-device-helper
+	install -Dm644 isopropyl/restore_device_helper.py $(DESTDIR)/usr/libexec/isopropyl/restore_device_helper.py
+	install -Dm644 data/io.github.codebooker.isopropyl.restore-device.policy $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy
 
 uninstall-host-helper:
 	test "$(PREFIX)" = "/usr"
 	rm -f $(DESTDIR)/usr/libexec/isopropyl-device-helper
 	rm -f $(DESTDIR)/usr/libexec/isopropyl/syslinux_device_helper.py
+	rm -f $(DESTDIR)/usr/libexec/isopropyl-restore-device-helper
+	rm -f $(DESTDIR)/usr/libexec/isopropyl/restore_device_helper.py
 	rmdir --ignore-fail-on-non-empty $(DESTDIR)/usr/libexec/isopropyl
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy
 	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy
+	rm -f $(DESTDIR)/usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy

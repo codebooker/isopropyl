@@ -5,6 +5,8 @@ import json
 import os
 import stat
 import subprocess
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -1845,6 +1847,68 @@ class FormatExecutorTests(unittest.TestCase):
             executor.execute(self.device, self.plan)
         self.assertTrue(processes[0].terminated)
         self.assertTrue(processes[0].killed)
+
+    def test_stop_retains_ownership_until_killed_child_is_reaped(self):
+        released = threading.Event()
+
+        class DelayedDeath(FakeProcess):
+            def __init__(self):
+                super().__init__(["/usr/bin/pkexec", "/usr/sbin/sfdisk"])
+                self.returncode = None
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+            def communicate(self, input=None, timeout=None):
+                if not released.wait(0.01):
+                    raise subprocess.TimeoutExpired(self.argv, timeout)
+                self.returncode = -9
+                return b"", b""
+
+        process = DelayedDeath()
+        executor = FormatExecutor(stop_grace=0.01)
+        thread = threading.Thread(target=executor._stop_process, args=(process,))
+        thread.start()
+        time.sleep(0.05)
+        self.assertTrue(thread.is_alive())
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.killed)
+        released.set()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+
+    def test_signal_errors_do_not_release_unreaped_child_ownership(self):
+        released = threading.Event()
+
+        class UnsignalableProcess(FakeProcess):
+            def __init__(self):
+                super().__init__(["/usr/bin/pkexec", "/usr/sbin/sfdisk"])
+                self.returncode = None
+
+            def terminate(self):
+                raise PermissionError("cannot signal wrapper")
+
+            def kill(self):
+                raise PermissionError("cannot signal wrapper")
+
+            def communicate(self, input=None, timeout=None):
+                if not released.wait(0.01):
+                    raise subprocess.TimeoutExpired(self.argv, timeout)
+                self.returncode = 1
+                return b"", b""
+
+        process = UnsignalableProcess()
+        executor = FormatExecutor(stop_grace=0.01)
+        thread = threading.Thread(target=executor._stop_process, args=(process,))
+        thread.start()
+        time.sleep(0.05)
+        self.assertTrue(thread.is_alive())
+        released.set()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
 
     def test_unmount_failure_stops_before_partitioning(self):
         def runner(argv, **_kwargs):

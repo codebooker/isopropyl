@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# This operation is isolated from the desktop Python installation.  The
+# installed script is stdlib-only and imports no user-selected package.
+exec /usr/bin/python3 -I -S /usr/libexec/isopropyl/restore_device_helper.py "$@"
