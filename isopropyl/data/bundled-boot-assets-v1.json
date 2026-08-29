@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "id": "rufus-prompt-mbr-440",
+      "path": "rufus-prompt-mbr-440.bin",
+      "size": 440,
+      "sha256": "4fca7dcfac9f90390d00ab42c2e814952fbce41c83aa87c5c696e663efd60259",
+      "license": "GPL-3.0-or-later",
+      "copyright": "Copyright (c) 2012 Pete Batard <pete@akeo.ie>",
+      "provenance": {
+        "repository": "https://github.com/pbatard/rufus.git",
+        "commit": "2368e49a82e854d3e702f824648cc723953dbb53",
+        "source": "third_party/rufus/res/mbr/mbr.S",
+        "source_sha256": "f6a831462d1cfefa739362223f31c61f8ad8d11466c6c0cc96ab2c646f002684",
+        "linker_script": "third_party/rufus/res/mbr/mbr.ld",
+        "linker_script_sha256": "03f3b06050e5aa4af1f2187d22fb4841a31ebbef43aaccb690e8da0263409771"
+      },
+      "reproduction": {
+        "toolchain": "GNU binutils as/ld/objcopy",
+        "full_mbr_size": 512,
+        "full_mbr_sha256": "3d92fffb6efd81da6ff44017f5b6b5696d781a1890c0c0c4834442e7bdccd632",
+        "packaged_region": "bytes 0..439; bytes 440..511 are mutable MBR metadata/signature space"
+      }
+    }
+  ]
+}

@@ -18,11 +18,14 @@ class SourceInstallTests(unittest.TestCase):
         configuration = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         patterns = configuration["tool"]["setuptools"]["package-data"]["isopropyl"]
         self.assertIn("data/*.hex", patterns)
+        self.assertIn("data/*.bin", patterns)
 
     def test_source_distribution_includes_reproducible_bios_sources(self):
         manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
         self.assertIn("include boot/fat32_bootmgr_stage0.S", manifest)
         self.assertIn("include boot/fat32_bootmgr_stage2.S", manifest)
+        self.assertIn("include third_party/rufus/res/mbr/mbr.S", manifest)
+        self.assertIn("include third_party/rufus/res/mbr/mbr.ld", manifest)
 
     @unittest.skipUnless(shutil.which("make"), "GNU make is not installed")
     def test_make_install_replaces_an_existing_package_without_nesting(self):

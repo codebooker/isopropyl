@@ -38,9 +38,15 @@ from isopropyl.private_fat32 import (
     PrivateFat32Error,
     PrivateFat32State,
 )
+from isopropyl.rufus_prompt_mbr import RUFUS_PROMPT_MBR_SHA256
+from isopropyl.syslinux import SYSLINUX_MBR_602_SHA256
 from isopropyl.wim import WimEdition, WimSelection
 from isopropyl.windows import WindowsCustomization
-from isopropyl.windows_bios_pbr import MODERN_BOOTMGR_ENTRY_STUB, STAGE_SECTOR
+from isopropyl.windows_bios_pbr import (
+    MODERN_BOOTMGR_ENTRY_STUB,
+    STAGE_SECTOR,
+    WindowsMbrProfile,
+)
 from isopropyl.uefi import ImageUefiPayload, SbatState, SignatureTableState
 from isopropyl.windows_iso_fat32 import (
     WindowsIsoFat32Builder,
@@ -191,6 +197,7 @@ class WindowsIsoFat32Tests(unittest.TestCase):
         *,
         write_plan: WritePlan | None = None,
         image_size: int = IMAGE_SIZE,
+        windows_mbr_profile: WindowsMbrProfile = WindowsMbrProfile.SYSLINUX_602_DIRECT,
     ):
         entries = (
             ArchiveEntry("bootmgr", 0x400),
@@ -211,6 +218,7 @@ class WindowsIsoFat32Tests(unittest.TestCase):
             staging_result,
             workspace,
             image_size=image_size,
+            windows_mbr_profile=windows_mbr_profile,
         )
         return plan, workspace
 
@@ -237,6 +245,14 @@ class WindowsIsoFat32Tests(unittest.TestCase):
                     if len(prefix) < plan.private_plan.geometry.volume_offset + 14 * 512:
                         prefix.extend(block)
                 result = prepared.result
+                self.assertIs(
+                    result.windows_mbr_profile,
+                    WindowsMbrProfile.SYSLINUX_602_DIRECT,
+                )
+                self.assertEqual(
+                    result.mbr_bootstrap_sha256,
+                    SYSLINUX_MBR_602_SHA256,
+                )
                 self.assertEqual(digest.hexdigest(), result.final_image_sha256)
                 self.assertNotEqual(
                     result.unpatched_image_sha256,
@@ -257,6 +273,61 @@ class WindowsIsoFat32Tests(unittest.TestCase):
                     ]
                 ))
             self.assertEqual(tuple(workspace.iterdir()), ())
+
+    def test_rufus_prompt_profile_is_bound_through_plan_pbr_and_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, _workspace = self.build_plan(
+                directory,
+                windows_mbr_profile=WindowsMbrProfile.RUFUS_PROMPT_V1,
+            )
+            self.assertIs(
+                plan.windows_mbr_profile,
+                WindowsMbrProfile.RUFUS_PROMPT_V1,
+            )
+            self.assertEqual(plan.mbr_bootstrap_sha256, RUFUS_PROMPT_MBR_SHA256)
+            validate_windows_iso_fat32_plan(plan)
+            with prepare_windows_iso_fat32(plan) as prepared:
+                result = prepared.result
+                self.assertIs(
+                    result.windows_mbr_profile,
+                    WindowsMbrProfile.RUFUS_PROMPT_V1,
+                )
+                self.assertEqual(
+                    result.mbr_bootstrap_sha256,
+                    RUFUS_PROMPT_MBR_SHA256,
+                )
+
+            for changes in (
+                {"windows_mbr_profile": WindowsMbrProfile.SYSLINUX_602_DIRECT},
+                {"mbr_bootstrap_sha256": "0" * 64},
+            ):
+                with self.subTest(changes=changes), self.assertRaisesRegex(
+                    WindowsIsoFat32Error,
+                    "receipt",
+                ):
+                    validate_windows_iso_fat32_plan(replace(plan, **changes))
+
+    def test_rejects_non_enum_mbr_profile_before_private_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            entries = (
+                ArchiveEntry("bootmgr", 0x400),
+                ArchiveEntry("Boot/BCD", 100),
+                ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 98),
+                ArchiveEntry("sources/boot.wim", 3 * 1024),
+            )
+            iso_plan, staging_result, workspace = self.publish(
+                directory,
+                entries,
+                windows_write_plan(sum(item.size for item in entries)),
+            )
+            with self.assertRaisesRegex(WindowsIsoFat32Error, "exact Windows MBR"):
+                build_windows_iso_fat32_plan(
+                    iso_plan,
+                    staging_result,
+                    workspace,
+                    image_size=IMAGE_SIZE,
+                    windows_mbr_profile="rufus-prompt-v1",  # type: ignore[arg-type]
+                )
 
     def test_composes_the_strict_planner_output_without_enabling_device_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

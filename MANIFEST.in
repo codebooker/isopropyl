@@ -1,6 +1,8 @@
 include tests/windows-profile-observations-v1.json
 include boot/fat32_bootmgr_stage0.S
 include boot/fat32_bootmgr_stage2.S
+include third_party/rufus/res/mbr/mbr.S
+include third_party/rufus/res/mbr/mbr.ld
 include tools/certify_freedos_boot.py
 include tools/certify_grub_rescue_boot.py
 include tools/certify_syslinux_boot.py

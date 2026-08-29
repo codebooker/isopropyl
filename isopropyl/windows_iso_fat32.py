@@ -58,16 +58,19 @@ from .staging_tree import (
 from .wim import WimSelection
 from .windows import WindowsCustomization
 from .windows_bios_pbr import (
+    DEFAULT_WINDOWS_MBR_PROFILE,
     Fat32BootmgrPbrPlan,
     WindowsBootmgrBiosProfile,
     WindowsBiosPbrError,
+    WindowsMbrProfile,
     attest_fat32_bootmgr_pbr,
     classify_windows_bootmgr_bios,
     plan_fat32_bootmgr_pbr,
+    windows_mbr_bootstrap_sha256,
 )
 
 
-_PLAN_PROFILE = "io.github.codebooker.isopropyl/windows-iso-fat32-plan/v1"
+_PLAN_PROFILE = "io.github.codebooker.isopropyl/windows-iso-fat32-plan/v2"
 _PLAN_WITNESS = object()
 _OWNER_WITNESS = object()
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -110,6 +113,8 @@ class WindowsIsoFat32Plan:
     bootmgr_sha256: str
     bcd_sha256: str
     bootx64_sha256: str
+    windows_mbr_profile: WindowsMbrProfile
+    mbr_bootstrap_sha256: str
     windows_customization: WindowsCustomization | None
     wim_selection: WimSelection | None
     autounattend_sha256: str | None
@@ -126,6 +131,8 @@ class WindowsIsoFat32Result:
     plan_sha256: str
     private_plan_sha256: str
     pbr_plan_sha256: str
+    windows_mbr_profile: WindowsMbrProfile
+    mbr_bootstrap_sha256: str
     disk_signature: int
     volume_id: int
     image_size: int
@@ -381,6 +388,8 @@ def _plan_digest(plan: WindowsIsoFat32Plan) -> str:
                 "boot/bcd": plan.bcd_sha256,
                 "efi/boot/bootx64.efi": plan.bootx64_sha256,
             },
+            "windows_mbr_profile": plan.windows_mbr_profile.value,
+            "mbr_bootstrap_sha256": plan.mbr_bootstrap_sha256,
             "windows_customization": (
                 asdict(plan.windows_customization)
                 if plan.windows_customization is not None else None
@@ -406,6 +415,8 @@ def _snapshot(plan: WindowsIsoFat32Plan) -> tuple[object, ...]:
         plan.bootmgr_sha256,
         plan.bcd_sha256,
         plan.bootx64_sha256,
+        plan.windows_mbr_profile,
+        plan.mbr_bootstrap_sha256,
         plan.windows_customization,
         plan.wim_selection,
         plan.autounattend_sha256,
@@ -436,6 +447,7 @@ def _validate_relationships(
         plan.bootmgr_sha256,
         plan.bcd_sha256,
         plan.bootx64_sha256,
+        plan.mbr_bootstrap_sha256,
         plan.plan_sha256,
     ):
         if type(digest) is not str or _SHA256.fullmatch(digest) is None:
@@ -448,6 +460,8 @@ def _validate_relationships(
         )
     ):
         raise WindowsIsoFat32Error("The Windows answer-file digest is invalid")
+    if type(plan.windows_mbr_profile) is not WindowsMbrProfile:
+        raise WindowsIsoFat32Error("The Windows MBR profile is invalid")
     try:
         manifest = validate_published_windows_staging(
             plan.iso_plan,
@@ -464,6 +478,12 @@ def _validate_relationships(
     )
     _validate_split_tree(plan.iso_plan.write_plan, manifest)
     _validate_bootmgr_payload(manifest)
+    try:
+        expected_mbr_bootstrap_sha256 = windows_mbr_bootstrap_sha256(
+            plan.windows_mbr_profile,
+        )
+    except WindowsBiosPbrError as error:
+        raise WindowsIsoFat32Error(str(error)) from error
     if (
         plan.private_plan.profile is not PrivateFat32BuildProfile.WINDOWS_BOOTMGR
         or manifest.root.as_posix() != plan.private_plan.source_root
@@ -478,6 +498,8 @@ def _validate_relationships(
         or plan.windows_customization != plan.iso_plan.windows_customization
         or plan.wim_selection != plan.iso_plan.wim_selection
         or plan.autounattend_sha256 != plan.iso_plan.autounattend_sha256
+        or plan.mbr_bootstrap_sha256
+        != expected_mbr_bootstrap_sha256
         or _required_file_digests(manifest)
         != (plan.bootmgr_sha256, plan.bcd_sha256, plan.bootx64_sha256)
         or not hmac.compare_digest(_plan_digest(plan), plan.plan_sha256)
@@ -492,6 +514,7 @@ def build_windows_iso_fat32_plan(
     workspace: os.PathLike[str] | str,
     *,
     image_size: int,
+    windows_mbr_profile: WindowsMbrProfile = DEFAULT_WINDOWS_MBR_PROFILE,
     cancel_check: CancelCheck | None = None,
 ) -> WindowsIsoFat32Plan:
     """Bind one complete final Windows tree to an anonymous Windows image plan."""
@@ -507,6 +530,10 @@ def build_windows_iso_fat32_plan(
     _validate_write_plan(iso_plan.write_plan, source_manifest, image_size)
     _validate_split_tree(iso_plan.write_plan, source_manifest)
     _validate_bootmgr_payload(source_manifest)
+    try:
+        mbr_bootstrap_sha256 = windows_mbr_bootstrap_sha256(windows_mbr_profile)
+    except WindowsBiosPbrError as error:
+        raise WindowsIsoFat32Error(str(error)) from error
     bootmgr, bcd, bootx64 = _required_file_digests(source_manifest)
     try:
         private_plan = build_windows_private_fat32_plan(
@@ -525,6 +552,8 @@ def build_windows_iso_fat32_plan(
         bootmgr_sha256=bootmgr,
         bcd_sha256=bcd,
         bootx64_sha256=bootx64,
+        windows_mbr_profile=windows_mbr_profile,
+        mbr_bootstrap_sha256=mbr_bootstrap_sha256,
         windows_customization=iso_plan.windows_customization,
         wim_selection=iso_plan.wim_selection,
         autounattend_sha256=iso_plan.autounattend_sha256,
@@ -538,6 +567,8 @@ def build_windows_iso_fat32_plan(
         bootmgr_sha256=candidate.bootmgr_sha256,
         bcd_sha256=candidate.bcd_sha256,
         bootx64_sha256=candidate.bootx64_sha256,
+        windows_mbr_profile=candidate.windows_mbr_profile,
+        mbr_bootstrap_sha256=candidate.mbr_bootstrap_sha256,
         windows_customization=candidate.windows_customization,
         wim_selection=candidate.wim_selection,
         autounattend_sha256=candidate.autounattend_sha256,
@@ -859,9 +890,14 @@ class WindowsIsoFat32Builder:
                 descriptor,
                 volume_offset=plan.private_plan.geometry.volume_offset,
                 volume_size=plan.private_plan.geometry.volume_size,
+                windows_mbr_profile=plan.windows_mbr_profile,
             )
-            if tuple(write.role for write in pbr_plan.writes) != (
-                "stage", "backup-vbr", "primary-vbr", "mbr",
+            if (
+                pbr_plan.windows_mbr_profile is not plan.windows_mbr_profile
+                or pbr_plan.mbr_bootstrap_sha256 != plan.mbr_bootstrap_sha256
+                or tuple(write.role for write in pbr_plan.writes) != (
+                    "stage", "backup-vbr", "primary-vbr", "mbr",
+                )
             ):
                 raise WindowsIsoFat32Error("The BIOS activation order is invalid")
             before_expected_hash = _identity(
@@ -947,19 +983,21 @@ class WindowsIsoFat32Builder:
             image._end_patch()
             patch_started = False
             result = WindowsIsoFat32Result(
-                plan.plan_sha256,
-                plan.private_plan.plan_sha256,
-                pbr_plan.plan_sha256,
-                plan.private_plan.disk_signature,
-                plan.private_plan.volume_id,
-                plan.private_plan.geometry.image_size,
-                image.result.image_sha256,
-                final_sha256,
-                plan.source_manifest_sha256,
-                final_inspection.manifest_sha256,
-                image.result.files_verified,
-                image.result.directories_verified,
-                image.result.bytes_verified,
+                plan_sha256=plan.plan_sha256,
+                private_plan_sha256=plan.private_plan.plan_sha256,
+                pbr_plan_sha256=pbr_plan.plan_sha256,
+                windows_mbr_profile=plan.windows_mbr_profile,
+                mbr_bootstrap_sha256=pbr_plan.mbr_bootstrap_sha256,
+                disk_signature=plan.private_plan.disk_signature,
+                volume_id=plan.private_plan.volume_id,
+                image_size=plan.private_plan.geometry.image_size,
+                unpatched_image_sha256=image.result.image_sha256,
+                final_image_sha256=final_sha256,
+                source_manifest_sha256=plan.source_manifest_sha256,
+                final_fat_manifest_sha256=final_inspection.manifest_sha256,
+                files_verified=image.result.files_verified,
+                directories_verified=image.result.directories_verified,
+                bytes_verified=image.result.bytes_verified,
             )
             owner = PreparedWindowsIsoFat32(image, result, _OWNER_WITNESS)
             image = None

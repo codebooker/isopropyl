@@ -24,7 +24,12 @@ from enum import Enum
 from importlib import resources
 from pathlib import Path
 
+from .rufus_prompt_mbr import (
+    RUFUS_PROMPT_MBR_SHA256,
+    load_rufus_prompt_mbr,
+)
 from .syslinux import (
+    SYSLINUX_MBR_602,
     SYSLINUX_MBR_602_SHA256,
     SyslinuxPatchError,
     prepare_syslinux_mbr,
@@ -67,6 +72,16 @@ class WindowsBootmgrBiosProfile(Enum):
     MODERN_ENTRY_ZERO = "modern-entry-zero"
 
 
+class WindowsMbrProfile(Enum):
+    """Closed project-known Windows legacy-MBR bootstrap choices."""
+
+    SYSLINUX_602_DIRECT = "syslinux-6.02-direct"
+    RUFUS_PROMPT_V1 = "rufus-prompt-v1"
+
+
+DEFAULT_WINDOWS_MBR_PROFILE = WindowsMbrProfile.SYSLINUX_602_DIRECT
+
+
 def classify_windows_bootmgr_bios(
     header: bytes,
     *,
@@ -106,6 +121,7 @@ class PbrWrite:
 
 @dataclass(frozen=True)
 class Fat32BootmgrPbrPlan:
+    windows_mbr_profile: WindowsMbrProfile
     mbr_offset: int
     volume_offset: int
     volume_size: int
@@ -326,8 +342,69 @@ def _merged_vbr(formatted: bytes, artifact: bytes) -> bytes:
     return bytes(merged)
 
 
+def _mbr_bootstrap(profile: WindowsMbrProfile) -> tuple[bytes, str]:
+    if type(profile) is not WindowsMbrProfile:
+        raise WindowsBiosPbrError("An exact Windows MBR profile is required")
+    if profile is WindowsMbrProfile.SYSLINUX_602_DIRECT:
+        bootstrap = SYSLINUX_MBR_602
+        expected_sha256 = SYSLINUX_MBR_602_SHA256
+    elif profile is WindowsMbrProfile.RUFUS_PROMPT_V1:
+        try:
+            bootstrap = load_rufus_prompt_mbr()
+        except (OSError, ValueError) as error:
+            raise WindowsBiosPbrError(
+                "The packaged Rufus prompt MBR does not match its project pin",
+            ) from error
+        expected_sha256 = RUFUS_PROMPT_MBR_SHA256
+    else:  # pragma: no cover - Enum exhaustiveness guard.
+        raise WindowsBiosPbrError("The Windows MBR profile is unsupported")
+    if (
+        type(bootstrap) is not bytes
+        or len(bootstrap) != 440
+        or _digest(bootstrap) != expected_sha256
+    ):
+        raise WindowsBiosPbrError(
+            "The selected Windows MBR bootstrap does not match its project pin",
+        )
+    return bootstrap, expected_sha256
+
+
+def windows_mbr_bootstrap_sha256(profile: WindowsMbrProfile) -> str:
+    """Return the pin for one exact, successfully loaded project bootstrap."""
+
+    return _mbr_bootstrap(profile)[1]
+
+
+def _prepare_windows_mbr(
+    formatted_mbr: bytes,
+    *,
+    profile: WindowsMbrProfile,
+    partition_start_sector: int,
+    partition_sector_count: int,
+) -> tuple[bytes, str]:
+    """Validate the common layout, then merge only one closed bootstrap."""
+
+    try:
+        validated = prepare_syslinux_mbr(
+            formatted_mbr,
+            partition_start_sector=partition_start_sector,
+            partition_sector_count=partition_sector_count,
+        )
+    except SyslinuxPatchError as error:
+        raise WindowsBiosPbrError(str(error)) from error
+    bootstrap, bootstrap_sha256 = _mbr_bootstrap(profile)
+    merged = bootstrap + validated.mbr[440:]
+    if merged[440:] != formatted_mbr[440:]:
+        raise WindowsBiosPbrError("The Windows MBR metadata changed while merging boot code")
+    return merged, bootstrap_sha256
+
+
 def _plan_digest(plan: Fat32BootmgrPbrPlan) -> str:
-    digest = hashlib.sha256(b"isopropyl-fat32-bootmgr-pbr-v1\0")
+    digest = hashlib.sha256(b"isopropyl-fat32-bootmgr-pbr-v2\0")
+    try:
+        digest.update(plan.windows_mbr_profile.value.encode("ascii") + b"\0")
+    except (AttributeError, UnicodeError):
+        return ""
     for value in (
         plan.mbr_offset, plan.volume_offset, plan.volume_size, plan.fsinfo_offset,
         plan.backup_vbr_offset, plan.backup_fsinfo_offset, plan.stage_offset,
@@ -352,6 +429,7 @@ def plan_fat32_bootmgr_pbr(
     *,
     volume_offset: int,
     volume_size: int,
+    windows_mbr_profile: WindowsMbrProfile = DEFAULT_WINDOWS_MBR_PROFILE,
     artifacts: BootCodeArtifacts | None = None,
 ) -> Fat32BootmgrPbrPlan:
     """Plan four exact writes against a regular-file FAT32 image descriptor."""
@@ -386,14 +464,12 @@ def plan_fat32_bootmgr_pbr(
     ):
         raise WindowsBiosPbrError("The BIOS artifacts are not self-consistent")
     formatted_mbr = _pread_exact(descriptor, 0, SECTOR_SIZE, "formatted MBR")
-    try:
-        mbr = prepare_syslinux_mbr(
-            formatted_mbr,
-            partition_start_sector=volume_offset // SECTOR_SIZE,
-            partition_sector_count=volume_size // SECTOR_SIZE,
-        )
-    except SyslinuxPatchError as error:
-        raise WindowsBiosPbrError(str(error)) from error
+    mbr, mbr_bootstrap_sha256 = _prepare_windows_mbr(
+        formatted_mbr,
+        profile=windows_mbr_profile,
+        partition_start_sector=volume_offset // SECTOR_SIZE,
+        partition_sector_count=volume_size // SECTOR_SIZE,
+    )
     primary = _pread_exact(descriptor, volume_offset, SECTOR_SIZE, "primary VBR")
     fsinfo_sector, backup_sector = _fat32_layout(primary, volume_offset, volume_size)
     fsinfo_offset = volume_offset + fsinfo_sector * SECTOR_SIZE
@@ -421,13 +497,13 @@ def plan_fat32_bootmgr_pbr(
         PbrWrite(stage_offset, _digest(stage_before), artifact.stage2, "stage"),
         PbrWrite(backup_offset, _digest(backup), merged, "backup-vbr"),
         PbrWrite(volume_offset, _digest(primary), merged, "primary-vbr"),
-        PbrWrite(0, _digest(formatted_mbr), mbr.mbr, "mbr"),
+        PbrWrite(0, _digest(formatted_mbr), mbr, "mbr"),
     )
     candidate = Fat32BootmgrPbrPlan(
-        0, volume_offset, volume_size, fsinfo_offset, backup_offset,
+        windows_mbr_profile, 0, volume_offset, volume_size, fsinfo_offset, backup_offset,
         backup_fsinfo_offset, stage_offset, _digest(primary_fsinfo),
         _digest(backup_fsinfo), artifact.stage0_sha256, artifact.stage2_sha256,
-        mbr.bootstrap_sha256, writes, "",
+        mbr_bootstrap_sha256, writes, "",
     )
     return replace(candidate, plan_sha256=_plan_digest(candidate))
 
@@ -437,6 +513,7 @@ def attest_fat32_bootmgr_pbr(descriptor: int, plan: Fat32BootmgrPbrPlan) -> None
 
     if (
         type(plan) is not Fat32BootmgrPbrPlan
+        or type(plan.windows_mbr_profile) is not WindowsMbrProfile
         or type(plan.writes) is not tuple
         or len(plan.writes) != 4
         or any(type(write) is not PbrWrite for write in plan.writes)
@@ -481,7 +558,8 @@ def attest_fat32_bootmgr_pbr(descriptor: int, plan: Fat32BootmgrPbrPlan) -> None
         or plan.stage_offset != plan.volume_offset + STAGE_SECTOR * SECTOR_SIZE
         or plan.artifact_stage0_sha256 != STAGE0_SHA256
         or plan.artifact_stage2_sha256 != STAGE2_SHA256
-        or plan.mbr_bootstrap_sha256 != SYSLINUX_MBR_602_SHA256
+        or plan.mbr_bootstrap_sha256
+        != windows_mbr_bootstrap_sha256(plan.windows_mbr_profile)
         or tuple(write.role for write in plan.writes)
         != ("stage", "backup-vbr", "primary-vbr", "mbr")
         or tuple(write.offset for write in plan.writes)
@@ -492,7 +570,7 @@ def attest_fat32_bootmgr_pbr(descriptor: int, plan: Fat32BootmgrPbrPlan) -> None
         or plan.writes[1].data != plan.writes[2].data
         or plan.writes[2].data[510:512] != b"\x55\xaa"
         or plan.writes[2].data[3:90] != plan.writes[1].data[3:90]
-        or _digest(plan.writes[3].data[:440]) != SYSLINUX_MBR_602_SHA256
+        or _digest(plan.writes[3].data[:440]) != plan.mbr_bootstrap_sha256
         or plan.plan_sha256 != _plan_digest(plan)
     ):
         raise WindowsBiosPbrError("The FAT32 BIOS patch plan is malformed")
@@ -505,16 +583,18 @@ def attest_fat32_bootmgr_pbr(descriptor: int, plan: Fat32BootmgrPbrPlan) -> None
         expected_backup_fsinfo = expected_backup + fsinfo_sector * SECTOR_SIZE
         artifacts = load_boot_code_artifacts()
         expected_vbr = _merged_vbr(plan.writes[2].data, artifacts.stage0)
-        expected_mbr = prepare_syslinux_mbr(
+        expected_mbr, expected_mbr_sha256 = _prepare_windows_mbr(
             plan.writes[3].data,
+            profile=plan.windows_mbr_profile,
             partition_start_sector=plan.volume_offset // SECTOR_SIZE,
             partition_sector_count=plan.volume_size // SECTOR_SIZE,
-        ).mbr
-    except (SyslinuxPatchError, WindowsBiosPbrError) as error:
+        )
+    except WindowsBiosPbrError as error:
         raise WindowsBiosPbrError("The FAT32 BIOS patch plan is malformed") from error
     if (
         (plan.fsinfo_offset, plan.backup_vbr_offset, plan.backup_fsinfo_offset)
         != (expected_fsinfo, expected_backup, expected_backup_fsinfo)
+        or plan.mbr_bootstrap_sha256 != expected_mbr_sha256
         or plan.writes[2].data != expected_vbr
         or plan.writes[3].data != expected_mbr
     ):

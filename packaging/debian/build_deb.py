@@ -38,6 +38,7 @@ cli.py
 conflicts.py
 constructed.py
 data/bootloaders-v2.json
+data/bundled-boot-assets-v1.json
 data/distro-write-policies-v1.json
 data/freedos-images-v1.json
 data/fat32-bootmgr-stage0.hex
@@ -45,6 +46,7 @@ data/fat32-bootmgr-stage2.hex
 data/io.github.codebooker.isopropyl.svg
 data/linux-images-v1.json
 data/microsoft-dbx-authenticode-v1.json
+data/rufus-prompt-mbr-440.bin
 data/windows-images-v2.json
 dbx.py
 descriptor_io.py
@@ -81,6 +83,7 @@ raw_workflow.py
 restore_device_helper.py
 restore_device_runner.py
 restore_workflow.py
+rufus_prompt_mbr.py
 runtime_validation.py
 settings.py
 sources.py
@@ -126,7 +129,12 @@ zip_overlay.py
 LICENSE_FILES = (
     "CERTVALIDATOR-MIT.txt",
     "MICROSOFT-SECUREBOOT-OBJECTS-BSD-2-CLAUSE-PATENT.txt",
+    "RUFUS-GPL-3.0.txt",
     "SYSLINUX-MBR-MIT.txt",
+)
+RUFUS_PROMPT_MBR_SOURCE_FILES = (
+    "res/mbr/mbr.S",
+    "res/mbr/mbr.ld",
 )
 COMPRESSED_DOCUMENTS = (
     ("README.md", "README.md.gz"),
@@ -411,6 +419,21 @@ def _copy_licenses(stage: Path) -> None:
         )
 
 
+def _copy_rufus_prompt_mbr_source(stage: Path) -> None:
+    source_root = ROOT / "third_party/rufus"
+    expected = set(RUFUS_PROMPT_MBR_SOURCE_FILES)
+    actual = {
+        source.relative_to(source_root).as_posix()
+        for source in source_root.rglob("*")
+        if source.is_file()
+    }
+    if actual != expected:
+        raise PackageBuildError("Rufus prompt MBR source allowlist does not match the source tree")
+    destination = stage / "usr/share/doc/isopropyl/sources/rufus-prompt-mbr"
+    for name in RUFUS_PROMPT_MBR_SOURCE_FILES:
+        _copy_regular(source_root / name, destination / name, 0o644)
+
+
 def _write_gzip(source: Path, destination: Path, epoch: int) -> None:
     payload = _read_regular(source)
     _mkdir(destination.parent)
@@ -561,6 +584,7 @@ def build_package(output_directory: Path) -> Path:
             _copy_regular(ROOT / source_name, stage / destination_name, mode)
         _copy_python_package(stage)
         _copy_licenses(stage)
+        _copy_rufus_prompt_mbr_source(stage)
         _write_changelog(stage, epoch)
         _write_compressed_documents(stage, epoch)
         _write_manpages(stage, epoch)

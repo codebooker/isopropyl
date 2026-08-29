@@ -43,7 +43,7 @@ isopropyl-cli = "isopropyl.cli:main"
 include = ["isopropyl*"]
 
 [tool.setuptools.package-data]
-isopropyl = ["data/*.hex", "data/*.json", "data/*.svg"]
+isopropyl = ["data/*.bin", "data/*.hex", "data/*.json", "data/*.svg"]
 
 [tool.setuptools.data-files]
 "share/applications" = ["data/io.github.codebooker.isopropyl.desktop"]

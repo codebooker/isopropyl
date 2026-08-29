@@ -13,7 +13,10 @@ from pathlib import Path
 from unittest import mock
 
 import isopropyl.windows_bios_pbr as windows_bios_pbr
+from isopropyl.rufus_prompt_mbr import RUFUS_PROMPT_MBR_SHA256
+from isopropyl.syslinux import SYSLINUX_MBR_602_SHA256
 from isopropyl.windows_bios_pbr import (
+    DEFAULT_WINDOWS_MBR_PROFILE,
     MODERN_BOOTMGR_ENTRY_STUB,
     MODERN_BOOTMGR_MAX_SIZE,
     MODERN_BOOTMGR_MIN_SIZE,
@@ -22,6 +25,7 @@ from isopropyl.windows_bios_pbr import (
     STAGE_SIZE,
     WindowsBiosPbrError,
     WindowsBootmgrBiosProfile,
+    WindowsMbrProfile,
     attest_fat32_bootmgr_pbr,
     classify_windows_bootmgr_bios,
     load_boot_code_artifacts,
@@ -106,6 +110,54 @@ def apply_plan(descriptor: int, plan) -> None:
 
 
 class WindowsBiosPbrTests(unittest.TestCase):
+    def test_mbr_profiles_are_closed_pinned_and_preserve_metadata_tail(self) -> None:
+        cases = (
+            (
+                WindowsMbrProfile.SYSLINUX_602_DIRECT,
+                SYSLINUX_MBR_602_SHA256,
+            ),
+            (WindowsMbrProfile.RUFUS_PROMPT_V1, RUFUS_PROMPT_MBR_SHA256),
+        )
+        self.assertIs(
+            DEFAULT_WINDOWS_MBR_PROFILE,
+            WindowsMbrProfile.SYSLINUX_602_DIRECT,
+        )
+        for profile, expected_sha256 in cases:
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                descriptor = make_image(Path(directory) / "fat32.img")
+                try:
+                    formatted_mbr = os.pread(descriptor, SECTOR_SIZE, 0)
+                    plan = plan_fat32_bootmgr_pbr(
+                        descriptor,
+                        volume_offset=VOLUME_OFFSET,
+                        volume_size=VOLUME_SIZE,
+                        windows_mbr_profile=profile,
+                    )
+                    self.assertIs(plan.windows_mbr_profile, profile)
+                    self.assertEqual(plan.mbr_bootstrap_sha256, expected_sha256)
+                    self.assertEqual(
+                        windows_bios_pbr._digest(plan.writes[-1].data[:440]),
+                        expected_sha256,
+                    )
+                    self.assertEqual(plan.writes[-1].data[440:], formatted_mbr[440:])
+                    apply_plan(descriptor, plan)
+                    attest_fat32_bootmgr_pbr(descriptor, plan)
+                finally:
+                    os.close(descriptor)
+
+        with tempfile.TemporaryDirectory() as directory:
+            descriptor = make_image(Path(directory) / "fat32.img")
+            try:
+                with self.assertRaisesRegex(WindowsBiosPbrError, "exact Windows MBR"):
+                    plan_fat32_bootmgr_pbr(
+                        descriptor,
+                        volume_offset=VOLUME_OFFSET,
+                        volume_size=VOLUME_SIZE,
+                        windows_mbr_profile="rufus-prompt-v1",  # type: ignore[arg-type]
+                    )
+            finally:
+                os.close(descriptor)
+
     def test_modern_bootmgr_classifier_is_exact_and_bounded(self) -> None:
         self.assertIs(
             classify_windows_bootmgr_bios(
@@ -270,6 +322,18 @@ class WindowsBiosPbrTests(unittest.TestCase):
                 )
                 apply_plan(descriptor, plan)
                 forged = replace(plan, stage_offset=plan.stage_offset + SECTOR_SIZE)
+                forged = replace(
+                    forged,
+                    plan_sha256=windows_bios_pbr._plan_digest(forged),
+                )
+                with self.assertRaisesRegex(WindowsBiosPbrError, "malformed"):
+                    attest_fat32_bootmgr_pbr(descriptor, forged)
+
+                forged = replace(
+                    plan,
+                    windows_mbr_profile=WindowsMbrProfile.RUFUS_PROMPT_V1,
+                    mbr_bootstrap_sha256=RUFUS_PROMPT_MBR_SHA256,
+                )
                 forged = replace(
                     forged,
                     plan_sha256=windows_bios_pbr._plan_digest(forged),
