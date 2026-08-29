@@ -85,6 +85,15 @@
     {
       "family": "grub",
       "version": "2.14",
+      "name": "boot.img",
+      "url": "https://raw.githubusercontent.com/pbatard/rufus/6d8fbf98305ff37eb531c45cbd6ff44563c53917/res/grub2/boot.img",
+      "sha256": "b31c4cf688e8e16ddd177b619c20b049940bab5c675f877a1aa84a15e1e6e2e6",
+      "size": 512,
+      "allowed_hosts": []
+    },
+    {
+      "family": "grub",
+      "version": "2.14",
       "name": "core.img",
       "url": "https://raw.githubusercontent.com/pbatard/rufus-web/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.14/core.img",
       "sha256": "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809",
@@ -251,10 +260,10 @@
     {
       "family": "grub",
       "version": "2.14",
-      "purpose": "blank-bios-core-image",
-      "artifacts": ["core.img"],
+      "purpose": "blank-bios-rescue-media",
+      "artifacts": ["boot.img", "core.img"],
       "license": "GPL-3.0-or-later",
-      "provenance_url": "https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.14"
+      "provenance_url": "https://github.com/pbatard/rufus/tree/6d8fbf98305ff37eb531c45cbd6ff44563c53917/res/grub2"
     },
     {
       "family": "uefi-shell",

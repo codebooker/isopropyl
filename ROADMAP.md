@@ -70,6 +70,15 @@ evidence.
 - Move the reviewed GRUB/Syslinux bundle metadata to project-owned signed
   release manifests and a corresponding-source-compliant artifact service;
   keep exact-match-only immutable preparation.
+- The exact Rufus-style GRUB 2.14 blank rescue backend is implemented. It builds
+  an empty anonymous MBR/FAT32 image, validates the pinned bootstrap/core and
+  diskboot blocklist, writes the core first, preserves a zero embedding gap,
+  activates the bootstrap last, and performs complete post-activation
+  reattestation. A sealed device-free image reaches the intentional
+  `grub rescue>` prompt under isolated QEMU/SeaBIOS. Next, add a distinct typed,
+  target-bound privileged transaction and physical BIOS evidence. Any future
+  normal/menu-mode profile requires a self-contained, matching module closure;
+  never combine the pinned core with host GRUB modules.
 - Certify and package the narrowly scoped Syslinux MBR/FAT installer. The exact ADV,
   extent, checksum, FAT32 VBR merge, descriptor-only FAT mapping, partition
   offset binding, regular-file before/after read-back harness, and exact
@@ -117,10 +126,9 @@ evidence.
   an installed PolicyKit/SCM_RIGHTS VM test,
   OVMF retained-UEFI coverage, hot-swap/failure tests, and physical certification.
   Keep the general BIOS planner blocker and normal GUI exposure intact until those
-  gates pass. GRUB
-  BIOS follows only after
-  its prefix, module set, filesystem, and boot-region layout can be reproduced
-  and verified without executing downloaded code.
+  gates pass. Keep the GRUB rescue backend device-free until a typed helper,
+  confirmation, cancellation/recovery contract, installed-integration tests,
+  and representative physical BIOS evidence pass independently.
 - Do not treat the implemented bounded El Torito FAT parser as an Ubuntu
   persistence solution: official Ubuntu 20.04.6, 22.04.5, and 24.04.4 embedded
   EFI images contain EFI binaries but no recognized text `grub.cfg`, and the

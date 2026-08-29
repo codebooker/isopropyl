@@ -49,7 +49,7 @@ def resource(
 class BootloaderTests(unittest.TestCase):
     def test_bundled_catalog_is_valid_and_network_inactive(self):
         catalog = load_catalog()
-        self.assertEqual(len(catalog.resources), 21)
+        self.assertEqual(len(catalog.resources), 22)
         self.assertEqual(len(catalog.bundles), 10)
         image = catalog.find(
             "uefi-ntfs", "2.8-rufus-2368e49a", "uefi-ntfs.img",
@@ -68,8 +68,47 @@ class BootloaderTests(unittest.TestCase):
         self.assertIsNotNone(syslinux)
         assert syslinux is not None
         self.assertEqual(syslinux.artifact_names, ("ldlinux.bss", "ldlinux.sys"))
-        grub = catalog.find_bundle("grub", "2.14", "blank-bios-core-image")
+        grub = catalog.find_bundle("grub", "2.14", "blank-bios-rescue-media")
         self.assertIsNotNone(grub)
+        assert grub is not None
+        self.assertEqual(grub.artifact_names, ("boot.img", "core.img"))
+        self.assertEqual(grub.license, "GPL-3.0-or-later")
+        self.assertEqual(
+            grub.provenance_url,
+            "https://github.com/pbatard/rufus/tree/"
+            "6d8fbf98305ff37eb531c45cbd6ff44563c53917/res/grub2",
+        )
+        grub_boot = catalog.find("grub", "2.14", "boot.img")
+        self.assertIsNotNone(grub_boot)
+        assert grub_boot is not None
+        self.assertEqual(grub_boot.size, 512)
+        self.assertEqual(
+            grub_boot.sha256,
+            "b31c4cf688e8e16ddd177b619c20b049940bab5c675f877a1aa84a15e1e6e2e6",
+        )
+        self.assertEqual(
+            grub_boot.url,
+            "https://raw.githubusercontent.com/pbatard/rufus/"
+            "6d8fbf98305ff37eb531c45cbd6ff44563c53917/res/grub2/boot.img",
+        )
+        self.assertEqual(grub_boot.allowed_hosts, ("raw.githubusercontent.com",))
+        grub_core = catalog.find("grub", "2.14", "core.img")
+        self.assertIsNotNone(grub_core)
+        assert grub_core is not None
+        self.assertEqual(grub_core.size, 42_742)
+        self.assertEqual(
+            grub_core.sha256,
+            "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809",
+        )
+        self.assertIsNone(
+            catalog.find_bundle("grub", "2.14", "blank-bios-core-image")
+        )
+        self.assertIsNotNone(
+            catalog.find_bundle("grub", "2.06", "blank-bios-core-image")
+        )
+        self.assertIsNotNone(
+            catalog.find_bundle("grub", "2.12", "blank-bios-core-image")
+        )
         self.assertIsNone(bundle_for_dependency("grub:2.14", catalog=catalog))
         shell = catalog.find_bundle("uefi-shell", "26H1", "blank-uefi-shell")
         self.assertIsNotNone(shell)

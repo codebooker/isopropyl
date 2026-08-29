@@ -58,6 +58,7 @@ fast_zero.py
 fat_image.py
 formatting.py
 freedos_downloads.py
+grub_rescue.py
 images.py
 iso.py
 iso_staging.py

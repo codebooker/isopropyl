@@ -220,8 +220,9 @@ issue requesting a private contact channel without disclosing the vulnerability.
   remove native BCD authoring, QEMU/OVMF, or physical-media execution blockers.
   No application, helper, PolicyKit, or device-writing path imports these modules.
 - The boot-artifact catalog contains the release-pinned UEFI:NTFS v2.8 image,
-  dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, and GRUB
-  2.06/2.12/2.14 blank-media research bundles, plus the exact upstream UEFI
+  dormant exact Syslinux `6.03-2014-10-06`/`6.04-pre1` payload sets, dormant
+  GRUB 2.06/2.12 `core.img` entries, and the closed GRUB 2.14 rescue-media
+  `boot.img`/`core.img` bundle, plus the exact upstream UEFI
   Shell 26H1 AA64, IA32, LoongArch64, RISC-V64, and X64 release set and the exact
   six-architecture `uefi-md5sum` v1.2 runtime-validation set. It records
   immutable upstream
@@ -231,8 +232,19 @@ issue requesting a private contact channel without disclosing the vulnerability.
   matching, and no partial return; every cache directory and object is opened
   no-follow, the parent pathname is revalidated against its bound descriptor,
   and every stable singly linked regular file is rehashed and frozen as immutable
-  bytes. GRUB entries never satisfy a detected-image dependency. A pure,
-  non-destructive Syslinux consumer independently re-pins the two enabled
+  bytes. GRUB entries never satisfy a detected-image dependency. The exact 2.14
+  rescue backend independently validates both payload hashes, the 432-byte
+  bootstrap hash and fields, and the core diskboot blocklist. It accepts only a
+  canonical empty anonymous MBR/FAT32 image, writes and read-back verifies the
+  core first, proves the remainder of the embedding gap is zero, activates the
+  MBR bootstrap last while preserving its metadata tail, and then revalidates
+  the empty FAT tree and hashes the entire image. Cancellation requested during
+  final attestation is honored before the image becomes streamable. Because the
+  pinned core has no `normal.mod`, menu, or configuration, successful boot is
+  intentionally limited to `grub rescue>`. The opt-in certificate passes only a
+  sealed read-only descriptor to networkless snapshot QEMU inside fresh user
+  and network namespaces. No GUI, helper, or physical-device caller consumes
+  this profile. A pure, non-destructive Syslinux consumer independently re-pins the two enabled
   payload pairs. A backend-only private-tree planner consumes caller-bound bytes
   as inert data, but no production BIOS executor or GUI path consumes them. The
   UEFI Shell backend independently

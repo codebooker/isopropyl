@@ -317,21 +317,50 @@ under their GPL-3.0-or-later option, which is compatible with
 AGPL-3.0-or-later through GPLv3/AGPLv3 section 13. Each covered component retains
 its license, and the AGPL network-source requirements apply to the combination.
 
-## GRUB BIOS core-image bundles
+## GRUB BIOS rescue-media bundles
 
-- Cataloged builds: GRUB 2.06, 2.12, and 2.14 `core.img`
-- Immutable catalog snapshot: Rufus web commit
-  [`e6e2182d`](https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files)
-- Build provenance and module/prefix details:
-  [2.06](https://github.com/pbatard/rufus-web/blob/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.06/readme.txt),
-  [2.12](https://github.com/pbatard/rufus-web/blob/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.12/readme.txt), and
-  [2.14](https://github.com/pbatard/rufus-web/blob/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files/grub-2.14/readme.txt)
-- Upstream release archives: [GNU GRUB](https://ftp.gnu.org/gnu/grub/). The
-  cataloged files were assembled by Rufus with the module/prefix choices in the
-  pinned readmes; ISOpropyl does not yet host a reproducible, project-owned
-  corresponding-source build for those exact bytes.
-- License: GPL-3.0-or-later
+The dormant GRUB 2.06 and 2.12 catalog entries contain only `core.img` from the
+immutable Rufus web snapshot
+[`e6e2182d`](https://github.com/pbatard/rufus-web/tree/e6e2182d325ae95ac15166ea2ee750cebccff3c1/files).
+They have no media consumer. The separately closed GRUB 2.14 rescue bundle is:
+
+- Rufus v4.15 source snapshot
+  [`6d8fbf98`](https://github.com/pbatard/rufus/tree/6d8fbf98305ff37eb531c45cbd6ff44563c53917/res/grub2),
+  including its exact [build notes](https://github.com/pbatard/rufus/blob/6d8fbf98305ff37eb531c45cbd6ff44563c53917/res/grub2/readme.txt);
+- `boot.img`: 512 bytes, SHA-256
+  `b31c4cf688e8e16ddd177b619c20b049940bab5c675f877a1aa84a15e1e6e2e6`;
+  only its first 432 bytes are applied to the generated MBR, with SHA-256
+  `82d8879ed51b42cab56ad071eb3b0d28d60cd83d57f24fe788014a639940e41e`;
+- `core.img`: 42,742 bytes, SHA-256
+  `9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809`;
+- license: GPL-3.0-or-later.
+
+Rufus built those files from the 7,725,668-byte GNU
+[GRUB 2.14 archive](https://ftp.gnu.org/gnu/grub/grub-2.14.tar.xz), SHA-256
+`bc8d3c73535b8838d8c8e2654d73edc4e6ae8c8acdb45d5df5dc9a1547446d43`,
+after applying Gentoo's 3,227-byte
+[`grub-2.14-revert-image-base.patch`](https://github.com/gentoo/gentoo/blob/d51cbeb087dbbe979ff29af645f32071cce2834d/sys-boot/grub/files/grub-2.14-revert-image-base.patch),
+SHA-256 `45b16e651279ba3839bac0401bd8da34231913605342a29ecdd71df2e34c814e`.
+The fixed recipe uses the prefix `(hd0,msdos1)/boot/grub` and embeds `biosdisk`,
+`fat`, `exfat`, `ext2`, `ntfs`, `ntfscomp`, and `part_msdos`. Rufus also NOPs
+the drive-check jump at boot-image offsets `0x66..0x67`, as documented in its
+build notes. ISOpropyl validates those fields, the core diskboot blocklist, both
+complete artifact hashes, and the 432-byte bootstrap hash. It never invokes a
+host `grub-install` or `grub-mkimage`.
+
+The backend composes these downloaded bytes only into a private anonymous
+512-byte-sector MBR/FAT32 image: the exact core starts at byte 512, the remaining
+embedding gap stays zero, and the exact bootstrap is activated last while the
+disk signature and partition table are preserved. The filesystem is deliberately
+empty. Because this build does not embed or install `normal.mod`, a successful
+boot intentionally stops at `grub rescue>`; it has no menu, configuration,
+kernel, or operating system. No ordinary GUI or physical-device transaction can
+consume this profile yet. The source-tree certification harness is the only
+current caller that requests the bundle, and does so only after `--run` consent.
 
 These images are not generic replacements for a distribution's GRUB build.
-ISOpropyl never truncates an exact downstream build identifier to make a catalog
-entry fit, and does not yet write these payloads to media.
+ISOpropyl never mixes them with host modules or truncates a downstream build
+identifier. The source archive, exact patch, transformation notes, and build
+recipe above provide corresponding-source provenance, but ISOpropyl has not
+independently reproduced the cataloged objects byte-for-byte with a frozen
+toolchain and does not claim that it has.

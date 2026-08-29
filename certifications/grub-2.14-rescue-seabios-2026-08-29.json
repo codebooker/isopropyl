@@ -1,0 +1,126 @@
+{
+  "bootloader_bundle": {
+    "artifacts": [
+      {
+        "name": "boot.img",
+        "sha256": "b31c4cf688e8e16ddd177b619c20b049940bab5c675f877a1aa84a15e1e6e2e6",
+        "size": 512
+      },
+      {
+        "name": "core.img",
+        "sha256": "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809",
+        "size": 42742
+      }
+    ],
+    "family": "grub",
+    "license": "GPL-3.0-or-later",
+    "provenance_url": "https://github.com/pbatard/rufus/tree/6d8fbf98305ff37eb531c45cbd6ff44563c53917/res/grub2",
+    "purpose": "blank-bios-rescue-media",
+    "version": "2.14"
+  },
+  "capture": {
+    "elapsed_seconds": 0.392,
+    "method": "qemu-curses-private-pty-80x25-screen",
+    "terminal_stream_bytes": 672
+  },
+  "certified": true,
+  "construction": {
+    "boot_image_sha256": "b31c4cf688e8e16ddd177b619c20b049940bab5c675f877a1aa84a15e1e6e2e6",
+    "bootstrap_sha256": "82d8879ed51b42cab56ad071eb3b0d28d60cd83d57f24fe788014a639940e41e",
+    "build_workspace_initially_empty": true,
+    "bytes_verified": 0,
+    "core_offset": 512,
+    "core_padded_size": 43008,
+    "core_sha256": "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809",
+    "core_size": 42742,
+    "directories_verified": 0,
+    "embedding_gap_zero_verified": true,
+    "files_verified": 0,
+    "final_fat_manifest_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "final_image_sha256": "beb69ff08141f110f04794c83ae3a97700289bb848815aab3ce2586a2145cdca",
+    "final_mbr_sha256": "5ac2995f153979781809d542738a9eb8bcf5f5da81401334de8a986e76651671",
+    "plan_sha256": "f811fe914f3938012d5ca214d68ea2a987481c34eb8163ff2922b44661c55283",
+    "private_plan_sha256": "68e9373d985c725e1d9f296dd273530cd7170577a945e5a8e47e0fd3f27b108c",
+    "production_builder": "GrubRescueBuilder.execute",
+    "production_planner": "build_grub_rescue_plan",
+    "staging_root_initially_empty": true,
+    "unpatched_image_sha256": "4dbf29e669d9e7a88041a9f6a0ebf915b1b562fb73ed1987771f054eb595272e"
+  },
+  "isolation": {
+    "acceleration": "tcg",
+    "attached_host_block_devices": [],
+    "firmware": "SeaBIOS",
+    "guest_network": "none",
+    "namespace_executable_set_id": false,
+    "network_namespace": "new-empty-namespace",
+    "qemu_executable_set_id": false,
+    "qemu_seccomp": true,
+    "qemu_seccomp_policy": "on,obsolete=deny,spawn=deny,resourcecontrol=deny",
+    "snapshot": true,
+    "source_read_only": true,
+    "source_sealed_memfd": true,
+    "unprivileged_process": true,
+    "user_namespace": true
+  },
+  "layout": {
+    "disk_signature": 3270609993,
+    "filesystem": "FAT32",
+    "filesystem_content_bytes": 0,
+    "filesystem_file_count": 0,
+    "partition_1_active": true,
+    "partition_1_sectors": 70000,
+    "partition_1_start_sector": 2048,
+    "partition_1_type": "0x0c-fat32-lba",
+    "partition_count": 1,
+    "partition_table": "MBR",
+    "sector_size": 512,
+    "volume_id": 563472166
+  },
+  "markers": [
+    "Booting from Hard Disk...",
+    "Welcome to GRUB!",
+    "Entering rescue mode...",
+    "grub rescue>"
+  ],
+  "namespace_tool": {
+    "arguments": [
+      "--user",
+      "--map-current-user",
+      "--net",
+      "--"
+    ],
+    "executable": "/usr/bin/unshare",
+    "sha256": "978a4aec5a404ad0a05faac981df501d4b7eb0c5a3ad9c1a7b929a0bfd84f6c8"
+  },
+  "prepared_image": {
+    "descriptor_access": "read-only",
+    "sealed_memfd": true,
+    "sha256": "beb69ff08141f110f04794c83ae3a97700289bb848815aab3ce2586a2145cdca",
+    "size": 36888576
+  },
+  "profile": "io.github.codebooker.isopropyl/grub-2.14-bios-rescue/v1",
+  "provenance": {
+    "catalog_bundle_hashes_verified": true,
+    "source_reproduction_note": "This run verifies the exact pinned catalog bytes; it does not rebuild GRUB 2.14 from upstream source.",
+    "source_reproduction_verified": false
+  },
+  "qemu": {
+    "executable": "/usr/bin/qemu-system-x86_64",
+    "sha256": "0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc",
+    "version": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)"
+  },
+  "result_semantics": "intentional-rescue-prompt",
+  "schema_version": 1,
+  "scope": {
+    "bios_first_stage_core_and_rescue_prompt_certified": true,
+    "grub_version": "2.14",
+    "intentional_rescue_prompt_certified": true,
+    "kernel_or_operating_system_certified": false,
+    "normal_mode_or_menu_certified": false,
+    "physical_media_certified": false,
+    "privileged_device_transaction_certified": false,
+    "secure_boot_certified": false,
+    "source_reproduction_verified": false,
+    "uefi_certified": false
+  }
+}

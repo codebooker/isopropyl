@@ -164,6 +164,7 @@ _BUNDLE_ARTIFACTS = {
     ("syslinux", "matched-bios-payloads"): ("ldlinux.bss", "ldlinux.sys"),
     ("syslinux", "blank-bios-module"): ("ldlinux.c32",),
     ("grub", "blank-bios-core-image"): ("core.img",),
+    ("grub", "blank-bios-rescue-media"): ("boot.img", "core.img"),
 }
 
 

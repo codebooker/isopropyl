@@ -54,6 +54,7 @@ identity, and require an explicit confirmation.
 | **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and a second typed warning for fixed USB disks or risky image profiles. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
 | **Syslinux BIOS developer preview** | For exact supported Syslinux 6.03/6.04 images, an explicit environment-gated preview can add a legacy-BIOS path while retaining the source UEFI files. It uses hash-pinned payloads, a target-bound typed confirmation, MBR-last activation, and mandatory full-device SHA-256 read-back. The normal GUI keeps it hidden pending a native hardened helper and physical-media certification. |
+| **GRUB 2.14 rescue-media backend** | Reproduces Rufus's exact blank BIOS rescue profile in a private anonymous MBR/FAT32 image. It validates the pinned `boot.img` and `core.img`, writes the core at byte 512, proves the embedding gap remains zero, activates the 432-byte bootstrap last, and reattests the complete image. A sealed copy has reached the intentional `grub rescue>` prompt under isolated QEMU/SeaBIOS. This backend does not contain a menu, configuration, `normal.mod`, kernel, or operating system, and no GUI or physical-device transaction exposes it yet. |
 | **Windows BIOS + UEFI developer preview** | `ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL=1` admits only the strict x64 Windows Boot Manager FAT32/active-MBR profile. It stages and witnesses the complete tree, can add ISOpropyl's exact regenerated `autounattend.xml`, splits the sole conventional oversized `install.wim`, builds an anonymous full-device image with the project-authored BIOS loader, and uses a separate typed, target-bound PolicyKit transaction with MBR-last activation and mandatory full SHA-256 read-back. The final confirmation names each selected customization and the answer-file digest. There is no formatter/mount or generic-writer fallback. An uncustomized Windows 11 image has reached Setup under both KVM/SeaBIOS and non-Secure-Boot OVMF; physical-media and customized-install certification remain release gates. |
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, can generate a reviewed `autounattend.xml`, and offers a narrowly profiled Windows 2023-generation installer-boot update for exact supported Microsoft media. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
@@ -565,6 +566,23 @@ privileged device transaction, or physical media. The real integration test is
 explicitly opt-in rather than part of the device-free default suite. A locally
 reproduced observation is retained as
 [`certifications/syslinux-6.03-seabios-2026-08-28.json`](https://github.com/codebooker/isopropyl/blob/main/certifications/syslinux-6.03-seabios-2026-08-28.json).
+
+The exact GRUB 2.14 blank rescue-media backend has a separate source-tree
+certificate:
+
+```bash
+python3 tools/certify_grub_rescue_boot.py --run
+```
+
+The run requires Linux memfd sealing, `unshare`, and
+`qemu-system-x86_64`. Bundle preparation may fetch only the catalog-pinned
+artifacts; the boot phase receives a fully sealed, read-only descriptor inside
+fresh user and network namespaces, uses QEMU snapshot mode, and exposes no
+guest NIC. Success requires the ordered SeaBIOS and GRUB rescue markers. It
+certifies only the exact empty BIOS rescue image—not normal/menu mode, an
+operating system, UEFI, Secure Boot, the privileged device transaction, or
+physical media. A locally reproduced observation is retained as
+[`certifications/grub-2.14-rescue-seabios-2026-08-29.json`](https://github.com/codebooker/isopropyl/blob/main/certifications/grub-2.14-rescue-seabios-2026-08-29.json).
 
 The experimental Windows dual-firmware pipeline has a separate opt-in harness:
 

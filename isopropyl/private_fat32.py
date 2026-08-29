@@ -69,6 +69,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GENERIC_PLAN_WITNESS = object()
 _SYSLINUX_PLAN_WITNESS = object()
 _WINDOWS_PLAN_WITNESS = object()
+_GRUB_RESCUE_PLAN_WITNESS = object()
 _IMAGE_WITNESS = object()
 _SHORT_ALLOWED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$%'-_@~`!(){}^#&"
@@ -102,6 +103,7 @@ class PrivateFat32BuildProfile(str, Enum):
     GENERIC = "generic-v1"
     SYSLINUX = "syslinux-v1"
     WINDOWS_BOOTMGR = "windows-bootmgr-v1"
+    GRUB_RESCUE = "grub-rescue-v1"
 
 
 @dataclass(frozen=True)
@@ -911,6 +913,8 @@ def _build_profiled_private_fat32_plan(
             if profile is PrivateFat32BuildProfile.SYSLINUX
             else _WINDOWS_PLAN_WITNESS
             if profile is PrivateFat32BuildProfile.WINDOWS_BOOTMGR
+            else _GRUB_RESCUE_PLAN_WITNESS
+            if profile is PrivateFat32BuildProfile.GRUB_RESCUE
             else _GENERIC_PLAN_WITNESS
         ),
     )
@@ -977,6 +981,28 @@ def build_windows_private_fat32_plan(
     )
 
 
+def build_grub_rescue_private_fat32_plan(
+    staging_root: Path | str,
+    workspace: Path | str,
+    *,
+    image_size: int,
+    cancel_check: CancelCheck | None = None,
+) -> PrivateFat32Plan:
+    """Plan an empty GRUB rescue image that cannot be consumed pre-patch."""
+
+    plan = _build_profiled_private_fat32_plan(
+        staging_root,
+        workspace,
+        image_size=image_size,
+        profile=PrivateFat32BuildProfile.GRUB_RESCUE,
+        expected_root_ldlinux=None,
+        cancel_check=cancel_check,
+    )
+    if len(plan.directories) != 1 or plan.directories[0].source.parts or plan.files:
+        raise PrivateFat32Error("The GRUB rescue FAT32 tree must be empty")
+    return plan
+
+
 def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
     if type(plan) is not PrivateFat32Plan:
         raise PrivateFat32Error("An authentic private FAT32 plan is required")
@@ -985,6 +1011,8 @@ def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
         if plan.profile is PrivateFat32BuildProfile.SYSLINUX
         else _WINDOWS_PLAN_WITNESS
         if plan.profile is PrivateFat32BuildProfile.WINDOWS_BOOTMGR
+        else _GRUB_RESCUE_PLAN_WITNESS
+        if plan.profile is PrivateFat32BuildProfile.GRUB_RESCUE
         else _GENERIC_PLAN_WITNESS
         if plan.profile is PrivateFat32BuildProfile.GENERIC
         else None
@@ -1027,6 +1055,7 @@ def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
     if plan.profile in {
         PrivateFat32BuildProfile.GENERIC,
         PrivateFat32BuildProfile.WINDOWS_BOOTMGR,
+        PrivateFat32BuildProfile.GRUB_RESCUE,
     }:
         if plan.root_ldlinux_size is not None or plan.root_ldlinux_sha256 is not None:
             raise PrivateFat32Error("The FAT32 profile carries unexpected Syslinux state")
@@ -1037,6 +1066,16 @@ def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
         or _SHA256.fullmatch(plan.root_ldlinux_sha256) is None
     ):
         raise PrivateFat32Error("The Syslinux FAT32 profile lacks its root loader")
+    if (
+        plan.profile is PrivateFat32BuildProfile.GRUB_RESCUE
+        and (
+            len(plan.directories) != 1
+            or plan.directories[0].source.parts
+            or plan.files
+            or plan.total_content_bytes != 0
+        )
+    ):
+        raise PrivateFat32Error("The GRUB rescue FAT32 plan is not empty")
     if plan.geometry != _geometry(plan.geometry.image_size):
         raise PrivateFat32Error("The private FAT32 geometry is not canonical")
     sources_directories = tuple(item.source for item in plan.directories)
@@ -1544,6 +1583,9 @@ class AnonymousFat32Image:
     def _begin_windows_patch(self) -> int:
         return self._begin_profile_patch(PrivateFat32BuildProfile.WINDOWS_BOOTMGR)
 
+    def _begin_grub_rescue_patch(self) -> int:
+        return self._begin_profile_patch(PrivateFat32BuildProfile.GRUB_RESCUE)
+
     def _commit_windows_patch(
         self,
         inspection: RegularFat32Image,
@@ -1557,6 +1599,23 @@ class AnonymousFat32Image:
             or _SHA256.fullmatch(image_sha256) is None
         ):
             raise PrivateFat32Error("The patched Windows FAT32 result is invalid")
+        self._inspection = inspection
+        self._patched_image_sha256 = image_sha256
+        self._state = PrivateFat32State.PATCHED_ATTESTED
+
+    def _commit_grub_rescue_patch(
+        self,
+        inspection: RegularFat32Image,
+        image_sha256: str,
+    ) -> None:
+        if (
+            self._state is not PrivateFat32State.PATCHING
+            or self._plan.profile is not PrivateFat32BuildProfile.GRUB_RESCUE
+            or type(inspection) is not RegularFat32Image
+            or type(image_sha256) is not str
+            or _SHA256.fullmatch(image_sha256) is None
+        ):
+            raise PrivateFat32Error("The patched GRUB rescue FAT32 result is invalid")
         self._inspection = inspection
         self._patched_image_sha256 = image_sha256
         self._state = PrivateFat32State.PATCHED_ATTESTED
@@ -1627,6 +1686,7 @@ class AnonymousFat32Image:
                         if self._plan.profile in {
                             PrivateFat32BuildProfile.SYSLINUX,
                             PrivateFat32BuildProfile.WINDOWS_BOOTMGR,
+                            PrivateFat32BuildProfile.GRUB_RESCUE,
                         }
                         else "Only a generic attested image can be consumed"
                     ),
