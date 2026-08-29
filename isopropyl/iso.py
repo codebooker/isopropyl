@@ -53,6 +53,7 @@ class FileSystem(str, Enum):
 class BootStrategy(str, Enum):
     IMAGE_NATIVE = "image-native"
     UEFI_NTFS = "uefi-ntfs"
+    WINDOWS_BOOTMGR_FAT32 = "windows-bootmgr-fat32"
 
 
 class EntryKind(str, Enum):
@@ -69,6 +70,7 @@ class EntryKind(str, Enum):
 class RequirementSource(str, Enum):
     SYSTEM = "system"
     IMAGE = "image"
+    BUNDLED = "bundled"
     SYSTEM_OR_VERIFIED_DOWNLOAD = "system-or-verified-download"
     VERIFIED_DOWNLOAD = "verified-download"
 
@@ -142,6 +144,7 @@ class TargetLayout:
     bios_bootable: bool
     uefi_bootable: bool
     boot_strategy: BootStrategy = BootStrategy.IMAGE_NATIVE
+    main_partition_active: bool = False
 
     @property
     def uses_uefi_ntfs(self) -> bool:
@@ -207,6 +210,85 @@ def _is_install_wim_path(path: str) -> bool:
         and parts[-1].casefold() == "install.wim"
         and parts[-2].casefold() == "sources"
     )
+
+
+_WINDOWS_DUAL_REQUIRED_FILES = (
+    "bootmgr",
+    "boot/bcd",
+    "efi/boot/bootx64.efi",
+)
+
+
+def _validate_windows_dual_fat32_profile(
+    inspection: ImageInspection,
+    entries: tuple[ArchiveEntry, ...],
+    non_wim_oversized: tuple[ArchiveEntry, ...],
+) -> None:
+    """Admit one exact planning-only x64 Windows BIOS+UEFI profile."""
+
+    if inspection.contents_scanned is not True or not entries:
+        raise PlanError(
+            "The Windows BIOS+UEFI profile requires a complete validated ISO catalog"
+        )
+    if not inspection.has_windows_installer:
+        raise PlanError(
+            "The BIOS+UEFI profile is limited to a detected Windows installer"
+        )
+    if (
+        inspection.bootloader != "Windows Boot Manager"
+        or inspection.bootloader_identity_ambiguous
+    ):
+        raise PlanError(
+            "The BIOS+UEFI profile requires an unambiguous Windows Boot Manager"
+        )
+    if inspection.architectures != ("x64",):
+        raise PlanError(
+            "The Windows BIOS+UEFI profile supports only one detected x64 UEFI architecture"
+        )
+    if not inspection.uefi_analysis_complete:
+        raise PlanError(
+            "The Windows BIOS+UEFI profile requires complete UEFI payload analysis"
+        )
+    if any(
+        entry.kind in {EntryKind.SYMLINK, EntryKind.HARDLINK}
+        for entry in entries
+    ):
+        raise PlanError(
+            "The Windows BIOS+UEFI profile does not admit symbolic or hard links"
+        )
+
+    by_path = {entry.path.casefold(): entry for entry in entries}
+    for required in _WINDOWS_DUAL_REQUIRED_FILES:
+        entry = by_path.get(required)
+        if entry is None:
+            raise PlanError(
+                f"The Windows BIOS+UEFI profile requires {required!r}"
+            )
+        if entry.kind is not EntryKind.FILE or entry.size <= 0:
+            raise PlanError(
+                f"The Windows BIOS+UEFI profile requires {required!r} "
+                "to be one non-empty regular file"
+            )
+
+    fallback_payloads = tuple(
+        payload for payload in inspection.uefi_payloads
+        if payload.source_kind == "iso-member"
+        if payload.target_path.casefold() == "efi/boot/bootx64.efi"
+    )
+    if (
+        len(fallback_payloads) != 1
+        or fallback_payloads[0].architecture != "x64"
+        or not fallback_payloads[0].is_uefi_image
+    ):
+        raise PlanError(
+            "The Windows BIOS+UEFI profile requires one structurally valid x64 "
+            "EFI/BOOT/BOOTX64.EFI application"
+        )
+    if non_wim_oversized:
+        raise PlanError(
+            "The Windows BIOS+UEFI FAT32 profile cannot hold unsplittable file "
+            f"{non_wim_oversized[0].path!r}"
+        )
 
 
 def _portable_component(component: str, member: str) -> str:
@@ -634,12 +716,21 @@ def _boot_requirements(
             RequirementSource.IMAGE,
             "Preserve the Windows BIOS boot files supplied by the ISO.",
         ))
-        requirements.append(_requirement(
-            "windows-bios-boot-code", ("ms-sys", "bootsect.exe"),
-            RequirementSource.SYSTEM_OR_VERIFIED_DOWNLOAD,
-            "Install compatible Windows MBR and partition boot-record code.",
-            "match-windows-generation",
-        ))
+        if layout.boot_strategy is BootStrategy.WINDOWS_BOOTMGR_FAT32:
+            requirements.append(_requirement(
+                "isopropyl-windows-bios-loader",
+                ("pinned-project-stage0", "pinned-project-stage2"),
+                RequirementSource.BUNDLED,
+                "Use ISOpropyl's digest-pinned project-authored FAT32 BIOS loader.",
+                "project-source-reproducible-v1",
+            ))
+        else:
+            requirements.append(_requirement(
+                "windows-bios-boot-code", ("ms-sys", "bootsect.exe"),
+                RequirementSource.SYSTEM_OR_VERIFIED_DOWNLOAD,
+                "Install compatible Windows MBR and partition boot-record code.",
+                "match-windows-generation",
+            ))
     elif layout.bios_bootable:
         requirements.append(_requirement(
             "supported-bios-installer", ("grub-install", "syslinux"),
@@ -785,6 +876,14 @@ def build_write_plan(
     )
     non_wim_oversized = tuple(entry for entry in oversized if entry not in large_wims)
 
+    if firmware_target is FirmwareTarget.BOTH:
+        if requested_filesystem not in {None, FileSystem.FAT32}:
+            raise PlanError("The Windows BIOS+UEFI profile requires FAT32")
+        validate_portable_fat_entries(supplied_entries)
+        _validate_windows_dual_fat32_profile(
+            inspection, safe_entries, non_wim_oversized,
+        )
+
     transformations: list[Transformation] = []
     if requested_filesystem is FileSystem.FAT32 and non_wim_oversized:
         blocked = non_wim_oversized[0]
@@ -829,7 +928,16 @@ def build_write_plan(
         bios_bootable=bios,
         uefi_bootable=uefi,
         boot_strategy=(
-            BootStrategy.UEFI_NTFS if uefi_ntfs else BootStrategy.IMAGE_NATIVE
+            BootStrategy.WINDOWS_BOOTMGR_FAT32
+            if firmware_target is FirmwareTarget.BOTH
+            else BootStrategy.UEFI_NTFS
+            if uefi_ntfs
+            else BootStrategy.IMAGE_NATIVE
+        ),
+        main_partition_active=(
+            firmware_target is FirmwareTarget.BOTH
+            and bios
+            and partition_table is PartitionTable.MBR
         ),
     )
 

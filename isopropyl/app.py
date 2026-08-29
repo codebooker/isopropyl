@@ -79,14 +79,15 @@ from .images import (
     compare_expected_checksum, inspect_image,
 )
 from .iso import (
-    AdditiveOverlayMerge, ArchiveEntry, BootStrategy, EntryKind, FirmwareTarget,
+    AdditiveOverlayMerge, ArchiveEntry, BootStrategy, EntryKind, FileSystem,
+    FirmwareTarget,
     WriteMode, WritePlan, WriteMethodRecommendation, build_write_plan,
     merge_additive_embedded_entries, merge_additive_overlay_entries,
     partition_sector_mismatch,
     partition_sector_unverified, recommend_write_method,
 )
 from .iso_staging import (
-    IsoStagingCancelled, IsoStagingExecutor, IsoStagingPlan,
+    IsoStagingCancelled, IsoStagingExecutor, IsoStagingPlan, IsoStagingResult,
     build_iso_staging_plan,
 )
 from .logging_setup import read_log, setup_logging
@@ -167,12 +168,27 @@ from .windows_bootex import (
     WindowsBootExOptions,
     available_bootex_profiles,
 )
+from .windows_device import (
+    WindowsDevicePlanError, WindowsDeviceWritePlan,
+    build_windows_device_write_plan, confirm_windows_device_write,
+)
+from .windows_device_runner import (
+    WindowsDeviceHelperUnavailable, WindowsDeviceWriteResult,
+    WindowsDeviceWriteRunner,
+    resolve_windows_helper_installation,
+)
+from .windows_iso_fat32 import (
+    build_windows_iso_fat32_plan,
+)
 from .zip_overlay import (
     ZipOverlayPlan, build_zip_overlay_plan,
 )
 
 
 FAST_ZERO_MODE = "fast-zero"
+WINDOWS_DUAL_TRANSITIONAL_BLOCKER = (
+    "BIOS construction is not enabled; choose UEFI-only or use DD mode."
+)
 
 
 class BackgroundPreparation:
@@ -202,6 +218,7 @@ class PendingIsoWrite:
     persistence_bytes: int = 0
     runtime_validation: PreparedRuntimeValidation | None = None
     syslinux_enabled: bool = False
+    windows_dual_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -209,6 +226,13 @@ class PreparedSyslinuxWrite:
     pending: PendingIsoWrite
     workflow: SyslinuxWriteWorkflow
     plan: SyslinuxDeviceWritePlan
+
+
+@dataclass(frozen=True)
+class PreparedWindowsDualWrite:
+    pending: PendingIsoWrite
+    runner: WindowsDeviceWriteRunner
+    plan: WindowsDeviceWritePlan
 
 
 @dataclass
@@ -264,6 +288,7 @@ class IsoStagingPreparationRequest:
     )
     runtime_validation_requested: bool = False
     syslinux_dependency_key: str | None = None
+    windows_dual_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -336,6 +361,8 @@ class Bridge(QObject):
     iso_staging_preparation_finished = pyqtSignal(object, object)
     syslinux_preparation_finished = pyqtSignal(object, object)
     syslinux_execution_finished = pyqtSignal(object, object)
+    windows_dual_preparation_finished = pyqtSignal(object, object)
+    windows_dual_execution_finished = pyqtSignal(object, object)
     staged_dbx_confirmation_requested = pyqtSignal(object)
     status_changed = pyqtSignal(str)
     media_progress = pyqtSignal(object)
@@ -406,6 +433,9 @@ class Window(QMainWindow):
         self.iso_stager: IsoStagingExecutor | None = None
         self.syslinux_workflow: SyslinuxWriteWorkflow | None = None
         self.syslinux_confirmation_dialog: QDialog | None = None
+        self.windows_device_runner: WindowsDeviceWriteRunner | None = None
+        self.windows_dual_confirmation_dialog: QDialog | None = None
+        self.prepared_windows_dual: PreparedWindowsDualWrite | None = None
         self.windows_wim_extractor: SafeIsoExtractor | None = None
         self.constructed_writer: ConstructedMediaExecutor | None = None
         self.uefi_ntfs_writer: UefiNtfsExecutor | None = None
@@ -456,6 +486,12 @@ class Window(QMainWindow):
         )
         self.bridge.syslinux_execution_finished.connect(
             self.on_syslinux_execution_finished
+        )
+        self.bridge.windows_dual_preparation_finished.connect(
+            self.on_windows_dual_preparation_finished
+        )
+        self.bridge.windows_dual_execution_finished.connect(
+            self.on_windows_dual_execution_finished
         )
         self.bridge.staged_dbx_confirmation_requested.connect(
             self.on_staged_dbx_confirmation_requested
@@ -2540,7 +2576,7 @@ class Window(QMainWindow):
         previous = self.selected_write_mode() if preserve_selection else None
         device = self.selected_device()
         try:
-            recommendation = recommend_write_method(
+            recommendation = self.recommend_write_method(
                 inspection,
                 self.effective_archive_entries(),
                 target_size=device.size if device is not None else None,
@@ -2579,7 +2615,16 @@ class Window(QMainWindow):
                 if inspection.virtual_format else
                 "DD mode — exact byte-for-byte copy"
             ),
-            WriteMode.EXTRACTED_ISO: "ISO mode — filesystem-aware, UEFI-only",
+            WriteMode.EXTRACTED_ISO: (
+                "ISO mode — Windows BIOS + UEFI (experimental)"
+                if (
+                    recommendation.iso_plan is not None
+                    and self.is_experimental_windows_dual_plan(
+                        recommendation.iso_plan
+                    )
+                )
+                else "ISO mode — filesystem-aware, UEFI-only"
+            ),
         }
         self.write_method.blockSignals(True)
         self.write_method.clear()
@@ -2616,14 +2661,104 @@ class Window(QMainWindow):
         self.write_method_reason.setText(detail)
         self.on_write_method_changed()
 
+    @staticmethod
+    def experimental_windows_dual_gui_enabled() -> bool:
+        """Require a conspicuous per-process opt-in until physical certification."""
+
+        return os.environ.get("ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL") == "1"
+
+    @classmethod
+    def is_experimental_windows_dual_plan(cls, plan: object) -> bool:
+        if type(plan) is not WritePlan or not cls.experimental_windows_dual_gui_enabled():
+            return False
+        layout = plan.layout
+        return bool(
+            plan.mode is WriteMode.EXTRACTED_ISO
+            and plan.firmware_target is FirmwareTarget.BOTH
+            and layout is not None
+            and layout.boot_strategy is BootStrategy.WINDOWS_BOOTMGR_FAT32
+            and layout.main_filesystem.value == "fat32"
+            and layout.partition_table.value == "mbr"
+            and layout.partition_count == 1
+            and layout.boot_partition_filesystem is None
+            and layout.bios_bootable
+            and layout.uefi_bootable
+            and layout.main_partition_active
+            and plan.content_constraints_checked
+            and plan.blockers == (WINDOWS_DUAL_TRANSITIONAL_BLOCKER,)
+        )
+
+    def recommend_write_method(
+        self,
+        inspection: ImageInspection,
+        entries: tuple[ArchiveEntry, ...],
+        *,
+        target_size: int | None,
+        target_logical_sector_size: int | None,
+    ) -> WriteMethodRecommendation:
+        """Overlay only the exact developer Windows profile on the safe default."""
+
+        recommendation = recommend_write_method(
+            inspection,
+            entries,
+            target_size=target_size,
+            target_logical_sector_size=target_logical_sector_size,
+        )
+        if not self.experimental_windows_dual_gui_enabled():
+            return recommendation
+        if (
+            target_size is not None
+            and target_logical_sector_size != 512
+        ):
+            return recommendation
+        try:
+            dual = build_write_plan(
+                inspection,
+                entries,
+                requested_mode=WriteMode.EXTRACTED_ISO,
+                requested_filesystem=FileSystem.FAT32,
+                firmware_target=FirmwareTarget.BOTH,
+                target_size=target_size,
+                target_logical_sector_size=target_logical_sector_size,
+            )
+        except ValueError:
+            return recommendation
+        if not self.is_experimental_windows_dual_plan(dual):
+            return recommendation
+        available = tuple(dict.fromkeys(
+            (*recommendation.available_modes, WriteMode.EXTRACTED_ISO)
+        ))
+        return replace(
+            recommendation,
+            available_modes=available,
+            recommended_mode=WriteMode.EXTRACTED_ISO,
+            reason=(
+                "Developer opt-in: the exact Windows x64 FAT32 profile will build "
+                "BIOS + UEFI media through the anonymous, descriptor-only writer. "
+                "VM and physical-media certification are still outstanding."
+            ),
+            iso_plan=dual,
+            iso_unavailable_reason="",
+        )
+
     def on_device_changed(self) -> None:
         self.rebuild_write_recommendation()
         self.update_ready()
 
     def on_write_method_changed(self) -> None:
         mode = self.selected_write_mode()
+        selected_plan = None
+        if self.write_recommendation is not None:
+            selected_plan = (
+                self.write_recommendation.iso_plan
+                if mode is WriteMode.EXTRACTED_ISO else
+                self.write_recommendation.dd_plan
+                if mode is WriteMode.DD else None
+            )
+        windows_dual = self.is_experimental_windows_dual_plan(selected_plan)
         if self.inspection is not None:
             label = (
+                "Windows BIOS + UEFI ISO mode" if windows_dual else
                 "ISO mode" if mode is WriteMode.EXTRACTED_ISO else
                 "VTSI restore" if (
                     mode is WriteMode.DD
@@ -2657,6 +2792,7 @@ class Window(QMainWindow):
         )
         self.update_runtime_validation_control()
         self.write_button.setText(
+            "Write Windows BIOS + UEFI" if windows_dual else
             "Write in ISO mode" if iso_mode else
             "Restore VTSI image" if vtsi_mode else
             "Restore virtual disk" if virtual_mode else
@@ -2758,6 +2894,7 @@ class Window(QMainWindow):
             self.extractor,
             self.iso_stager,
             self.syslinux_workflow,
+            self.windows_device_runner,
             self.windows_wim_extractor,
             self.constructed_writer,
             self.uefi_ntfs_writer,
@@ -2982,7 +3119,7 @@ class Window(QMainWindow):
         base_entries = self.archive_entries()
         try:
             entries = self.effective_archive_entries()
-            recommendation = recommend_write_method(
+            recommendation = self.recommend_write_method(
                 inspection, entries, target_size=device.size,
                 target_logical_sector_size=device.logical_sector_size,
             )
@@ -3387,7 +3524,10 @@ class Window(QMainWindow):
 
     def on_progress(self, done: int, total: int, stage: str) -> None:
         if (
-            self.syslinux_workflow is not None
+            (
+                self.syslinux_workflow is not None
+                or self.windows_device_runner is not None
+            )
             and stage.split(" ·", 1)[0]
             in {"writing", "preactivation-readback", "readback"}
         ):
@@ -3433,6 +3573,9 @@ class Window(QMainWindow):
         if syslinux_workflow is not None:
             syslinux_workflow.close()
         self.syslinux_confirmation_dialog = None
+        self.windows_device_runner = None
+        self.windows_dual_confirmation_dialog = None
+        self.prepared_windows_dual = None
         self.iso_staging_preparer = None
         self.iso_staging_token = None
         self.windows_wim_extractor = None
@@ -3525,6 +3668,7 @@ class Window(QMainWindow):
             self.optical_runner, self.extractor,
             self.iso_stager, self.constructed_writer,
             self.syslinux_workflow,
+            self.windows_device_runner,
             self.uefi_ntfs_writer,
             self.uefi_preparer,
             self.uefi_shell_preparer,
@@ -3547,6 +3691,8 @@ class Window(QMainWindow):
                 self.fast_zero_confirmation_dialog.reject()
             if self.syslinux_confirmation_dialog is not None:
                 self.syslinux_confirmation_dialog.reject()
+            if self.windows_dual_confirmation_dialog is not None:
+                self.windows_dual_confirmation_dialog.reject()
         elif was_inspecting:
             self.status.setText("Image inspection cancelled")
             self.image_detail.setText("Image inspection cancelled")
@@ -5801,17 +5947,41 @@ class Window(QMainWindow):
         base_entries = self.archive_entries()
         try:
             entries = self.effective_archive_entries()
+            selected = self.selected_device()
             plan = build_write_plan(
-                self.inspection, entries, requested_mode=WriteMode.EXTRACTED_ISO,
+                self.inspection,
+                entries,
+                requested_mode=WriteMode.EXTRACTED_ISO,
                 firmware_target=FirmwareTarget.UEFI_ONLY,
-                target_size=self.selected_device().size if self.selected_device() else None,
+                target_size=selected.size if selected else None,
+                target_logical_sector_size=(
+                    selected.logical_sector_size if selected else None
+                ),
             )
+            if self.experimental_windows_dual_gui_enabled():
+                recommendation = self.recommend_write_method(
+                    self.inspection,
+                    entries,
+                    target_size=selected.size if selected else None,
+                    target_logical_sector_size=(
+                        selected.logical_sector_size if selected else None
+                    ),
+                )
+                if self.is_experimental_windows_dual_plan(
+                    recommendation.iso_plan
+                ):
+                    assert recommendation.iso_plan is not None
+                    plan = recommendation.iso_plan
         except ValueError as error:
             QMessageBox.warning(self, "ISO plan could not be built", str(error))
             return
         assert plan.layout is not None
+        windows_dual = self.is_experimental_windows_dual_plan(plan)
         lines = [
-            "Filesystem-aware UEFI ISO mode", "",
+            (
+                "Experimental Windows BIOS + UEFI ISO mode"
+                if windows_dual else "Filesystem-aware UEFI ISO mode"
+            ), "",
             f"Partition table: {plan.layout.partition_table.value.upper()}",
             f"Main filesystem: {plan.layout.main_filesystem.value.upper()}",
             f"Partitions: {plan.layout.partition_count}",
@@ -5821,7 +5991,7 @@ class Window(QMainWindow):
             f"File content: {self.display_size(plan.minimum_content_bytes)}",
             f"Conservative target minimum: {self.display_size(plan.minimum_target_bytes)}",
         ]
-        if self.inspection.embedded_uefi_fat is not None:
+        if self.inspection.embedded_uefi_fat is not None and not windows_dual:
             embedded = self.inspection.embedded_uefi_fat
             lines.extend((
                 "",
@@ -5891,7 +6061,14 @@ class Window(QMainWindow):
                 "• windows-boot-files: wimlib-imagex (wimtools)"
             )
         lines.extend(("", "Execution blockers:"))
-        lines.extend(f"• {blocker}" for blocker in plan.blockers)
+        if windows_dual:
+            lines.append(
+                "• The generic BIOS-construction blocker is admitted only by the "
+                "developer-gated Windows descriptor workflow; it remains a blocker "
+                "for every other executor."
+            )
+        else:
+            lines.extend(f"• {blocker}" for blocker in plan.blockers)
         dialog = QDialog(self)
         dialog.setWindowTitle("Filesystem-aware ISO-mode plan")
         dialog.resize(720, 560)
@@ -5931,11 +6108,17 @@ class Window(QMainWindow):
             "Write USB in ISO mode…", QDialogButtonBox.ButtonRole.ActionRole
         )
         write_iso_button.setEnabled(
-            plan.executable and self.selected_device() is not None
+            (plan.executable or windows_dual)
+            and self.selected_device() is not None
             and not self._zip_overlay_is_on_target()
         )
-        if plan.executable:
-            if plan.layout.boot_strategy is BootStrategy.UEFI_NTFS:
+        if plan.executable or windows_dual:
+            if windows_dual:
+                write_iso_button.setToolTip(
+                    "Use the developer-gated anonymous Windows BIOS + UEFI "
+                    "descriptor workflow; physical-media certification is pending."
+                )
+            elif plan.layout.boot_strategy is BootStrategy.UEFI_NTFS:
                 write_iso_button.setToolTip(
                     "Stage the ISO privately, then create and verify an NTFS USB "
                     "with a pinned UEFI:NTFS boot bridge."
@@ -5971,7 +6154,10 @@ class Window(QMainWindow):
         if (
             image is None or inspection is None or device is None
             or self.operation_active or type(write_plan) is not WritePlan
-            or not write_plan.executable
+            or (
+                not write_plan.executable
+                and not self.is_experimental_windows_dual_plan(write_plan)
+            )
         ):
             return
         base_entries = self.archive_entries()
@@ -5986,7 +6172,7 @@ class Window(QMainWindow):
             return
         try:
             effective_entries = self.effective_archive_entries()
-            recommendation = recommend_write_method(
+            recommendation = self.recommend_write_method(
                 inspection,
                 effective_entries,
                 target_size=device.size,
@@ -5999,7 +6185,10 @@ class Window(QMainWindow):
         fresh_plan = recommendation.iso_plan
         if (
             fresh_plan is None
-            or not fresh_plan.executable
+            or (
+                not fresh_plan.executable
+                and not self.is_experimental_windows_dual_plan(fresh_plan)
+            )
             or WriteMode.EXTRACTED_ISO not in recommendation.available_modes
         ):
             QMessageBox.warning(
@@ -6055,6 +6244,54 @@ class Window(QMainWindow):
             return
         if not self.confirm_dbx_matches(inspection):
             return
+        windows_dual_enabled = self.is_experimental_windows_dual_plan(write_plan)
+        if windows_dual_enabled:
+            incompatibilities = []
+            if self.zip_overlay_plan is not None:
+                incompatibilities.append("remove the ZIP overlay")
+            if self.windows_options.enabled:
+                incompatibilities.append("disable Windows customization")
+            if self.windows_bootex.enabled:
+                incompatibilities.append("disable the BootEx replacement")
+            if self.selected_persistence_bytes():
+                incompatibilities.append("disable persistent storage")
+            if self.runtime_validation.isChecked():
+                incompatibilities.append("disable boot-time corruption checking")
+            if device.logical_sector_size != 512:
+                incompatibilities.append("select removable media with 512-byte sectors")
+            if not device.removable or device.read_only:
+                incompatibilities.append("select writable kernel-removable media")
+            if device.transport not in {"usb", "mmc"}:
+                incompatibilities.append("select USB or SD media")
+            if incompatibilities:
+                QMessageBox.warning(
+                    self,
+                    "Experimental Windows dual-firmware mode unavailable",
+                    "This deliberately narrow profile does not compose with the "
+                    "selected options or target. Please "
+                    + ", ".join(incompatibilities)
+                    + ". No target was changed.",
+                )
+                return
+            warning = QMessageBox.warning(
+                self,
+                "Experimental Windows BIOS + UEFI write",
+                "This developer-only path has passed automated backend checks, "
+                "but VM, physical USB-media, and broad firmware certification "
+                "are still pending. A failed result may "
+                "not boot even after a successful write.\n\n"
+                "ISOpropyl will use only the strict x64 Windows Boot Manager "
+                "profile: safe ISO staging, optional install.wim splitting, an "
+                "anonymous full-device FAT32 image, the project-authored BIOS "
+                "loader, MBR-last activation, and mandatory complete SHA-256 "
+                "read-back through the fixed PolicyKit helper. There is no "
+                "formatter/mount or generic-writer fallback.\n\n"
+                "Continue to choose private working space?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if warning != QMessageBox.StandardButton.Yes:
+                return
         if self.windows_bootex.enabled:
             layout = write_plan.layout
             incompatibility = ""
@@ -6295,6 +6532,7 @@ class Window(QMainWindow):
             windows_bootex=self.windows_bootex,
             runtime_validation_requested=runtime_validation_requested,
             syslinux_dependency_key=syslinux_dependency_key,
+            windows_dual_enabled=windows_dual_enabled,
         )
         self.iso_staging_preparation_generation += 1
         operation = BackgroundPreparation()
@@ -6358,11 +6596,22 @@ class Window(QMainWindow):
                     request.base_entries,
                     request.write_plan,
                     overlay=request.overlay,
-                    embedded_fat=request.inspection.embedded_uefi_fat,
+                    embedded_fat=(
+                        None if request.windows_dual_enabled
+                        else request.inspection.embedded_uefi_fat
+                    ),
                     cancel_check=check_cancelled,
-                    windows_customization=request.windows_customization,
+                    windows_customization=(
+                        None
+                        if request.windows_dual_enabled
+                        else request.windows_customization
+                    ),
                     windows_architecture=request.windows_architecture,
-                    windows_bootex=request.windows_bootex,
+                    windows_bootex=(
+                        None
+                        if request.windows_dual_enabled
+                        else request.windows_bootex
+                    ),
                     **syslinux_arguments,
                 )
                 if request.runtime_validation_requested:
@@ -6429,6 +6678,12 @@ class Window(QMainWindow):
                 and self.selected_device() == request.device
                 and self.zip_overlay_plan == request.overlay
                 and self.windows_bootex == request.windows_bootex
+                and (
+                    not request.windows_dual_enabled
+                    or self.is_experimental_windows_dual_plan(
+                        request.write_plan
+                    )
+                )
                 and self.archive_entries() == request.base_entries
                 and image_identity(request.image) == request.image_identity
                 and not path_is_on_device(request.workspace.name, request.device)
@@ -6494,6 +6749,10 @@ class Window(QMainWindow):
                 request.windows_architecture
                 if request.windows_customization.enabled else None
             )
+            or (
+                request.windows_dual_enabled
+                != self.is_experimental_windows_dual_plan(result.write_plan)
+            )
             or result.wim_selection != request.windows_customization.install_image
             or result.windows_bootex_options != (
                 request.windows_bootex if request.windows_bootex.enabled else None
@@ -6551,6 +6810,7 @@ class Window(QMainWindow):
             persistence_bytes=request.persistence_bytes,
             runtime_validation=prepared_runtime_validation,
             syslinux_enabled=request.syslinux_dependency_key is not None,
+            windows_dual_enabled=request.windows_dual_enabled,
         )
         self.set_busy(False)
         self._continue_prepared_iso_write(pending)
@@ -6564,6 +6824,9 @@ class Window(QMainWindow):
         persistence_profile = pending.persistence_profile
         if pending.syslinux_enabled:
             self.start_syslinux_preparation(pending)
+            return
+        if pending.windows_dual_enabled:
+            self.start_windows_dual_preparation(pending)
             return
         if persistence_profile is not None:
             self.start_casper_preparation(pending)
@@ -6685,6 +6948,315 @@ class Window(QMainWindow):
             self.bridge.syslinux_preparation_finished.emit(workflow, result)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def start_windows_dual_preparation(self, pending: PendingIsoWrite) -> None:
+        """Stage and bind the gated Windows image without touching the target."""
+
+        if (
+            not pending.windows_dual_enabled
+            or not self.is_experimental_windows_dual_plan(pending.write_plan)
+            or pending.syslinux_enabled
+            or pending.persistence_profile is not None
+            or pending.runtime_validation is not None
+            or pending.staging_plan.overlay is not None
+            or pending.staging_plan.embedded_fat is not None
+            or pending.staging_plan.windows_customization is not None
+            or pending.staging_plan.windows_bootex_options is not None
+            or self.windows_device_runner is not None
+        ):
+            try:
+                pending.workspace.cleanup()
+            except OSError as error:
+                self.logger.warning(
+                    "Could not remove rejected Windows workspace: %s", error,
+                )
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "Experimental Windows write unavailable",
+                "The exact Windows BIOS + UEFI staging inputs are incomplete or "
+                "were combined with an unsupported option. No target was changed.",
+            )
+            return
+        try:
+            resolve_windows_helper_installation()
+        except WindowsDeviceHelperUnavailable as error:
+            try:
+                pending.workspace.cleanup()
+            except OSError as cleanup_error:
+                self.logger.warning(
+                    "Could not remove rejected Windows workspace: %s",
+                    cleanup_error,
+                )
+            self.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "Windows host integration unavailable",
+                f"{error}\n\nInstall the current native ISOpropyl package with "
+                "its fixed Windows PolicyKit action and helper, then try again. "
+                "No target was changed.",
+            )
+            return
+
+        runner = WindowsDeviceWriteRunner()
+        stager = IsoStagingExecutor()
+        self.iso_workspace = pending.workspace
+        self.pending_iso_write = pending
+        self.windows_device_runner = runner
+        self.iso_stager = stager
+        self.set_busy(True)
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.status.setText("Staging the exact Windows tree before target confirmation…")
+
+        def work() -> None:
+            try:
+                staged = stager.execute(
+                    pending.staging_plan,
+                    lambda update: self.bridge.progress.emit(
+                        update.bytes_done, update.total_bytes, update.stage,
+                    ),
+                )
+                if type(staged) is not IsoStagingResult:
+                    raise RuntimeError("The Windows staging result type is invalid")
+                scratch = Path(pending.workspace.name) / "anonymous-image-workspace"
+                scratch.mkdir(mode=0o700)
+                composite = build_windows_iso_fat32_plan(
+                    pending.staging_plan,
+                    staged,
+                    scratch,
+                    image_size=pending.device.size,
+                    cancel_check=runner._check_cancelled,
+                )
+                target_plan = build_windows_device_write_plan(
+                    composite,
+                    pending.device,
+                    cancel_check=runner._check_cancelled,
+                )
+                result: object = PreparedWindowsDualWrite(
+                    pending, runner, target_plan,
+                )
+            except BaseException as error:
+                result = error
+            self.bridge.windows_dual_preparation_finished.emit(runner, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_windows_dual_preparation_finished(
+        self,
+        runner: object,
+        result: object,
+    ) -> None:
+        if type(runner) is not WindowsDeviceWriteRunner:
+            return
+        if runner is not self.windows_device_runner:
+            runner.cancel()
+            return
+        self.iso_stager = None
+        pending = self.pending_iso_write
+        if (
+            type(result) is not PreparedWindowsDualWrite
+            or pending is None
+            or result.pending is not pending
+            or result.runner is not runner
+            or result.plan.composite_plan.iso_plan is not pending.staging_plan
+            or result.plan.device != pending.device
+        ):
+            message = (
+                str(result) if isinstance(result, BaseException)
+                else "The Windows preparation result did not match the selected write."
+            )
+            self.logger.warning("Windows dual preparation failed safely: %s", message)
+            self.bridge.finished.emit(False, message + " No target was changed.")
+            return
+        self.prepared_windows_dual = result
+        self.prompt_windows_dual_confirmation(result)
+
+    def prompt_windows_dual_confirmation(
+        self,
+        prepared: PreparedWindowsDualWrite,
+    ) -> None:
+        plan = prepared.plan
+        dialog = QDialog(self)
+        self.windows_dual_confirmation_dialog = dialog
+        dialog.setWindowTitle("Confirm experimental Windows BIOS + UEFI write")
+        available = self.screen().availableGeometry()
+        dialog.resize(min(720, max(560, available.width() - 80)),
+                      min(660, max(500, available.height() - 80)))
+        layout = QVBoxLayout(dialog)
+        heading = QLabel("Final destructive confirmation — physical certification pending")
+        heading.setObjectName("dialogHeading")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        details = QPlainTextEdit()
+        details.setObjectName("windowsDualConfirmationDetails")
+        details.setReadOnly(True)
+        details.setPlainText(
+            "EVERYTHING ON THIS DEVICE WILL BE PERMANENTLY ERASED\n\n"
+            "Profile: Windows x64 · BIOS + UEFI · active MBR FAT32\n"
+            "Status: developer-only; VM and physical-media certification pending\n"
+            f"Source tree SHA-256: {plan.source_manifest_sha256}\n"
+            f"Composite plan SHA-256: {plan.composite_plan_sha256}\n"
+            f"Target: {plan.device.path}\n"
+            f"Model: {plan.device.vendor} {plan.device.model}\n"
+            f"Serial/WWN: {plan.device.serial or plan.device.wwn or 'not reported'}\n"
+            f"Kernel identity: {plan.device.major_minor}\n"
+            f"Capacity: {self.display_size(plan.image_size)} ({plan.image_size} bytes)\n"
+            f"Logical sector: {plan.logical_sector_size} bytes\n\n"
+            "The complete staged tree is bound to an anonymous FAT32 image. The "
+            "project-authored BIOS loader is installed before the fixed PolicyKit "
+            "helper receives a descriptor. The helper uses exclusive access, "
+            "MBR-last activation, cache flush, and mandatory full SHA-256 read-back. "
+            "There is no formatter, mount, loop-device, named-image, or generic "
+            "writer fallback. A successful write still does not guarantee that "
+            "this USB will boot on physical hardware."
+        )
+        details.setMinimumHeight(260)
+        layout.addWidget(details, 1)
+        phrase_label = QLabel(
+            "Type this exact phrase to authorize only the selected target:\n"
+            f"{plan.confirmation_phrase}"
+        )
+        phrase_label.setWordWrap(True)
+        phrase_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(phrase_label)
+        phrase = QLineEdit()
+        phrase.setObjectName("windowsDualConfirmationPhrase")
+        phrase.setPlaceholderText(plan.confirmation_phrase)
+        layout.addWidget(phrase)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        write_button = buttons.addButton(
+            "Erase and write experimental media",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        write_button.setObjectName("windowsDualWriteButton")
+        write_button.setEnabled(False)
+        phrase.textChanged.connect(
+            lambda value: write_button.setEnabled(
+                value == plan.confirmation_phrase
+            )
+        )
+        write_button.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self.windows_dual_confirmation_dialog = None
+        if not accepted:
+            prepared.runner.cancel()
+            self.windows_device_runner = None
+            self.prepared_windows_dual = None
+            self.pending_iso_write = None
+            workspace = prepared.pending.workspace
+            self.iso_workspace = None
+            try:
+                workspace.cleanup()
+            except OSError as error:
+                self.logger.warning(
+                    "Could not remove cancelled Windows workspace: %s", error,
+                )
+            self.set_busy(False)
+            self.status.setText("Experimental Windows write cancelled; no target changed")
+            return
+        try:
+            confirmation = confirm_windows_device_write(
+                plan,
+                phrase.text(),
+                cancel_check=prepared.runner._check_cancelled,
+            )
+        except WindowsDevicePlanError as error:
+            self.bridge.finished.emit(False, f"{error} No target was changed.")
+            return
+        self.start_windows_dual_device_write(prepared, confirmation)
+
+    def start_windows_dual_device_write(
+        self,
+        prepared: PreparedWindowsDualWrite,
+        confirmation: object,
+    ) -> None:
+        runner = prepared.runner
+        if runner is not self.windows_device_runner:
+            runner.cancel()
+            return
+        self.status.setText("Building and writing the attested Windows image…")
+        self.logger.info(
+            "Confirmed experimental Windows dual write: image=%s target=%s "
+            "identity=%s plan_sha256=%s",
+            prepared.pending.image,
+            prepared.plan.device.path,
+            prepared.plan.device.identity,
+            prepared.plan.plan_sha256,
+        )
+
+        def work() -> None:
+            try:
+                result: object = runner.run(
+                    prepared.plan,
+                    confirmation,  # runtime validation is performed by the runner
+                    lambda stage, path, done, total: self.bridge.progress.emit(
+                        done,
+                        total,
+                        stage + (f" · {path}" if path else ""),
+                    ),
+                )
+            except BaseException as error:
+                result = error
+            self.bridge.windows_dual_execution_finished.emit(runner, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_windows_dual_execution_finished(
+        self,
+        runner: object,
+        outcome: object,
+    ) -> None:
+        if type(runner) is not WindowsDeviceWriteRunner:
+            return
+        if runner is not self.windows_device_runner:
+            runner.cancel()
+            return
+        pending = self.pending_iso_write
+        prepared = self.prepared_windows_dual
+        if (
+            type(outcome) is WindowsDeviceWriteResult
+            and pending is not None
+            and prepared is not None
+            and prepared.runner is runner
+            and outcome.composite_plan_sha256
+            == prepared.plan.composite_plan_sha256
+            and outcome.plan_sha256 == prepared.plan.plan_sha256
+            and outcome.target_path == prepared.plan.device.path
+            and outcome.major_minor == prepared.plan.device.major_minor
+            and outcome.image_size == prepared.plan.image_size
+            and outcome.mandatory_readback
+        ):
+            message = (
+                "Your experimental Windows BIOS + UEFI USB passed mandatory "
+                "complete SHA-256 read-back. Eject it with your desktop before "
+                "removing it. Physical boot compatibility is still uncertified."
+            )
+            if outcome.cancellation_deferred:
+                message += (
+                    " A late cancellation was safely deferred after COMMIT so "
+                    "durability and verification could finish."
+                )
+            self.bridge.finished.emit(True, message)
+            return
+        message = (
+            str(outcome) if isinstance(outcome, BaseException)
+            else "The Windows device workflow returned an invalid result."
+        )
+        if runner.committed:
+            message += (
+                " The helper had already accepted COMMIT, so target state is "
+                "unknown or incomplete. Keep it connected, then rewrite or "
+                "restore it before attempting to boot."
+            )
+        else:
+            message += " No target mutation was committed."
+        self.logger.error("Windows dual device write failed: %s", message)
+        self.bridge.finished.emit(False, message)
 
     def on_syslinux_preparation_finished(
         self,

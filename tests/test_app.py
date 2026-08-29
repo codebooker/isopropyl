@@ -125,6 +125,23 @@ def optical_windows_inspection(*, hybrid: bool = False) -> ImageInspection:
     )
 
 
+def optical_windows_dual_inspection() -> ImageInspection:
+    return replace(
+        optical_windows_inspection(hybrid=False),
+        boot_modes=("BIOS", "UEFI"),
+        members=(
+            ImageMember("bootmgr", 4096, "file"),
+            ImageMember("Boot", 0, "directory"),
+            ImageMember("Boot/BCD", 8192, "file"),
+            ImageMember("EFI", 0, "directory"),
+            ImageMember("EFI/BOOT", 0, "directory"),
+            ImageMember("EFI/BOOT/BOOTX64.EFI", 16384, "file"),
+            ImageMember("sources", 0, "directory"),
+            ImageMember("sources/install.esd", 32768, "file"),
+        ),
+    )
+
+
 def syslinux_uefi_inspection() -> ImageInspection:
     return replace(
         optical_windows_inspection(),
@@ -4345,6 +4362,323 @@ class WindowWriteMethodTests(unittest.TestCase):
         self.assertFalse(self.window.device_refresh_busy)
         self.assertTrue(self.window.device_combo.isEnabled())
         self.assertEqual(self.window.selected_device(), replacement)
+
+
+class WindowWindowsDualRoutingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.settings_home = tempfile.TemporaryDirectory()
+        settings = QSettings(
+            str(Path(self.settings_home.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        with (
+            patch("isopropyl.app.QSettings", return_value=settings),
+            patch("isopropyl.app.list_devices", return_value=[]),
+        ):
+            self.window = Window()
+        self.window.device_refresh_generation += 1
+        self.window.device_refresh_busy = False
+        self.window.devices = [device()]
+        self.window.device_combo.clear()
+        self.window.device_combo.addItem(self.window.devices[0].label)
+
+    def tearDown(self) -> None:
+        self.window.close()
+        self.window.deleteLater()
+        self.application.processEvents()
+        self.settings_home.cleanup()
+
+    def recommendation(self, sector_size: int = 512):
+        inspection = optical_windows_dual_inspection()
+        entries = tuple(
+            ArchiveEntry(member.path, member.size, EntryKind(member.kind))
+            for member in inspection.members
+        )
+        return self.window.recommend_write_method(
+            inspection,
+            entries,
+            target_size=device().size,
+            target_logical_sector_size=sector_size,
+        )
+
+    def test_windows_dual_profile_is_invisible_without_exact_environment_flag(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL", None)
+            recommendation = self.recommendation()
+
+        self.assertIsNotNone(recommendation.iso_plan)
+        assert recommendation.iso_plan is not None
+        self.assertEqual(
+            recommendation.iso_plan.firmware_target,
+            FirmwareTarget.UEFI_ONLY,
+        )
+        self.assertFalse(
+            self.window.is_experimental_windows_dual_plan(
+                recommendation.iso_plan
+            )
+        )
+
+    def test_exact_flag_routes_only_the_strict_blocked_plan(self):
+        with patch.dict(
+            os.environ,
+            {"ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL": "1"},
+        ):
+            recommendation = self.recommendation()
+
+            self.assertIsNotNone(recommendation.iso_plan)
+            assert recommendation.iso_plan is not None
+            self.assertTrue(
+                self.window.is_experimental_windows_dual_plan(
+                    recommendation.iso_plan
+                )
+            )
+            self.assertEqual(
+                recommendation.iso_plan.blockers,
+                (app_module.WINDOWS_DUAL_TRANSITIONAL_BLOCKER,),
+            )
+            self.assertIs(
+                recommendation.iso_plan.layout.boot_strategy,
+                BootStrategy.WINDOWS_BOOTMGR_FAT32,
+            )
+            self.assertEqual(
+                recommendation.recommended_mode,
+                WriteMode.EXTRACTED_ISO,
+            )
+
+    def test_dual_route_rejects_non_512_target_instead_of_weakening_backend(self):
+        with patch.dict(
+            os.environ,
+            {"ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL": "1"},
+        ):
+            recommendation = self.recommendation(4096)
+
+        self.assertIsNotNone(recommendation.iso_plan)
+        assert recommendation.iso_plan is not None
+        self.assertEqual(
+            recommendation.iso_plan.firmware_target,
+            FirmwareTarget.UEFI_ONLY,
+        )
+
+    def test_dual_route_normalizes_disabled_windows_options_before_staging(self):
+        inspection = optical_windows_dual_inspection()
+        source = Path(self.settings_home.name) / "source.iso"
+        source.write_bytes(b"test image")
+        status = source.stat()
+        identity = (
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+        )
+        self.window.image = source
+        self.window.inspection = inspection
+        self.window.inspection_identity = identity
+        continuation = Mock()
+        self.window._continue_prepared_iso_write = continuation
+
+        def builder(*args, **kwargs):
+            self.assertIsNone(kwargs["windows_customization"])
+            self.assertIsNone(kwargs["windows_bootex"])
+            self.assertIsNone(kwargs["embedded_fat"])
+            return fake_iso_staging_plan(*args, **kwargs)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL": "1"},
+            ),
+            patch("isopropyl.app.image_is_on_device", return_value=False),
+            patch("isopropyl.app.path_is_on_device", return_value=False),
+            patch("isopropyl.app.image_identity", return_value=identity),
+            patch(
+                "isopropyl.app.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "isopropyl.app.QFileDialog.getExistingDirectory",
+                return_value=self.settings_home.name,
+            ),
+            patch("isopropyl.app.build_iso_staging_plan", side_effect=builder),
+            patch("isopropyl.app.threading.Thread", ImmediateThread),
+        ):
+            recommendation = self.recommendation()
+            assert recommendation.iso_plan is not None
+            self.window.start_constructed_iso_write(
+                list(self.window.archive_entries()), recommendation.iso_plan,
+            )
+
+        continuation.assert_called_once()
+        pending = continuation.call_args.args[0]
+        self.assertTrue(pending.windows_dual_enabled)
+        pending.workspace.cleanup()
+
+    def test_prepared_dual_plan_dispatches_only_to_windows_backend(self):
+        inspection = optical_windows_dual_inspection()
+        entries = tuple(
+            ArchiveEntry(member.path, member.size, EntryKind(member.kind))
+            for member in inspection.members
+        )
+        with patch.dict(
+            os.environ,
+            {"ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL": "1"},
+        ):
+            recommendation = self.window.recommend_write_method(
+                inspection,
+                entries,
+                target_size=device().size,
+                target_logical_sector_size=512,
+            )
+            assert recommendation.iso_plan is not None
+            pending = PendingIsoWrite(
+                Path("/source.iso"),
+                inspection,
+                device(),
+                recommendation.iso_plan,
+                Mock(),
+                Mock(),
+                windows_dual_enabled=True,
+            )
+            with (
+                patch.object(
+                    self.window, "start_windows_dual_preparation"
+                ) as windows_start,
+                patch.object(self.window, "start_casper_preparation") as casper,
+                patch.object(self.window, "start_uefi_preparation") as uefi_ntfs,
+                patch.object(
+                    self.window, "confirm_and_start_iso_write"
+                ) as generic,
+            ):
+                self.window._continue_prepared_iso_write(pending)
+
+        windows_start.assert_called_once_with(pending)
+        casper.assert_not_called()
+        uefi_ntfs.assert_not_called()
+        generic.assert_not_called()
+
+    def test_windows_preparation_uses_witnessed_composite_and_device_chain(self):
+        inspection = optical_windows_dual_inspection()
+        entries = tuple(
+            ArchiveEntry(member.path, member.size, EntryKind(member.kind))
+            for member in inspection.members
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL": "1"},
+            ),
+            tempfile.TemporaryDirectory() as temporary_parent,
+        ):
+            recommendation = self.window.recommend_write_method(
+                inspection,
+                entries,
+                target_size=device().size,
+                target_logical_sector_size=512,
+            )
+            assert recommendation.iso_plan is not None
+            workspace = tempfile.TemporaryDirectory(dir=temporary_parent)
+            staging_plan = Mock(
+                overlay=None,
+                embedded_fat=None,
+                windows_customization=None,
+                windows_bootex_options=None,
+            )
+            pending = PendingIsoWrite(
+                Path("/source.iso"),
+                inspection,
+                device(),
+                recommendation.iso_plan,
+                workspace,
+                staging_plan,
+                windows_dual_enabled=True,
+            )
+            staged = app_module.IsoStagingResult(
+                Path(workspace.name) / "ready-media",
+                (1, 2, 3, 4, 5),
+                "a" * 64,
+                1,
+                3,
+                28_672,
+                (),
+                False,
+            )
+            composite = SimpleNamespace(iso_plan=staging_plan)
+            target_plan = app_module.WindowsDeviceWritePlan(
+                composite,
+                pending.device,
+                1,
+                "b" * 64,
+                "c" * 64,
+                "d" * 64,
+                "e" * 64,
+                "f" * 64,
+                "0" * 64,
+                pending.device.size,
+                1,
+                2,
+                512,
+                "windows-11-modern-entry-zero/bios+uefi/fat32-mbr/v1",
+                True,
+                "io.github.codebooker.isopropyl/windows-device-helper/v1",
+                ("warning",),
+                "WRITE WINDOWS DUAL /dev/sdz 65:144",
+                "1" * 64,
+            )
+            stager = Mock()
+            stager.execute.return_value = staged
+            with (
+                patch(
+                    "isopropyl.app.resolve_windows_helper_installation"
+                ),
+                patch("isopropyl.app.IsoStagingExecutor", return_value=stager),
+                patch(
+                    "isopropyl.app.build_windows_iso_fat32_plan",
+                    return_value=composite,
+                ) as build_composite,
+                patch(
+                    "isopropyl.app.build_windows_device_write_plan",
+                    return_value=target_plan,
+                ) as build_target,
+                patch.object(
+                    self.window, "prompt_windows_dual_confirmation"
+                ) as prompt,
+                patch("isopropyl.app.threading.Thread", ImmediateThread),
+            ):
+                self.window.start_windows_dual_preparation(pending)
+
+            runner = self.window.windows_device_runner
+            self.assertIsInstance(runner, app_module.WindowsDeviceWriteRunner)
+            assert runner is not None
+            stager.execute.assert_called_once()
+            build_composite.assert_called_once()
+            self.assertIs(build_composite.call_args.args[0], staging_plan)
+            self.assertIs(build_composite.call_args.args[1], staged)
+            self.assertEqual(
+                build_composite.call_args.kwargs["image_size"],
+                pending.device.size,
+            )
+            build_target.assert_called_once_with(
+                composite,
+                pending.device,
+                cancel_check=runner._check_cancelled,
+            )
+            prompt.assert_called_once()
+            prepared = prompt.call_args.args[0]
+            self.assertIs(prepared.plan, target_plan)
+            self.assertIs(prepared.runner, runner)
+
+            runner.cancel()
+            self.window.windows_device_runner = None
+            self.window.prepared_windows_dual = None
+            self.window.pending_iso_write = None
+            self.window.iso_stager = None
+            self.window.iso_workspace = None
+            workspace.cleanup()
+            self.window.set_busy(False)
 
 
 class WindowFastZeroTests(unittest.TestCase):

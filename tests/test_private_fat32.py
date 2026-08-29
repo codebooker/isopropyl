@@ -20,6 +20,7 @@ import isopropyl.private_fat32 as private_fat32
 from isopropyl.fat_image import FatImageError, inspect_regular_fat32_image
 from isopropyl.private_fat32 import (
     AnonymousFat32Image,
+    PrivateFat32BuildProfile,
     PrivateFat32Builder,
     PrivateFat32Error,
     PrivateFat32Plan,
@@ -88,6 +89,7 @@ class PrivateFat32Tests(unittest.TestCase):
 
     def test_builds_deterministic_mount_free_tree_and_attests_every_file(self):
         plan = self.plan()
+        self.assertIs(plan.profile, PrivateFat32BuildProfile.SYSLINUX)
         self.assertEqual(plan.geometry.partition_sectors, 70_000)
         self.assertEqual(plan.geometry.sectors_per_cluster, 1)
         self.assertEqual(plan.geometry.sectors_per_fat, 539)

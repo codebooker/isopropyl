@@ -55,6 +55,17 @@ def inspection(
     )
 
 
+def windows_dual_entries(
+    *extra: ArchiveEntry,
+) -> list[ArchiveEntry]:
+    return [
+        ArchiveEntry("bootmgr", 4096),
+        ArchiveEntry("Boot/BCD", 8192),
+        ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 16384),
+        *extra,
+    ]
+
+
 class PlanTests(unittest.TestCase):
     def test_authenticode_analysis_is_presentation_only_for_write_planning(self):
         image = inspection()
@@ -132,6 +143,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.mode, WriteMode.EXTRACTED_ISO)
         self.assertEqual(plan.layout.main_filesystem, FileSystem.FAT32)
         self.assertEqual(plan.layout.partition_table, PartitionTable.MBR)
+        self.assertFalse(plan.layout.main_partition_active)
         keys = {requirement.key for requirement in plan.requirements}
         self.assertIn("matching-grub-i386-pc", keys)
         self.assertIn("efi-removable-loader-x64", keys)
@@ -217,6 +229,229 @@ class PlanTests(unittest.TestCase):
         plan = build_write_plan(inspection(iso=False))
         with self.assertRaises(FrozenInstanceError):
             plan.mode = WriteMode.EXTRACTED_ISO  # type: ignore[misc]
+
+    def test_explicit_windows_dual_profile_is_mbr_active_fat32_and_blocked(self):
+        plan = build_write_plan(
+            inspection(windows=True, bootloader="Windows Boot Manager"),
+            windows_dual_entries(
+                ArchiveEntry("sources/install.wim", FAT32_MAX_FILE_SIZE + 1),
+            ),
+            firmware_target=FirmwareTarget.BOTH,
+        )
+
+        self.assertEqual(plan.firmware_target, FirmwareTarget.BOTH)
+        self.assertEqual(plan.layout.partition_table, PartitionTable.MBR)
+        self.assertEqual(plan.layout.main_filesystem, FileSystem.FAT32)
+        self.assertEqual(plan.layout.partition_count, 1)
+        self.assertTrue(plan.layout.main_partition_active)
+        self.assertTrue(plan.layout.bios_bootable)
+        self.assertTrue(plan.layout.uefi_bootable)
+        self.assertEqual(
+            plan.layout.boot_strategy,
+            BootStrategy.WINDOWS_BOOTMGR_FAT32,
+        )
+        self.assertTrue(plan.needs_wim_split)
+        self.assertEqual(
+            {
+                "efi-removable-loader-x64",
+                "isopropyl-windows-bios-loader",
+                "windows-bios-boot-files",
+                "wim-splitter",
+            },
+            {
+                requirement.key for requirement in plan.requirements
+                if requirement.key in {
+                    "efi-removable-loader-x64",
+                    "isopropyl-windows-bios-loader",
+                    "windows-bios-boot-files",
+                    "wim-splitter",
+                }
+            },
+        )
+        loader = next(
+            requirement for requirement in plan.requirements
+            if requirement.key == "isopropyl-windows-bios-loader"
+        )
+        self.assertEqual(loader.source, RequirementSource.BUNDLED)
+        self.assertEqual(loader.version_constraint, "project-source-reproducible-v1")
+        self.assertFalse(plan.executable)
+        self.assertTrue(any("BIOS construction" in item for item in plan.blockers))
+        self.assertFalse(any("No constructed-media executor" in item for item in plan.blockers))
+
+    def test_explicit_windows_dual_profile_requires_regular_nonempty_boot_files(self):
+        for required_path in ("bootmgr", "Boot/BCD", "EFI/BOOT/BOOTX64.EFI"):
+            entries = windows_dual_entries()
+            entries = [entry for entry in entries if entry.path != required_path]
+            with self.subTest(path=required_path, condition="missing"):
+                with self.assertRaisesRegex(PlanError, "requires"):
+                    build_write_plan(
+                        inspection(windows=True, bootloader="Windows Boot Manager"),
+                        entries,
+                        firmware_target=FirmwareTarget.BOTH,
+                    )
+
+            entries = windows_dual_entries()
+            index = next(
+                index for index, entry in enumerate(entries)
+                if entry.path == required_path
+            )
+            entries[index] = ArchiveEntry(required_path, 0)
+            with self.subTest(path=required_path, condition="empty"):
+                with self.assertRaisesRegex(PlanError, "non-empty regular file"):
+                    build_write_plan(
+                        inspection(windows=True, bootloader="Windows Boot Manager"),
+                        entries,
+                        firmware_target=FirmwareTarget.BOTH,
+                    )
+
+            entries[index] = ArchiveEntry(required_path, kind=EntryKind.DIRECTORY)
+            with self.subTest(path=required_path, condition="directory"):
+                with self.assertRaisesRegex(PlanError, "non-empty regular file"):
+                    build_write_plan(
+                        inspection(windows=True, bootloader="Windows Boot Manager"),
+                        entries,
+                        firmware_target=FirmwareTarget.BOTH,
+                    )
+
+    def test_windows_dual_profile_uses_the_staged_iso_fallback_not_eltorito_copy(self):
+        direct = inspection().uefi_payloads[0]
+        embedded = replace(
+            direct,
+            path="El Torito #3: EFI/BOOT/BOOTX64.EFI",
+            source_kind="eltorito-fat",
+            destination_path="EFI/BOOT/BOOTX64.EFI",
+        )
+        image = replace(
+            inspection(windows=True, bootloader="Windows Boot Manager"),
+            uefi_payloads=(direct, embedded),
+        )
+
+        plan = build_write_plan(
+            image,
+            windows_dual_entries(),
+            firmware_target=FirmwareTarget.BOTH,
+        )
+
+        self.assertIs(
+            plan.layout.boot_strategy,
+            BootStrategy.WINDOWS_BOOTMGR_FAT32,
+        )
+
+    def test_explicit_windows_dual_profile_rejects_links_and_path_aliases(self):
+        for link in (
+            ArchiveEntry("answer.txt", kind=EntryKind.SYMLINK, link_target="bootmgr"),
+            ArchiveEntry("answer.txt", kind=EntryKind.HARDLINK, link_target="bootmgr"),
+        ):
+            with self.subTest(kind=link.kind):
+                with self.assertRaisesRegex(PlanError, "symbolic or hard links"):
+                    build_write_plan(
+                        inspection(windows=True, bootloader="Windows Boot Manager"),
+                        windows_dual_entries(link),
+                        firmware_target=FirmwareTarget.BOTH,
+                    )
+
+        with self.assertRaisesRegex(UnsafeArchiveError, "case-colliding"):
+            build_write_plan(
+                inspection(windows=True, bootloader="Windows Boot Manager"),
+                windows_dual_entries(ArchiveEntry("BOOTMGR", 1)),
+                firmware_target=FirmwareTarget.BOTH,
+            )
+        with self.assertRaisesRegex(UnsafeArchiveError, "Backslashes"):
+            build_write_plan(
+                inspection(windows=True, bootloader="Windows Boot Manager"),
+                [
+                    ArchiveEntry("bootmgr", 4096),
+                    ArchiveEntry("Boot\\BCD", 8192),
+                    ArchiveEntry("EFI/BOOT/BOOTX64.EFI", 16384),
+                ],
+                firmware_target=FirmwareTarget.BOTH,
+            )
+
+    def test_explicit_windows_dual_profile_rejects_non_x64_or_unknown_identity(self):
+        candidates = (
+            (inspection(windows=False, bootloader="Windows Boot Manager"), "Windows installer"),
+            (inspection(windows=True, bootloader="Unknown"), "Windows Boot Manager"),
+            (
+                replace(
+                    inspection(windows=True, bootloader="Windows Boot Manager"),
+                    bootloader_identity_ambiguous=True,
+                ),
+                "Windows Boot Manager",
+            ),
+            (
+                inspection(
+                    windows=True, bootloader="Windows Boot Manager",
+                    architectures=("ARM64",),
+                ),
+                "only one detected x64",
+            ),
+            (
+                inspection(
+                    windows=True, bootloader="Windows Boot Manager",
+                    architectures=("x64", "ARM64"),
+                ),
+                "only one detected x64",
+            ),
+        )
+        for image, message in candidates:
+            with self.subTest(message=message, architectures=image.architectures):
+                with self.assertRaisesRegex(PlanError, message):
+                    build_write_plan(
+                        image, windows_dual_entries(),
+                        firmware_target=FirmwareTarget.BOTH,
+                    )
+
+    def test_explicit_windows_dual_profile_requires_valid_unique_x64_payload(self):
+        image = inspection(windows=True, bootloader="Windows Boot Manager")
+        candidates = (
+            replace(image, uefi_payloads=()),
+            replace(
+                image,
+                uefi_payloads=(replace(image.uefi_payloads[0], architecture="ARM64"),),
+            ),
+            replace(
+                image,
+                uefi_payloads=(replace(image.uefi_payloads[0], is_uefi_image=False),),
+            ),
+            replace(image, uefi_analysis_complete=False),
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(PlanError):
+                    build_write_plan(
+                        candidate, windows_dual_entries(),
+                        firmware_target=FirmwareTarget.BOTH,
+                    )
+
+    def test_explicit_windows_dual_profile_rejects_non_wim_fat32_overflow_and_ntfs(self):
+        image = inspection(windows=True, bootloader="Windows Boot Manager")
+        with self.assertRaisesRegex(PlanError, "unsplittable file"):
+            build_write_plan(
+                image,
+                windows_dual_entries(
+                    ArchiveEntry("sources/install.esd", FAT32_MAX_FILE_SIZE + 1),
+                ),
+                firmware_target=FirmwareTarget.BOTH,
+            )
+        with self.assertRaisesRegex(PlanError, "requires FAT32"):
+            build_write_plan(
+                image, windows_dual_entries(),
+                firmware_target=FirmwareTarget.BOTH,
+                requested_filesystem=FileSystem.NTFS,
+            )
+
+    def test_explicit_windows_dual_profile_requires_complete_catalog_and_both_paths(self):
+        image = inspection(windows=True, bootloader="Windows Boot Manager")
+        with self.assertRaisesRegex(PlanError, "complete validated ISO catalog"):
+            build_write_plan(
+                replace(image, contents_scanned=False), windows_dual_entries(),
+                firmware_target=FirmwareTarget.BOTH,
+            )
+        with self.assertRaisesRegex(PlanError, "both BIOS and UEFI"):
+            build_write_plan(
+                replace(image, boot_modes=("UEFI",)), windows_dual_entries(),
+                firmware_target=FirmwareTarget.BOTH,
+            )
 
     def test_large_windows_wim_is_split_for_fat32(self):
         plan = build_write_plan(inspection(windows=True, bootloader="Windows Boot Manager"), [

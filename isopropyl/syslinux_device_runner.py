@@ -308,6 +308,8 @@ def _validate_prepared(
 class SyslinuxDeviceWriteRunner:
     """One-shot unprivileged owner of one helper-backed disk transaction."""
 
+    _operation = OPERATION
+
     def __init__(
         self,
         *,
@@ -339,6 +341,37 @@ class SyslinuxDeviceWriteRunner:
     def _set_process(self, process: subprocess.Popen[bytes] | None) -> None:
         with self._process_lock:
             self._process = process
+
+    @staticmethod
+    def _pack_request(*args: object) -> bytes:
+        return pack_helper_request(*args)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _build_result(
+        plan: SyslinuxDeviceWritePlan,
+        ready: ReadySyslinuxDeviceWrite,
+        request_id: bytes,
+        source_sha256: str,
+        cancellation_deferred: bool,
+    ) -> SyslinuxDeviceWriteResult:
+        return SyslinuxDeviceWriteResult(
+            plan.plan_sha256,
+            ready.ready_sha256,
+            request_id.hex(),
+            ready.device.path,
+            ready.device.major_minor,
+            ready.disk_sequence,
+            plan.image_size,
+            source_sha256,
+            plan.disk_signature,
+            plan.volume_id,
+            plan.logical_sector_size,
+            HELPER_PROFILE,
+            True,
+            True,
+            True,
+            cancellation_deferred,
+        )
 
     @property
     def committed(self) -> bool:
@@ -527,7 +560,7 @@ class SyslinuxDeviceWriteRunner:
         major_number, minor_number = (
             int(part) for part in ready.device.major_minor.split(":", 1)
         )
-        packet = pack_helper_request(
+        packet = self._pack_request(
             request_id,
             major_number,
             minor_number,
@@ -556,7 +589,7 @@ class SyslinuxDeviceWriteRunner:
                         installation.pkexec,
                         "--disable-internal-agent",
                         installation.helper,
-                        OPERATION,
+                        self._operation,
                     ],
                     stdin=child.fileno(),
                     stdout=subprocess.DEVNULL,
@@ -730,22 +763,11 @@ class SyslinuxDeviceWriteRunner:
                 raise SyslinuxDeviceRunError(
                     "The privileged helper result does not match the authorized transaction",
                 )
-            return SyslinuxDeviceWriteResult(
-                plan.plan_sha256,
-                ready.ready_sha256,
-                request_id.hex(),
-                ready.device.path,
-                ready.device.major_minor,
-                ready.disk_sequence,
-                plan.image_size,
+            return self._build_result(
+                plan,
+                ready,
+                request_id,
                 source_sha256,
-                plan.disk_signature,
-                plan.volume_id,
-                plan.logical_sector_size,
-                HELPER_PROFILE,
-                True,
-                True,
-                True,
                 self._cancelled.is_set(),
             )
         finally:

@@ -40,6 +40,8 @@ constructed.py
 data/bootloaders-v2.json
 data/distro-write-policies-v1.json
 data/freedos-images-v1.json
+data/fat32-bootmgr-stage0.hex
+data/fat32-bootmgr-stage2.hex
 data/io.github.codebooker.isopropyl.svg
 data/linux-images-v1.json
 data/microsoft-dbx-authenticode-v1.json
@@ -97,6 +99,10 @@ wim.py
 wim_apply_backend.py
 wim_apply_protocol.py
 windows.py
+windows_bios_pbr.py
+windows_iso_fat32.py
+windows_device.py
+windows_device_runner.py
 windows_bcd.py
 windows_bcd_capture.py
 windows_bcd_capture_import.py
@@ -221,6 +227,11 @@ PAYLOAD_FILES: tuple[tuple[str, str, int], ...] = (
     (
         "data/io.github.codebooker.isopropyl.fast-zero.policy",
         "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy",
+        0o644,
+    ),
+    (
+        "data/io.github.codebooker.isopropyl.windows-write.policy",
+        "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.windows-write.policy",
         0o644,
     ),
     (

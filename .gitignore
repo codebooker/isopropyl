@@ -10,6 +10,11 @@ venv/
 build/
 dist/
 
+# Device-free certification workspaces can contain extracted proprietary media.
+.isopropyl-real-cert.*/
+.isopropyl-windows-cert-*/
+.isopropyl-test-tmp.*/
+
 # Local captures, installer media, and virtual disks are never source assets.
 *.iso
 *.img

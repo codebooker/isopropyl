@@ -8,8 +8,9 @@ The builder accepts one descriptor-bound staging tree, creates one anonymous
 regular file through a bound workspace directory, preallocates its complete
 logical size, and writes the MBR, FAT32 metadata, directories, and file bytes
 without a loop device, mount, or subprocess.  A separate read-only FAT parser
-then hashes every resulting file before the opaque image can be handed to the
-Syslinux transaction in this module.
+then hashes every resulting file before the opaque image can be consumed.  The
+generic profile has no bootloader dependency; the legacy Syslinux constructor
+and patch function are a strict adapter that preserves its loader-first layout.
 """
 
 import fcntl
@@ -27,6 +28,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from .staging_tree import (
     StagedDirectory,
@@ -44,14 +46,12 @@ from .fat_image import (
     RegularFat32Image,
     inspect_regular_fat32_image,
 )
-from .bootloaders import BoundBootBundle
-from .syslinux_transaction import (
-    MAX_SYSLINUX_REGULAR_IMAGE_BYTES,
-    SyslinuxRegularFileTransaction,
-    SyslinuxRegularFileTransactionResult,
-    SyslinuxWriteKind,
-    build_syslinux_regular_file_transaction_plan,
-)
+if TYPE_CHECKING:
+    from .bootloaders import BoundBootBundle
+    from .syslinux_transaction import (
+        SyslinuxRegularFileTransaction,
+        SyslinuxRegularFileTransactionResult,
+    )
 
 
 SECTOR_SIZE = 512
@@ -62,10 +62,13 @@ FSINFO_SECTOR = 1
 BACKUP_BOOT_SECTOR = 6
 VOLUME_LABEL = b"ISOPROPYL  "
 COPY_BLOCK_BYTES = 4 * 1024 * 1024
+MAX_PRIVATE_FAT32_IMAGE_BYTES = 128 * 1024**3
 _MEDIA_ID_PROFILE = "io.github.codebooker.isopropyl/private-fat32/media-id/v1"
 _FORBIDDEN_MEDIA_IDS = frozenset({0, 0xFFFFFFFF})
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_PLAN_WITNESS = object()
+_GENERIC_PLAN_WITNESS = object()
+_SYSLINUX_PLAN_WITNESS = object()
+_WINDOWS_PLAN_WITNESS = object()
 _IMAGE_WITNESS = object()
 _SHORT_ALLOWED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$%'-_@~`!(){}^#&"
@@ -85,11 +88,20 @@ class PrivateFat32Cancelled(PrivateFat32Error):
 
 
 class PrivateFat32State(str, Enum):
+    GENERIC_ATTESTED = "generic-attested"
     UNPATCHED_ATTESTED = "unpatched-attested"
     PATCHING = "patching"
     PATCHED_ATTESTED = "patched-attested"
     POISONED = "poisoned"
     CLOSED = "closed"
+
+
+class PrivateFat32BuildProfile(str, Enum):
+    """Allocation and consumption contract layered over the FAT32 engine."""
+
+    GENERIC = "generic-v1"
+    SYSLINUX = "syslinux-v1"
+    WINDOWS_BOOTMGR = "windows-bootmgr-v1"
 
 
 @dataclass(frozen=True)
@@ -145,8 +157,9 @@ class PrivateFat32Plan:
     geometry: PrivateFat32Geometry
     directories: tuple[PrivateFat32Directory, ...]
     files: tuple[PrivateFat32File, ...]
-    root_ldlinux_size: int
-    root_ldlinux_sha256: str
+    profile: PrivateFat32BuildProfile
+    root_ldlinux_size: int | None
+    root_ldlinux_sha256: str | None
     total_content_bytes: int
     allocated_clusters: int
     disk_signature: int
@@ -245,7 +258,7 @@ def _geometry(image_size: int) -> PrivateFat32Geometry:
     if (
         type(image_size) is not int
         or image_size <= PARTITION_START_SECTOR * SECTOR_SIZE
-        or image_size > MAX_SYSLINUX_REGULAR_IMAGE_BYTES
+        or image_size > MAX_PRIVATE_FAT32_IMAGE_BYTES
         or image_size % SECTOR_SIZE
     ):
         raise PrivateFat32Error("The private FAT32 image size is invalid")
@@ -551,6 +564,8 @@ def _layout(
     directories: tuple[StagedDirectory, ...],
     files: tuple[StagedFile, ...],
     hashes: tuple[str, ...],
+    *,
+    priority_file: tuple[str, ...] | None,
 ) -> tuple[tuple[PrivateFat32Directory, ...], tuple[PrivateFat32File, ...], int]:
     aliases = _assign_aliases(directories, files)
     children: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
@@ -588,9 +603,13 @@ def _layout(
         )
         for index, (source, digest) in enumerate(zip(files, hashes, strict=True))
     ]
-    root_specs = tuple(item for item in file_specs if item[1].parts == ("ldlinux.sys",))
-    if len(root_specs) != 1 or root_specs[0][4] <= 0:
-        raise PrivateFat32Error("The staging tree has no non-empty root ldlinux.sys")
+    priority_specs = tuple(
+        item for item in file_specs if item[1].parts == priority_file
+    ) if priority_file is not None else ()
+    if priority_file is not None and (
+        len(priority_specs) != 1 or priority_specs[0][4] <= 0
+    ):
+        raise PrivateFat32Error("The staging tree lacks its required priority file")
 
     next_cluster = 2
     planned_directories_by_parts: dict[tuple[str, ...], PrivateFat32Directory] = {}
@@ -605,17 +624,25 @@ def _layout(
     )
     next_cluster += root_count
     by_index: dict[int, PrivateFat32File] = {}
-    root_index, root_file, root_digest, root_file_alias, root_file_count = root_specs[0]
-    by_index[root_index] = PrivateFat32File(
-        root_file,
-        root_digest,
-        root_file_alias[0],
-        root_file_alias[1],
-        root_file_alias[2],
-        next_cluster,
-        root_file_count,
-    )
-    next_cluster += root_file_count
+    priority_index: int | None = None
+    if priority_specs:
+        (
+            priority_index,
+            priority_source,
+            priority_digest,
+            priority_alias,
+            priority_count,
+        ) = priority_specs[0]
+        by_index[priority_index] = PrivateFat32File(
+            priority_source,
+            priority_digest,
+            priority_alias[0],
+            priority_alias[1],
+            priority_alias[2],
+            next_cluster,
+            priority_count,
+        )
+        next_cluster += priority_count
 
     for source, alias, cluster_count in directory_specs[1:]:
         planned_directories_by_parts[source.parts] = PrivateFat32Directory(
@@ -628,7 +655,7 @@ def _layout(
         )
         next_cluster += cluster_count
     for index, source, digest, alias, cluster_count in sorted(
-        (item for item in file_specs if item[0] != root_index),
+        (item for item in file_specs if item[0] != priority_index),
         key=lambda item: tuple(part.casefold() for part in item[1].parts),
     ):
         by_index[index] = PrivateFat32File(
@@ -648,13 +675,18 @@ def _layout(
         planned_directories_by_parts[item.parts] for item in directories
     )
     planned_files = tuple(by_index[index] for index in range(len(files)))
-    root_loader = tuple(item for item in planned_files if item.source.parts == ("ldlinux.sys",))
-    if (
-        len(root_loader) != 1
-        or root_loader[0].long_name
-        or root_loader[0].short_name != b"LDLINUX SYS"
-    ):
-        raise PrivateFat32Error("The root ldlinux.sys is not an unaliased FAT short name")
+    if priority_file is not None:
+        priority = tuple(
+            item for item in planned_files if item.source.parts == priority_file
+        )
+        if (
+            len(priority) != 1
+            or priority[0].long_name
+            or priority[0].short_name != b"LDLINUX SYS"
+        ):
+            raise PrivateFat32Error(
+                "The root ldlinux.sys is not an unaliased FAT short name",
+            )
     return planned_directories, planned_files, allocated
 
 
@@ -706,6 +738,7 @@ def _plan_payload(plan: PrivateFat32Plan) -> dict[str, object]:
             ]
             for item in plan.files
         ],
+        "profile": plan.profile.value,
         "root_ldlinux_size": plan.root_ldlinux_size,
         "root_ldlinux_sha256": plan.root_ldlinux_sha256,
         "total_content_bytes": plan.total_content_bytes,
@@ -786,18 +819,24 @@ def _derive_media_ids(
     return disk_signature, volume_id
 
 
-def build_private_fat32_plan(
+def _build_profiled_private_fat32_plan(
     staging_root: Path | str,
     workspace: Path | str,
     *,
     image_size: int,
-    expected_root_ldlinux: bytes,
+    profile: PrivateFat32BuildProfile,
+    expected_root_ldlinux: bytes | None,
     cancel_check: CancelCheck | None = None,
 ) -> PrivateFat32Plan:
     """Hash and allocate one final staged tree without creating an image."""
 
-    if type(expected_root_ldlinux) is not bytes or not expected_root_ldlinux:
-        raise PrivateFat32Error("Exact unpatched root ldlinux.sys bytes are required")
+    if type(profile) is not PrivateFat32BuildProfile:
+        raise PrivateFat32Error("The private FAT32 build profile is invalid")
+    if profile is PrivateFat32BuildProfile.SYSLINUX:
+        if type(expected_root_ldlinux) is not bytes or not expected_root_ldlinux:
+            raise PrivateFat32Error("Exact unpatched root ldlinux.sys bytes are required")
+    elif expected_root_ldlinux is not None:
+        raise PrivateFat32Error("The generic FAT32 profile accepts no Syslinux payload")
     root, _root_info = _canonical_path(staging_root, "staging root")
     workspace_path, workspace_info = _canonical_path(workspace, "private workspace")
     if workspace_info.st_uid != os.geteuid():
@@ -822,15 +861,31 @@ def build_private_fat32_plan(
         directories,
         files,
         hashes,
+        priority_file=(
+            ("ldlinux.sys",)
+            if profile is PrivateFat32BuildProfile.SYSLINUX
+            else None
+        ),
     )
-    root_files = tuple(item for item in planned_files if item.source.parts == ("ldlinux.sys",))
-    expected_digest = hashlib.sha256(expected_root_ldlinux).hexdigest()
-    if (
-        len(root_files) != 1
-        or root_files[0].source.size != len(expected_root_ldlinux)
-        or not hmac.compare_digest(root_files[0].sha256, expected_digest)
-    ):
-        raise PrivateFat32Error("The staged root ldlinux.sys does not match its exact payload")
+    root_ldlinux_size: int | None = None
+    root_ldlinux_sha256: str | None = None
+    if profile is PrivateFat32BuildProfile.SYSLINUX:
+        assert type(expected_root_ldlinux) is bytes
+        root_files = tuple(
+            item for item in planned_files
+            if item.source.parts == ("ldlinux.sys",)
+        )
+        expected_digest = hashlib.sha256(expected_root_ldlinux).hexdigest()
+        if (
+            len(root_files) != 1
+            or root_files[0].source.size != len(expected_root_ldlinux)
+            or not hmac.compare_digest(root_files[0].sha256, expected_digest)
+        ):
+            raise PrivateFat32Error(
+                "The staged root ldlinux.sys does not match its exact payload",
+            )
+        root_ldlinux_size = len(expected_root_ldlinux)
+        root_ldlinux_sha256 = expected_digest
     disk_signature, volume_id = _derive_media_ids(
         geometry,
         planned_directories,
@@ -843,23 +898,101 @@ def build_private_fat32_plan(
         geometry,
         planned_directories,
         planned_files,
-        len(expected_root_ldlinux),
-        expected_digest,
+        profile,
+        root_ldlinux_size,
+        root_ldlinux_sha256,
         sum(item.source.size for item in planned_files),
         allocated,
         disk_signature,
         volume_id,
         "",
-        _PLAN_WITNESS,
+        (
+            _SYSLINUX_PLAN_WITNESS
+            if profile is PrivateFat32BuildProfile.SYSLINUX
+            else _WINDOWS_PLAN_WITNESS
+            if profile is PrivateFat32BuildProfile.WINDOWS_BOOTMGR
+            else _GENERIC_PLAN_WITNESS
+        ),
     )
     return PrivateFat32Plan(
         **{**candidate.__dict__, "plan_sha256": _plan_digest(candidate)},
     )
 
 
+def build_generic_private_fat32_plan(
+    staging_root: Path | str,
+    workspace: Path | str,
+    *,
+    image_size: int,
+    cancel_check: CancelCheck | None = None,
+) -> PrivateFat32Plan:
+    """Plan a deterministic anonymous MBR/FAT32 image for any safe tree."""
+
+    return _build_profiled_private_fat32_plan(
+        staging_root,
+        workspace,
+        image_size=image_size,
+        profile=PrivateFat32BuildProfile.GENERIC,
+        expected_root_ldlinux=None,
+        cancel_check=cancel_check,
+    )
+
+
+def build_private_fat32_plan(
+    staging_root: Path | str,
+    workspace: Path | str,
+    *,
+    image_size: int,
+    expected_root_ldlinux: bytes,
+    cancel_check: CancelCheck | None = None,
+) -> PrivateFat32Plan:
+    """Build the legacy exact Syslinux plan through the generic engine."""
+
+    return _build_profiled_private_fat32_plan(
+        staging_root,
+        workspace,
+        image_size=image_size,
+        profile=PrivateFat32BuildProfile.SYSLINUX,
+        expected_root_ldlinux=expected_root_ldlinux,
+        cancel_check=cancel_check,
+    )
+
+
+def build_windows_private_fat32_plan(
+    staging_root: Path | str,
+    workspace: Path | str,
+    *,
+    image_size: int,
+    cancel_check: CancelCheck | None = None,
+) -> PrivateFat32Plan:
+    """Plan a Windows image whose unpatched form cannot be consumed."""
+
+    return _build_profiled_private_fat32_plan(
+        staging_root,
+        workspace,
+        image_size=image_size,
+        profile=PrivateFat32BuildProfile.WINDOWS_BOOTMGR,
+        expected_root_ldlinux=None,
+        cancel_check=cancel_check,
+    )
+
+
 def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
-    if type(plan) is not PrivateFat32Plan or plan._witness is not _PLAN_WITNESS:
+    if type(plan) is not PrivateFat32Plan:
         raise PrivateFat32Error("An authentic private FAT32 plan is required")
+    expected_witness = (
+        _SYSLINUX_PLAN_WITNESS
+        if plan.profile is PrivateFat32BuildProfile.SYSLINUX
+        else _WINDOWS_PLAN_WITNESS
+        if plan.profile is PrivateFat32BuildProfile.WINDOWS_BOOTMGR
+        else _GENERIC_PLAN_WITNESS
+        if plan.profile is PrivateFat32BuildProfile.GENERIC
+        else None
+    )
+    if plan._witness is not expected_witness:
+        raise PrivateFat32Error(
+            "The private FAT32 plan profile does not match its construction",
+        )
     if (
         type(plan.source_root) is not str
         or not os.path.isabs(plan.source_root)
@@ -877,10 +1010,7 @@ def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
         or type(plan.files) is not tuple
         or any(type(item) is not PrivateFat32Directory for item in plan.directories)
         or any(type(item) is not PrivateFat32File for item in plan.files)
-        or type(plan.root_ldlinux_size) is not int
-        or plan.root_ldlinux_size <= 0
-        or type(plan.root_ldlinux_sha256) is not str
-        or _SHA256.fullmatch(plan.root_ldlinux_sha256) is None
+        or type(plan.profile) is not PrivateFat32BuildProfile
         or type(plan.total_content_bytes) is not int
         or plan.total_content_bytes < 0
         or type(plan.allocated_clusters) is not int
@@ -894,6 +1024,19 @@ def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
         or _SHA256.fullmatch(plan.plan_sha256) is None
     ):
         raise PrivateFat32Error("The private FAT32 plan fields are invalid")
+    if plan.profile in {
+        PrivateFat32BuildProfile.GENERIC,
+        PrivateFat32BuildProfile.WINDOWS_BOOTMGR,
+    }:
+        if plan.root_ldlinux_size is not None or plan.root_ldlinux_sha256 is not None:
+            raise PrivateFat32Error("The FAT32 profile carries unexpected Syslinux state")
+    elif (
+        type(plan.root_ldlinux_size) is not int
+        or plan.root_ldlinux_size <= 0
+        or type(plan.root_ldlinux_sha256) is not str
+        or _SHA256.fullmatch(plan.root_ldlinux_sha256) is None
+    ):
+        raise PrivateFat32Error("The Syslinux FAT32 profile lacks its root loader")
     if plan.geometry != _geometry(plan.geometry.image_size):
         raise PrivateFat32Error("The private FAT32 geometry is not canonical")
     sources_directories = tuple(item.source for item in plan.directories)
@@ -924,15 +1067,29 @@ def _validate_plan_shape(plan: PrivateFat32Plan) -> None:
         sources_directories,
         sources_files,
         tuple(item.sha256 for item in plan.files),
+        priority_file=(
+            ("ldlinux.sys",)
+            if plan.profile is PrivateFat32BuildProfile.SYSLINUX
+            else None
+        ),
     )
     root_files = tuple(item for item in plan.files if item.source.parts == ("ldlinux.sys",))
+    loader_invalid = (
+        plan.profile is PrivateFat32BuildProfile.SYSLINUX
+        and (
+            len(root_files) != 1
+            or root_files[0].source.size != plan.root_ldlinux_size
+            or not hmac.compare_digest(
+                root_files[0].sha256,
+                plan.root_ldlinux_sha256 or "",
+            )
+        )
+    )
     if (
         rebuilt_directories != plan.directories
         or rebuilt_files != plan.files
         or rebuilt_allocated != plan.allocated_clusters
-        or len(root_files) != 1
-        or root_files[0].source.size != plan.root_ldlinux_size
-        or not hmac.compare_digest(root_files[0].sha256, plan.root_ldlinux_sha256)
+        or loader_invalid
         or sum(item.source.size for item in plan.files) != plan.total_content_bytes
         or plan.allocated_clusters > plan.geometry.cluster_count
         or (plan.disk_signature, plan.volume_id)
@@ -1085,7 +1242,10 @@ def _directory_content(
             records.extend(_lfn_records(item.source.parts[-1], item.short_name))
         is_directory = type(item) is PrivateFat32Directory
         attributes = 0x10 if is_directory else 0x20
-        if item.source.parts == ("ldlinux.sys",):
+        if (
+            plan.profile is PrivateFat32BuildProfile.SYSLINUX
+            and item.source.parts == ("ldlinux.sys",)
+        ):
             attributes = 0x07
         records.append(_short_record(
             item.short_name,
@@ -1308,7 +1468,7 @@ class AnonymousFat32Image:
 
     __slots__ = (
         "_descriptor", "_inspection", "_lifecycle", "_plan", "_result", "_state",
-        "_transaction_result", "_witness",
+        "_patched_image_sha256", "_transaction_result", "_witness",
     )
 
     def __init__(
@@ -1326,8 +1486,13 @@ class AnonymousFat32Image:
         self._result = result
         self._inspection = inspection
         self._lifecycle = threading.RLock()
-        self._state = PrivateFat32State.UNPATCHED_ATTESTED
+        self._state = (
+            PrivateFat32State.GENERIC_ATTESTED
+            if plan.profile is PrivateFat32BuildProfile.GENERIC
+            else PrivateFat32State.UNPATCHED_ATTESTED
+        )
         self._transaction_result: SyslinuxRegularFileTransactionResult | None = None
+        self._patched_image_sha256: str | None = None
         self._witness = witness
 
     @property
@@ -1355,11 +1520,12 @@ class AnonymousFat32Image:
             raise PrivateFat32Error("The anonymous FAT32 image is closed")
         return self._descriptor
 
-    def _begin_patch(self) -> int:
+    def _begin_profile_patch(self, profile: PrivateFat32BuildProfile) -> int:
         self._lifecycle.acquire()
         try:
             if (
                 self._witness is not _IMAGE_WITNESS
+                or self._plan.profile is not profile
                 or self._state is not PrivateFat32State.UNPATCHED_ATTESTED
             ):
                 raise PrivateFat32Error(
@@ -1371,6 +1537,29 @@ class AnonymousFat32Image:
         except BaseException:
             self._lifecycle.release()
             raise
+
+    def _begin_patch(self) -> int:
+        return self._begin_profile_patch(PrivateFat32BuildProfile.SYSLINUX)
+
+    def _begin_windows_patch(self) -> int:
+        return self._begin_profile_patch(PrivateFat32BuildProfile.WINDOWS_BOOTMGR)
+
+    def _commit_windows_patch(
+        self,
+        inspection: RegularFat32Image,
+        image_sha256: str,
+    ) -> None:
+        if (
+            self._state is not PrivateFat32State.PATCHING
+            or self._plan.profile is not PrivateFat32BuildProfile.WINDOWS_BOOTMGR
+            or type(inspection) is not RegularFat32Image
+            or type(image_sha256) is not str
+            or _SHA256.fullmatch(image_sha256) is None
+        ):
+            raise PrivateFat32Error("The patched Windows FAT32 result is invalid")
+        self._inspection = inspection
+        self._patched_image_sha256 = image_sha256
+        self._state = PrivateFat32State.PATCHED_ATTESTED
 
     def _end_patch(self) -> None:
         self._lifecycle.release()
@@ -1396,7 +1585,7 @@ class AnonymousFat32Image:
             self._state = PrivateFat32State.CLOSED
 
     def chunks(self, chunk_bytes: int = COPY_BLOCK_BYTES) -> Iterator[bytes]:
-        """Yield bounded image bytes only after the Syslinux attestation."""
+        """Yield bounded bytes from a generic or patched attested image."""
 
         if type(chunk_bytes) is not int or not 1 <= chunk_bytes <= COPY_BLOCK_BYTES:
             raise PrivateFat32Error("The private image chunk size is invalid")
@@ -1426,9 +1615,21 @@ class AnonymousFat32Image:
         """Duplicate only a still-attested image for the owned helper bridge."""
 
         with self._lifecycle:
-            if self._state is not PrivateFat32State.PATCHED_ATTESTED:
+            generic = (
+                self._plan.profile is PrivateFat32BuildProfile.GENERIC
+                and self._state is PrivateFat32State.GENERIC_ATTESTED
+            )
+            patched = self._state is PrivateFat32State.PATCHED_ATTESTED
+            if not (generic or patched):
                 raise PrivateFat32Error(
-                    "Only a patched, attested image can cross the helper boundary",
+                    (
+                        "Only a patched, attested image can cross the helper boundary"
+                        if self._plan.profile in {
+                            PrivateFat32BuildProfile.SYSLINUX,
+                            PrivateFat32BuildProfile.WINDOWS_BOOTMGR,
+                        }
+                        else "Only a generic attested image can be consumed"
+                    ),
                 )
             descriptor = os.dup(self._owned_descriptor())
             image_size = self._plan.geometry.image_size
@@ -1441,32 +1642,124 @@ class AnonymousFat32Image:
                     cancel_check,
                 )
                 after_stream = _private_status(descriptor, image_size)
-                transaction_result = self._transaction_result
+                expected_identity = (
+                    (
+                        self._inspection.source_identity.device,
+                        self._inspection.source_identity.inode,
+                        self._inspection.source_identity.size,
+                        self._inspection.source_identity.modified_ns,
+                        self._inspection.source_identity.changed_ns,
+                    )
+                    if generic
+                    else (
+                        self._inspection.source_identity.device,
+                        self._inspection.source_identity.inode,
+                        self._inspection.source_identity.size,
+                        self._inspection.source_identity.modified_ns,
+                        self._inspection.source_identity.changed_ns,
+                    )
+                    if self._patched_image_sha256 is not None
+                    else None
+                )
+                expected_sha256 = (
+                    self._result.image_sha256
+                    if generic
+                    else self._patched_image_sha256
+                    if self._patched_image_sha256 is not None
+                    else ""
+                )
                 if (
-                    transaction_result is None
+                    expected_identity is None
                     or _source_identity(before_stream)
                     != _source_identity(after_stream)
                     or _source_identity(after_stream)
-                    != (
-                        transaction_result.final_identity.device,
-                        transaction_result.final_identity.inode,
-                        transaction_result.final_identity.size,
-                        transaction_result.final_identity.modified_ns,
-                        transaction_result.final_identity.changed_ns,
-                    )
+                    != expected_identity
                     or not hmac.compare_digest(
                         stream_sha256,
-                        transaction_result.final_image_sha256,
+                        expected_sha256,
                     )
                 ):
                     self._poison()
                     raise PrivateFat32Error(
-                        "The patched FAT32 image changed before streaming or helper transfer",
+                        "The FAT32 image changed before streaming or helper transfer",
                     )
             except BaseException:
                 os.close(descriptor)
                 raise
             return descriptor, image_size
+
+    def _duplicate_attested_readonly_descriptor(
+        self,
+        cancel_check: CancelCheck | None = None,
+    ) -> tuple[int, int]:
+        """Internally reopen one attested anonymous image read-only for a VM."""
+
+        self._lifecycle.acquire()
+        try:
+            source, image_size = self._duplicate_attested_descriptor(cancel_check)
+        except BaseException:
+            self._lifecycle.release()
+            raise
+        readonly = -1
+        try:
+            source_status = _private_status(source, image_size)
+            try:
+                readonly = os.open(
+                    f"/proc/self/fd/{source}",
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                )
+                readonly_status = os.fstat(readonly)
+                readonly_flags = fcntl.fcntl(readonly, fcntl.F_GETFL)
+            except OSError as error:
+                raise PrivateFat32Error(
+                    "Could not create a read-only attested image descriptor",
+                ) from error
+            if (
+                readonly_flags & os.O_ACCMODE != os.O_RDONLY
+                or readonly_flags & os.O_APPEND
+                or not stat.S_ISREG(readonly_status.st_mode)
+                or readonly_status.st_nlink != 0
+                or readonly_status.st_uid != os.geteuid()
+                or stat.S_IMODE(readonly_status.st_mode) != 0o600
+                or _source_identity(readonly_status) != _source_identity(source_status)
+            ):
+                raise PrivateFat32Error(
+                    "The read-only attested image descriptor is unsafe",
+                )
+            before_hash = _source_identity(readonly_status)
+            observed_sha256 = _image_digest(readonly, image_size, cancel_check)
+            after_hash = _source_identity(os.fstat(readonly))
+            expected_sha256 = (
+                self._result.image_sha256
+                if self._state is PrivateFat32State.GENERIC_ATTESTED
+                else self._patched_image_sha256 or ""
+            )
+            if (
+                before_hash != after_hash
+                or not hmac.compare_digest(observed_sha256, expected_sha256)
+            ):
+                self._poison()
+                raise PrivateFat32Error(
+                    "The read-only image changed before virtual-machine transfer",
+                )
+            result = readonly
+            readonly = -1
+            return result, image_size
+        finally:
+            try:
+                if readonly >= 0:
+                    try:
+                        os.close(readonly)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    try:
+                        os.close(source)
+                    except OSError:
+                        pass
+                finally:
+                    self._lifecycle.release()
 
     def __enter__(self) -> AnonymousFat32Image:
         with self._lifecycle:
@@ -1612,10 +1905,14 @@ class PrivateFat32Builder:
             directory_map = {item.source.parts: item.source for item in plan.directories}
             copied = 0
             try:
-                allocation_order = sorted(plan.files, key=lambda item: (
-                    item.source.parts != ("ldlinux.sys",),
-                    tuple(part.casefold() for part in item.source.parts),
-                ))
+                allocation_order = sorted(
+                    plan.files,
+                    key=lambda item: (
+                        item.first_cluster == 0,
+                        item.first_cluster,
+                        tuple(part.casefold() for part in item.source.parts),
+                    ),
+                )
                 for item in allocation_order:
                     _check_cancelled(cancel_check)
                     base = (
@@ -1756,7 +2053,17 @@ def patch_private_fat32_syslinux(
 ) -> SyslinuxRegularFileTransactionResult:
     """Patch and re-attest one builder-owned image without exposing its fd."""
 
-    if type(image) is not AnonymousFat32Image:
+    from .syslinux_transaction import (
+        SyslinuxRegularFileTransaction,
+        SyslinuxRegularFileTransactionResult,
+        SyslinuxWriteKind,
+        build_syslinux_regular_file_transaction_plan,
+    )
+
+    if (
+        type(image) is not AnonymousFat32Image
+        or image.plan.profile is not PrivateFat32BuildProfile.SYSLINUX
+    ):
         raise PrivateFat32Error("One unpatched builder-owned FAT32 image is required")
     descriptor = image._begin_patch()
     try:
@@ -1889,6 +2196,7 @@ def patch_private_fat32_syslinux(
             raise PrivateFat32Error("The patched FAT32 image failed final tree attestation")
         image._inspection = final_inspection
         image._transaction_result = result
+        image._patched_image_sha256 = final_image_sha256
         image._state = PrivateFat32State.PATCHED_ATTESTED
         return result
     except BaseException as error:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SourceInstallTests(unittest.TestCase):
+    def test_wheel_package_data_includes_bios_hex_artifacts(self):
+        configuration = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        patterns = configuration["tool"]["setuptools"]["package-data"]["isopropyl"]
+        self.assertIn("data/*.hex", patterns)
+
+    def test_source_distribution_includes_reproducible_bios_sources(self):
+        manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+        self.assertIn("include boot/fat32_bootmgr_stage0.S", manifest)
+        self.assertIn("include boot/fat32_bootmgr_stage2.S", manifest)
+
     @unittest.skipUnless(shutil.which("make"), "GNU make is not installed")
     def test_make_install_replaces_an_existing_package_without_nesting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -41,6 +52,8 @@ class SourceInstallTests(unittest.TestCase):
             self.assertTrue((package / "app.py").is_file())
             self.assertTrue((package / "freedos_downloads.py").is_file())
             self.assertTrue((data / "freedos-images-v1.json").is_file())
+            self.assertTrue((data / "fat32-bootmgr-stage0.hex").is_file())
+            self.assertTrue((data / "fat32-bootmgr-stage2.hex").is_file())
             self.assertTrue((data / "windows-images-v2.json").is_file())
             self.assertFalse((data / "windows-images-v1.json").exists())
             self.assertFalse((package / "stale-marker").exists())

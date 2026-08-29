@@ -36,6 +36,7 @@ from pathlib import Path
 
 
 HELPER_PROFILE = "io.github.codebooker.isopropyl/syslinux-device-helper/v1"
+WINDOWS_HELPER_PROFILE = "io.github.codebooker.isopropyl/windows-device-helper/v1"
 RAW_HELPER_PROFILE = "io.github.codebooker.isopropyl/raw-device-helper/v1"
 FAST_ZERO_HELPER_PROFILE = "io.github.codebooker.isopropyl/fast-zero-device-helper/v1"
 SECTOR_SIZE = 512
@@ -52,6 +53,15 @@ CONTROL_TIMEOUT_SECONDS = 30.0
 SYSLINUX_MBR_602_SHA256 = (
     "4746f74bc9b9d3d579c41988a4a29bb7ac932ad1c70470ea779ea161eb799b64"
 )
+WINDOWS_STAGE0_SHA256 = (
+    "852ac6b9a78d3ed2a092d051ef1674e76f1c0b319d7eb4d7f684067b5951072d"
+)
+WINDOWS_STAGE2_SHA256 = (
+    "127a6e7eda4545ba329c43af810ae9e85587302a9a588fafa05c06b8d6dd3a60"
+)
+WINDOWS_BOOTMGR_ENTRY_STUB = b"\xe9\xd5\x01\xeb\x04\x90"
+WINDOWS_BOOTMGR_MIN_SIZE = 0x1D9
+WINDOWS_BOOTMGR_MAX_SIZE = 0x7E000
 # SHA-256 of each accepted ldlinux.bss boot sector after zeroing the FAT32 BPB
 # (bytes 11..89) and the two installer-patched first-sector pointers.  This
 # preserves the independently pinned immutable Syslinux 6.03/6.04-pre1 code
@@ -68,6 +78,7 @@ FAT_COUNT = 2
 MIN_FAT32_CLUSTERS = 65_525
 
 PROTOCOL_MAGIC = b"ISOPROPYL-SYSLX1"
+WINDOWS_PROTOCOL_MAGIC = b"ISOPROPYL-WIN001"
 RAW_PROTOCOL_MAGIC = b"ISOPROPYL-RAW001"
 FAST_ZERO_PROTOCOL_MAGIC = b"ISOPROPYL-ZERO01"
 PROTOCOL_VERSION = 1
@@ -82,6 +93,7 @@ PACKET_MUTATION_STARTED = 8
 PACKET_PARTIAL_CANCEL = 9
 PACKET_PARTIAL_FAILURE = 10
 OPERATION = "write-image-v1"
+WINDOWS_OPERATION = "write-windows-image-v1"
 RAW_OPERATION = "write-raw-image-v1"
 FAST_ZERO_OPERATION = "fast-zero-drive-v1"
 FAST_ZERO_FAILURE_NONE = 0
@@ -613,7 +625,7 @@ def validate_helper_request(request: HelperRequest) -> None:
         raise HelperRequestError("An exact privileged-helper request is required")
     if type(request.request_id) is not bytes or len(request.request_id) != 16:
         raise HelperRequestError("The privileged request identifier is invalid")
-    if request.profile != HELPER_PROFILE:
+    if request.profile not in {HELPER_PROFILE, WINDOWS_HELPER_PROFILE}:
         raise HelperRequestError("The privileged-helper profile is unsupported")
     if type(request.target_path) is not str or _TARGET_PATH.fullmatch(request.target_path) is None:
         raise HelperRequestError("The privileged target path is invalid")
@@ -646,7 +658,7 @@ def validate_helper_request(request: HelperRequest) -> None:
         or not 0 < request.expected_volume_id < 0xFFFFFFFF
         or request.expected_volume_id == request.expected_disk_signature
     ):
-        raise HelperRequestError("The expected Syslinux media identifiers are invalid")
+        raise HelperRequestError("The expected image media identifiers are invalid")
     if type(request.expected_sha256) is not str or _SHA256.fullmatch(request.expected_sha256) is None:
         raise HelperRequestError("The expected image digest is invalid")
 
@@ -1003,6 +1015,271 @@ def _validate_syslinux_image_layout(
     return mbr
 
 
+def _fat32_short_entry(
+    descriptor: int,
+    *,
+    volume_offset: int,
+    data_start: int,
+    fat_start: int,
+    sectors_per_cluster: int,
+    cluster_end: int,
+    directory_cluster: int,
+    short_name: bytes,
+    long_name: str | None = None,
+    read_at: Callable[[int, int, int], bytes],
+) -> tuple[int, int, int]:
+    """Find one exact short/LFN entry while bounding every FAT traversal."""
+
+    if len(short_name) != 11 or (long_name is not None and not long_name.isascii()):
+        raise HelperSourceError("The Windows FAT lookup name is invalid")
+
+    def short_checksum(value: bytes) -> int:
+        checksum = 0
+        for byte in value:
+            checksum = ((checksum & 1) << 7) + (checksum >> 1) + byte
+            checksum &= 0xFF
+        return checksum
+
+    def decode_lfn(entries: list[bytes], following_short: bytes) -> str | None:
+        if not entries:
+            return None
+        expected_count = entries[0][0] & 0x1F
+        if (
+            not entries[0][0] & 0x40
+            or expected_count == 0
+            or len(entries) != expected_count
+        ):
+            return None
+        checksum = short_checksum(following_short)
+        parts: dict[int, bytes] = {}
+        for index, entry in enumerate(entries):
+            ordinal = entry[0] & 0x1F
+            if (
+                ordinal != expected_count - index
+                or entry[11] != 0x0F
+                or entry[12] != 0
+                or entry[13] != checksum
+                or entry[26:28] != b"\0\0"
+            ):
+                return None
+            parts[ordinal] = entry[1:11] + entry[14:26] + entry[28:32]
+        raw = b"".join(parts[index] for index in range(1, expected_count + 1))
+        units = [raw[index:index + 2] for index in range(0, len(raw), 2)]
+        rendered: list[bytes] = []
+        terminated = False
+        for unit in units:
+            if unit == b"\0\0":
+                terminated = True
+                continue
+            if unit == b"\xff\xff" and terminated:
+                continue
+            if terminated or unit == b"\xff\xff":
+                return None
+            rendered.append(unit)
+        try:
+            return b"".join(rendered).decode("utf-16le", errors="strict")
+        except UnicodeDecodeError:
+            return None
+
+    visited: set[int] = set()
+    cluster = directory_cluster
+    pending_lfn: list[bytes] = []
+    while True:
+        if not 2 <= cluster < cluster_end or cluster in visited:
+            raise HelperSourceError("The Windows FAT directory chain is invalid")
+        visited.add(cluster)
+        if len(visited) > cluster_end - 2:
+            raise HelperSourceError("The Windows FAT directory traversal is too large")
+        lba = data_start + (cluster - 2) * sectors_per_cluster
+        content = _read_exact_at(
+            descriptor,
+            volume_offset + lba * SECTOR_SIZE,
+            sectors_per_cluster * SECTOR_SIZE,
+            read_at=read_at,
+            label="Windows FAT directory",
+        )
+        for offset in range(0, len(content), 32):
+            entry = content[offset:offset + 32]
+            if entry[0] == 0:
+                raise HelperSourceError("The required Windows FAT entry is absent")
+            if entry[0] == 0xE5:
+                pending_lfn.clear()
+                continue
+            if entry[11] == 0x0F:
+                pending_lfn.append(entry)
+                continue
+            observed_lfn = decode_lfn(pending_lfn, entry[:11])
+            pending_lfn.clear()
+            if entry[11] & 0x08:
+                continue
+            if entry[:11] == short_name or (
+                long_name is not None and observed_lfn == long_name
+            ):
+                first_cluster = (
+                    struct.unpack_from("<H", entry, 20)[0] << 16
+                    | struct.unpack_from("<H", entry, 26)[0]
+                )
+                return entry[11], first_cluster, struct.unpack_from("<I", entry, 28)[0]
+        fat_offset = cluster * 4
+        successor = _read_exact_at(
+            descriptor,
+            volume_offset + fat_start * SECTOR_SIZE + fat_offset,
+            4,
+            read_at=read_at,
+            label="Windows FAT successor",
+        )
+        cluster = struct.unpack("<I", successor)[0] & 0x0FFFFFFF
+        if cluster >= 0x0FFFFFF8:
+            raise HelperSourceError("The required Windows FAT entry is absent")
+
+
+def _validate_windows_image_layout(
+    descriptor: int,
+    request: HelperRequest,
+    *,
+    read_at: Callable[[int, int, int], bytes],
+) -> bytes:
+    """Require the exact project Windows FAT32/BIOS image before mutation."""
+
+    mbr = _read_exact_at(descriptor, 0, SECTOR_SIZE, read_at=read_at, label="Windows MBR")
+    volume_offset = PARTITION_START_SECTOR * SECTOR_SIZE
+    partition_sectors, sectors_per_cluster, sectors_per_fat, cluster_count = (
+        _canonical_fat32_geometry(request.expected_size)
+    )
+    expected_partition = bytearray(16)
+    expected_partition[:8] = b"\x80\x20\x21\x00\x0c\xfe\xff\xff"
+    struct.pack_into("<I", expected_partition, 8, PARTITION_START_SECTOR)
+    struct.pack_into("<I", expected_partition, 12, partition_sectors)
+    if (
+        mbr[510:512] != b"\x55\xaa"
+        or hashlib.sha256(mbr[:440]).hexdigest() != SYSLINUX_MBR_602_SHA256
+        or struct.unpack_from("<I", mbr, 440)[0] != request.expected_disk_signature
+        or mbr[444:446] != b"\0\0"
+        or mbr[446:462] != expected_partition
+        or any(mbr[462:510])
+    ):
+        raise HelperSourceError("The anonymous source is not the bound Windows MBR image")
+
+    primary = _read_exact_at(
+        descriptor, volume_offset, SECTOR_SIZE,
+        read_at=read_at, label="primary Windows FAT32 boot sector",
+    )
+    backup = _read_exact_at(
+        descriptor, volume_offset + 6 * SECTOR_SIZE, SECTOR_SIZE,
+        read_at=read_at, label="backup Windows FAT32 boot sector",
+    )
+    template = bytearray(primary)
+    template[3:90] = b"\0" * 87
+    if (
+        primary != backup
+        or hashlib.sha256(template).hexdigest() != WINDOWS_STAGE0_SHA256
+        or primary[:11] != b"\xeb\x58\x90ISOPROPY"
+        or struct.unpack_from("<H", primary, 11)[0] != SECTOR_SIZE
+        or primary[13] != sectors_per_cluster
+        or struct.unpack_from("<H", primary, 14)[0] != RESERVED_SECTORS
+        or primary[16] != FAT_COUNT
+        or struct.unpack_from("<H", primary, 17)[0] != 0
+        or struct.unpack_from("<H", primary, 19)[0] != 0
+        or primary[21] != 0xF8
+        or struct.unpack_from("<H", primary, 22)[0] != 0
+        or struct.unpack_from("<H", primary, 24)[0] != 63
+        or struct.unpack_from("<H", primary, 26)[0] != 255
+        or struct.unpack_from("<I", primary, 28)[0] != PARTITION_START_SECTOR
+        or struct.unpack_from("<I", primary, 32)[0] != partition_sectors
+        or struct.unpack_from("<I", primary, 36)[0] != sectors_per_fat
+        or struct.unpack_from("<H", primary, 40)[0] != 0
+        or struct.unpack_from("<H", primary, 42)[0] != 0
+        or struct.unpack_from("<I", primary, 44)[0] != 2
+        or struct.unpack_from("<H", primary, 48)[0] != 1
+        or struct.unpack_from("<H", primary, 50)[0] != 6
+        or any(primary[52:64])
+        or primary[64:67] != b"\x80\0\x29"
+        or struct.unpack_from("<I", primary, 67)[0] != request.expected_volume_id
+        or primary[71:82] != b"ISOPROPYL  "
+        or primary[82:90] != b"FAT32   "
+        or primary[510:512] != b"\x55\xaa"
+    ):
+        raise HelperSourceError("The Windows FAT32 VBR is not the pinned project profile")
+    stage = _read_exact_at(
+        descriptor, volume_offset + 12 * SECTOR_SIZE, 2 * SECTOR_SIZE,
+        read_at=read_at, label="Windows BIOS stage",
+    )
+    if hashlib.sha256(stage).hexdigest() != WINDOWS_STAGE2_SHA256:
+        raise HelperSourceError("The Windows FAT32 BIOS stage does not match its pin")
+
+    fsinfo = _read_exact_at(
+        descriptor, volume_offset + SECTOR_SIZE, SECTOR_SIZE,
+        read_at=read_at, label="Windows FAT32 FSInfo",
+    )
+    backup_fsinfo = _read_exact_at(
+        descriptor, volume_offset + 7 * SECTOR_SIZE, SECTOR_SIZE,
+        read_at=read_at, label="backup Windows FAT32 FSInfo",
+    )
+    free_clusters = struct.unpack_from("<I", fsinfo, 488)[0]
+    next_free = struct.unpack_from("<I", fsinfo, 492)[0]
+    expected_next_free = 0xFFFFFFFF if free_clusters == 0 else 2 + cluster_count - free_clusters
+    canonical_fsinfo = bytearray(SECTOR_SIZE)
+    struct.pack_into("<I", canonical_fsinfo, 0, 0x41615252)
+    struct.pack_into("<I", canonical_fsinfo, 484, 0x61417272)
+    struct.pack_into("<I", canonical_fsinfo, 488, free_clusters)
+    struct.pack_into("<I", canonical_fsinfo, 492, next_free)
+    struct.pack_into("<I", canonical_fsinfo, 508, 0xAA550000)
+    if (
+        fsinfo != backup_fsinfo
+        or fsinfo != bytes(canonical_fsinfo)
+        or free_clusters > cluster_count
+        or next_free != expected_next_free
+    ):
+        raise HelperSourceError("The Windows FAT32 allocation metadata is not canonical")
+
+    data_start = RESERVED_SECTORS + FAT_COUNT * sectors_per_fat
+    cluster_end = cluster_count + 2
+    lookup = lambda directory, name, long_name=None: _fat32_short_entry(
+        descriptor,
+        volume_offset=volume_offset,
+        data_start=data_start,
+        fat_start=RESERVED_SECTORS,
+        sectors_per_cluster=sectors_per_cluster,
+        cluster_end=cluster_end,
+        directory_cluster=directory,
+        short_name=name,
+        long_name=long_name,
+        read_at=read_at,
+    )
+    bootmgr_attr, bootmgr_cluster, bootmgr_size = lookup(2, b"BOOTMGR    ")
+    boot_attr, boot_cluster, _ = lookup(2, b"BOOT       ", "Boot")
+    efi_attr, efi_cluster, _ = lookup(2, b"EFI        ")
+    bcd_attr, bcd_cluster, bcd_size = lookup(boot_cluster, b"BCD        ")
+    efi_boot_attr, efi_boot_cluster, _ = lookup(efi_cluster, b"BOOT       ")
+    bootx64_attr, bootx64_cluster, bootx64_size = lookup(
+        efi_boot_cluster, b"BOOTX64 EFI",
+    )
+    if (
+        bootmgr_attr & 0x18
+        or not WINDOWS_BOOTMGR_MIN_SIZE <= bootmgr_size <= WINDOWS_BOOTMGR_MAX_SIZE
+        or not 2 <= bootmgr_cluster < cluster_end
+        or not boot_attr & 0x10
+        or not efi_attr & 0x10
+        or bcd_attr & 0x18
+        or bcd_size == 0
+        or not 2 <= bcd_cluster < cluster_end
+        or not efi_boot_attr & 0x10
+        or bootx64_attr & 0x18
+        or bootx64_size == 0
+        or not 2 <= bootx64_cluster < cluster_end
+    ):
+        raise HelperSourceError("The required Windows BIOS/UEFI files are invalid")
+    bootmgr_offset = volume_offset + (
+        data_start + (bootmgr_cluster - 2) * sectors_per_cluster
+    ) * SECTOR_SIZE
+    if _read_exact_at(
+        descriptor, bootmgr_offset, len(WINDOWS_BOOTMGR_ENTRY_STUB),
+        read_at=read_at, label="Windows BOOTMGR entry stub",
+    ) != WINDOWS_BOOTMGR_ENTRY_STUB:
+        raise HelperSourceError("The Windows BOOTMGR entry stub is unsupported")
+    return mbr
+
+
 def _hash_descriptor(
     descriptor: int,
     size: int,
@@ -1136,10 +1413,18 @@ def execute_helper_transaction(
         operations.flock(source_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
         raise HelperSourceError("The anonymous source image is not exclusively owned") from error
-    source_mbr = _validate_syslinux_image_layout(
-        source_descriptor,
-        request,
-        read_at=operations.pread,
+    source_mbr = (
+        _validate_windows_image_layout(
+            source_descriptor,
+            request,
+            read_at=operations.pread,
+        )
+        if request.profile == WINDOWS_HELPER_PROFILE
+        else _validate_syslinux_image_layout(
+            source_descriptor,
+            request,
+            read_at=operations.pread,
+        )
     )
     source_sha256 = _hash_descriptor(
         source_descriptor,
@@ -1456,7 +1741,7 @@ def execute_helper_transaction(
             raise HelperVerificationError("The target identity or geometry changed after verification")
         return HelperResult(
             request.request_id,
-            HELPER_PROFILE,
+            request.profile,
             request.target_path,
             request.expected_major_minor,
             request.expected_disk_sequence,
@@ -2606,6 +2891,53 @@ def unpack_helper_request(
     return request
 
 
+def pack_windows_helper_request(
+    request_id: bytes,
+    major_number: int,
+    minor_number: int,
+    disk_sequence: int,
+    size: int,
+    sector_size: int,
+    disk_signature: int,
+    volume_id: int,
+    sha256_hex: str,
+) -> bytes:
+    packet = pack_helper_request(
+        request_id, major_number, minor_number, disk_sequence, size,
+        sector_size, disk_signature, volume_id, sha256_hex,
+    )
+    return WINDOWS_PROTOCOL_MAGIC + packet[len(PROTOCOL_MAGIC):]
+
+
+def unpack_windows_helper_request(
+    packet: bytes,
+    *,
+    sys_root: Path = Path("/sys"),
+) -> HelperRequest:
+    if type(packet) is not bytes or len(packet) != _REQUEST_PACKET.size:
+        raise HelperRequestError("The Windows request packet has the wrong size")
+    if packet[:len(WINDOWS_PROTOCOL_MAGIC)] != WINDOWS_PROTOCOL_MAGIC:
+        raise HelperRequestError("The Windows request packet is unsupported")
+    generic = unpack_helper_request(
+        PROTOCOL_MAGIC + packet[len(WINDOWS_PROTOCOL_MAGIC):],
+        sys_root=sys_root,
+    )
+    request = HelperRequest(
+        generic.request_id,
+        WINDOWS_HELPER_PROFILE,
+        generic.target_path,
+        generic.expected_major_minor,
+        generic.expected_disk_sequence,
+        generic.expected_size,
+        generic.expected_sector_size,
+        generic.expected_disk_signature,
+        generic.expected_volume_id,
+        generic.expected_sha256,
+    )
+    validate_helper_request(request)
+    return request
+
+
 def pack_raw_helper_request(
     request_id: bytes,
     major_number: int,
@@ -2880,6 +3212,18 @@ def unpack_server_packet(packet: bytes) -> tuple[object, ...]:
     raise HelperRequestError("The helper response packet has an invalid type or size")
 
 
+def unpack_windows_server_packet(packet: bytes) -> tuple[object, ...]:
+    """Strictly decode one Windows-profile helper packet."""
+
+    if type(packet) is not bytes or len(packet) < _HEADER.size:
+        raise HelperRequestError("The Windows helper response is truncated")
+    if packet[:len(WINDOWS_PROTOCOL_MAGIC)] != WINDOWS_PROTOCOL_MAGIC:
+        raise HelperRequestError("The Windows helper response is unsupported")
+    return unpack_server_packet(
+        PROTOCOL_MAGIC + packet[len(WINDOWS_PROTOCOL_MAGIC):],
+    )
+
+
 def unpack_raw_server_packet(packet: bytes) -> tuple[object, ...]:
     """Strictly decode one raw-device helper packet for its runner."""
 
@@ -3121,6 +3465,11 @@ def pack_helper_control(request_id: bytes, *, commit: bool) -> bytes:
     )
 
 
+def pack_windows_helper_control(request_id: bytes, *, commit: bool) -> bytes:
+    packet = pack_helper_control(request_id, commit=commit)
+    return WINDOWS_PROTOCOL_MAGIC + packet[len(PROTOCOL_MAGIC):]
+
+
 def pack_raw_helper_control(request_id: bytes, *, commit: bool) -> bytes:
     if type(request_id) is not bytes or len(request_id) != 16 or type(commit) is not bool:
         raise HelperRequestError("The privileged raw control decision cannot be encoded")
@@ -3164,6 +3513,7 @@ class _ProtocolProgress:
     ) -> None:
         if protocol_magic not in {
             PROTOCOL_MAGIC,
+            WINDOWS_PROTOCOL_MAGIC,
             RAW_PROTOCOL_MAGIC,
             FAST_ZERO_PROTOCOL_MAGIC,
         }:
@@ -3608,6 +3958,7 @@ def main(argv: list[str] | None = None) -> int:
         arguments = sys.argv[1:] if argv is None else argv
         if len(arguments) != 1 or arguments[0] not in {
             OPERATION,
+            WINDOWS_OPERATION,
             RAW_OPERATION,
             FAST_ZERO_OPERATION,
         }:
@@ -3615,6 +3966,7 @@ def main(argv: list[str] | None = None) -> int:
         operation = arguments[0]
         protocol_magic = {
             OPERATION: PROTOCOL_MAGIC,
+            WINDOWS_OPERATION: WINDOWS_PROTOCOL_MAGIC,
             RAW_OPERATION: RAW_PROTOCOL_MAGIC,
             FAST_ZERO_OPERATION: FAST_ZERO_PROTOCOL_MAGIC,
         }[operation]
@@ -3639,6 +3991,8 @@ def main(argv: list[str] | None = None) -> int:
             request = (
                 unpack_helper_request(packet)
                 if operation == OPERATION
+                else unpack_windows_helper_request(packet)
+                if operation == WINDOWS_OPERATION
                 else unpack_raw_helper_request(packet)
             )
         progress = _ProtocolProgress(
@@ -3699,7 +4053,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if type(result) is HelperResult:
                 response = _SUCCESS_PACKET.pack(
-                    PROTOCOL_MAGIC,
+                    (
+                        WINDOWS_PROTOCOL_MAGIC
+                        if result.profile == WINDOWS_HELPER_PROFILE
+                        else PROTOCOL_MAGIC
+                    ),
                     PROTOCOL_VERSION,
                     PACKET_SUCCESS,
                     0,

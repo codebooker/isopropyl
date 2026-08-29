@@ -73,6 +73,7 @@ from .iso import (
     EntryKind,
     FileSystem,
     FirmwareTarget,
+    PartitionTable,
     Transformation,
     UnsafeArchiveError,
     WriteMode,
@@ -202,6 +203,9 @@ _BOOTEX_WIM_PATHS = (
 )
 _BOOTEX_EXTRA_SPACE = (
     WIM_MAX_EXTRACT_BYTES + BOOTEX_MAX_EXTRACTED_TOTAL_BYTES
+)
+_WINDOWS_DUAL_TRANSITIONAL_BLOCKER = (
+    "BIOS construction is not enabled; choose UEFI-only or use DD mode."
 )
 
 
@@ -708,23 +712,90 @@ def _validate_staging_scalar_bindings(plan: IsoStagingPlan) -> None:
             raise IsoStagingSafetyError(f"The staging plan {name} is invalid")
 
 
+def _is_transitional_windows_plan(plan: WritePlan) -> bool:
+    if type(plan) is not WritePlan:
+        return False
+    layout = plan.layout
+    return (
+        plan.firmware_target is FirmwareTarget.BOTH
+        and layout is not None
+        and layout.partition_table is PartitionTable.MBR
+        and layout.main_filesystem is FileSystem.FAT32
+        and layout.partition_count == 1
+        and layout.boot_partition_filesystem is None
+        and layout.bios_bootable
+        and layout.uefi_bootable
+        and layout.main_partition_active
+        and layout.boot_strategy is BootStrategy.WINDOWS_BOOTMGR_FAT32
+        and plan.blockers == (_WINDOWS_DUAL_TRANSITIONAL_BLOCKER,)
+    )
+
+
+def _validate_transitional_windows_staging_scope(
+    write_plan: WritePlan,
+    *,
+    overlay: object,
+    embedded_fat: object,
+    windows_customization: object,
+    windows_bootex: object,
+    syslinux_c32_bundle: object,
+    syslinux_payload_bundle: object,
+) -> None:
+    """Keep the legacy blocked-plan exception inside its reviewed profile."""
+
+    if _is_transitional_windows_plan(write_plan) and any(
+        value is not None
+        for value in (
+            overlay,
+            embedded_fat,
+            windows_customization,
+            windows_bootex,
+            syslinux_c32_bundle,
+            syslinux_payload_bundle,
+        )
+    ):
+        raise IsoStagingSafetyError(
+            "The transitional Windows BIOS+UEFI profile does not compose with "
+            "overlays, customization, embedded images, BootEx, or Syslinux",
+        )
+
+
 def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> str | None:
     if type(plan) is not WritePlan:
         raise IsoStagingSafetyError("A WritePlan is required")
     layout = plan.layout
-    if not plan.executable:
-        detail = plan.blockers[0] if plan.blockers else "the plan is not executable"
-        raise IsoStagingSafetyError(f"Refusing a non-executable write plan: {detail}")
     if plan.mode is not WriteMode.EXTRACTED_ISO:
         raise IsoStagingSafetyError("ISO staging requires extracted-ISO write mode")
-    if plan.firmware_target is not FirmwareTarget.UEFI_ONLY:
-        raise IsoStagingSafetyError("ISO staging currently requires an explicit UEFI-only plan")
-    fat32_layout = (
+    uefi_fat32_layout = (
         layout is not None
         and layout.main_filesystem is FileSystem.FAT32
         and layout.partition_count == 1
         and layout.boot_strategy is BootStrategy.IMAGE_NATIVE
     )
+    windows_dual_layout = (
+        layout is not None
+        and plan.firmware_target is FirmwareTarget.BOTH
+        and layout.partition_table is PartitionTable.MBR
+        and layout.main_filesystem is FileSystem.FAT32
+        and layout.partition_count == 1
+        and layout.boot_partition_filesystem is None
+        and layout.bios_bootable
+        and layout.uefi_bootable
+        and layout.main_partition_active
+        and layout.boot_strategy is BootStrategy.WINDOWS_BOOTMGR_FAT32
+    )
+    transitional_windows_plan = _is_transitional_windows_plan(plan)
+    if not plan.executable and not transitional_windows_plan:
+        detail = plan.blockers[0] if plan.blockers else "the plan is not executable"
+        raise IsoStagingSafetyError(f"Refusing a non-executable write plan: {detail}")
+    if (
+        plan.firmware_target is not FirmwareTarget.UEFI_ONLY
+        and not windows_dual_layout
+    ):
+        raise IsoStagingSafetyError(
+            "ISO staging requires an explicit supported firmware profile",
+        )
+    fat32_layout = uefi_fat32_layout or windows_dual_layout
     uefi_ntfs_layout = (
         layout is not None
         and layout.main_filesystem is FileSystem.NTFS
@@ -735,13 +806,16 @@ def _validate_write_plan(plan: WritePlan, entries: Sequence[ArchiveEntry]) -> st
         layout is None
         or layout.boot_partition_filesystem is not None
         or not layout.uefi_bootable
-        or layout.bios_bootable
+        or (layout.bios_bootable and not windows_dual_layout)
         or not (fat32_layout or uefi_ntfs_layout)
     ):
         raise IsoStagingSafetyError(
             "ISO staging requires the supported UEFI/FAT32 or UEFI:NTFS layout"
         )
-    if not plan.content_constraints_checked or plan.blockers:
+    if (
+        not plan.content_constraints_checked
+        or (plan.blockers and not transitional_windows_plan)
+    ):
         raise IsoStagingSafetyError("The write plan has not passed all content checks")
 
     files = tuple(entry for entry in entries if entry.kind is EntryKind.FILE)
@@ -1174,6 +1248,15 @@ def build_iso_staging_plan(
         raise IsoStagingSafetyError(
             "The Syslinux C32 and BIOS payload bundles must be supplied together"
         )
+    _validate_transitional_windows_staging_scope(
+        write_plan,
+        overlay=overlay,
+        embedded_fat=embedded_fat,
+        windows_customization=windows_customization,
+        windows_bootex=windows_bootex,
+        syslinux_c32_bundle=syslinux_c32_bundle,
+        syslinux_payload_bundle=syslinux_payload_bundle,
+    )
     try:
         safe_entries = validate_extraction_entries(entries)
     except (UnsafeArchiveError, ValueError) as error:
@@ -1455,6 +1538,15 @@ def validate_iso_staging_plan(
     if type(plan) is not IsoStagingPlan:
         raise IsoStagingSafetyError("An IsoStagingPlan is required")
     _validate_staging_scalar_bindings(plan)
+    _validate_transitional_windows_staging_scope(
+        plan.write_plan,
+        overlay=plan.overlay,
+        embedded_fat=plan.embedded_fat,
+        windows_customization=plan.windows_customization,
+        windows_bootex=plan.windows_bootex_options,
+        syslinux_c32_bundle=plan.syslinux_c32_bundle,
+        syslinux_payload_bundle=plan.syslinux_payload_bundle,
+    )
     try:
         entries = validate_extraction_entries(plan.entries)
     except (UnsafeArchiveError, ValueError) as error:
@@ -1961,6 +2053,135 @@ def validate_published_syslinux_staging(
     ):
         raise IsoStagingSafetyError(
             "The published tree does not match its complete Syslinux staging catalog",
+        )
+    if cancel_check is not None:
+        cancel_check()
+    return manifest
+
+
+def validate_published_windows_staging(
+    plan: IsoStagingPlan,
+    result: IsoStagingResult,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> StagingTreeManifest:
+    """Reauthenticate one executor-published Windows BIOS+UEFI FAT32 tree.
+
+    The result receipt is created only after extraction, optional split-WIM
+    replacement, full descriptor-safe manifesting, atomic publication, and a
+    second manifest comparison.  This first composition profile deliberately
+    excludes overlays and Windows customization/BootEx so the only admitted
+    catalog mutation is the witnessed conventional install.wim split.
+    """
+
+    if cancel_check is not None:
+        cancel_check()
+    if type(plan) is not IsoStagingPlan:
+        raise IsoStagingSafetyError("An exact ISO staging plan is required")
+    receipt = result._receipt if type(result) is IsoStagingResult else None
+    if (
+        type(result) is not IsoStagingResult
+        or type(receipt) is not _PublishedReceipt
+        or receipt.token is not _RESULT_WITNESS_TOKEN
+        or receipt.plan is not plan
+        or receipt.manifest is not result.tree_manifest
+        or (
+            receipt.destination,
+            receipt.image_identity,
+            receipt.catalog_digest,
+            receipt.directories,
+            receipt.files,
+            receipt.bytes_staged,
+            receipt.wim_parts,
+            receipt.autounattend_added,
+            receipt.windows_bootex,
+        )
+        != (
+            result.destination,
+            result.image_identity,
+            result.catalog_digest,
+            result.directories,
+            result.files,
+            result.bytes_staged,
+            result.wim_parts,
+            result.autounattend_added,
+            result.windows_bootex,
+        )
+    ):
+        raise IsoStagingSafetyError(
+            "An authentic result for this exact ISO staging plan is required",
+        )
+    layout = plan.write_plan.layout
+    if (
+        plan.write_plan.firmware_target is not FirmwareTarget.BOTH
+        or layout is None
+        or layout.partition_table is not PartitionTable.MBR
+        or layout.main_filesystem is not FileSystem.FAT32
+        or layout.partition_count != 1
+        or layout.boot_partition_filesystem is not None
+        or not layout.bios_bootable
+        or not layout.uefi_bootable
+        or not layout.main_partition_active
+        or layout.boot_strategy is not BootStrategy.WINDOWS_BOOTMGR_FAT32
+    ):
+        raise IsoStagingSafetyError(
+            "The published tree is outside the Windows BIOS+UEFI FAT32 profile",
+        )
+    if any((
+        plan.overlay is not None,
+        plan.embedded_fat is not None,
+        plan.syslinux_staging is not None,
+        plan.syslinux_c32_bundle is not None,
+        plan.syslinux_payload_bundle is not None,
+        plan.wim_selection is not None,
+        plan.autounattend_xml is not None,
+        plan.windows_customization is not None,
+        plan.windows_architecture is not None,
+        plan.windows_bootex_options is not None,
+        plan.windows_bootex_source is not None,
+        plan.windows_boot_wim_source is not None,
+    )):
+        raise IsoStagingSafetyError(
+            "The initial Windows dual-firmware profile does not compose with "
+            "overlays or customization",
+        )
+    wim_source = _validate_write_plan(plan.write_plan, plan.effective_entries)
+    if wim_source != plan.wim_source:
+        raise IsoStagingSafetyError("The published split-WIM binding is inconsistent")
+    expected_split = wim_source is not None
+    if (
+        result.destination != plan.destination
+        or result.image_identity != plan.image_identity
+        or result.catalog_digest != plan.staged_catalog_digest
+        or type(result.directories) is not int
+        or result.directories <= 0
+        or type(result.files) is not int
+        or result.files <= 0
+        or type(result.bytes_staged) is not int
+        or result.bytes_staged <= 0
+        or type(result.wim_parts) is not tuple
+        or bool(result.wim_parts) != expected_split
+        or result.autounattend_added is not False
+        or result.windows_bootex is not None
+        or type(result.tree_manifest) is not StagingTreeManifest
+    ):
+        raise IsoStagingSafetyError(
+            "The published Windows result fields are invalid or inconsistent",
+        )
+    manifest = result.tree_manifest
+    assert manifest is not None
+    try:
+        validate_staging_tree_manifest(manifest, cancel_check=cancel_check)
+    except StagingTreeSafetyError as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    if (
+        manifest.root != plan.destination
+        or result.directories != len(manifest.directories)
+        or result.files != len(manifest.files)
+        or result.bytes_staged != manifest.total_bytes
+    ):
+        raise IsoStagingSafetyError(
+            "The published Windows tree does not match its authenticated manifest",
         )
     if cancel_check is not None:
         cancel_check()
@@ -3245,9 +3466,16 @@ class IsoStagingExecutor:
                 self._check_cancelled,
             )
             private_manifest: StagingTreeManifest | None = None
+            windows_dual_manifest = (
+                plan.write_plan.firmware_target is FirmwareTarget.BOTH
+                and plan.write_plan.layout is not None
+                and plan.write_plan.layout.boot_strategy
+                is BootStrategy.WINDOWS_BOOTMGR_FAT32
+            )
             if (
                 plan.syslinux_staging is not None
                 or plan.windows_bootex_source is not None
+                or windows_dual_manifest
             ):
                 manifest_file_limit = (
                     FAT32_MAX_FILE_SIZE

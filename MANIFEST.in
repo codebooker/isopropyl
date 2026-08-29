@@ -1,8 +1,12 @@
 include tests/windows-profile-observations-v1.json
+include boot/fat32_bootmgr_stage0.S
+include boot/fat32_bootmgr_stage2.S
 include tools/certify_freedos_boot.py
 include tools/certify_syslinux_boot.py
+include tools/certify_windows_dual_boot.py
 include tools/certify_wim_apply_backend.py
 include tools/validate_windows_bcd_capture.py
 include tools/import_windows_bcd_capture.py
 include tools/capture_windows_bcd_oracle.ps1
 include certifications/syslinux-6.03-seabios-2026-08-28.json
+include certifications/windows-11-ltsc-dual-kvm-2026-08-28.json

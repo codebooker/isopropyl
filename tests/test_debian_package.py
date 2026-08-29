@@ -191,6 +191,7 @@ class DebianPackageTests(unittest.TestCase):
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.policy",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.raw-write.policy",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.fast-zero.policy",
+            "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.windows-write.policy",
             "usr/share/polkit-1/actions/io.github.codebooker.isopropyl.restore-device.policy",
             "usr/share/man/man1/isopropyl.1.gz",
             "usr/share/man/man1/isopropyl-cli.1.gz",

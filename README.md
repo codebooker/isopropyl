@@ -54,6 +54,7 @@ identity, and require an explicit confirmation.
 | **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and a second typed warning for fixed USB disks or risky image profiles. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. |
 | **Syslinux BIOS developer preview** | For exact supported Syslinux 6.03/6.04 images, an explicit environment-gated preview can add a legacy-BIOS path while retaining the source UEFI files. It uses hash-pinned payloads, a target-bound typed confirmation, MBR-last activation, and mandatory full-device SHA-256 read-back. The normal GUI keeps it hidden pending a native hardened helper and physical-media certification. |
+| **Windows BIOS + UEFI developer preview** | `ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL=1` admits only the strict x64 Windows Boot Manager FAT32/active-MBR profile. It stages and witnesses the complete tree, splits the sole conventional oversized `install.wim`, builds an anonymous full-device image with the project-authored BIOS loader, and uses a separate typed, target-bound PolicyKit transaction with MBR-last activation and mandatory full SHA-256 read-back. There is no formatter/mount or generic-writer fallback. A real Windows 11 image has reached Setup under both KVM/SeaBIOS and non-Secure-Boot OVMF; physical-media certification remains a release gate. |
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, can generate a reviewed `autounattend.xml`, and offers a narrowly profiled Windows 2023-generation installer-boot update for exact supported Microsoft media. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
@@ -143,6 +144,23 @@ image equal to the target capacity. Do not treat the successful SeaBIOS
 certificate as physical-device or firmware certification; a native hardened
 replacement for the provisional Python helper and installed
 VM/OVMF/physical-media coverage remain release gates.
+
+The Windows x64 BIOS + UEFI path is also hidden from ordinary launches. For
+maintainer testing only, start the current source/package with:
+
+```bash
+ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL=1 ./isopropyl-gui
+```
+
+Only a completely inspected Windows installer with exact `bootmgr`, `Boot/BCD`,
+and ISO-member `EFI/BOOT/BOOTX64.EFI` evidence is admitted. The target must be
+writable kernel-removable USB/SD media with 512-byte logical sectors. ZIP
+overlays, Windows customization, BootEx replacement, persistence, and the
+boot-time corruption wrapper are deliberately rejected by this first profile.
+The GUI gives a preflight certification warning and then requires the exact
+target-bound phrase. The production pipeline has reached Windows 11 Setup under
+both KVM/SeaBIOS and non-Secure-Boot OVMF, but this remains a developer
+experiment until representative physical-media certification is complete.
 
 For development, replace `python -m pip install .` with
 `python -m pip install -e .`. A checkout can also be launched directly:
@@ -295,6 +313,7 @@ expanded drive visibility are never persisted.
 |---|---|---|
 | Hybrid `.iso` | DD mode | Preserves the supplied disk layout exactly. |
 | Eligible UEFI `.iso` | ISO mode | FAT32 or verified UEFI:NTFS; currently UEFI-only. |
+| Exact Windows x64 BIOS+UEFI installer `.iso` | Developer ISO mode | Hidden unless `ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL=1`; strict FAT32/active-MBR descriptor workflow, VM-certified with one Windows 11 LTSC image; physical certification pending. |
 | `.img`, `.raw`, `.usb`, `.wic` | DD mode | Treated as raw disk images. |
 | SquashFS `.squashfs`, `.sqfs` | DD mode | Validates and reports the standalone SquashFS 4.0 superblock before raw writing. |
 | `.gz`, `.bz2`, `.xz`, `.lzma`, `.zst`, `.Z`, single-file `.zip` | Authenticated raw snapshot | The exact expanded bytes are privately allocated, hashed, and confirmed before writing. |
@@ -433,22 +452,22 @@ The GUI and CLI raw/DD paths transfer only a fully allocated, re-attested
 anonymous snapshot to a fixed root-owned helper. They support images shorter
 than the target, mandatory pre-activation verification, optional complete final
 verification, and stale physical-tail sanitation. The same provisional helper
-also contains a separate, default-off developer preview for a narrowly
-supported Syslinux FAT32 image.
+also contains separate, default-off developer transactions for narrowly
+supported Syslinux and Windows FAT32 images.
 These privileged paths are:
 
 - not installed by `pip install` or the ordinary `make install` target;
 - required for every GUI or CLI raw/DD write, with failure closed when the exact
   host integration is missing or unsafe;
 - limited to eligible removable or explicitly revealed external USB media and
-  512-byte logical sectors (the Syslinux profile additionally requires exact
-  matched 6.03/6.04 payloads); and
-- now covered by a device-free QEMU/SeaBIOS boot certificate, while still gated
-  on native-helper hardening, an installed PolicyKit integration test, OVMF,
+  512-byte logical sectors (each developer profile has additional exact payload
+  and layout requirements); and
+- covered by device-free VM certificates appropriate to each profile, while
+  still gated on native-helper hardening, installed PolicyKit integration,
   hot-swap/failure coverage, and representative physical media.
 
-Distribution integrators can stage the isolated launcher, helper, and three
-exact PolicyKit actions with `make install-host-helper PREFIX=/usr`. Source testers
+Distribution integrators can stage the isolated launcher, helper, and five
+exact PolicyKit policies with `make install-host-helper PREFIX=/usr`. Source testers
 must invoke it with root privileges as shown above. It does not make alpha media
 writes risk-free; test with expendable media and keep verification enabled.
 
@@ -480,8 +499,9 @@ ISOpropyl is an ambitious alpha. Automated tests cover the non-destructive logic
 and mocked destructive boundaries, but CI does not write physical media. Broad
 distribution, desktop, Wayland/X11, firmware, Secure Boot, card-reader, and
 hardware testing is still required. BIOS controls remain hidden in ordinary
-launches; the narrowly scoped Syslinux developer preview requires an explicit
-per-process environment opt-in and expendable media.
+launches; the narrowly scoped Syslinux and Windows dual-firmware developer
+previews each require an explicit per-process environment opt-in and expendable
+media.
 
 The honest capability audit lives in [FEATURE_MATRIX.md](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md);
 planned work and release gates live in [ROADMAP.md](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md).
@@ -532,6 +552,27 @@ privileged device transaction, or physical media. The real integration test is
 explicitly opt-in rather than part of the device-free default suite. A locally
 reproduced observation is retained as
 [`certifications/syslinux-6.03-seabios-2026-08-28.json`](https://github.com/codebooker/isopropyl/blob/main/certifications/syslinux-6.03-seabios-2026-08-28.json).
+
+The experimental Windows dual-firmware pipeline has a separate opt-in harness:
+
+```bash
+python3 tools/certify_windows_dual_boot.py --run /path/to/windows.iso --accel kvm
+```
+
+It binds and hashes the user-owned ISO, exercises the production inspection,
+WIM-split, witnessed staging, anonymous FAT32 composition, MBR/PBR, and
+project-authored BIOS loader path, then presents the same read-only anonymous
+image to networkless snapshot VMs. Success requires OCR from one exact frame to
+contain both a Windows Setup title and an independent setup control. On the
+recorded Windows 11 IoT Enterprise LTSC 2024 image, both KVM/SeaBIOS and OVMF
+reached `Windows 11 Setup` with `Language to install`; no screenshot or Microsoft
+payload is retained. The observation and all source/pipeline/emulator hashes are
+in [`certifications/windows-11-ltsc-dual-kvm-2026-08-28.json`](https://github.com/codebooker/isopropyl/blob/main/certifications/windows-11-ltsc-dual-kvm-2026-08-28.json).
+
+That certificate covers one image, one host, legacy BIOS, and non-Secure-Boot
+UEFI. It does not certify Secure Boot, the privileged device transaction,
+physical USB media, other Windows releases, or arbitrary firmware. Those remain
+explicit release gates.
 
 Maintainers with `wimlib-imagex`, `mkntfs`, and the ntfs-3g inspection tools can
 also reproduce the unprivileged, device-free WIM apply certificate:

@@ -1,0 +1,86 @@
+{
+  "certified": true,
+  "firmware_results": [
+    {
+      "capture_attempts": 45,
+      "elapsed_seconds": 162.161,
+      "firmware": "seabios",
+      "height": 768,
+      "markers": [
+        "WINDOWS 11 SETUP",
+        "LANGUAGE TO INSTALL"
+      ],
+      "rgb_unique_sample_count": 445,
+      "screenshot_retained": false,
+      "screenshot_sha256": "9a58f343750bb5e3b36f98e91bf1f03fc24e18789d23b8e0c27c9b395be95c5c",
+      "width": 1024
+    },
+    {
+      "capture_attempts": 7,
+      "elapsed_seconds": 63.636,
+      "firmware": "ovmf",
+      "height": 800,
+      "markers": [
+        "WINDOWS 11 SETUP",
+        "LANGUAGE TO INSTALL"
+      ],
+      "rgb_unique_sample_count": 293,
+      "screenshot_retained": false,
+      "screenshot_sha256": "2eb8972a24b0d115163b82d5bee3ba8710a9dc15ae47cfb9f1c31399f2b8981e",
+      "width": 1280
+    }
+  ],
+  "isolation": {
+    "acceleration": "kvm",
+    "attached_host_block_devices": [],
+    "network": "none",
+    "qemu_executable_set_id": false,
+    "qemu_seccomp": true,
+    "qemu_seccomp_policy": "on,obsolete=deny,spawn=deny,resourcecontrol=deny",
+    "secure_boot": false,
+    "snapshot": true,
+    "source_anonymous_otmpfile": true,
+    "source_read_only_descriptor": true,
+    "unprivileged_process": true
+  },
+  "ovmf": {
+    "code_sha256": "a5708766c49ee39db0f4e7e53d73376e2dbc0d45bf12501c0977c48412bf8902",
+    "secure_boot": false,
+    "vars_template_sha256": "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e"
+  },
+  "pipeline": {
+    "anonymous_image": true,
+    "bytes_verified": 5124097097,
+    "composite_plan_sha256": "e84480ca4be4f765aaf01a30f032fadf389f01ae938577136470b458dcdbc02e",
+    "directories_verified": 94,
+    "files_verified": 969,
+    "final_fat_manifest_sha256": "3d1c7298c38cabd4a7420969671e0c2bf88a11363cad48bc200450579c5694a8",
+    "final_image_sha256": "d412bb5b96ffba4762e69735b67c0421c60a3497decb243113768857fda3e665",
+    "image_size": 5661261824,
+    "named_image_published": false,
+    "pbr_plan_sha256": "e1905670030cdc0786122203bd9c33a304da54c5ed389b9d3707d23b5572b3b8",
+    "private_plan_sha256": "021da3f4f56e8d483505c53da4bfcad5f96b0e70a3f6d40c0b043d3792f54485",
+    "staging_catalog_sha256": "a7e7fd5618489ab7d542037790ee137e16bc4758c9388a53c4580e937eaca0c9",
+    "staging_manifest_sha256": "8849b671a7bf20ad3179510135dfc2c9999edeae267a983ede3befd95a764cfb"
+  },
+  "profile": "windows-x64-fat32-mbr-active-bios-uefi",
+  "qemu": {
+    "executable": "/usr/bin/qemu-system-x86_64",
+    "sha256": "0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc",
+    "version": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)"
+  },
+  "schema_version": 1,
+  "source": {
+    "catalog_members": 1062,
+    "filename": "en-us_windows_11_iot_enterprise_ltsc_2024_x64_dvd_f6b14814.iso",
+    "kind": "user-owned-windows-iso",
+    "microsoft_bytes_redistributed": false,
+    "sha256": "4f59662a96fc1da48c1b415d6c369d08af55ddd64e8f1c84e0166d9e50405d7a",
+    "size": 5144817664,
+    "volume_label": "CES_X64FREO_EN-US_DV9"
+  },
+  "tesseract": {
+    "executable": "/usr/bin/tesseract",
+    "sha256": "644efa639b77a21b1096a6ced155112f0c730d05c7db871d52f4b2eb16bdf42a"
+  }
+}

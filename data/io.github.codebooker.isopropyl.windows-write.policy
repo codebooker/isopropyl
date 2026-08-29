@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>ISOpropyl</vendor>
+  <vendor_url>https://github.com/codebooker/isopropyl</vendor_url>
+  <icon_name>io.github.codebooker.isopropyl</icon_name>
+
+  <action id="io.github.codebooker.isopropyl.write-windows-image">
+    <description>Write a prepared Windows BIOS and UEFI image to removable media</description>
+    <message>Authentication is required to overwrite the selected removable drive with the prepared Windows image</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/isopropyl-device-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">write-windows-image-v1</annotate>
+  </action>
+</policyconfig>
