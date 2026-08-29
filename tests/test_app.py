@@ -4929,7 +4929,7 @@ class WindowWindowsDualRoutingTests(unittest.TestCase):
                 self.window.windows_options,
             )
             self.assertIsNone(kwargs["windows_bootex"])
-            self.assertIsNone(kwargs["embedded_fat"])
+            self.assertEqual(kwargs["embedded_fats"], ())
             return fake_iso_staging_plan(*args, **kwargs)
 
         with (
@@ -5129,7 +5129,7 @@ class WindowWindowsDualRoutingTests(unittest.TestCase):
             workspace = tempfile.TemporaryDirectory(dir=temporary_parent)
             staging_plan = Mock(
                 overlay=None,
-                embedded_fat=None,
+                embedded_fats=(),
                 windows_customization=None,
                 windows_bootex_options=None,
             )

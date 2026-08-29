@@ -33,7 +33,7 @@ from isopropyl.eltorito import (
     ElToritoNotFound, EmulationType, ValidationEntry,
 )
 from isopropyl.fat_image import FatType
-from tests.test_fat_image import make_fat, write_container
+from tests.test_fat_image import make_fat, write_container, write_plural_container
 from tests.test_uefi import make_pe
 
 
@@ -1358,6 +1358,10 @@ Size = 3
             self.assertEqual(result.boot_modes, ("UEFI",))
             self.assertEqual(result.architectures, ("x64",))
             self.assertIsNotNone(result.embedded_uefi_fat)
+            self.assertEqual(
+                result.embedded_uefi_fats,
+                (result.embedded_uefi_fat,),
+            )
             self.assertEqual(result.embedded_uefi_issues, ())
             self.assertTrue(result.uefi_analysis_complete)
             self.assertEqual(result.uefi_candidate_count, 1)
@@ -1367,6 +1371,44 @@ Size = 3
             self.assertEqual(payload.source_kind, "eltorito-fat")
             self.assertEqual(payload.target_path, "EFI/BOOT/BOOTX64.EFI")
             self.assertTrue(payload.is_uefi_image)
+
+    def test_all_embedded_fats_are_pe_inspected_in_canonical_offset_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plural-embedded.iso"
+            catalog, _second_offset = write_plural_container(
+                path,
+                make_fat(FatType.FAT12, payload=make_pe()),
+                make_fat(FatType.FAT12, payload=make_pe()),
+            )
+            with (
+                patch(
+                    "isopropyl.images.scan_image_contents",
+                    return_value=([], True),
+                ),
+                patch(
+                    "isopropyl.images.inspect_eltorito_file",
+                    return_value=catalog,
+                ),
+            ):
+                result = inspect_image(path)
+
+            self.assertEqual(
+                tuple(
+                    fat.boot_entry.catalog_index
+                    for fat in result.embedded_uefi_fats
+                ),
+                (1, 2),
+            )
+            self.assertIsNone(result.embedded_uefi_fat)
+            self.assertEqual(result.uefi_candidate_count, 2)
+            self.assertEqual(result.uefi_selected_count, 2)
+            self.assertEqual(
+                tuple(payload.path.split(":", 1)[0] for payload in result.uefi_payloads),
+                ("El Torito #1", "El Torito #2"),
+            )
+            self.assertEqual(result.architectures, ("x64",))
+            self.assertEqual(result.embedded_uefi_issues, ())
+            self.assertTrue(result.uefi_analysis_complete)
 
     def test_el_torito_parse_failure_is_reported_without_losing_iso_inspection(self):
         with tempfile.TemporaryDirectory() as directory:

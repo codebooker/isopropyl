@@ -24,6 +24,7 @@ from .images import ImageInspection
 
 TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 MAX_TOOL_OUTPUT = 4096
+MAX_EMBEDDED_UEFI_FAT_SUMMARIES = 32
 
 
 def _device_record(device: Device, include_identifiers: bool) -> dict[str, Any]:
@@ -83,18 +84,31 @@ def _image_record(inspection: ImageInspection | None) -> dict[str, Any] | None:
     }
     record.pop("uefi_analysis_issues", None)
     record["uefi_analysis_issue_count"] = len(inspection.uefi_analysis_issues)
+    record.pop("embedded_uefi_fats", None)
     record.pop("embedded_uefi_fat", None)
     record.pop("embedded_uefi_issues", None)
     record["embedded_uefi_issue_count"] = len(inspection.embedded_uefi_issues)
-    if inspection.embedded_uefi_fat is not None:
-        embedded = inspection.embedded_uefi_fat
-        record["embedded_uefi_fat"] = {
+    record["embedded_uefi_fat_count"] = len(inspection.embedded_uefi_fats)
+    embedded_summaries = [
+        {
+            "catalog_index": embedded.boot_entry.catalog_index,
             "fat_type": embedded.fat_type.value,
             "entry_count": len(embedded.entries),
             "file_count": sum(not entry.is_directory for entry in embedded.entries),
             "content_bytes": embedded.content_bytes,
             "mbr_wrapped": embedded.partition_start_lba is not None,
         }
+        for embedded in inspection.embedded_uefi_fats[
+            :MAX_EMBEDDED_UEFI_FAT_SUMMARIES
+        ]
+    ]
+    record["embedded_uefi_fats"] = embedded_summaries
+    record["embedded_uefi_fat_summaries_complete"] = (
+        len(embedded_summaries) == len(inspection.embedded_uefi_fats)
+    )
+    if len(embedded_summaries) == 1:
+        # Schema-1 compatibility for consumers which predate plural EFI images.
+        record["embedded_uefi_fat"] = embedded_summaries[0]
     if inspection.eltorito is not None:
         record["eltorito"] = {
             "source_size": inspection.eltorito.source_size,

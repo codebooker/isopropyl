@@ -398,6 +398,16 @@ class SyslinuxWorkflowTests(unittest.TestCase):
             SyslinuxWriteWorkflow(
                 replace(fixture.inputs, runtime_validation=object())
             )
+        fixture = self.make_fixture()
+        plural = replace(
+            fixture.staging,
+            embedded_fats=(object(), object()),
+        )
+        self.assertIsNone(plural.embedded_fat)
+        with self.assertRaisesRegex(SyslinuxWorkflowError, "other ISO transformations"):
+            SyslinuxWriteWorkflow(
+                replace(fixture.inputs, staging_plan=plural)
+            )
 
     def test_fixed_4kn_and_oversized_targets_are_rejected_before_helper_use(self):
         for changes in (

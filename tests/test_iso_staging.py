@@ -26,8 +26,10 @@ from isopropyl.extraction import (
 )
 from isopropyl.eltorito import inspect_eltorito_file
 from isopropyl.fat_image import (
+    FatImageEntry,
     FatType,
     inspect_uefi_eltorito_fat,
+    inspect_uefi_eltorito_fats,
 )
 from isopropyl.iso import (
     FAT32_MAX_FILE_SIZE,
@@ -76,7 +78,7 @@ from isopropyl.zip_overlay import (
     apply_zip_overlay,
     build_zip_overlay_plan,
 )
-from tests.test_fat_image import make_fat, write_container
+from tests.test_fat_image import make_fat, write_container, write_plural_container
 from tests.test_windows_bootex import signed_efi
 
 
@@ -828,12 +830,279 @@ class IsoStagingTests(unittest.TestCase):
                     embedded_fat=embedded,
                 )
             self.assertEqual(plan.embedded_entries, ())
-            self.assertEqual(plan.embedded_targets, ())
+            self.assertEqual(plan.embedded_targets, ((),))
+            self.assertEqual(plan.embedded_additions, ((),))
             self.assertEqual(plan.embedded_content_bytes, 0)
             self.assertEqual(plan.base_with_embedded_entries, base_entries)
             validate_iso_staging_plan(plan)
             result = IsoStagingExecutor(extractor=FakeExtractor()).execute(plan)
             self.assertEqual(result.bytes_staged, 3)
+
+    def test_multiple_embedded_fats_exact_duplicate_is_skipped_and_counted_once(self):
+        base_entries = (ArchiveEntry("README.txt", 5),)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "embedded.iso"
+            fat = make_fat(FatType.FAT12)
+            catalog, _second_offset = write_plural_container(image, fat, fat)
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded_fats = inspect_uefi_eltorito_fats(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            self.assertEqual(len(embedded_fats), 2)
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "image-offset order",
+            ):
+                iso_staging.preview_embedded_fat_catalog(
+                    base_entries, tuple(reversed(embedded_fats)),
+                )
+            embedded_entries = tuple(
+                ArchiveEntry(
+                    entry.path,
+                    entry.size,
+                    EntryKind.DIRECTORY if entry.is_directory else EntryKind.FILE,
+                )
+                for entry in embedded_fats[0].entries
+            )
+            effective = merge_additive_embedded_entries(
+                base_entries, embedded_entries,
+            ).merged_entries
+            with (
+                patch(
+                    "isopropyl.iso_staging.scan_image_contents",
+                    fake_catalog_scanner(base_entries),
+                ),
+                patch(
+                    "isopropyl.iso_staging.inspect_eltorito_file",
+                    return_value=catalog,
+                ),
+            ):
+                plan = build_iso_staging_plan(
+                    image,
+                    root / "ready-media",
+                    base_entries,
+                    write_plan(effective),
+                    seven_zip=SEVEN_ZIP,
+                    embedded_fats=embedded_fats,
+                )
+                self.assertEqual(plan.embedded_fats, embedded_fats)
+                self.assertIsNone(plan.embedded_fat)
+                self.assertEqual(
+                    len(plan.embedded_targets[0]), len(embedded_fats[0].entries),
+                )
+                self.assertEqual(
+                    plan.embedded_targets[1],
+                    (None,) * len(embedded_fats[1].entries),
+                )
+                self.assertEqual(plan.embedded_content_bytes, 3)
+                validate_iso_staging_plan(plan)
+                result = IsoStagingExecutor(extractor=FakeExtractor()).execute(plan)
+            self.assertEqual(
+                (result.destination / "EFI/BOOT/BOOTX64.EFI").read_bytes(),
+                b"MZ!",
+            )
+            self.assertEqual(result.bytes_staged, 8)
+
+    def test_multiple_distinct_embedded_fats_accumulate_and_never_publish_on_collision(self):
+        base_entries = (ArchiveEntry("README.txt", 5),)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "embedded-distinct.iso"
+            catalog, _second_offset = write_plural_container(
+                image,
+                make_fat(
+                    FatType.FAT12,
+                    payload=b"MZ1",
+                    loader_name=b"BOOTX64 EFI",
+                ),
+                make_fat(
+                    FatType.FAT12,
+                    payload=b"MZ22",
+                    loader_name=b"BOOTAA64EFI",
+                ),
+            )
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded_fats = inspect_uefi_eltorito_fats(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            expected_entries = iso_staging.preview_embedded_fat_catalog(
+                base_entries, embedded_fats,
+            ).merged_entries
+            with (
+                patch(
+                    "isopropyl.iso_staging.scan_image_contents",
+                    fake_catalog_scanner(base_entries),
+                ),
+                patch(
+                    "isopropyl.iso_staging.inspect_eltorito_file",
+                    return_value=catalog,
+                ),
+            ):
+                plan = build_iso_staging_plan(
+                    image,
+                    root / "ready-media",
+                    base_entries,
+                    write_plan(expected_entries),
+                    seven_zip=SEVEN_ZIP,
+                    embedded_fats=embedded_fats,
+                )
+                updates = []
+                result = IsoStagingExecutor(
+                    extractor=FakeExtractor(),
+                ).execute(plan, updates.append)
+            embedded_updates = tuple(
+                update for update in updates
+                if update.stage == "Expanding embedded UEFI boot image"
+                and update.relative_path
+            )
+            self.assertEqual(
+                tuple(update.relative_path for update in embedded_updates),
+                ("EFI/BOOT/BOOTX64.EFI", "EFI/BOOT/BOOTAA64.EFI"),
+            )
+            self.assertEqual(
+                tuple(update.bytes_done for update in embedded_updates),
+                (8, 12),
+            )
+            self.assertTrue(all(update.total_bytes == 12 for update in embedded_updates))
+            self.assertEqual(result.bytes_staged, 12)
+            self.assertEqual(
+                (result.destination / "EFI/BOOT/BOOTX64.EFI").read_bytes(),
+                b"MZ1",
+            )
+            self.assertEqual(
+                (result.destination / "EFI/BOOT/BOOTAA64.EFI").read_bytes(),
+                b"MZ22",
+            )
+
+            collision_destination = root / "collision-media"
+            with (
+                patch(
+                    "isopropyl.iso_staging.scan_image_contents",
+                    fake_catalog_scanner(base_entries),
+                ),
+                patch(
+                    "isopropyl.iso_staging.inspect_eltorito_file",
+                    return_value=catalog,
+                ),
+            ):
+                collision_plan = build_iso_staging_plan(
+                    image,
+                    collision_destination,
+                    base_entries,
+                    write_plan(expected_entries),
+                    seven_zip=SEVEN_ZIP,
+                    embedded_fats=embedded_fats,
+                )
+
+                def occupy_second(update) -> None:
+                    if update.relative_path != "EFI/BOOT/BOOTX64.EFI":
+                        return
+                    partials = tuple(root.glob(".collision-media.*.partial"))
+                    self.assertEqual(len(partials), 1)
+                    occupied = partials[0] / "tree/EFI/BOOT/BOOTAA64.EFI"
+                    occupied.parent.mkdir(parents=True, exist_ok=True)
+                    occupied.write_bytes(b"occupied")
+
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    "would replace staged path",
+                ):
+                    IsoStagingExecutor(
+                        extractor=FakeExtractor(),
+                    ).execute(collision_plan, occupy_second)
+            self.assertFalse(collision_destination.exists())
+            self.assertEqual(
+                tuple(root.glob(".collision-media.*.partial")),
+                (),
+            )
+
+    def test_multiple_embedded_fats_reject_differing_file_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "embedded.iso"
+            catalog, _second_offset = write_plural_container(
+                image,
+                make_fat(FatType.FAT12, payload=b"MZ-first"),
+                make_fat(FatType.FAT12, payload=b"MZ-second"),
+            )
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded_fats = inspect_uefi_eltorito_fats(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "differing files",
+            ):
+                iso_staging.preview_embedded_fat_catalog((), embedded_fats)
+
+    def test_embedded_fat_partial_base_collision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "embedded.iso"
+            catalog = write_container(image, make_fat(FatType.FAT12))
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded = inspect_uefi_eltorito_fat(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            assert embedded is not None
+            loader = next(entry for entry in embedded.entries if not entry.is_directory)
+            extra = FatImageEntry(
+                "EFI/BOOT/EXTRA.EFI",
+                loader.size,
+                False,
+                loader.first_cluster,
+                loader.clusters,
+                loader.sha256,
+            )
+            partial = replace(embedded, entries=embedded.entries + (extra,))
+            base = (ArchiveEntry(loader.path, loader.size),)
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "partially collides",
+            ):
+                iso_staging.preview_embedded_fat_catalog(base, (partial,))
+
+    def test_embedded_fats_reject_case_alias_even_with_identical_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "embedded.iso"
+            catalog = write_container(image, make_fat(FatType.FAT12))
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded = inspect_uefi_eltorito_fat(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            assert embedded is not None
+            aliased = replace(
+                embedded,
+                image_offset=embedded.image_offset + 2048,
+                entries=tuple(
+                    replace(entry, path=entry.path.lower())
+                    for entry in embedded.entries
+                ),
+            )
+            with self.assertRaisesRegex(
+                IsoStagingSafetyError, "differing spellings|case/VFAT",
+            ):
+                iso_staging.preview_embedded_fat_catalog((), (embedded, aliased))
+
+    def test_embedded_preview_enforces_parser_aggregate_budgets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "embedded.iso"
+            catalog = write_container(image, make_fat(FatType.FAT12))
+            descriptor = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                embedded = inspect_uefi_eltorito_fat(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+            assert embedded is not None
+            entry = embedded.entries[-1]
+            oversized = replace(
+                embedded,
+                entries=(entry,) * (iso_staging.FAT_MAX_ENTRIES + 1),
+            )
+            with self.assertRaisesRegex(IsoStagingSafetyError, "too many entries"):
+                iso_staging.preview_embedded_fat_catalog((), (oversized,))
 
     def test_distro_exclusion_is_rechecked_before_extraction(self):
         entries = basic_entries() + (ArchiveEntry(".miso", 1),)

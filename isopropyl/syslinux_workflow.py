@@ -192,7 +192,7 @@ def _require_narrow_profile(inputs: SyslinuxWorkflowInputs) -> Path:
         )
     if (
         plan.overlay is not None
-        or plan.embedded_fat is not None
+        or bool(plan.embedded_fats)
         or plan.windows_customization is not None
         or plan.windows_architecture is not None
         or plan.autounattend_xml is not None

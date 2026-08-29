@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
+import isopropyl.fat_image as fat_image_module
 from isopropyl.eltorito import (
     BootEntry,
     BootPlatform,
@@ -19,8 +21,10 @@ from isopropyl.fat_image import (
     FatImageError,
     FatType,
     inspect_uefi_eltorito_fat,
+    inspect_uefi_eltorito_fats,
     materialize_embedded_fat,
     read_embedded_fat_file,
+    validate_uefi_eltorito_fats,
 )
 
 BLOCK = 2_048
@@ -91,14 +95,17 @@ def make_fat(
     bad_lfn_checksum: bool = False,
     fat12_max_geometry: bool = False,
     loader_clusters: tuple[int, ...] = (5,),
+    loader_name: bytes = b"BOOTX64 EFI",
 ) -> bytes:
     if (
         not payload
         or not loader_clusters
         or len(payload) > 512 * len(loader_clusters)
         or len(payload) <= 512 * (len(loader_clusters) - 1)
+        or len(loader_name) != 11
+        or (long_name and loader_name != b"BOOTX64 EFI")
     ):
-        raise ValueError("The FAT fixture payload must exactly fill its cluster chain")
+        raise ValueError("The FAT fixture payload or loader name is invalid")
     if kind is FatType.FAT12:
         reserved, root_entries = 1, 16
         if fat12_max_geometry:
@@ -184,7 +191,7 @@ def make_fat(
         b"BOOT       ", directory=True, cluster=4,
     )
     boot = cluster_offset(4)
-    short_name = b"BOOTX6~1EFI" if long_name else b"BOOTX64 EFI"
+    short_name = b"BOOTX6~1EFI" if long_name else loader_name
     if long_name:
         image[boot:boot + 32] = _lfn_entry(
             "bootx64.efi",
@@ -290,7 +297,158 @@ def write_container(path: Path, fat: bytes, *, wrapped: bool = False) -> ElTorit
     return inspection(size)
 
 
+def write_plural_container(
+    path: Path,
+    first_fat: bytes,
+    second_fat: bytes,
+) -> tuple[ElToritoInspection, int]:
+    base = write_container(path, first_fat)
+    second_offset = IMAGE_OFFSET + (
+        (len(first_fat) + BLOCK - 1) // BLOCK
+    ) * BLOCK
+    size = second_offset + len(second_fat)
+    size = ((size + BLOCK - 1) // BLOCK) * BLOCK
+    with path.open("r+b") as stream:
+        stream.truncate(size)
+        stream.seek(16 * BLOCK + 80)
+        logical_blocks = size // BLOCK
+        stream.write(struct.pack("<I", logical_blocks))
+        stream.write(struct.pack(">I", logical_blocks))
+        stream.seek(second_offset)
+        stream.write(second_fat)
+    second = replace(
+        base.entries[0],
+        catalog_index=2,
+        is_default=False,
+        image_lba=second_offset // BLOCK,
+        image_offset=second_offset,
+        extent_end=second_offset + 512,
+    )
+    return (
+        replace(
+            base,
+            source_size=size,
+            entries=(second, base.entries[0]),
+            logical_volume_size=size,
+        ),
+        second_offset,
+    )
+
+
 class EmbeddedFatImageTests(unittest.TestCase):
+    def test_plural_parser_is_deterministic_validates_and_rechecks_each_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plural.iso"
+            catalog, second_offset = write_plural_container(
+                path,
+                make_fat(FatType.FAT12, payload=b"MZ-first"),
+                make_fat(FatType.FAT12, payload=b"MZ-second"),
+            )
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                with mock.patch.object(
+                    fat_image_module.os,
+                    "fstat",
+                    wraps=os.fstat,
+                ) as checked:
+                    results = inspect_uefi_eltorito_fats(descriptor, catalog)
+                self.assertEqual(
+                    tuple(result.image_offset for result in results),
+                    (IMAGE_OFFSET, second_offset),
+                )
+                self.assertEqual(len(results), 2)
+                self.assertGreaterEqual(checked.call_count, 3)
+                validate_uefi_eltorito_fats(descriptor, catalog, results)
+                with self.assertRaisesRegex(FatImageError, "ambiguous"):
+                    inspect_uefi_eltorito_fat(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+
+    def test_plural_parser_rejects_duplicate_eligible_offsets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "duplicate.iso"
+            base = write_container(path, make_fat(FatType.FAT12))
+            duplicate = replace(
+                base.entries[0],
+                catalog_index=2,
+                is_default=False,
+            )
+            catalog = replace(base, entries=(base.entries[0], duplicate))
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                with self.assertRaisesRegex(FatImageError, "duplicate offsets"):
+                    inspect_uefi_eltorito_fats(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+
+    def test_plural_parser_rejects_more_than_eight_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "too-many.iso"
+            base = write_container(path, make_fat(FatType.FAT12))
+            entries = tuple(
+                replace(
+                    base.entries[0],
+                    catalog_index=index + 1,
+                    is_default=index == 0,
+                    image_lba=IMAGE_LBA + index,
+                    image_offset=IMAGE_OFFSET + index * BLOCK,
+                    extent_end=IMAGE_OFFSET + index * BLOCK + 512,
+                )
+                for index in range(fat_image_module.MAX_EMBEDDED_IMAGES + 1)
+            )
+            catalog = replace(base, entries=entries)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                with self.assertRaisesRegex(FatImageError, "too many"):
+                    inspect_uefi_eltorito_fats(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+
+    def test_plural_parser_bounds_each_image_by_the_next_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "overlap.iso"
+            catalog, _ = write_plural_container(
+                path,
+                make_fat(FatType.FAT12),
+                make_fat(FatType.FAT12),
+            )
+            intruding = replace(
+                catalog.entries[0],
+                image_lba=(IMAGE_OFFSET + BLOCK) // BLOCK,
+                image_offset=IMAGE_OFFSET + BLOCK,
+                extent_end=IMAGE_OFFSET + BLOCK + 512,
+            )
+            bounded = replace(catalog, entries=(catalog.entries[1], intruding))
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                with self.assertRaisesRegex(FatImageError, "bounded image extent"):
+                    inspect_uefi_eltorito_fats(descriptor, bounded)
+            finally:
+                os.close(descriptor)
+
+    def test_plural_parser_applies_aggregate_tree_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aggregate.iso"
+            fat = make_fat(FatType.FAT12)
+            catalog, _ = write_plural_container(path, fat, fat)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                with mock.patch.object(fat_image_module, "MAX_ENTRIES", 5):
+                    with self.assertRaisesRegex(FatImageError, "too many entries"):
+                        inspect_uefi_eltorito_fats(descriptor, catalog)
+                with mock.patch.object(fat_image_module, "MAX_DIRECTORIES", 3):
+                    with self.assertRaisesRegex(FatImageError, "too many directories"):
+                        inspect_uefi_eltorito_fats(descriptor, catalog)
+                with mock.patch.object(
+                    fat_image_module,
+                    "MAX_FILESYSTEM_BYTES",
+                    len(fat) * 2 - 1,
+                ):
+                    with self.assertRaises(FatImageError):
+                        inspect_uefi_eltorito_fats(descriptor, catalog)
+            finally:
+                os.close(descriptor)
+
     def test_parses_direct_fat12_fat16_and_fat32(self):
         for kind in FatType:
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:

@@ -145,9 +145,67 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(summary["file_count"], 1)
         self.assertEqual(summary["content_bytes"], 8)
         self.assertEqual(
+            report["selected_image_inspection"]["embedded_uefi_fat_count"],
+            1,
+        )
+        self.assertEqual(
+            report["selected_image_inspection"]["embedded_uefi_fats"],
+            [summary],
+        )
+        self.assertEqual(
             report["selected_image_inspection"]["embedded_uefi_issue_count"],
             1,
         )
+
+    def test_plural_embedded_fat_diagnostics_are_bounded_and_path_free(self):
+        boot = BootEntry(
+            1, True, BootPlatform.EFI, "SECRET-SECTION", True,
+            EmulationType.NO_EMULATION, 0, 0, 1, 24, 49_152,
+            512, 49_664, 0, b"",
+        )
+        embedded = EmbeddedFatImage(
+            FatSourceIdentity(1, 2, 100_000, 3, 4),
+            boot,
+            49_152,
+            100_000,
+            49_152,
+            4_096,
+            None,
+            None,
+            FatType.FAT12,
+            512,
+            1,
+            (FatImageEntry(
+                "EFI/SECRET-CUSTOMER/BOOTX64.EFI",
+                8,
+                False,
+                2,
+                (2,),
+                "b" * 64,
+            ),),
+            "c" * 64,
+        )
+        fats = tuple(
+            replace(
+                embedded,
+                boot_entry=replace(boot, catalog_index=index + 1),
+            )
+            for index in range(33)
+        )
+        report = build_diagnostics(
+            [],
+            replace(inspection(), embedded_uefi_fats=fats),
+            tool_probe=lambda: {},
+        )
+        image = report["selected_image_inspection"]
+        rendered = json.dumps(image)
+        self.assertEqual(image["embedded_uefi_fat_count"], 33)
+        self.assertEqual(len(image["embedded_uefi_fats"]), 32)
+        self.assertFalse(image["embedded_uefi_fat_summaries_complete"])
+        self.assertNotIn("embedded_uefi_fat", image)
+        self.assertNotIn("SECRET", rendered)
+        self.assertNotIn("b" * 64, rendered)
+        self.assertNotIn("c" * 64, rendered)
 
     def test_explicit_opt_in_includes_identifiers_and_log(self):
         report = build_diagnostics(

@@ -92,13 +92,13 @@ from .iso import (
     AdditiveOverlayMerge, ArchiveEntry, BootStrategy, EntryKind, FileSystem,
     FirmwareTarget,
     WriteMode, WritePlan, WriteMethodRecommendation, build_write_plan,
-    merge_additive_embedded_entries, merge_additive_overlay_entries,
+    merge_additive_overlay_entries,
     partition_sector_mismatch,
     partition_sector_unverified, recommend_write_method,
 )
 from .iso_staging import (
     IsoStagingCancelled, IsoStagingExecutor, IsoStagingPlan, IsoStagingResult,
-    build_iso_staging_plan,
+    build_iso_staging_plan, preview_embedded_fat_catalog,
 )
 from .logging_setup import read_log, setup_logging
 from .linux_downloads import (
@@ -2259,7 +2259,7 @@ class Window(QMainWindow):
         return merged.merged_entries
 
     def embedded_archive_entries(self) -> tuple[ArchiveEntry, ...]:
-        if self.inspection is None or self.inspection.embedded_uefi_fat is None:
+        if self.inspection is None:
             return ()
         return tuple(
             ArchiveEntry(
@@ -2267,30 +2267,17 @@ class Window(QMainWindow):
                 entry.size,
                 EntryKind.DIRECTORY if entry.is_directory else EntryKind.FILE,
             )
-            for entry in self.inspection.embedded_uefi_fat.entries
+            for embedded in self.inspection.embedded_uefi_fats
+            for entry in embedded.entries
         )
 
     def constructed_base_entries(self) -> tuple[ArchiveEntry, ...]:
         base_entries = self.archive_entries()
-        embedded_entries = self.embedded_archive_entries()
-        if not embedded_entries:
+        if self.inspection is None or not self.inspection.embedded_uefi_fats:
             return base_entries
-        base_file_keys = {
-            unicodedata.normalize("NFC", entry.path).casefold()
-            for entry in base_entries if entry.kind is EntryKind.FILE
-        }
-        embedded_file_keys = {
-            unicodedata.normalize("NFC", entry.path).casefold()
-            for entry in embedded_entries if entry.kind is EntryKind.FILE
-        }
-        if embedded_file_keys and embedded_file_keys <= base_file_keys:
-            # UDF Windows media can expose the same fallback loader both in
-            # its normal tree and in an El Torito FAT image.  The staging
-            # backend binds this wholly path-covered case to the UDF tree.
-            return base_entries
-        return merge_additive_embedded_entries(
+        return preview_embedded_fat_catalog(
             base_entries,
-            embedded_entries,
+            self.inspection.embedded_uefi_fats,
         ).merged_entries
 
     @staticmethod
@@ -3332,7 +3319,7 @@ class Window(QMainWindow):
             or self.windows_options.enabled
             or self.windows_bootex.enabled
             or self.zip_overlay_plan is not None
-            or inspection.embedded_uefi_fat is not None
+            or bool(inspection.embedded_uefi_fats)
             or self.selected_persistence_bytes()
             or self.runtime_validation.isChecked()
         ):
@@ -6337,12 +6324,18 @@ class Window(QMainWindow):
                     f"El Torito catalog: LBA {self.inspection.eltorito.catalog_lba}; "
                     f"{platforms}"
                 )
-            if self.inspection.embedded_uefi_fat is not None:
-                embedded = self.inspection.embedded_uefi_fat
+            if self.inspection.embedded_uefi_fats:
+                embedded_fats = self.inspection.embedded_uefi_fats
+                fat_types = ", ".join(dict.fromkeys(
+                    embedded.fat_type.value for embedded in embedded_fats
+                ))
                 detail_lines.append(
-                    f"Embedded UEFI {embedded.fat_type.value} image: "
-                    f"{len(embedded.entries)} entries · "
-                    f"{self.display_size(embedded.content_bytes)}; added only "
+                    f"Embedded UEFI boot images: {len(embedded_fats)} · "
+                    f"{fat_types} · "
+                    f"{sum(len(embedded.entries) for embedded in embedded_fats)} "
+                    "entries · "
+                    f"{self.display_size(sum(embedded.content_bytes for embedded in embedded_fats))}; "
+                    "added only "
                     "through collision-free private ISO staging"
                 )
             if self.inspection.embedded_uefi_issues:
@@ -6889,17 +6882,21 @@ class Window(QMainWindow):
             f"File content: {self.display_size(plan.minimum_content_bytes)}",
             f"Conservative target minimum: {self.display_size(plan.minimum_target_bytes)}",
         ]
-        if self.inspection.embedded_uefi_fat is not None and not windows_dual:
-            embedded = self.inspection.embedded_uefi_fat
+        if self.inspection.embedded_uefi_fats and not windows_dual:
+            embedded_fats = self.inspection.embedded_uefi_fats
+            fat_types = ", ".join(dict.fromkeys(
+                embedded.fat_type.value for embedded in embedded_fats
+            ))
             lines.extend((
                 "",
-                f"Embedded UEFI image: {embedded.fat_type.value} · "
-                f"{len(embedded.entries)} entries · "
-                f"{self.display_size(embedded.content_bytes)}",
-                "Merge policy: missing files are added from the bound El Torito "
-                "image; a wholly path-covered embedded file tree is superseded "
-                "by the complete UDF tree, while "
-                "mixed additions and collisions block ISO mode.",
+                f"Embedded UEFI boot images: {len(embedded_fats)} · {fat_types} · "
+                f"{sum(len(embedded.entries) for embedded in embedded_fats)} entries · "
+                f"{self.display_size(sum(embedded.content_bytes for embedded in embedded_fats))}",
+                "Merge policy: images are applied in physical-offset order; "
+                "missing files are added, exact cross-image duplicates are "
+                "deduplicated, a wholly path-covered image is superseded by "
+                "the complete optical tree, and partial or differing collisions "
+                "block ISO mode.",
             ))
         if self.zip_overlay_plan is not None:
             merge = self.zip_overlay_merge
@@ -7498,9 +7495,9 @@ class Window(QMainWindow):
                     request.base_entries,
                     request.write_plan,
                     overlay=request.overlay,
-                    embedded_fat=(
-                        None if request.windows_dual_enabled
-                        else request.inspection.embedded_uefi_fat
+                    embedded_fats=(
+                        () if request.windows_dual_enabled
+                        else request.inspection.embedded_uefi_fats
                     ),
                     cancel_check=check_cancelled,
                     windows_customization=request.windows_customization,
@@ -7858,7 +7855,7 @@ class Window(QMainWindow):
             or pending.persistence_profile is not None
             or pending.runtime_validation is not None
             or pending.staging_plan.overlay is not None
-            or pending.staging_plan.embedded_fat is not None
+            or bool(pending.staging_plan.embedded_fats)
             or not exact_windows_dual_customization(pending.staging_plan)
             or pending.staging_plan.windows_bootex_options is not None
             or self.windows_device_runner is not None
@@ -8809,13 +8806,17 @@ class Window(QMainWindow):
                 f"{self.display_size(staging_plan.content_bytes)} of ISO/overlay file data."
                 "\nOverlay policy: additive only; no existing ISO file is replaced."
             )
-        if staging_plan.embedded_fat is not None:
+        if staging_plan.embedded_fats:
+            fat_types = ", ".join(dict.fromkeys(
+                embedded.fat_type.value for embedded in staging_plan.embedded_fats
+            ))
             customization += (
-                f"\nEmbedded UEFI image: expand a bound "
-                f"{staging_plan.embedded_fat.fat_type.value} tree with "
-                f"{len(staging_plan.embedded_entries)} entries and "
+                f"\nEmbedded UEFI images: expand "
+                f"{len(staging_plan.embedded_fats)} bound {fat_types} trees with "
+                f"{len(staging_plan.embedded_entries)} added entries and "
                 f"{self.display_size(staging_plan.embedded_content_bytes)} of "
-                "file data. Existing ISO files are never replaced."
+                "added file data. Exact duplicates are deduplicated; existing "
+                "ISO files are never replaced."
             )
         if persistence_enabled:
             assert pending.persistence_profile is not None

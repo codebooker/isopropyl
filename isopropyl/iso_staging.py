@@ -62,9 +62,14 @@ from .eltorito import (
 )
 from .fat_image import (
     EmbeddedFatImage,
+    FatImageEntry,
     FatImageError,
+    MAX_DIRECTORIES as FAT_MAX_DIRECTORIES,
+    MAX_EMBEDDED_IMAGES as FAT_MAX_EMBEDDED_IMAGES,
+    MAX_ENTRIES as FAT_MAX_ENTRIES,
+    MAX_FILESYSTEM_BYTES as FAT_MAX_FILESYSTEM_BYTES,
     materialize_embedded_fat,
-    validate_uefi_eltorito_fat,
+    validate_uefi_eltorito_fats,
 )
 from .iso import (
     FAT32_MAX_FILE_SIZE,
@@ -250,9 +255,10 @@ class IsoStagingPlan:
     effective_entries: tuple[ArchiveEntry, ...] = ()
     effective_catalog_digest: str = ""
     _catalog_witness: object | None = None
-    embedded_fat: EmbeddedFatImage | None = None
+    embedded_fats: tuple[EmbeddedFatImage, ...] = ()
     embedded_entries: tuple[ArchiveEntry, ...] = ()
-    embedded_targets: tuple[str, ...] = ()
+    embedded_targets: tuple[tuple[str | None, ...], ...] = ()
+    embedded_additions: tuple[tuple[ArchiveEntry, ...], ...] = ()
     base_with_embedded_entries: tuple[ArchiveEntry, ...] = ()
     base_with_embedded_catalog_digest: str = ""
     embedded_content_bytes: int = 0
@@ -270,6 +276,12 @@ class IsoStagingPlan:
     @property
     def needs_wim_split(self) -> bool:
         return self.wim_source is not None
+
+    @property
+    def embedded_fat(self) -> EmbeddedFatImage | None:
+        """Backward-compatible view of an unambiguous single embedded image."""
+
+        return self.embedded_fats[0] if len(self.embedded_fats) == 1 else None
 
 
 @dataclass(frozen=True)
@@ -526,10 +538,8 @@ def _merge_effective_catalog(
 
 
 def _embedded_archive_entries(
-    embedded: EmbeddedFatImage | None,
+    embedded: EmbeddedFatImage,
 ) -> tuple[ArchiveEntry, ...]:
-    if embedded is None:
-        return ()
     return tuple(
         ArchiveEntry(
             entry.path,
@@ -540,64 +550,269 @@ def _embedded_archive_entries(
     )
 
 
+@dataclass(frozen=True)
+class EmbeddedCatalogPreview:
+    """Pure, deterministic multi-image merge decisions for staging callers."""
+
+    merged_entries: tuple[ArchiveEntry, ...]
+    embedded_entries: tuple[ArchiveEntry, ...]
+    target_sets: tuple[tuple[str | None, ...], ...]
+    addition_sets: tuple[tuple[ArchiveEntry, ...], ...]
+    content_bytes: int
+
+
+def _fat_entry_by_key(
+    embedded: EmbeddedFatImage,
+) -> dict[tuple[str, ...], FatImageEntry]:
+    return {
+        _case_key(entry.path): entry
+        for entry in embedded.entries
+        if not entry.is_directory
+    }
+
+
+def preview_embedded_fat_catalog(
+    entries: Sequence[ArchiveEntry],
+    embedded_fats: tuple[EmbeddedFatImage, ...],
+) -> EmbeddedCatalogPreview:
+    """Preview additive embedded FAT merging without accessing the source ISO.
+
+    Images are considered strictly in ascending physical-offset order. A whole
+    image whose files are already represented by the base catalog is skipped, as for
+    optical bridge images.  Partial base collisions fail closed.  Across FAT
+    images, only exactly spelled files with equal size and SHA-256 are safely
+    deduplicated. Aliases or differing content are rejected. Directory merge
+    points must retain one exact spelling across images. A ``None`` target is
+    an explicit per-image instruction to skip such a proven duplicate.
+    """
+
+    if type(embedded_fats) is not tuple:
+        raise IsoStagingSafetyError("The embedded boot-image tuple is invalid")
+    if len(embedded_fats) > FAT_MAX_EMBEDDED_IMAGES:
+        raise IsoStagingSafetyError("There are too many embedded boot images")
+    if any(type(item) is not EmbeddedFatImage for item in embedded_fats):
+        raise IsoStagingSafetyError("The embedded boot-image tuple is invalid")
+    if any(type(item.entries) is not tuple for item in embedded_fats):
+        raise IsoStagingSafetyError("An embedded boot-image entry tuple is invalid")
+    entry_count = sum(len(item.entries) for item in embedded_fats)
+    if entry_count > FAT_MAX_ENTRIES:
+        raise IsoStagingSafetyError("The embedded boot images contain too many entries")
+    if any(
+        type(entry) is not FatImageEntry
+        for item in embedded_fats for entry in item.entries
+    ):
+        raise IsoStagingSafetyError("An embedded boot-image entry is invalid")
+    directory_count = sum(
+        entry.is_directory
+        for item in embedded_fats for entry in item.entries
+        if type(entry.is_directory) is bool
+    )
+    if (
+        directory_count > FAT_MAX_DIRECTORIES
+        or any(
+            type(entry.is_directory) is not bool
+            or type(entry.path) is not str
+            or type(entry.size) is not int
+            or entry.size < 0
+            or type(entry.sha256) is not str
+            or (
+                entry.is_directory
+                and (entry.size != 0 or entry.sha256 != "")
+            )
+            or (
+                not entry.is_directory
+                and re.fullmatch(r"[0-9a-f]{64}", entry.sha256) is None
+            )
+            for item in embedded_fats for entry in item.entries
+        )
+    ):
+        raise IsoStagingSafetyError("An embedded boot-image entry is invalid")
+    filesystem_bytes = 0
+    content_bytes = 0
+    for item in embedded_fats:
+        if type(item.filesystem_size) is not int or item.filesystem_size <= 0:
+            raise IsoStagingSafetyError("An embedded FAT filesystem size is invalid")
+        filesystem_bytes += item.filesystem_size
+        content_bytes += sum(
+            entry.size for entry in item.entries if not entry.is_directory
+        )
+        if (
+            filesystem_bytes > FAT_MAX_FILESYSTEM_BYTES
+            or content_bytes > FAT_MAX_FILESYSTEM_BYTES
+        ):
+            raise IsoStagingSafetyError(
+                "The embedded FAT images exceed their aggregate byte limit"
+            )
+    if any(
+        type(item.image_offset) is not int or item.image_offset < 0
+        for item in embedded_fats
+    ):
+        raise IsoStagingSafetyError("An embedded boot-image offset is invalid")
+    offsets = tuple(item.image_offset for item in embedded_fats)
+    if offsets != tuple(sorted(set(offsets))):
+        raise IsoStagingSafetyError(
+            "Embedded boot images are not in unique image-offset order"
+        )
+    current = tuple(entries)
+    if not embedded_fats:
+        return EmbeddedCatalogPreview(current, (), (), (), 0)
+    try:
+        # Establish the complete portable base namespace before applying the
+        # special whole-image coverage exception.
+        current = merge_additive_embedded_entries(current, ()).merged_entries
+    except (UnsafeArchiveError, ValueError) as error:
+        raise IsoStagingSafetyError(str(error)) from error
+    base_file_keys = {
+        _case_key(entry.path)
+        for entry in current if entry.kind is EntryKind.FILE
+    }
+    seen_entries: dict[tuple[str, ...], ArchiveEntry] = {}
+    seen_files: dict[tuple[str, ...], FatImageEntry] = {}
+    directory_spellings: dict[tuple[str, ...], tuple[str, ...]] = {}
+    all_additions: list[ArchiveEntry] = []
+    target_sets: list[tuple[str | None, ...]] = []
+    addition_sets: list[tuple[ArchiveEntry, ...]] = []
+
+    for embedded in embedded_fats:
+        image_entries = _embedded_archive_entries(embedded)
+        image_file_keys = {
+            _case_key(entry.path)
+            for entry in image_entries if entry.kind is EntryKind.FILE
+        }
+        base_collisions = base_file_keys & image_file_keys
+        if image_file_keys and base_collisions == image_file_keys:
+            target_sets.append(())
+            addition_sets.append(())
+            continue
+        if base_collisions:
+            raise IsoStagingSafetyError(
+                "An embedded boot image only partially collides with the base image"
+            )
+
+        unique: list[ArchiveEntry] = []
+        duplicate_targets: dict[tuple[str, ...], None] = {}
+        fat_files = _fat_entry_by_key(embedded)
+        for entry in image_entries:
+            parts = PurePosixPath(entry.path).parts
+            prefix_count = (
+                len(parts) if entry.kind is EntryKind.DIRECTORY else len(parts) - 1
+            )
+            for length in range(1, prefix_count + 1):
+                prefix = parts[:length]
+                key = _case_key(PurePosixPath(*prefix).as_posix())
+                previous = directory_spellings.get(key)
+                if previous is not None and previous != prefix:
+                    raise IsoStagingSafetyError(
+                        "Embedded boot images use differing spellings for the "
+                        "same VFAT directory: "
+                        f"{str(PurePosixPath(*previous))!r} and "
+                        f"{str(PurePosixPath(*prefix))!r}"
+                    )
+                directory_spellings[key] = prefix
+
+            key = _case_key(entry.path)
+            previous = seen_entries.get(key)
+            if previous is None:
+                unique.append(entry)
+                continue
+            if previous.path != entry.path or previous.kind is not entry.kind:
+                raise IsoStagingSafetyError(
+                    "Embedded boot images contain a differing case/VFAT path "
+                    f"collision: {previous.path!r} and {entry.path!r}"
+                )
+            if entry.kind is EntryKind.DIRECTORY:
+                duplicate_targets[key] = None
+                continue
+            previous_file = seen_files.get(key)
+            current_file = fat_files.get(key)
+            if (
+                previous_file is None
+                or current_file is None
+                or previous_file.size != current_file.size
+                or not hmac.compare_digest(previous_file.sha256, current_file.sha256)
+            ):
+                raise IsoStagingSafetyError(
+                    f"Embedded boot images contain differing files at {entry.path!r}"
+                )
+            duplicate_targets[key] = None
+
+        try:
+            merged = merge_additive_embedded_entries(current, unique)
+        except (UnsafeArchiveError, ValueError) as error:
+            raise IsoStagingSafetyError(str(error)) from error
+        unique_targets = {
+            _case_key(source.path): target.path
+            for source, target in zip(unique, merged.overlay_targets, strict=True)
+        }
+        targets = tuple(
+            (
+                None
+                if _case_key(entry.path) in duplicate_targets
+                else unique_targets[_case_key(entry.path)]
+            )
+            for entry in image_entries
+        )
+        additions = merged.overlay_entries
+        if len(targets) != len(image_entries):
+            raise IsoStagingSafetyError(
+                "An embedded boot image is not bound to per-image staging targets"
+            )
+        for entry in image_entries:
+            key = _case_key(entry.path)
+            seen_entries.setdefault(key, entry)
+            if entry.kind is EntryKind.FILE:
+                seen_files.setdefault(key, fat_files[key])
+        current = merged.merged_entries
+        all_additions.extend(additions)
+        target_sets.append(targets)
+        addition_sets.append(additions)
+
+    content_bytes = sum(
+        entry.size for entry in all_additions if entry.kind is EntryKind.FILE
+    )
+    return EmbeddedCatalogPreview(
+        current,
+        tuple(all_additions),
+        tuple(target_sets),
+        tuple(addition_sets),
+        content_bytes,
+    )
+
+
 def _merge_embedded_catalog(
     entries: Sequence[ArchiveEntry],
-    embedded: EmbeddedFatImage | None,
+    embedded_fats: tuple[EmbeddedFatImage, ...],
 ) -> tuple[
     tuple[ArchiveEntry, ...],
     tuple[ArchiveEntry, ...],
-    tuple[str, ...],
+    tuple[tuple[str | None, ...], ...],
+    tuple[tuple[ArchiveEntry, ...], ...],
     int,
 ]:
-    embedded_entries = _embedded_archive_entries(embedded)
-    if not embedded_entries:
-        return tuple(entries), (), (), 0
-    base_file_keys = {
-        _case_key(entry.path)
-        for entry in entries if entry.kind is EntryKind.FILE
-    }
-    embedded_file_keys = {
-        _case_key(entry.path)
-        for entry in embedded_entries if entry.kind is EntryKind.FILE
-    }
-    colliding_files = base_file_keys & embedded_file_keys
-    if embedded_file_keys and colliding_files == embedded_file_keys:
-        # Optical bridge images commonly expose fallback EFI paths both in the
-        # complete UDF tree and in their El Torito FAT image.  When every
-        # embedded file path is already covered, prefer the cataloged UDF tree
-        # and materialize none of the optical-only copy.  A mixed
-        # collision/addition set remains ambiguous and is rejected below.
-        return tuple(entries), (), (), 0
-    try:
-        merged = merge_additive_embedded_entries(entries, embedded_entries)
-    except (UnsafeArchiveError, ValueError) as error:
-        raise IsoStagingSafetyError(str(error)) from error
-    if len(merged.overlay_targets) != len(embedded_entries):
-        raise IsoStagingSafetyError(
-            "The embedded boot-image tree is not bound to its staging targets"
-        )
-    content_bytes = sum(
-        entry.size for entry in merged.overlay_entries
-        if entry.kind is EntryKind.FILE
-    )
+    preview = preview_embedded_fat_catalog(entries, embedded_fats)
     return (
-        merged.merged_entries,
-        embedded_entries,
-        tuple(entry.path for entry in merged.overlay_targets),
-        content_bytes,
+        preview.merged_entries,
+        preview.embedded_entries,
+        preview.target_sets,
+        preview.addition_sets,
+        preview.content_bytes,
     )
 
 
 def _validate_embedded_source(
     image: Path,
     image_identity: FileIdentity,
-    embedded: EmbeddedFatImage | None,
+    embedded_fats: tuple[EmbeddedFatImage, ...],
     cancel_check: Callable[[], None] | None,
 ) -> None:
-    if embedded is None:
+    if not embedded_fats:
         return
-    if not isinstance(embedded, EmbeddedFatImage):
-        raise IsoStagingSafetyError("The embedded boot-image plan is invalid")
+    if (
+        type(embedded_fats) is not tuple
+        or len(embedded_fats) > FAT_MAX_EMBEDDED_IMAGES
+        or any(type(item) is not EmbeddedFatImage for item in embedded_fats)
+    ):
+        raise IsoStagingSafetyError("The embedded boot-image tuple is invalid")
     flags = (
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
@@ -621,22 +836,23 @@ def _validate_embedded_source(
             raise IsoStagingSafetyError(
                 "The ISO identity changed before embedded boot-image validation"
             )
-        expected_source = embedded.source_identity
-        if observed != (
-            expected_source.device,
-            expected_source.inode,
-            expected_source.size,
-            expected_source.modified_ns,
-            expected_source.changed_ns,
-        ):
-            raise IsoStagingSafetyError(
-                "The embedded boot-image plan belongs to another ISO identity"
-            )
         catalog = inspect_eltorito_file(image, image_fd=descriptor)
-        validate_uefi_eltorito_fat(
+        for embedded in embedded_fats:
+            expected_source = embedded.source_identity
+            if observed != (
+                expected_source.device,
+                expected_source.inode,
+                expected_source.size,
+                expected_source.modified_ns,
+                expected_source.changed_ns,
+            ):
+                raise IsoStagingSafetyError(
+                    "An embedded boot-image plan belongs to another ISO identity"
+                )
+        validate_uefi_eltorito_fats(
             descriptor,
             catalog,
-            embedded,
+            embedded_fats,
             cancel_check=cancel_check,
         )
         after = os.fstat(descriptor)
@@ -1393,6 +1609,7 @@ def build_iso_staging_plan(
     *,
     seven_zip: str | None = None,
     overlay: ZipOverlayPlan | None = None,
+    embedded_fats: tuple[EmbeddedFatImage, ...] = (),
     embedded_fat: EmbeddedFatImage | None = None,
     cancel_check: Callable[[], None] | None = None,
     windows_customization: WindowsCustomization | None = None,
@@ -1412,6 +1629,14 @@ def build_iso_staging_plan(
 
     if cancel_check is not None:
         cancel_check()
+    if type(embedded_fats) is not tuple:
+        raise IsoStagingSafetyError("The embedded boot-image tuple is invalid")
+    if embedded_fat is not None:
+        if embedded_fats:
+            raise IsoStagingSafetyError(
+                "Use either embedded_fats or the legacy embedded_fat input, not both"
+            )
+        embedded_fats = (embedded_fat,)
     if (syslinux_c32_bundle is None) != (syslinux_payload_bundle is None):
         raise IsoStagingSafetyError(
             "The Syslinux C32 and BIOS payload bundles must be supplied together"
@@ -1419,7 +1644,7 @@ def build_iso_staging_plan(
     _validate_transitional_windows_staging_scope(
         write_plan,
         overlay=overlay,
-        embedded_fat=embedded_fat,
+        embedded_fat=embedded_fats or None,
         windows_customization=windows_customization,
         windows_architecture=windows_architecture,
         windows_bootex=windows_bootex,
@@ -1437,8 +1662,9 @@ def build_iso_staging_plan(
         base_with_embedded_entries,
         embedded_entries,
         embedded_targets,
+        embedded_additions,
         embedded_content_bytes,
-    ) = _merge_embedded_catalog(safe_entries, embedded_fat)
+    ) = _merge_embedded_catalog(safe_entries, embedded_fats)
     _validate_overlay(overlay, cancel_check=cancel_check)
     effective_entries, _overlay_targets = _merge_effective_catalog(
         base_with_embedded_entries, overlay,
@@ -1575,7 +1801,7 @@ def build_iso_staging_plan(
     _validate_embedded_source(
         extraction.image,
         extraction.image_identity,
-        embedded_fat,
+        embedded_fats,
         cancel_check,
     )
 
@@ -1678,9 +1904,10 @@ def build_iso_staging_plan(
             _catalog_digest(safe_entries),
             extraction.archive_namespace,
         ),
-        embedded_fat=embedded_fat,
+        embedded_fats=embedded_fats,
         embedded_entries=embedded_entries,
         embedded_targets=embedded_targets,
+        embedded_additions=embedded_additions,
         base_with_embedded_entries=base_with_embedded_entries,
         base_with_embedded_catalog_digest=_catalog_digest(
             base_with_embedded_entries,
@@ -1714,7 +1941,7 @@ def validate_iso_staging_plan(
     _validate_transitional_windows_staging_scope(
         plan.write_plan,
         overlay=plan.overlay,
-        embedded_fat=plan.embedded_fat,
+        embedded_fat=plan.embedded_fats or None,
         windows_customization=plan.windows_customization,
         windows_architecture=plan.windows_architecture,
         windows_bootex=plan.windows_bootex_options,
@@ -1728,21 +1955,23 @@ def validate_iso_staging_plan(
     if entries != plan.entries or _catalog_digest(entries) != plan.catalog_digest:
         raise IsoStagingSafetyError("The ISO catalog binding is invalid")
     _validate_distro_iso_policy(entries)
-    _validate_embedded_source(
-        plan.image,
-        plan.image_identity,
-        plan.embedded_fat,
-        cancel_check,
-    )
     (
         base_with_embedded_entries,
         embedded_entries,
         embedded_targets,
+        embedded_additions,
         embedded_content_bytes,
-    ) = _merge_embedded_catalog(entries, plan.embedded_fat)
+    ) = _merge_embedded_catalog(entries, plan.embedded_fats)
+    _validate_embedded_source(
+        plan.image,
+        plan.image_identity,
+        plan.embedded_fats,
+        cancel_check,
+    )
     if (
         embedded_entries != plan.embedded_entries
         or embedded_targets != plan.embedded_targets
+        or embedded_additions != plan.embedded_additions
         or embedded_content_bytes != plan.embedded_content_bytes
         or base_with_embedded_entries != plan.base_with_embedded_entries
         or _catalog_digest(base_with_embedded_entries)
@@ -2194,7 +2423,7 @@ def validate_published_windows_staging(
         )
     if any((
         plan.overlay is not None,
-        plan.embedded_fat is not None,
+        bool(plan.embedded_fats),
         plan.syslinux_staging is not None,
         plan.syslinux_c32_bundle is not None,
         plan.syslinux_payload_bundle is not None,
@@ -3183,23 +3412,42 @@ class IsoStagingExecutor:
                         entry.size for entry in plan.entries
                         if entry.kind is EntryKind.FILE
                     )
-                    written = materialize_embedded_fat(
-                        descriptor,
-                        catalog,
-                        plan.embedded_fat,
-                        tree,
+                    written_total = 0
+                    for embedded, targets, additions in zip(
+                        plan.embedded_fats,
                         plan.embedded_targets,
-                        cancel_check=self._check_cancelled,
-                        progress=lambda relative, done, _total: progress(
-                            IsoStagingProgress(
-                                "Expanding embedded UEFI boot image",
-                                relative,
-                                base_bytes + done,
-                                plan.content_bytes,
+                        plan.embedded_additions,
+                        strict=True,
+                    ):
+                        if not targets:
+                            continue
+                        before_image = written_total
+                        written = materialize_embedded_fat(
+                            descriptor,
+                            catalog,
+                            embedded,
+                            tree,
+                            targets,
+                            cancel_check=self._check_cancelled,
+                            progress=lambda relative, done, _total, before=before_image: progress(
+                                IsoStagingProgress(
+                                    "Expanding embedded UEFI boot image",
+                                    relative,
+                                    base_bytes + before + done,
+                                    plan.content_bytes,
+                                )
+                            ),
+                        )
+                        expected = sum(
+                            entry.size for entry in additions
+                            if entry.kind is EntryKind.FILE
+                        )
+                        if written != expected:
+                            raise IsoStagingSafetyError(
+                                "An embedded boot-image byte count changed"
                             )
-                        ),
-                    )
-                    if written != plan.embedded_content_bytes:
+                        written_total += written
+                    if written_total != plan.embedded_content_bytes:
                         raise IsoStagingSafetyError(
                             "The embedded boot-image byte count changed"
                         )

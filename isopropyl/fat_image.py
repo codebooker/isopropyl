@@ -40,6 +40,7 @@ MAX_DEPTH = 32
 MAX_PATH_UTF8_BYTES = 4_096
 MAX_COMPONENT_UTF16_UNITS = 255
 MAX_READ_FILE_BYTES = 256 * 1024**2
+MAX_EMBEDDED_IMAGES = 8
 FAT_PARTITION_TYPES = frozenset({0x01, 0x04, 0x06, 0x0B, 0x0C, 0x0E})
 _FALLBACK_LOADER = re.compile(
     r"boot(?:ia32|x64|arm|aa64|ia64|riscv64|loongarch64|ebc)\.efi",
@@ -210,6 +211,8 @@ class _FatVolume:
         upper_bound: int,
         cancel_check: CancelCheck | None,
         maximum_content_bytes: int = MAX_FILESYSTEM_BYTES,
+        maximum_entries: int = MAX_ENTRIES,
+        maximum_directories: int = MAX_DIRECTORIES,
         strict_directories: bool = False,
     ) -> None:
         self.reader = reader
@@ -219,6 +222,12 @@ class _FatVolume:
         if type(maximum_content_bytes) is not int or maximum_content_bytes <= 0:
             raise FatImageError("The FAT content limit is invalid")
         self.maximum_content_bytes = maximum_content_bytes
+        if type(maximum_entries) is not int or maximum_entries <= 0:
+            raise FatImageError("The FAT entry limit is invalid")
+        self.maximum_entries = maximum_entries
+        if type(maximum_directories) is not int or maximum_directories <= 0:
+            raise FatImageError("The FAT directory limit is invalid")
+        self.maximum_directories = maximum_directories
         if type(strict_directories) is not bool:
             raise FatImageError("The FAT directory-validation mode is invalid")
         self.strict_directories = strict_directories
@@ -601,9 +610,12 @@ class _FatVolume:
                 if size != 0:
                     raise FatImageError(f"Embedded directory {rendered!r} has a file size")
                 clusters = self._chain(first_cluster, rendered)
-                if len(self._entries) >= MAX_ENTRIES:
+                if len(self._entries) >= self.maximum_entries:
                     raise FatImageError("The embedded FAT tree has too many entries")
-                if sum(entry.is_directory for entry in self._entries) >= MAX_DIRECTORIES:
+                if (
+                    sum(entry.is_directory for entry in self._entries)
+                    >= self.maximum_directories
+                ):
                     raise FatImageError("The embedded FAT tree has too many directories")
                 entry = FatImageEntry(rendered, 0, True, first_cluster, clusters, "")
                 self._entries.append(entry)
@@ -626,7 +638,7 @@ class _FatVolume:
                         raise FatImageError(
                             f"Embedded file {rendered!r} has an over- or under-sized cluster chain"
                         )
-                if len(self._entries) >= MAX_ENTRIES:
+                if len(self._entries) >= self.maximum_entries:
                     raise FatImageError("The embedded FAT tree has too many entries")
                 self._entries.append(
                     FatImageEntry(
@@ -839,14 +851,10 @@ def _manifest_digest(entries: Sequence[FatImageEntry]) -> str:
     ).hexdigest()
 
 
-def inspect_uefi_eltorito_fat(
+def _embedded_fat_context(
     descriptor: int,
     inspection: ElToritoInspection,
-    *,
-    cancel_check: CancelCheck | None = None,
-) -> EmbeddedFatImage | None:
-    """Return one fully bound embedded FAT tree, or ``None`` when none exists."""
-
+) -> tuple[FatSourceIdentity, _Reader, tuple[BootEntry, ...]]:
     try:
         before_status = os.fstat(descriptor)
     except OSError as error:
@@ -879,34 +887,137 @@ def inspect_uefi_eltorito_fat(
             and entry.image_offset is not None
         )
     )
+    return before, _Reader(descriptor, before.size), eligible
+
+
+def inspect_uefi_eltorito_fats(
+    descriptor: int,
+    inspection: ElToritoInspection,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> tuple[EmbeddedFatImage, ...]:
+    """Return all bounded bootable UEFI El Torito FAT images in offset order."""
+
+    before, reader, eligible = _embedded_fat_context(descriptor, inspection)
+    if not eligible:
+        return ()
+    if len(eligible) > MAX_EMBEDDED_IMAGES:
+        raise FatImageError("The ISO has too many bootable UEFI El Torito images")
+    offsets = tuple(entry.image_offset for entry in eligible)
+    if len(set(offsets)) != len(offsets):
+        raise FatImageError("Bootable UEFI El Torito images have duplicate offsets")
+
+    results: list[EmbeddedFatImage] = []
+    filesystem_bytes = 0
+    content_bytes = 0
+    entry_count = 0
+    directory_count = 0
+    for boot_entry in sorted(eligible, key=lambda entry: entry.image_offset or 0):
+        filesystem_remaining = MAX_FILESYSTEM_BYTES - filesystem_bytes
+        content_remaining = MAX_FILESYSTEM_BYTES - content_bytes
+        entries_remaining = MAX_ENTRIES - entry_count
+        directories_remaining = MAX_DIRECTORIES - directory_count
+        if filesystem_remaining <= 0:
+            raise FatImageError("The embedded FAT filesystems exceed the aggregate limit")
+        if content_remaining <= 0:
+            raise FatImageError("The embedded FAT file content exceeds the aggregate limit")
+        if entries_remaining <= 0:
+            raise FatImageError("The embedded FAT trees have too many aggregate entries")
+        if directories_remaining <= 0:
+            raise FatImageError("The embedded FAT trees have too many aggregate directories")
+        result = _inspect_uefi_eltorito_fat_image(
+            descriptor,
+            inspection,
+            boot_entry,
+            before,
+            reader,
+            maximum_filesystem_bytes=filesystem_remaining,
+            maximum_content_bytes=content_remaining,
+            maximum_entries=entries_remaining,
+            maximum_directories=directories_remaining,
+            cancel_check=cancel_check,
+        )
+        results.append(result)
+        filesystem_bytes += result.filesystem_size
+        content_bytes += result.content_bytes
+        entry_count += len(result.entries)
+        directory_count += sum(entry.is_directory for entry in result.entries)
+    return tuple(results)
+
+
+def inspect_uefi_eltorito_fat(
+    descriptor: int,
+    inspection: ElToritoInspection,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> EmbeddedFatImage | None:
+    """Return one fully bound embedded FAT tree, or ``None`` when none exists."""
+
+    before, reader, eligible = _embedded_fat_context(descriptor, inspection)
     if not eligible:
         return None
     if len(eligible) != 1:
         raise FatImageError("Multiple bootable UEFI El Torito images are ambiguous")
-    boot_entry = eligible[0]
+    return _inspect_uefi_eltorito_fat_image(
+        descriptor,
+        inspection,
+        eligible[0],
+        before,
+        reader,
+        maximum_filesystem_bytes=MAX_FILESYSTEM_BYTES,
+        maximum_content_bytes=MAX_FILESYSTEM_BYTES,
+        maximum_entries=MAX_ENTRIES,
+        maximum_directories=MAX_DIRECTORIES,
+        cancel_check=cancel_check,
+    )
+
+
+def _inspect_uefi_eltorito_fat_image(
+    descriptor: int,
+    inspection: ElToritoInspection,
+    boot_entry: BootEntry,
+    before: FatSourceIdentity,
+    reader: _Reader,
+    *,
+    maximum_filesystem_bytes: int,
+    maximum_content_bytes: int,
+    maximum_entries: int,
+    maximum_directories: int,
+    cancel_check: CancelCheck | None = None,
+) -> EmbeddedFatImage:
     assert boot_entry.image_offset is not None
     later_offsets = sorted({
         entry.image_offset
         for entry in inspection.entries
         if entry.image_offset is not None and entry.image_offset > boot_entry.image_offset
     })
-    logical_limit = inspection.logical_volume_size or before.size
+    logical_limit = min(inspection.logical_volume_size or before.size, before.size)
+    iso_structure_offsets = tuple(
+        offset
+        for offset in (16 * 2_048, inspection.catalog_offset)
+        if offset > boot_entry.image_offset
+    )
     image_limit = min(
         later_offsets[0] if later_offsets else logical_limit,
+        min(iso_structure_offsets) if iso_structure_offsets else logical_limit,
         logical_limit,
     )
     if boot_entry.sector_count > 1:
         image_limit = min(image_limit, boot_entry.image_offset + boot_entry.load_size)
     if boot_entry.image_offset + 512 > image_limit:
         raise FatImageError("The UEFI El Torito image has no complete first sector")
-    reader = _Reader(descriptor, before.size)
     if cancel_check is not None:
         cancel_check()
 
     candidates: list[tuple[_VolumeLayout, int | None, int | None]] = []
     direct_error: FatImageError | None = None
     try:
-        direct = _parse_layout(reader, boot_entry.image_offset, image_limit)
+        direct = _parse_layout(
+            reader,
+            boot_entry.image_offset,
+            image_limit,
+            maximum_filesystem_bytes=maximum_filesystem_bytes,
+        )
         candidates.append((direct, None, None))
     except FatImageError as error:
         direct_error = error
@@ -915,7 +1026,12 @@ def inspect_uefi_eltorito_fat(
         start_lba, sectors = partition
         partition_offset = boot_entry.image_offset + start_lba * 512
         partition_limit = partition_offset + sectors * 512
-        wrapped = _parse_layout(reader, partition_offset, partition_limit)
+        wrapped = _parse_layout(
+            reader,
+            partition_offset,
+            partition_limit,
+            maximum_filesystem_bytes=maximum_filesystem_bytes,
+        )
         if wrapped.filesystem_size > sectors * 512:
             raise FatImageError("The embedded FAT volume exceeds its MBR partition")
         candidates.append((wrapped, start_lba, sectors))
@@ -942,6 +1058,9 @@ def inspect_uefi_eltorito_fat(
         layout,
         upper_bound=layout.filesystem_offset + layout.filesystem_size,
         cancel_check=cancel_check,
+        maximum_content_bytes=maximum_content_bytes,
+        maximum_entries=maximum_entries,
+        maximum_directories=maximum_directories,
     )
     entries = volume.parse()
     result = EmbeddedFatImage(
@@ -1140,6 +1259,22 @@ def validate_uefi_eltorito_fat(
         raise FatImageError("The embedded UEFI FAT image no longer matches its bound plan")
 
 
+def validate_uefi_eltorito_fats(
+    descriptor: int,
+    inspection: ElToritoInspection,
+    expected: tuple[EmbeddedFatImage, ...],
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> None:
+    rebuilt = inspect_uefi_eltorito_fats(
+        descriptor,
+        inspection,
+        cancel_check=cancel_check,
+    )
+    if rebuilt != expected:
+        raise FatImageError("The embedded UEFI FAT images no longer match their bound plans")
+
+
 def _entry_by_path(plan: EmbeddedFatImage, path: str) -> FatImageEntry:
     matches = tuple(entry for entry in plan.entries if entry.path == path)
     if len(matches) != 1:
@@ -1208,21 +1343,31 @@ def materialize_embedded_fat(
     inspection: ElToritoInspection,
     plan: EmbeddedFatImage,
     destination: Path,
-    targets: Sequence[str],
+    targets: Sequence[str | None],
     *,
     cancel_check: CancelCheck | None = None,
     progress: MaterializeProgress | None = None,
 ) -> int:
-    """Add the bound FAT tree to a private staging directory without replacement."""
+    """Add selected bound FAT entries without replacement.
 
-    validate_uefi_eltorito_fat(
+    A ``None`` target skips an entry that the caller has already proven is an
+    exact duplicate of an earlier bound embedded image.  The complete FAT plan
+    is still revalidated before any selected entry is created.
+    """
+
+    rebuilt = inspect_uefi_eltorito_fats(
         descriptor,
         inspection,
-        plan,
         cancel_check=cancel_check,
     )
+    if sum(candidate == plan for candidate in rebuilt) != 1:
+        raise FatImageError(
+            "The embedded UEFI FAT image no longer matches one unique bound plan"
+        )
     if len(targets) != len(plan.entries):
         raise FatImageError("The embedded FAT target mapping is incomplete")
+    if any(target is not None and type(target) is not str for target in targets):
+        raise FatImageError("The embedded FAT target mapping is invalid")
     target_by_source = dict(zip((entry.path for entry in plan.entries), targets, strict=True))
     if len(target_by_source) != len(plan.entries):
         raise FatImageError("The embedded FAT target mapping is ambiguous")
@@ -1257,7 +1402,13 @@ def materialize_embedded_fat(
     except BaseException:
         os.close(root_fd)
         raise
-    total = plan.content_bytes
+    selected_entries = tuple(
+        entry for entry in plan.entries
+        if target_by_source[entry.path] is not None
+    )
+    total = sum(
+        entry.size for entry in selected_entries if not entry.is_directory
+    )
     written_total = 0
 
     def open_directory(parts: tuple[str, ...], create: bool) -> int:
@@ -1290,12 +1441,16 @@ def materialize_embedded_fat(
 
     try:
         for entry in sorted(
-            plan.entries,
-            key=lambda item: (len(PurePosixPath(target_by_source[item.path]).parts), item.path.casefold()),
+            selected_entries,
+            key=lambda item: (
+                len(PurePosixPath(target_by_source[item.path]).parts),
+                item.path.casefold(),
+            ),
         ):
             if cancel_check is not None:
                 cancel_check()
             target = target_by_source[entry.path]
+            assert target is not None
             parts = PurePosixPath(target).parts
             if not parts or PurePosixPath(target).is_absolute() or ".." in parts:
                 raise FatImageError("An embedded FAT target path is unsafe")

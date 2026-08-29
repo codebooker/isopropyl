@@ -428,6 +428,23 @@ class WindowsIsoFat32Tests(unittest.TestCase):
                 "isopropyl.iso_staging.scan_image_contents",
                 fake_catalog_scanner(entries),
             ):
+                with self.assertRaisesRegex(
+                    IsoStagingSafetyError,
+                    r"transitional Windows BIOS\+UEFI profile",
+                ):
+                    build_iso_staging_plan(
+                        image,
+                        root / "staging-embedded-fats",
+                        entries,
+                        write_plan,
+                        seven_zip=SEVEN_ZIP,
+                        embedded_fats=(object(), object()),
+                    )
+
+            with patch(
+                "isopropyl.iso_staging.scan_image_contents",
+                fake_catalog_scanner(entries),
+            ):
                 clean = build_iso_staging_plan(
                     image,
                     root / "staging-clean",

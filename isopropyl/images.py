@@ -37,7 +37,7 @@ from .eltorito import (
 from .fat_image import (
     EmbeddedFatImage,
     FatImageError,
-    inspect_uefi_eltorito_fat,
+    inspect_uefi_eltorito_fats,
     read_embedded_fat_file,
 )
 from .uefi import (
@@ -194,6 +194,29 @@ class ImageInspection:
     embedded_uefi_fat: EmbeddedFatImage | None = None
     embedded_uefi_issues: tuple[str, ...] = ()
     squashfs: SquashFsInspection | None = None
+    embedded_uefi_fats: tuple[EmbeddedFatImage, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Normalize the legacy singular embedded-FAT view.
+
+        ``embedded_uefi_fats`` is authoritative for new callers. Accepting a
+        legacy singular constructor argument keeps saved/test inspection
+        fixtures usable, while the singular attribute deliberately becomes
+        unavailable when an ISO contains more than one embedded EFI image.
+        """
+
+        fats = self.embedded_uefi_fats
+        legacy = self.embedded_uefi_fat
+        if legacy is not None and not fats:
+            fats = (legacy,)
+            object.__setattr__(self, "embedded_uefi_fats", fats)
+        elif legacy is not None and fats != (legacy,):
+            raise ValueError(
+                "embedded_uefi_fat must match the sole embedded_uefi_fats item"
+            )
+        compatible = fats[0] if len(fats) == 1 else None
+        if legacy is not compatible:
+            object.__setattr__(self, "embedded_uefi_fat", compatible)
 
     @property
     def partition_table_incomplete(self) -> bool:
@@ -1189,7 +1212,7 @@ def inspect_image(
                 mode for mode in ("BIOS", "UEFI", "PowerPC", "Mac")
                 if mode in detected
             )
-        embedded_uefi_fat: EmbeddedFatImage | None = None
+        embedded_uefi_fats: tuple[EmbeddedFatImage, ...] = ()
         embedded_uefi_issues: tuple[str, ...] = ()
         if (
             inspection_fd >= 0
@@ -1197,7 +1220,7 @@ def inspect_image(
             and BootPlatform.EFI in eltorito.bootable_platforms
         ):
             try:
-                embedded_uefi_fat = inspect_uefi_eltorito_fat(
+                embedded_uefi_fats = inspect_uefi_eltorito_fats(
                     inspection_fd,
                     eltorito,
                     cancel_check=check_inspection,
@@ -1234,50 +1257,55 @@ def inspect_image(
                 uefi_issues += (
                     "a complete ISO file catalog was unavailable for DBX analysis",
                 )
-            if embedded_uefi_fat is not None:
-                embedded_analysis = _inspect_embedded_uefi_payloads(
-                    inspection_fd,
-                    embedded_uefi_fat,
-                    cancel_check=check_inspection,
-                )
-                uefi_payloads += embedded_analysis.payloads
-                uefi_issues += tuple(
-                    f"embedded El Torito FAT: {issue}"
-                    for issue in embedded_analysis.issues
-                )
-                embedded_uefi_issues += embedded_analysis.issues
-                uefi_complete = uefi_complete and embedded_analysis.complete
-                uefi_candidate_count += embedded_analysis.candidate_count
-                uefi_selected_count += embedded_analysis.selected_count
-
-                embedded_payloads = {
-                    payload.target_path.casefold(): payload
-                    for payload in embedded_analysis.payloads
-                }
+            if embedded_uefi_fats:
                 detected_architectures = list(architectures)
-                for loader in embedded_uefi_fat.fallback_loaders:
-                    name = PurePosixPath(loader.path).name.casefold()
-                    expected = fallback_loader_architecture(name)
-                    payload = embedded_payloads.get(loader.path.casefold())
-                    if (
-                        expected is None
-                        or payload is None
-                        or not payload.is_uefi_image
-                        or not fallback_loader_matches_architecture(
-                            name,
-                            payload.architecture,
-                        )
-                    ):
-                        uefi_complete = False
-                        issue = (
-                            f"embedded fallback loader {loader.path!r} did not "
-                            "validate as matching UEFI PE code"
-                        )
-                        uefi_issues += (issue,)
-                        embedded_uefi_issues += (issue,)
-                        continue
-                    if expected not in detected_architectures:
-                        detected_architectures.append(expected)
+                for embedded_uefi_fat in embedded_uefi_fats:
+                    embedded_analysis = _inspect_embedded_uefi_payloads(
+                        inspection_fd,
+                        embedded_uefi_fat,
+                        cancel_check=check_inspection,
+                    )
+                    label = (
+                        "embedded El Torito FAT "
+                        f"#{embedded_uefi_fat.boot_entry.catalog_index}"
+                    )
+                    uefi_payloads += embedded_analysis.payloads
+                    labeled_issues = tuple(
+                        f"{label}: {issue}" for issue in embedded_analysis.issues
+                    )
+                    uefi_issues += labeled_issues
+                    embedded_uefi_issues += labeled_issues
+                    uefi_complete = uefi_complete and embedded_analysis.complete
+                    uefi_candidate_count += embedded_analysis.candidate_count
+                    uefi_selected_count += embedded_analysis.selected_count
+
+                    embedded_payloads = {
+                        payload.target_path.casefold(): payload
+                        for payload in embedded_analysis.payloads
+                    }
+                    for loader in embedded_uefi_fat.fallback_loaders:
+                        name = PurePosixPath(loader.path).name.casefold()
+                        expected = fallback_loader_architecture(name)
+                        payload = embedded_payloads.get(loader.path.casefold())
+                        if (
+                            expected is None
+                            or payload is None
+                            or not payload.is_uefi_image
+                            or not fallback_loader_matches_architecture(
+                                name,
+                                payload.architecture,
+                            )
+                        ):
+                            uefi_complete = False
+                            issue = (
+                                f"{label}: fallback loader {loader.path!r} did not "
+                                "validate as matching UEFI PE code"
+                            )
+                            uefi_issues += (issue,)
+                            embedded_uefi_issues += (issue,)
+                            continue
+                        if expected not in detected_architectures:
+                            detected_architectures.append(expected)
                 architectures = tuple(detected_architectures)
             elif (
                 eltorito is not None
@@ -1288,7 +1316,7 @@ def inspect_image(
                     "the EFI El Torito boot image could not be parsed for DBX analysis",
                 )
                 uefi_issues += tuple(
-                    f"embedded El Torito FAT: {issue}"
+                    f"embedded El Torito FAT inspection: {issue}"
                     for issue in embedded_uefi_issues
                 )
             if eltorito_issues:
@@ -1337,7 +1365,7 @@ def inspect_image(
         partition_table_inspection_complete=partition_tables.complete,
         sparse_format="VTSI" if sparse_format == "vtsi" else "",
         container_size=container_size,
-        embedded_uefi_fat=embedded_uefi_fat,
+        embedded_uefi_fats=embedded_uefi_fats,
         embedded_uefi_issues=embedded_uefi_issues,
         squashfs=squashfs,
     )
