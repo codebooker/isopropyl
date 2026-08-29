@@ -68,6 +68,23 @@ identity, and require an explicit confirmation.
 For the exhaustive, evidence-based Rufus comparison, see the
 [feature matrix](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md).
 
+## Physical-media evidence
+
+On 29 August 2026, the ordinary filesystem-aware FAT32/UEFI-only path created
+physical media from the 4.8 GiB English x64 Windows 11 IoT Enterprise LTSC 2024
+ISO on a 14.3 GiB SanDisk Cruzer Glide. The tester confirmed that the resulting
+USB booted on physical hardware.
+
+That pre-`2cfcaec` run copied and individually read-back verified every file,
+then incorrectly reported failure while trying to preserve the synthetic FAT32
+root-directory timestamp. The written media booted despite that metadata-only
+error; `2cfcaec` removes the invalid root-timestamp requirement while retaining
+strict verification for every file and real subdirectory. A repeat write that
+reaches the post-fix success receipt, broader hardware coverage, Secure Boot
+testing, and installation-through testing remain pending. This result is
+evidence for the UEFI-only constructed-media path, not certification of the
+separate experimental Windows BIOS+UEFI path.
+
 ## Build a Debian/Ubuntu alpha package
 
 The repository contains an offline, reproducible `.deb` builder for 64-bit x86
