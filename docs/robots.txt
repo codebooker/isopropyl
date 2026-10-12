@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://isopropyl.app/sitemap.xml
