@@ -1,40 +1,49 @@
 <div align="center">
 
-![ISOpropyl — Bootable media, without the guesswork](https://raw.githubusercontent.com/codebooker/isopropyl/dbde952ddde89e7b4e0b08533c0e2c5014fc6696/data/isopropyl-hero.svg)
+![ISOpropyl — Bootable media, without the guesswork](data/isopropyl-hero.svg)
 
 [![Tests](https://github.com/codebooker/isopropyl/actions/workflows/test.yml/badge.svg)](https://github.com/codebooker/isopropyl/actions/workflows/test.yml)
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-F6922E.svg)](https://github.com/codebooker/isopropyl/blob/main/LICENSE)
-[![Platform: Linux](https://img.shields.io/badge/platform-Linux-252B35.svg?logo=linux&logoColor=white)](#requirements)
-[![Status: alpha](https://img.shields.io/badge/status-alpha-5B6574.svg)](#project-status)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-F6922E.svg)](LICENSE)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-303238.svg)](#project-status)
 
-### Powerful enough for Windows installers. Careful enough for `/dev`.
+### A fresh start. One USB away.
 
-**A Linux-native image writer with guarded device selection, transparent write
-plans, Windows customization, and end-to-end verification.**
+**Create bootable USB media with Windows installer customization, guarded drive selection, and read-back verification.**
 
-[Build & install](#build-a-debianubuntu-alpha-package) · [Quick start](#quick-start) · [Capabilities](#capabilities) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
-
-<sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; VERIFIED WRITES</sub>
+[Website](https://isopropyl.app) · [Platform status](#platform-status) · [Build & install](#build-a-debianubuntu-alpha-package) · [Quick start](#quick-start) · [Windows options](#windows-customization) · [Report a problem](https://github.com/codebooker/isopropyl/issues)
 
 </div>
 
-![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/7156e64dc2b585a4fd90bef901db76b7b84889a0/data/screenshot.png)
+ISOpropyl helps you turn an operating-system image into bootable USB or SD media.
+Inspect your image, choose your drive, configure the installer, and verify the
+written result. It is free software, inspired by Rufus, with development underway
+across Linux, macOS, and Windows.
 
-<p align="center"><sub>Rendered with synthetic image and device metadata. No physical drive was written.</sub></p>
+## Platform status
 
-ISOpropyl gives Linux users a polished way to create bootable USB and SD media
-without running an entire graphical application as root. It pairs an
-approachable Qt interface with explicit write methods, detailed media
-inspection, narrow privilege boundaries, and read-back verification.
+| Host | Architectures | Availability |
+|---|---|---|
+| **Linux** | x86-64 and ARM64 | Alpha source and Debian/Ubuntu package builder in this repository. The advanced tools documented below currently use Linux. |
+| **macOS** | Apple silicon ARM64 | Development preview with raw-image writing and Windows UEFI/FAT32 installer creation. A tester has created a Windows installer USB and booted a physical laptop from it. Public package and source integration are pending. |
+| **Windows** | x86-64 and ARM64 targets | The x86-64 portable EXE is in private testing. Windows installer creation needs physical-media validation; ARM64 packaging and hardware validation are pending. Public package and source integration are pending. |
 
-It is inspired by Rufus, but it is a Linux-native project—not a port and not yet
-a feature-for-feature replacement.
+The cross-platform previews share a compact dark-gray/orange interface and
+Windows installer settings. Those settings include edition selection, setup-check
+options, local-account setup, privacy choices, region and time zone, and a
+reviewable installer answer file. Large Windows WIM files are split for FAT32.
+The preview interfaces use a second **Yes/Cancel** erasure confirmation.
 
-> [!CAUTION]
-> **ISOpropyl is destructive alpha software.** Native test packages are not yet
-> signed releases, and physical-media coverage is still limited. Keep backups,
-> leave verification enabled, and check the target model, capacity, path, and
-> serial before approving a write.
+**Downloads:** public macOS and Windows installers have not been published yet.
+Check [isopropyl.app](https://isopropyl.app) and
+[GitHub Releases](https://github.com/codebooker/isopropyl/releases) for availability.
+The installation commands and detailed feature documentation below describe the
+Linux source currently published on `main`; preview features are not yet included
+in that checkout. Only 64-bit hosts are targeted.
+
+> [!NOTE]
+> ISOpropyl is alpha software. Writing an image erases the selected drive.
+> Review the drive model and capacity before confirming. Broader hardware and
+> firmware testing, including Secure Boot, is still in progress.
 
 ## Why ISOpropyl
 
