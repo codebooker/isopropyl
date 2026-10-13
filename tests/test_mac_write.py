@@ -72,6 +72,7 @@ class MacWorkerTests(unittest.TestCase):
             load_request(self.request)
 
 
+@unittest.skipUnless(os.name == 'posix', 'macOS staging uses POSIX file metadata')
 class MacStagingTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
