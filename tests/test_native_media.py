@@ -13,7 +13,7 @@ from isopropyl.native_media import NativeMediaOptions,build_media_plan,prepare_m
 from isopropyl.native_tree import construct_fat32
 from isopropyl.partition_tables import inspect_partition_tables_capture,PARTITION_TABLE_CAPTURE_BYTES
 from isopropyl.native_layout import MIB
-from tests.test_uefi import make_pe
+from tests.pe_fixture import make_pe
 
 class NativeMediaTests(unittest.TestCase):
     def setUp(self):
