@@ -323,7 +323,7 @@ def export_private_backup(raw, destination, writer, progress, *, before_publish=
         _require_tool(tool)
         run_native_command([str(tool.path), 'compare', '-q', '-f', 'raw', '-F', fmt, str(raw), str(temporary)], writer)
         _require_tool(tool); writer.check_cancelled()
-        with temporary.open('rb') as output: os.fsync(output.fileno())
+        with temporary.open('r+b') as output: os.fsync(output.fileno())
         before_publish()
         os.link(temporary, destination)
         progress('Converting verified backup', 1, 1)

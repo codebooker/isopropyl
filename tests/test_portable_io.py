@@ -73,3 +73,35 @@ class ChangeTimeTests(unittest.TestCase):
             if sys.platform=='win32':time.sleep(0.05)
             path.write_bytes(b'B'*4096);os.utime(path,ns=(original.st_atime_ns,original.st_mtime_ns))
             with self.assertRaisesRegex(NativeWriteError,'staged source file changed'):consume(root,files[0],writer)
+
+
+class SparseFileTests(unittest.TestCase):
+    def test_windows_sparse_extension_uses_native_eof_without_crt_truncate(self):
+        from isopropyl.native_layout import sparse_file
+        kernel=SimpleNamespace(DeviceIoControl=Mock(return_value=True),
+                               SetFilePointerEx=Mock(return_value=True),SetEndOfFile=Mock(return_value=True))
+        stream=Mock();stream.tell.return_value=37;stream.fileno.return_value=9
+        with patch('isopropyl.native_layout.os.name','nt'), \
+             patch.object(ctypes,'WinDLL',return_value=kernel,create=True), \
+             patch.dict('sys.modules',{'msvcrt':SimpleNamespace(get_osfhandle=lambda fd:123)}):
+            sparse_file(stream,2*1024**4)
+        stream.truncate.assert_not_called();stream.flush.assert_called_once()
+        kernel.SetFilePointerEx.assert_called_once_with(123,2*1024**4,None,0)
+        kernel.SetEndOfFile.assert_called_once_with(123)
+        self.assertIs(kernel.SetFilePointerEx.argtypes[1],ctypes.c_int64)
+        stream.seek.assert_called_once_with(37)
+
+    @unittest.skipUnless(sys.platform=='win32','Actual Windows sparse-file API')
+    def test_real_two_tib_extension_preserves_offset_and_allocates_only_written_data(self):
+        from isopropyl.native_layout import sparse_file
+        from isopropyl.native_sparse import iter_allocated_ranges
+        size=2*1024**4;marker=b'METADATA'*64
+        with tempfile.TemporaryFile() as stream:
+            stream.write(marker);stream.seek(37)
+            sparse_file(stream,size)
+            self.assertEqual(stream.tell(),37)
+            self.assertEqual(os.fstat(stream.fileno()).st_size,size)
+            stream.seek(0);self.assertEqual(stream.read(len(marker)),marker)
+            stream.seek(size-512);self.assertEqual(stream.read(512),bytes(512))
+            allocated=sum(length for _,length in iter_allocated_ranges(stream.fileno()))
+            self.assertLess(allocated,1024*1024)

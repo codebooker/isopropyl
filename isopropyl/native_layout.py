@@ -33,14 +33,27 @@ class Volume:
 
 
 def sparse_file(stream,size):
+    if type(size) is not int or not 0<=size<2**63:raise ValueError('Invalid sparse image size')
     if os.name=='nt':
         import ctypes,msvcrt
         from ctypes import wintypes
         kernel=ctypes.WinDLL('kernel32',use_last_error=True)
         kernel.DeviceIoControl.argtypes=[wintypes.HANDLE,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD),ctypes.c_void_p]
+        kernel.DeviceIoControl.restype=wintypes.BOOL
+        kernel.SetFilePointerEx.argtypes=[wintypes.HANDLE,ctypes.c_int64,ctypes.POINTER(ctypes.c_int64),wintypes.DWORD]
+        kernel.SetFilePointerEx.restype=wintypes.BOOL
+        kernel.SetEndOfFile.argtypes=[wintypes.HANDLE];kernel.SetEndOfFile.restype=wintypes.BOOL
+        previous=stream.tell();stream.flush();handle=msvcrt.get_osfhandle(stream.fileno())
         count=wintypes.DWORD()
-        if not kernel.DeviceIoControl(msvcrt.get_osfhandle(stream.fileno()),0x900C4,None,0,None,0,ctypes.byref(count),None):
-            raise OSError('Could not mark private image as sparse')
+        if not kernel.DeviceIoControl(handle,0x900C4,None,0,None,0,ctypes.byref(count),None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # CRT _chsize_s (Python truncate) explicitly writes zeroes when
+        # extending a file. Native EOF extension retains sparse holes instead.
+        try:
+            if not kernel.SetFilePointerEx(handle,size,None,0) or not kernel.SetEndOfFile(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:stream.seek(previous)
+        return
     stream.truncate(size)
     if sys.platform=='darwin' and size:
         # APFS ftruncate initially retains zero/unwritten allocation; explicit
