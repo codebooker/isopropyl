@@ -80,9 +80,11 @@ jobs:
       - run: python -c "import os; from isopropyl.host_platform import validate_host; assert validate_host()[1] == os.environ['ISOPROPYL_EXPECT_CPU']"
       - run: isopropyl-cli --help
       - run: python -m unittest tests.test_native_platform tests.test_native_devices tests.test_native_writer tests.test_native_inputs tests.test_native_inspection tests.test_native_downloads tests.test_native_tools tests.test_native_virtual tests.test_native_disk_io tests.test_native_app tests.test_native_cli tests.test_native_elevation tests.test_mac_write tests.test_devices -v
-      - run: python -m unittest tests.test_windows_media tests.test_native_drive_parity tests.test_helper_tools tests.test_native_extract tests.test_native_options tests.test_native_media tests.test_portable_io tests.test_portable_fs_windows tests.test_compress_z -v
-      - run: python tools/validate_native_helpers.py --require-all
-      - if: runner.os == 'macOS'
+      - if: success() || failure()
+        run: python -m unittest tests.test_windows_media tests.test_native_drive_parity tests.test_helper_tools tests.test_native_extract tests.test_native_options tests.test_native_media tests.test_portable_io tests.test_portable_fs_windows tests.test_compress_z -v
+      - if: success() || failure()
+        run: python tools/validate_native_helpers.py --require-all
+      - if: runner.os == 'macOS' && (success() || failure())
         run: python -m unittest tests.test_mac_windows_iso tests.test_native_windows_options tests.test_windows tests.test_windows_bootex -v
       - run: python -m compileall -q isopropyl tests
       - run: python -m pip wheel --no-deps . --wheel-dir dist
