@@ -23,7 +23,7 @@ from isopropyl.windows import WindowsCustomization, generate_autounattend
 
 
 def loader_bytes(machine=0x8664):
-    from tests.test_uefi import make_pe
+    from tests.pe_fixture import make_pe
     return make_pe(machine=machine)
 
 
