@@ -235,4 +235,4 @@ foreach ($script in (Get-Content -Raw -LiteralPath $ImagePath | ConvertFrom-Json
         self.assertEqual(metadata.install_size,len(b'alternate'))
         self.assertEqual(metadata.install_source_count,2)
         self.assertEqual({c.path for c in metadata.install_candidates},{'sources/install.wim','alternate/sources/install.wim'})
-        self.assertTrue(command.call_args.args[0][2].endswith('alternate/sources/install.wim'))
+        self.assertEqual(Path(command.call_args.args[0][2]).parts[-3:],('alternate','sources','install.wim'))
