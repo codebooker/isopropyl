@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .portable_io import pread
+from .portable_io import pread,regular_status,descriptor_status
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -67,7 +67,7 @@ class SourceIdentity:
 
 
 def _identity(path: Path) -> SourceIdentity:
-    status = path.stat()
+    status = regular_status(path)
     if not stat.S_ISREG(status.st_mode):
         raise ImageSourceError("The selected image must be a regular file")
     return SourceIdentity(
@@ -132,7 +132,7 @@ class _DescriptorReader(io.RawIOBase):
         elif whence == os.SEEK_CUR:
             position = self._position + offset
         elif whence == os.SEEK_END:
-            position = os.fstat(self._descriptor).st_size + offset
+            position = descriptor_status(self._descriptor).st_size + offset
         else:
             raise ValueError(f"unsupported whence value: {whence}")
         if position < 0:
@@ -233,7 +233,7 @@ class ImageSource:
                 "The selected image could not be opened safely"
             ) from error
         try:
-            status = os.fstat(descriptor)
+            status = descriptor_status(descriptor)
             self.identity = _identity_from_status(status)
         except BaseException:
             os.close(descriptor)
@@ -307,7 +307,7 @@ class ImageSource:
     def _ensure_unchanged(self) -> None:
         if self._descriptor is not None:
             try:
-                status = os.fstat(self._descriptor)
+                status = descriptor_status(self._descriptor)
             except OSError as error:
                 raise SourceChanged("The selected image is no longer available") from error
             if (
@@ -355,7 +355,7 @@ class ImageSource:
         if cancel_check is not None:
             cancel_check()
         descriptor = self._require_descriptor()
-        size = os.fstat(descriptor).st_size
+        size = descriptor_status(descriptor).st_size
         tail_size = min(size, 22 + 65535)
         tail_offset = size - tail_size
         tail = pread(descriptor, tail_size, tail_offset)
@@ -789,7 +789,7 @@ class ImageSource:
                 yield stream
             return
         if self.compression == "compress-z":
-            if sys.platform=='win32':
+            if sys.platform in {'darwin','win32'}:
                 from .compress_z import CompressReader
                 with self._open_bound_stream(cancel_check=cancel_check) as compressed:
                     with io.BufferedReader(CompressReader(compressed,cancel_check)) as stream:
@@ -821,48 +821,54 @@ class ImageSource:
             )
         self._ensure_unchanged()
         descriptor = self._require_descriptor()
-        descriptor_path = f"{'/dev/fd' if sys.platform == 'darwin' else '/proc/self/fd'}/{descriptor}"
+        position=os.lseek(descriptor,0,os.SEEK_CUR)
         try:
-            if _bound_identity(os.stat(descriptor_path)) != self._descriptor_identity:
-                raise OSError("descriptor identity mismatch")
+            os.lseek(descriptor,0,os.SEEK_SET)
+            # The decoder receives the already-bound file as stdin. zstd
+            # rejects procfs descriptor symlinks on newer distributions;
+            # --force would also enable unwanted invalid-input passthrough.
             process = subprocess.Popen(
-                [executable, *arguments, descriptor_path],
-                stdin=subprocess.DEVNULL,
+                [executable, *arguments],
+                stdin=descriptor,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=False,
-                pass_fds=(descriptor,),
             )
         except OSError as error:
+            os.lseek(descriptor,position,os.SEEK_SET)
             raise ImageSourceError(
                 "The external decoder could not be bound to the selected image"
             ) from error
-        assert process.stdout is not None
-        assert process.stderr is not None
         try:
-            yield (
-                _InterruptiblePipeReader(process.stdout, cancel_check)
-                if cancel_check is not None else process.stdout
-            )
-        except BaseException:
-            process.stdout.close()
-            self._stop_decoder(process)
-            raise
-        else:
-            process.stdout.close()
+            assert process.stdout is not None
+            assert process.stderr is not None
             try:
-                code = process.wait(timeout=DECODER_WAIT_SECONDS)
-            except subprocess.TimeoutExpired as error:
+                yield (
+                    _InterruptiblePipeReader(process.stdout, cancel_check)
+                    if cancel_check is not None else process.stdout
+                )
+            except BaseException:
+                process.stdout.close()
                 self._stop_decoder(process)
-                raise ImageSourceError("The image decoder did not exit cleanly") from error
-        error = process.stderr.read(DECODER_ERROR_LIMIT + 1)
-        process.stderr.close()
-        if code:
-            raise ImageSourceError(
-                error[:DECODER_ERROR_LIMIT].decode(errors="replace").strip()
-                or failure_message
-                or f"Could not decompress the {self.path.suffix} image"
-            )
+                raise
+            else:
+                process.stdout.close()
+                try:
+                    code = process.wait(timeout=DECODER_WAIT_SECONDS)
+                except subprocess.TimeoutExpired as error:
+                    self._stop_decoder(process)
+                    raise ImageSourceError("The image decoder did not exit cleanly") from error
+            error = process.stderr.read(DECODER_ERROR_LIMIT + 1)
+            process.stderr.close()
+            if code:
+                raise ImageSourceError(
+                    error[:DECODER_ERROR_LIMIT].decode(errors="replace").strip()
+                    or failure_message
+                    or f"Could not decompress the {self.path.suffix} image"
+                )
+        finally:
+            try:os.lseek(descriptor,position,os.SEEK_SET)
+            except OSError:pass
 
     @staticmethod
     def _stop_decoder(process: subprocess.Popen[bytes]) -> None:

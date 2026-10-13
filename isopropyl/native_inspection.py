@@ -5,6 +5,7 @@ import os
 import stat
 from pathlib import Path
 
+from .portable_io import descriptor_status
 from .native_writer import BLOCK, NativeWriteError, file_identity, path_file_identity
 from .partition_tables import PARTITION_TABLE_CAPTURE_BYTES, inspect_partition_tables_capture
 
@@ -17,12 +18,12 @@ def inspect_source(path, writer, progress=lambda *args: None):
     hashes = {'MD5':hashlib.md5(usedforsecurity=False), 'SHA-1':hashlib.sha1(usedforsecurity=False),
               'SHA-256':hashlib.sha256(), 'SHA-512':hashlib.sha512()}
     with path.open('rb') as source:
-        if file_identity(os.fstat(source.fileno())) != identity:
+        if file_identity(descriptor_status(source.fileno())) != identity:
             raise NativeWriteError('The source image changed before inspection')
         done = 0
         while data := source.read(BLOCK):
             writer.check_cancelled()
-            if file_identity(os.fstat(source.fileno())) != identity:
+            if file_identity(descriptor_status(source.fileno())) != identity:
                 raise NativeWriteError('The source image changed during inspection')
             for digest in hashes.values():
                 digest.update(data)
@@ -33,7 +34,7 @@ def inspect_source(path, writer, progress=lambda *args: None):
         prefix = source.read(capture)
         source.seek(identity[2]-capture)
         tail = source.read(capture)
-        if (done != identity[2] or file_identity(os.fstat(source.fileno())) != identity
+        if (done != identity[2] or file_identity(descriptor_status(source.fileno())) != identity
                 or path_file_identity(path) != identity):
             raise NativeWriteError('The source image changed during inspection')
     writer.check_cancelled()

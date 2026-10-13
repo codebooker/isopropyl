@@ -12,7 +12,7 @@ class PlatformTests(unittest.TestCase):
     def test_arm_linux_uses_x86_cross_tools_for_bios_code(self):
         for machine, prefix in [('aarch64', 'x86_64-linux-gnu-'), ('x86_64', '')]:
             with patch('isopropyl.host_platform.platform.machine', return_value=machine):
-                self.assertEqual(str(x86_binutil('as')), f'/usr/bin/{prefix}as')
+                self.assertEqual(x86_binutil('as').as_posix(), f'/usr/bin/{prefix}as')
 
     def test_exact_supported_matrix(self):
         for host, machine in [('linux', 'x86_64'), ('linux', 'aarch64'),

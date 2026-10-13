@@ -1,0 +1,3 @@
+# Native helper integrity hashes cover exact bytes, including license/source
+# provenance files. Never apply checkout newline conversion to this tree.
+isopropyl/helpers/** -text

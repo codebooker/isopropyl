@@ -102,6 +102,7 @@ class MacStagingTests(unittest.TestCase):
                 run_macos_write(plan, plan.confirmation, self.writer)
         authorize.assert_not_called()
 
+    @unittest.skipUnless(os.name=='posix','macOS private image permissions')
     def test_prepared_private_image_is_moved_without_copying(self):
         self.path.chmod(0o600)
         self.plan=build_plan(self.path,self.target)

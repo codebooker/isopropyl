@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .tree_records import StagedDirectory,StagedFile,validate_staged_component
+from .portable_io import descriptor_status, path_status
 from .native_writer import BLOCK,NativeWriteError,file_identity,path_file_identity
 from .fat32_layout import _geometry,_mbr,_boot_sector,_fsinfo,_fat,_cluster_offset
 from .fat32_tree import (_layout,_directory_content,_expected_entries,_derive_media_ids,
@@ -21,7 +22,7 @@ MAX_ENTRIES=65536
 
 
 def ordinary(path,kind):
-    info=path.lstat()
+    info=path_status(path)
     if path.is_symlink() or getattr(info,'st_file_attributes',0)&0x400 or not kind(info.st_mode):
         raise NativeWriteError(f'Unsafe filesystem object: {path.name}')
     return info
@@ -50,7 +51,7 @@ def scan_tree(root,writer):
             else:
                 ordinary(entry,stat.S_ISREG)
                 with entry.open('rb') as stream:
-                    opened=os.fstat(stream.fileno())
+                    opened=descriptor_status(stream.fileno())
                     if (opened.st_dev,opened.st_ino)!=(status.st_dev,status.st_ino) or opened.st_nlink!=1:
                         raise NativeWriteError('The source file is replaced or multiply linked')
                     files.append(StagedFile(child,opened.st_dev,opened.st_ino,opened.st_size,
@@ -73,11 +74,11 @@ def consume(root,source,writer,callback=lambda data,offset:None):
     expected=(source.device,source.inode,source.size,source.modified_ns,source.changed_ns)
     digest=hashlib.sha256();done=0
     with path.open('rb') as stream:
-        if file_identity(os.fstat(stream.fileno()))!=expected:
+        if file_identity(descriptor_status(stream.fileno()))!=expected:
             raise NativeWriteError('A staged source file changed')
         while data:=stream.read(BLOCK):
             writer.check_cancelled()
-            if done+len(data)>source.size or file_identity(os.fstat(stream.fileno()))!=expected:
+            if done+len(data)>source.size or file_identity(descriptor_status(stream.fileno()))!=expected:
                 raise NativeWriteError('A staged source file changed while reading')
             callback(data,done);digest.update(data);done+=len(data)
         if done!=source.size or path_file_identity(path)!=expected:

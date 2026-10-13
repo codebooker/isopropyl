@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .portable_io import pread
+from .portable_io import pread,descriptor_status
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -812,7 +812,7 @@ def inspect_partition_tables_fd(
     """Inspect one already-open regular file without reopening its pathname."""
 
     try:
-        before = os.fstat(descriptor)
+        before = descriptor_status(descriptor)
     except OSError as error:
         raise PartitionTableError("The image descriptor is unavailable") from error
     if not stat.S_ISREG(before.st_mode):
@@ -822,7 +822,7 @@ def inspect_partition_tables_fd(
     bound = _bound_identity(before)
     result = _inspect(_FdReader(descriptor, before.st_size))
     try:
-        after = os.fstat(descriptor)
+        after = descriptor_status(descriptor)
     except OSError as error:
         raise PartitionTableError("The image descriptor became unavailable") from error
     if _bound_identity(after) != bound:

@@ -15,6 +15,7 @@ invoked between the final descriptor/path verification and ``os.link()``.
 import hashlib
 import hmac
 import os
+from .portable_io import descriptor_status
 import sys
 import re
 import stat
@@ -354,7 +355,7 @@ def open_stage(
             f"Download resume directory is unsafe: {safe_error_detail(error)}"
         ) from error
     try:
-        status = os.fstat(descriptor)
+        status = descriptor_status(descriptor)
         if (
             not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid()
             or stat.S_IMODE(status.st_mode) != 0o700
@@ -381,8 +382,8 @@ def revalidate_directory(
             open_directory(path) if open_directory is not None
             else open_absolute_directory(path, policy=policy)
         )
-        opened = os.fstat(descriptor)
-        named = os.fstat(current)
+        opened = descriptor_status(descriptor)
+        named = descriptor_status(current)
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise policy.error("Download destination directory changed")
     except OSError as error:
@@ -417,7 +418,7 @@ def open_partial(
             f"Partial download path is unsafe: {safe_error_detail(error)}"
         ) from error
     try:
-        status = os.fstat(descriptor)
+        status = descriptor_status(descriptor)
         if (
             not stat.S_ISREG(status.st_mode) or status.st_uid != os.geteuid()
             or status.st_nlink != 1 or stat.S_IMODE(status.st_mode) != 0o600
@@ -466,7 +467,7 @@ def verify_completed_partial(
 ) -> tuple[os.stat_result, str]:
     """Re-read exact final bytes and freeze descriptor/path identity for publish."""
 
-    before = os.fstat(descriptor)
+    before = descriptor_status(descriptor)
     named_before = os.stat("partial", dir_fd=stage_fd, follow_symlinks=False)
     if (
         not same_file_fn(before, named_before) or not stat.S_ISREG(before.st_mode)
@@ -482,7 +483,7 @@ def verify_completed_partial(
     ).hexdigest()
     check_cancel(cancel_event, cancel_check, policy=policy)
     deadline_check(deadline, policy=policy)
-    after = os.fstat(descriptor)
+    after = descriptor_status(descriptor)
     named_after = os.stat("partial", dir_fd=stage_fd, follow_symlinks=False)
     if not same_file_fn(before, after) or not same_file_fn(after, named_after):
         raise policy.error("Completed partial image changed during final verification")
@@ -502,7 +503,7 @@ def revalidate_stage(
     *,
     policy: DownloadErrorPolicy = DEFAULT_ERROR_POLICY,
 ) -> None:
-    opened = os.fstat(descriptor)
+    opened = descriptor_status(descriptor)
     named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if (
         not stat.S_ISDIR(named.st_mode)
@@ -547,7 +548,7 @@ def download_image(
             raise policy.error("Completed partial download has the wrong checksum")
         if progress is not None:
             progress(done, artifact.size)
-        return os.fstat(descriptor), value
+        return descriptor_status(descriptor), value
     if available_space is None:
         filesystem = os.fstatvfs(descriptor)
         available = filesystem.f_bavail * filesystem.f_frsize
@@ -636,7 +637,7 @@ def download_image(
                 f"{policy.hash_authority} SHA-256 checksum"
             )
         os.fsync(descriptor)
-        return os.fstat(descriptor), value
+        return descriptor_status(descriptor), value
     finally:
         try:
             response.close()
@@ -792,7 +793,7 @@ def execute_verified_download(
 
         cleanup_private = False
         try:
-            linked = os.fstat(partial_fd)
+            linked = descriptor_status(partial_fd)
             named_partial = os.stat("partial", dir_fd=stage_fd, follow_symlinks=False)
             named_destination = os.stat(
                 destination_name, dir_fd=parent_fd, follow_symlinks=False,

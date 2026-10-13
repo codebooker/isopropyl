@@ -17,6 +17,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from .portable_io import descriptor_status
 from .native_devices import NativeDevice, discover
 from .native_disk_io import open_disk, require_privileges
 from .partition_tables import (
@@ -41,10 +42,9 @@ def file_identity(info) -> tuple[int, ...]:
 
 
 def path_file_identity(path: Path) -> tuple[int, ...]:
-    # On Windows stat(path).ctime can mean creation time while fstat(fd).ctime
-    # means metadata-change time. Use handle metadata on both sides of a bind.
+    # Bind both path and descriptor identities to the actual metadata-change time.
     with path.open('rb') as source:
-        return file_identity(os.fstat(source.fileno()))
+        return file_identity(descriptor_status(source.fileno()))
 
 
 @dataclass(frozen=True)
@@ -96,7 +96,7 @@ def build_plan(source: str | Path, target: NativeDevice, *, include_fixed: bool 
             prefix = source.read(size)
             source.seek(info.st_size - size)
             tail = source.read(size)
-            if file_identity(os.fstat(source.fileno())) != identity or path_file_identity(path) != identity:
+            if file_identity(descriptor_status(source.fileno())) != identity or path_file_identity(path) != identity:
                 raise NativeWriteError("The source image changed during preflight")
         partitions = inspect_partition_tables_capture(prefix, tail, info.st_size)
         if not partitions.valid or not partitions.complete or partitions.sector_size != 512:
@@ -163,7 +163,7 @@ class NativeWriter:
         with (plan.source.open("rb") if reuse else tempfile.TemporaryFile(dir=directory)) as snapshot:
             digest = hashlib.sha256()
             with plan.source.open("rb") as source:
-                if file_identity(os.fstat(source.fileno())) != plan.source_identity:
+                if file_identity(descriptor_status(source.fileno())) != plan.source_identity:
                     raise NativeWriteError("The source image changed after confirmation")
                 done = 0
                 while done < plan.size:
@@ -175,7 +175,7 @@ class NativeWriter:
                     digest.update(chunk)
                     done += len(chunk)
                     progress("Staging image", done, plan.size)
-                if (source.read(1) or file_identity(os.fstat(source.fileno())) != plan.source_identity
+                if (source.read(1) or file_identity(descriptor_status(source.fileno())) != plan.source_identity
                         or path_file_identity(plan.source) != plan.source_identity):
                     raise NativeWriteError("The source image changed while staging")
             checksum = digest.hexdigest()

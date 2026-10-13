@@ -62,7 +62,7 @@ def create_exfat(image, size, writer, *, label='ISOPROPYL', cluster_size=None,se
             yield position,bytes(data)
     boot = bytearray(12*sector_size)
     boot[:3]=b'\xeb\x76\x90';boot[3:11]=b'EXFAT   '
-    struct.pack_into('<QQIIIIIIHHBBBBB',boot,64,1024*1024//sector_size,sectors,fat_start,fat_sectors,heap,count,root_cluster,
+    struct.pack_into('<QQIIIIIIHHBBBBB',boot,64,0,sectors,fat_start,fat_sectors,heap,count,root_cluster,
                      secrets.randbits(32),0x100,0,sector_size.bit_length()-1,spc.bit_length()-1,1,0x80,0)
     boot[510:512]=b'\x55\xaa'
     for sector in range(1,9):boot[(sector+1)*sector_size-4:(sector+1)*sector_size]=b'\x00\x00\x55\xaa'

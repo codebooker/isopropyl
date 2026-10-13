@@ -50,7 +50,7 @@ class NativeDiskTests(unittest.TestCase):
     def test_apfs_busy_container_aborts_before_physical_unmount_or_open(self):
         target = NativeDevice(Device('/dev/disk2', 4096, 'Flash', '', 'usb', '123', '',
                                     'disk2', True, True, False, (), (), 512), ('/dev/disk3',))
-        with patch('isopropyl.native_disk_io.command', side_effect=OSError('busy APFS volume')) as command, \
+        with patch.dict(sys.modules,{'fcntl':Mock()}), patch('isopropyl.native_disk_io.command', side_effect=OSError('busy APFS volume')) as command, \
                 patch('isopropyl.native_disk_io.os.open') as opening:
             with self.assertRaisesRegex(OSError, 'busy APFS'):
                 with open_disk(target, 'darwin'):
@@ -156,7 +156,7 @@ class NativeDiskTests(unittest.TestCase):
     def test_mac_unmount_failure_never_opens_raw_device(self):
         target = NativeDevice(Device('/dev/disk2', 4096, 'Flash', '', 'usb', '123', '',
                                     'disk2', True, True, False, (), (), 512))
-        with patch('isopropyl.native_disk_io.command', side_effect=RuntimeError('busy')), \
+        with patch.dict(sys.modules,{'fcntl':Mock()}), patch('isopropyl.native_disk_io.command', side_effect=RuntimeError('busy')), \
                 patch('isopropyl.native_disk_io.os.open') as opening:
             with self.assertRaisesRegex(RuntimeError, 'busy'):
                 with open_disk(target, 'darwin'):

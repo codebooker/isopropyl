@@ -40,7 +40,7 @@ def create_small_fat(image,size,kind,writer,*,label='ISOPROPYL',cluster_size=Non
     boot[16]=2;struct.pack_into('<H',boot,17,0 if bits==32 else 512)
     struct.pack_into('<H',boot,19,total if total<=65535 and bits!=32 else 0);boot[21]=0xF8
     struct.pack_into('<H',boot,22,0 if bits==32 else sectors_per_fat)
-    struct.pack_into('<HHI',boot,24,63,255,1024*1024//sector_size)
+    struct.pack_into('<HHI',boot,24,63,255,0)
     struct.pack_into('<I',boot,32,total if total>65535 or bits==32 else 0)
     identity=uuid.uuid4().int&0xFFFFFFFF
     if bits==32:

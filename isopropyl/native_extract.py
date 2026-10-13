@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .native_archive import seven_zip,bound_archive
+from .portable_io import descriptor_status
 from .native_writer import BLOCK,NativeWriteError,file_identity,path_file_identity
 from .timestamps import MIN_PORTABLE_ARCHIVE_MTIME_NS,MAX_PORTABLE_ARCHIVE_MTIME_NS
 
@@ -19,12 +20,12 @@ def snapshot_file(source,identity,destination,writer,progress=lambda *args:None)
     digest=hashlib.sha256();done=0
     with source.open('rb') as original,destination.open('xb') as output:
         destination.chmod(0o600)
-        if file_identity(os.fstat(original.fileno()))!=identity:raise NativeWriteError('Source changed after confirmation')
+        if file_identity(descriptor_status(original.fileno()))!=identity:raise NativeWriteError('Source changed after confirmation')
         while data:=original.read(BLOCK):
             writer.check_cancelled();output.write(data);digest.update(data);done+=len(data)
             if done>identity[2]:raise NativeWriteError('Source grew while staging')
             progress('Staging source',done,max(1,identity[2]))
-        if done!=identity[2] or file_identity(os.fstat(original.fileno()))!=identity or path_file_identity(source)!=identity:
+        if done!=identity[2] or file_identity(descriptor_status(original.fileno()))!=identity or path_file_identity(source)!=identity:
             raise NativeWriteError('Source changed during staging')
         output.flush();os.fsync(output.fileno())
     return digest.hexdigest()
@@ -101,5 +102,5 @@ def extract_iso(source,tree,writer,progress=lambda *args:None):
                 materialize_embedded_fat(stream.fileno(),boot_catalog,fat,tree,targets,
                     cancel_check=writer.check_cancelled,
                     progress=lambda path,done,total:progress('Reconstructing embedded EFI files',done,max(1,total)))
-        if file_identity(os.fstat(stream.fileno()))!=identity:raise NativeWriteError('ISO changed during extraction')
+        if file_identity(descriptor_status(stream.fileno()))!=identity:raise NativeWriteError('ISO changed during extraction')
     return inspection,preview.merged_entries

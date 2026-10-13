@@ -1,3 +1,4 @@
+from isopropyl.portable_io import regular_status
 import hashlib
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import gzip
@@ -130,7 +131,7 @@ def squashfs_fixture(*, image_size: int = 8192, **changes: int) -> bytes:
 class ImageTests(unittest.TestCase):
     @staticmethod
     def file_identity(path: Path) -> tuple[int, int, int, int, int]:
-        status = path.stat()
+        status = regular_status(path)
         return (
             status.st_dev, status.st_ino, status.st_size,
             status.st_mtime_ns, status.st_ctime_ns,
@@ -142,7 +143,7 @@ class ImageTests(unittest.TestCase):
             payload = bytearray(4096)
             add_valid_mbr(payload)
             path.write_bytes(payload)
-            status = path.stat()
+            status = regular_status(path)
             selected_identity = (
                 status.st_dev, status.st_ino, status.st_size + 1,
                 status.st_mtime_ns, status.st_ctime_ns,
@@ -716,7 +717,7 @@ Size = 3
                     else:
                         with zipfile.ZipFile(path, "w") as archive:
                             archive.writestr(zip_member, b"virtual fixture")
-                    status = path.stat()
+                    status = regular_status(path)
                     info = SimpleNamespace(
                         virtual_size=8192,
                         display_format=display_format,

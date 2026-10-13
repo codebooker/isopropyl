@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .portable_io import descriptor_status,regular_status,path_status
 from .sources import (
     ImageSourceError, SourceChanged, SourceIdentity, open_image_source,
 )
@@ -174,7 +175,7 @@ def _identity_from_status(status: os.stat_result, label: str) -> FileIdentity:
 
 def _file_identity(path: Path, label: str) -> FileIdentity:
     try:
-        status = path.stat()
+        status = regular_status(path)
     except OSError as error:
         raise VirtualDiskError(f"{label} is not available: {error}") from error
     return _identity_from_status(status, label)
@@ -182,7 +183,7 @@ def _file_identity(path: Path, label: str) -> FileIdentity:
 
 def _descriptor_identity(descriptor: int, label: str) -> FileIdentity:
     try:
-        status = os.fstat(descriptor)
+        status = descriptor_status(descriptor)
     except OSError as error:
         raise VirtualDiskChanged(f"{label} descriptor is unavailable") from error
     return _identity_from_status(status, label)
@@ -560,7 +561,7 @@ def _anonymous_output_identity(
     if type(descriptor) is not int or descriptor < 0:
         raise VirtualDiskError("The anonymous virtual-conversion output is invalid")
     try:
-        status = os.fstat(descriptor)
+        status = descriptor_status(descriptor)
         flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
     except OSError as error:
         raise VirtualDiskError(
@@ -860,7 +861,7 @@ class CompressedVirtualDiskPreparer:
                 raise VirtualDiskError("The decoded virtual container is empty")
             os.fsync(descriptor)
             check_cancelled()
-            status = os.fstat(descriptor)
+            status = descriptor_status(descriptor)
             if (
                 not stat.S_ISREG(status.st_mode)
                 or status.st_nlink != 1
@@ -892,9 +893,9 @@ class CompressedVirtualDiskPreparer:
                 maximum_virtual_size=maximum_virtual_size,
                 cancel_check=check_cancelled,
             )
-            final_status = os.fstat(descriptor)
+            final_status = descriptor_status(descriptor)
             try:
-                final_path_status = output.lstat()
+                final_path_status = path_status(output)
             except OSError as error:
                 raise VirtualDiskChanged(
                     "The decoded virtual container disappeared during inspection"
@@ -1453,7 +1454,7 @@ class VirtualDiskStager:
             _unchanged(info.path, info.identity, "The selected virtual disk")
             _unchanged(info.qemu_img.path, info.qemu_img.identity, "qemu-img")
             try:
-                status = output.lstat()
+                status = path_status(output)
             except OSError as error:
                 raise VirtualDiskError(f"qemu-img did not create raw staging output: {error}") from error
             if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:

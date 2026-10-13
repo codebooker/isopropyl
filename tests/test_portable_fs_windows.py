@@ -53,3 +53,45 @@ class WindowsIdentityTests(unittest.TestCase):
         with patch.object(fs,'_api',return_value=(c,W,api,None)),patch.object(Path,'lstat',return_value=status),patch.object(fs,'_handle_id',side_effect=OSError('query failed')):
             with self.assertRaises(OSError):fs._open_directory('/private')
         self.assertEqual(api.CloseHandle.calls,[(9,)])
+
+    def test_owner_sddl_alias_is_canonicalized_without_accepting_other_users(self):
+        sid='S-1-5-21-100-200-300-500'
+        strings=[]
+        def security_info(handle,kind,flags,owner,group,dacl,sacl,descriptor):
+            owner._obj.value=123;descriptor._obj.value=456;return 0
+        def as_sddl(descriptor,revision,flags,text,length):
+            text._obj.value=strings[-1];return True
+        def owner_string(owner,text):text._obj.value=sid;return True
+        security=SimpleNamespace(GetSecurityInfo=Call(security_info),ConvertSecurityDescriptorToStringSecurityDescriptorW=Call(as_sddl),ConvertSidToStringSidW=Call(owner_string))
+        api=SimpleNamespace(LocalFree=Call(lambda *a:None))
+        types=SimpleNamespace(LPWSTR=c.c_wchar_p,DWORD=c.c_uint32,BOOL=c.c_int)
+        with patch.object(fs,'_api',return_value=(c,types,api,security)),patch.object(fs,'_current_sid',return_value=sid):
+            strings.append('O:LAD:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)')
+            self.assertEqual(fs._security(9),(sid,True))
+            strings.append('O:LAD:P(A;OICI;FA;;;LA)(A;OICIIO;FA;;;WD)')
+            self.assertEqual(fs._security(9),(sid,False))
+
+    def test_status_of_already_open_file_does_not_reopen_delete_on_close_path(self):
+        from pathlib import Path
+        import stat
+        info=SimpleNamespace(st_dev=11,st_ino=7,st_mode=stat.S_IFREG|0o600,st_size=512,st_file_attributes=0,st_ctime_ns=123,st_mtime_ns=100)
+        api=SimpleNamespace(CloseHandle=Call(lambda *a:True))
+        with patch.object(fs,'_api',return_value=(c,W,api,None)),patch.object(Path,'lstat',return_value=info),patch.object(Path,'open',side_effect=AssertionError('must not reopen')),patch.object(fs,'_handle_id',return_value=(11,7)),patch.object(fs,'_security',return_value=('S-1-5-18',True)),patch.object(fs,'_current_sid',return_value='S-1-5-18'):
+            result=fs._status(Path('/temporary'),9,opened_info=info)
+        self.assertEqual(result.st_uid,0);self.assertEqual(stat.S_IMODE(result.st_mode),0o600)
+        self.assertEqual(result.st_ctime_ns,123);self.assertFalse(api.CloseHandle.calls)
+
+    def test_private_mkdir_assigns_creator_owner_and_protected_dacl(self):
+        import tempfile
+        from pathlib import Path
+        captured=[]
+        def descriptor(text,revision,pointer,size):captured.append(text);pointer._obj.value=123;return True
+        security=SimpleNamespace(ConvertStringSecurityDescriptorToSecurityDescriptorW=Call(descriptor),SetFileSecurityW=Call(lambda *a:True))
+        api=SimpleNamespace(LocalFree=Call(lambda *a:None))
+        types=SimpleNamespace(LPCWSTR=c.c_wchar_p,DWORD=c.c_uint32,BOOL=c.c_int)
+        with tempfile.TemporaryDirectory() as directory,patch.object(fs,'_api',return_value=(c,types,api,security)),patch.object(fs,'_current_sid',return_value='S-1-5-18'):
+            target=Path(directory)/'private';fs.WindowsOS().mkdir(target,0o700)
+            self.assertTrue(target.is_dir())
+        self.assertTrue(captured[0].startswith('O:S-1-5-18D:P'))
+        self.assertEqual(security.SetFileSecurityW.calls[0][1],1|4|0x80000000)
+        self.assertNotIn(';;;WD)',captured[0]);self.assertNotIn(';;;AU)',captured[0])

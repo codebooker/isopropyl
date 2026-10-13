@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from . import verified_download as verified
 from .native_writer import path_file_identity
+from .portable_io import descriptor_status
 
 
 def _directory(path, policy):
@@ -49,7 +50,7 @@ def execute_windows_download(artifact,destination,authorize_source,progress,*,ca
     committed = False
     try:
         with partial.open('r+b' if partial.exists() else 'x+b',buffering=0) as output:
-            initial = os.fstat(output.fileno())
+            initial = descriptor_status(output.fileno())
             if initial.st_nlink != 1 or not stat.S_ISREG(initial.st_mode) or initial.st_size > artifact.size:
                 raise policy.error('Download partial has unsafe metadata or exceeds the expected size')
             verified.check_cancel(cancel_event,cancel_check,policy=policy)
@@ -68,7 +69,7 @@ def execute_windows_download(artifact,destination,authorize_source,progress,*,ca
             verified.check_cancel(cancel_event,cancel_check,policy=policy)
             verified.deadline_check(deadline,policy=policy)
             if (_directory(parent,policy)!=parent_identity or _directory(stage,policy)!=stage_identity
-                    or not verified.same_file(final,os.fstat(output.fileno()))
+                    or not verified.same_file(final,descriptor_status(output.fileno()))
                     or path_file_identity(partial)!=(final.st_dev,final.st_ino,final.st_size,final.st_mtime_ns,final.st_ctime_ns)):
                 raise policy.error('Download workspace or image changed before publication')
             os.link(partial,destination)

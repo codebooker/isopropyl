@@ -23,6 +23,7 @@ from .mac_windows_iso import (
     run_tool,
     verify_loader,
 )
+from .portable_io import descriptor_status
 from .native_writer import (
     BLOCK,
     NativeWriteError,
@@ -191,7 +192,7 @@ def copy_snapshot(source, identity, destination, writer, progress):
     digest = hashlib.sha256()
     done = 0
     with source.open("rb") as original, destination.open("xb") as staged:
-        if file_identity(os.fstat(original.fileno())) != identity:
+        if file_identity(descriptor_status(original.fileno())) != identity:
             raise NativeWriteError("The ISO changed after confirmation")
         while done < identity[2]:
             writer.check_cancelled()
@@ -204,7 +205,7 @@ def copy_snapshot(source, identity, destination, writer, progress):
             progress("Staging Windows ISO", done, identity[2])
         if (
             original.read(1)
-            or file_identity(os.fstat(original.fileno())) != identity
+            or file_identity(descriptor_status(original.fileno())) != identity
             or path_file_identity(source) != identity
         ):
             raise NativeWriteError("The ISO changed during staging")

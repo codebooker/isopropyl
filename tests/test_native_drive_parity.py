@@ -213,6 +213,61 @@ class OpticalParityTests(unittest.TestCase):
             self.assertEqual(list(root.iterdir()),[])
 
 class RestoreImageParityTests(unittest.TestCase):
+    def test_composed_boot_offsets_match_both_partition_starts(self):
+        import struct
+        from isopropyl.native_layout import Volume,compose_disk,MIB
+        from isopropyl.native_small_fat import create_small_fat
+        from isopropyl.native_exfat import create_exfat,checksum
+        from isopropyl.native_filesystems import construct_volume,verify_filesystem
+        writer=SimpleNamespace(check_cancelled=lambda:None)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);tree=root/'tree';tree.mkdir()
+            for sector in (512,4096):
+                for kind in ('fat12','fat16','fat32','ntfs','exfat'):
+                    with self.subTest(sector=sector,filesystem=kind):
+                        size=(4 if kind=='fat12' else 128 if kind=='fat16' else
+                              512 if kind=='fat32' and sector==4096 else 64)*MIB
+                        source=root/f'{kind}-{sector}.img'
+                        if kind.startswith('fat'):create_small_fat(source,size,kind,writer,sector_size=sector)
+                        elif kind=='exfat':create_exfat(source,size,writer,sector_size=sector)
+                        else:
+                            try:construct_volume(tree,source,size,kind,writer,sector_size=sector)
+                            except NativeWriteError as error:
+                                if 'helper is missing' in str(error):continue
+                                raise
+                        before=None
+                        with source.open('rb') as stream:
+                            if kind=='exfat':before=hashlib.sha256(stream.read(24*sector)).digest();stream.seek(0)
+                            boot=stream.read(sector)
+                            self.assertEqual(struct.unpack_from('<Q' if kind=='exfat' else '<I',boot,64 if kind=='exfat' else 28)[0],0)
+                        output=root/f'{kind}-{sector}-disk.img'
+                        starts=compose_disk([Volume(source,0,size,kind),Volume(source,0,size,kind)],
+                                            output,2*size+3*MIB,'gpt',writer,sector_size=sector)
+                        for start in starts:
+                            with output.open('rb') as stream:
+                                stream.seek(start);boot=stream.read(sector)
+                                self.assertEqual(struct.unpack_from('<Q' if kind=='exfat' else '<I',boot,64 if kind=='exfat' else 28)[0],start//sector)
+                                if kind=='exfat':
+                                    stream.seek(start);primary=stream.read(12*sector);backup=stream.read(12*sector)
+                                    self.assertEqual(primary,backup)
+                                    expected=checksum(primary[:11*sector],boot=True)
+                                    self.assertEqual(primary[11*sector:],struct.pack('<I',expected)*(sector//4))
+                                elif kind in {'fat32','ntfs'}:
+                                    backup_offset=struct.unpack_from('<H',boot,50)[0]*sector if kind=='fat32' else size-sector
+                                    stream.seek(start+backup_offset);self.assertEqual(stream.read(sector),boot)
+                            if kind!='exfat':verify_filesystem(output,{},kind,writer,offset=start,sector_size=sector)
+                        if before is not None:
+                            with source.open('rb') as stream:self.assertEqual(hashlib.sha256(stream.read(24*sector)).digest(),before)
+
+    def test_opaque_efi_helper_is_preserved_byte_for_byte(self):
+        from isopropyl.native_layout import Volume,compose_disk,MIB
+        writer=SimpleNamespace(check_cancelled=lambda:None)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'efi.img';data=os.urandom(MIB);source.write_bytes(data)
+            output=root/'disk.img'
+            start,=compose_disk([Volume(source,0,MIB,'efi')],output,3*MIB,'gpt',writer)
+            with output.open('rb') as stream:stream.seek(start);self.assertEqual(stream.read(MIB),data)
+
     def test_actual_empty_restore_images_have_independent_partition_maps(self):
         try: import dissect.fat, dissect.extfs, dissect.ntfs
         except ImportError: self.skipTest('Native independent filesystem parsers are not installed')

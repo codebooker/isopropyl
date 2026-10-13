@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .portable_io import descriptor_status
 from .native_writer import BLOCK,NativeWriteError,file_identity,path_file_identity
 from .partition_tables import PARTITION_TABLE_CAPTURE_BYTES,inspect_partition_tables_capture
 
@@ -54,6 +55,46 @@ def _gpt_header(current,alternate,last_usable,disk_id,table_lba,table_crc,sector
                      last_usable,disk_id,table_lba,128,128,table_crc)
     struct.pack_into('<I',result,16,binascii.crc32(result[:92])&0xFFFFFFFF)
     return bytes(result)
+
+
+def _relocate_volume_headers(image,volume,start,sector_size):
+    """Bind copied filesystem boot metadata to its partition's actual LBA."""
+    kind=volume.filesystem
+    if kind not in {'fat12','fat16','fat32','ntfs','exfat'}:return
+    image.seek(start);boot=bytearray(image.read(sector_size))
+    logical=(1<<boot[108]) if kind=='exfat' else struct.unpack_from('<H',boot,11)[0]
+    if logical!=sector_size:raise NativeWriteError('Filesystem and partition logical sectors differ')
+    lba=start//logical
+    if kind=='exfat':
+        from .native_exfat import checksum
+        image.seek(start);region=bytearray(image.read(12*logical))
+        struct.pack_into('<Q',region,64,lba)
+        value=checksum(region[:11*logical],boot=True)
+        region[11*logical:]=struct.pack('<I',value)*(logical//4)
+        for offset in (0,12*logical):image.seek(start+offset);image.write(region)
+        image.flush();image.seek(start);primary=image.read(12*logical);backup=image.read(12*logical)
+        expected=checksum(primary[:11*logical],boot=True)
+        if primary!=backup or struct.unpack_from('<Q',primary,64)[0]!=lba or \
+                primary[11*logical:]!=struct.pack('<I',expected)*(logical//4):
+            raise NativeWriteError('Relocated exFAT boot metadata verification failed')
+        return
+    if lba>0xFFFFFFFF:raise NativeWriteError('Filesystem hidden-sector field exceeds its bounds')
+    struct.pack_into('<I',boot,28,lba)
+    offsets=[0]
+    if kind=='fat32':
+        backup=struct.unpack_from('<H',boot,50)[0]
+        reserved=struct.unpack_from('<H',boot,14)[0]
+        if backup not in {0,0xFFFF}:
+            if backup>=reserved:raise NativeWriteError('Invalid FAT32 backup boot sector')
+            offsets.append(backup*logical)
+    elif kind=='ntfs':offsets.append(volume.size-logical)
+    for offset in offsets:
+        image.seek(start+offset);image.write(boot)
+    image.flush()
+    for offset in offsets:
+        image.seek(start+offset);observed=image.read(logical)
+        if observed!=boot or struct.unpack_from('<I',observed,28)[0]!=lba:
+            raise NativeWriteError('Relocated filesystem boot metadata verification failed')
 
 
 def compose_disk(volumes,output,total_size,partition_table,writer,progress=lambda *args:None,*,active=False,sector_size=512):
@@ -119,7 +160,8 @@ def compose_disk(volumes,output,total_size,partition_table,writer,progress=lambd
                             # final sparse image for quick-restore semantics.
                             image.seek(start+offset+copied);image.write(data)
                             copied+=len(data);done+=len(data);progress('Composing partition layout',done,total)
-                    if file_identity(os.fstat(source.fileno()))!=identity:raise NativeWriteError('Filesystem source changed during composition')
+                    if file_identity(descriptor_status(source.fileno()))!=identity:raise NativeWriteError('Filesystem source changed during composition')
+                _relocate_volume_headers(image,volume,start,sector_size)
             image.flush();os.fsync(image.fileno())
             size=min(total_size,PARTITION_TABLE_CAPTURE_BYTES);image.seek(0);prefix=image.read(size)
             image.seek(total_size-size);tail=image.read(size)

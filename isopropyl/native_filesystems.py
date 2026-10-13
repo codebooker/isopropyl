@@ -110,7 +110,7 @@ def construct_volume(tree,image,size,filesystem,writer,progress=lambda *args:Non
     expected=tree_hashes(tree,writer)
     try:
         if filesystem=='ntfs':
-            args=[helper('mkntfs'),'-F','-f','-s',str(sector_size),'-p',str(1024*1024//sector_size),'-L',label]
+            args=[helper('mkntfs'),'-F','-f','-s',str(sector_size),'-p','0','-L',label]
             if cluster_size:args += ['-c',str(cluster_size)]
             progress('Formatting private NTFS image',0,1)
             run_native_command([*args,str(image)],writer)

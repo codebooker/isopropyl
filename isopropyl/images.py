@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .portable_io import pread,regular_status
+from .portable_io import pread,regular_status,descriptor_status
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -971,18 +971,18 @@ def _read_partition_evidence(
     descriptor_fd = source.fileno()
     expected_identity = (
         source.identity.device, source.identity.inode,
-        source.identity.size, source.identity.modified_ns,
+        source.identity.size, source.identity.modified_ns,source.identity.changed_ns,
     )
-    status = os.fstat(descriptor_fd)
+    status = descriptor_status(descriptor_fd)
     if (
-        status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,
+        status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,status.st_ctime_ns,
     ) != expected_identity:
         raise OSError("The selected image changed before it could be inspected")
     size = status.st_size
     header = pread(descriptor_fd, 4096, 0)
     descriptor = pread(descriptor_fd, 2048, 16 * 2048)
     partition_tables = inspect_partition_tables_fd(
-        descriptor_fd, expected_identity=expected_identity,
+        descriptor_fd, expected_identity=expected_identity[:4],
     )
     return size, header, descriptor, partition_tables
 
@@ -1178,7 +1178,7 @@ def inspect_image(
     if not is_compressed and not sparse_format:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         inspection_fd = os.open(path, flags)
-        bound = os.fstat(inspection_fd)
+        bound = descriptor_status(inspection_fd)
         bound_identity = (
             bound.st_dev, bound.st_ino, bound.st_size,
             bound.st_mtime_ns, bound.st_ctime_ns,
@@ -1336,7 +1336,7 @@ def inspect_image(
                     "the malformed El Torito catalog prevents complete DBX analysis",
                 )
         if inspection_fd >= 0:
-            final_bound = os.fstat(inspection_fd)
+            final_bound = descriptor_status(inspection_fd)
             final_bound_identity = (
                 final_bound.st_dev, final_bound.st_ino, final_bound.st_size,
                 final_bound.st_mtime_ns, final_bound.st_ctime_ns,
@@ -1419,7 +1419,7 @@ def calculate_checksums(
     except OSError as error:
         raise OSError(f"Could not securely open the selected image: {error}") from error
     try:
-        opened = os.fstat(descriptor)
+        opened = descriptor_status(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise OSError("The selected image is not a regular file")
         opened_identity = identity(opened)
@@ -1436,11 +1436,11 @@ def calculate_checksums(
         done = 0
         while True:
             check_cancelled()
-            if identity(os.fstat(descriptor)) != opened_identity:
+            if identity(descriptor_status(descriptor)) != opened_identity:
                 raise OSError("The image changed while checksums were being calculated")
             block = os.read(descriptor, 4 * 1024 * 1024)
             check_cancelled()
-            if identity(os.fstat(descriptor)) != opened_identity:
+            if identity(descriptor_status(descriptor)) != opened_identity:
                 raise OSError("The image changed while checksums were being calculated")
             if not block:
                 break

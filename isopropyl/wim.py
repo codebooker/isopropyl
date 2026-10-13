@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .portable_io import descriptor_status as bound_descriptor_status, path_status as bound_path_status
 from .windows_paths import validate_install_image_member_path
 
 FAT32_MAX_FILE_SIZE = (4 * 1024 * 1024 * 1024) - 1
@@ -225,8 +226,8 @@ def _open_regular_file(
         parent = raw.parent.resolve(strict=True)
         resolved = parent / raw.name
         descriptor = os.open(resolved, _SOURCE_FLAGS)
-        status = os.fstat(descriptor)
-        linked = os.lstat(resolved)
+        status = bound_descriptor_status(descriptor)
+        linked = bound_path_status(resolved)
     except (OSError, RuntimeError) as error:
         if descriptor >= 0:
             os.close(descriptor)
@@ -262,8 +263,8 @@ def _descriptor_still_bound(
     path: Path, descriptor: int, expected: FileIdentity,
 ) -> bool:
     try:
-        descriptor_status = os.fstat(descriptor)
-        path_status = os.lstat(path)
+        descriptor_status = bound_descriptor_status(descriptor)
+        path_status = bound_path_status(path)
     except OSError:
         return False
     return (
@@ -1158,7 +1159,7 @@ def _validate_extracted_tree(
             descriptor = -1
             try:
                 descriptor = os.open(output, _SOURCE_FLAGS)
-                descriptor_status = os.fstat(descriptor)
+                descriptor_status = bound_descriptor_status(descriptor)
                 if _identity(descriptor_status) != _identity(status):
                     raise WimCommandError(
                         "An extracted WIM file changed during validation"

@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .native_virtual import run_native_command
+from .portable_io import descriptor_status
 from .native_writer import NativeWriteError,file_identity,path_file_identity
 
 
@@ -21,10 +22,10 @@ def bound_archive(path,descriptor):
     path=Path(path).absolute()
     if not stat.S_ISREG(path.lstat().st_mode):raise NativeWriteError('Archive source must be a regular file')
     identity=path_file_identity(path)
-    if descriptor is not None and file_identity(os.fstat(descriptor))!=identity:
+    if descriptor is not None and file_identity(descriptor_status(descriptor))!=identity:
         raise NativeWriteError('Archive pathname differs from its bound source')
     yield str(path)
-    if path_file_identity(path)!=identity or descriptor is not None and file_identity(os.fstat(descriptor))!=identity:
+    if path_file_identity(path)!=identity or descriptor is not None and file_identity(descriptor_status(descriptor))!=identity:
         raise NativeWriteError('The archive source changed during the command')
 
 

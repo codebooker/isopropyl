@@ -77,10 +77,17 @@ def _security(handle):
         value=text.value
         import re
         own=re.search(r'O:(.*?)(?=G:|D:|S:|$)',value)
-        owner_sid=own.group(1) if own else ''
-        allowed={owner_sid,'OW','SY','BA',_current_sid()}
+        owner_alias=own.group(1) if own else ''
+        security.ConvertSidToStringSidW.argtypes=[c.c_void_p,c.POINTER(w.LPWSTR)]
+        security.ConvertSidToStringSidW.restype=w.BOOL
+        owner_text=w.LPWSTR()
+        if not owner or not security.ConvertSidToStringSidW(owner,c.byref(owner_text)):
+            raise OSError('Cannot encode private-directory owner SID')
+        try:owner_sid=owner_text.value
+        finally:kernel.LocalFree(c.cast(owner_text,c.c_void_p))
+        allowed={owner_sid,owner_alias,'OW','SY','BA',_current_sid()}
         aces=re.findall(r'\(([^()]+)\)',value)
-        private=bool(aces) and all(ace.split(';')[-1] in allowed or 'IO' in ace.split(';')[1] for ace in aces)
+        private=bool(aces) and all(ace.split(';')[-1] in allowed or (ace.split(';')[-1]=='CO' and 'IO' in ace.split(';')[1]) for ace in aces)
         return owner_sid,private
     finally:
         if text:kernel.LocalFree(c.cast(text,c.c_void_p))
@@ -137,7 +144,7 @@ def _path(path,dir_fd=None):
     return Path(path)
 
 
-def _status(path,handle=None):
+def _status(path,handle=None,opened_info=None):
     named=path.lstat()
     if getattr(named,'st_file_attributes',0)&0x400:return named
     own_handle=None
@@ -152,15 +159,25 @@ def _status(path,handle=None):
             raise OSError('Metadata handle differs from its named file identity')
         owner,private=_security(handle)
         if stat.S_ISREG(named.st_mode):
-            with path.open('rb') as stream:info=real_os.fstat(stream.fileno())
+            if opened_info is not None:info=opened_info
+            else:
+                # Reopening a CRT delete-on-close TemporaryFile omits its
+                # required share-delete mode. Use our already bound handle.
+                import msvcrt
+                descriptor=msvcrt.open_osfhandle(own_handle,real_os.O_RDONLY|getattr(real_os,'O_BINARY',0))
+                own_handle=None
+                try:
+                    from .portable_io import descriptor_status
+                    info=descriptor_status(descriptor)
+                finally:real_os.close(descriptor)
             if (info.st_dev,info.st_ino)!=named_identity:
                 raise OSError('Regular file changed while binding its metadata')
         else:info=named
         values={name:getattr(info,name) for name in dir(info) if name.startswith('st_')}
         import ctypes
-        values['st_uid']=0 if owner==_current_sid() or owner=='BA' and ctypes.windll.shell32.IsUserAnAdmin() else 1
+        values['st_uid']=0 if owner==_current_sid() or owner in {'BA','S-1-5-32-544'} and ctypes.windll.shell32.IsUserAnAdmin() else 1
         values['st_gid']=0
-        mode=0o700 if stat.S_ISDIR(info.st_mode) else (0o400 if getattr(info,'st_file_attributes',0)&1 else 0o600)
+        mode=0o700 if stat.S_ISDIR(info.st_mode) else (0o400 if getattr(named,'st_file_attributes',0)&1 else 0o600)
         if not private:mode |= 0o055 if stat.S_ISDIR(info.st_mode) else 0o044
         values['st_mode']=stat.S_IFMT(info.st_mode)|mode
         return SimpleNamespace(**values)
@@ -199,9 +216,11 @@ class WindowsOS:
     def fstat(self,fd):
         if fd in _frames:
             path=_path('.',fd);return _status(path,_frames[fd][1])
-        info=real_os.fstat(fd);path=self._fdpath(fd);named=path.lstat()
+        from .portable_io import descriptor_status
+        info=descriptor_status(fd);path=self._fdpath(fd);named=path.lstat()
         if (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino):raise OSError('Bound regular file pathname changed')
-        result=_status(path)
+        import msvcrt
+        result=_status(path,msvcrt.get_osfhandle(fd),opened_info=info)
         for name in dir(info):
             if name.startswith('st_') and name not in {'st_uid','st_gid','st_mode'}:setattr(result,name,getattr(info,name))
         return result
@@ -217,10 +236,10 @@ class WindowsOS:
             security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes=[w.LPCWSTR,w.DWORD,c.POINTER(c.c_void_p),c.c_void_p]
             security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype=w.BOOL
             security.SetFileSecurityW.argtypes=[w.LPCWSTR,w.DWORD,c.c_void_p];security.SetFileSecurityW.restype=w.BOOL
-            sddl=f'D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{_current_sid()})'
+            sddl=f'O:{_current_sid()}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{_current_sid()})'
             if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,c.byref(descriptor),None):raise OSError('Cannot construct private-directory ACL')
             try:
-                if not security.SetFileSecurityW(str(path),4|0x80000000,descriptor):raise OSError('Cannot restrict private-directory ACL')
+                if not security.SetFileSecurityW(str(path),1|4|0x80000000,descriptor):raise OSError('Cannot restrict private-directory ACL')
             finally:kernel.LocalFree(descriptor)
     def unlink(self,path,*,dir_fd=None):return real_os.unlink(_path(path,dir_fd))
     def rmdir(self,path,*,dir_fd=None):return real_os.rmdir(_path(path,dir_fd))

@@ -310,7 +310,7 @@ class SourceTests(unittest.TestCase):
                 with self.assertRaises(SourceChanged):
                     next(blocks)
 
-    def test_external_decoder_receives_only_a_bound_descriptor_path(self):
+    def test_external_decoder_receives_only_the_bound_descriptor_as_stdin(self):
         class FakeProcess:
             def __init__(self):
                 self.stdout = tempfile.TemporaryFile()
@@ -336,6 +336,7 @@ class SourceTests(unittest.TestCase):
             path.write_bytes(b"compressed bytes")
             process = FakeProcess()
             with (
+                patch("isopropyl.sources.sys.platform", "linux"),
                 patch("isopropyl.sources.shutil.which", return_value="/usr/bin/gzip"),
                 patch("isopropyl.sources.subprocess.Popen", return_value=process) as popen,
             ):
@@ -343,13 +344,10 @@ class SourceTests(unittest.TestCase):
                 self.assertEqual(b"".join(source.chunks()), PAYLOAD)
 
             command = popen.call_args.args[0]
-            descriptor_path = command[-1]
-            self.assertTrue(descriptor_path.startswith("/proc/self/fd/"))
-            self.assertNotIn(str(path), command)
-            self.assertEqual(
-                popen.call_args.kwargs["pass_fds"],
-                (int(descriptor_path.rsplit("/", 1)[-1]),),
-            )
+            self.assertNotIn(str(path),command)
+            self.assertFalse(any('/proc/self/fd/' in arg for arg in command))
+            self.assertEqual(popen.call_args.kwargs['stdin'],source.fileno())
+            self.assertNotIn('--force',command)
 
     def test_single_file_zip(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -506,6 +504,7 @@ class SourceTests(unittest.TestCase):
                     raise RuntimeError("fixture cancellation")
 
             with (
+                patch("isopropyl.sources.sys.platform", "linux"),
                 patch("isopropyl.sources.shutil.which", return_value="/usr/bin/gzip"),
                 patch("isopropyl.sources.subprocess.Popen", return_value=process),
                 patch("isopropyl.sources.DECODER_POLL_SECONDS", 0.001),

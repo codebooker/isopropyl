@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .portable_io import descriptor_status
 from .native_writer import (
     BLOCK, NativeWriteError, NativeWritePlan, build_plan, file_identity,
     path_file_identity,
@@ -54,7 +55,7 @@ def prepare_image(plan, workspace, writer, progress, *, return_source=False):
     output = workspace / ('expanded' + suffix)
     with open_image_source(plan.source, cancel_check=writer.check_cancelled,
                            maximum_sparse_bytes=plan.target.device.size) as source:
-        if file_identity(os.fstat(source.fileno())) != plan.source_identity:
+        if file_identity(descriptor_status(source.fileno())) != plan.source_identity:
             raise NativeWriteError('The source image changed after confirmation')
         if source.requires_exact_target_size:
             size = source.measure(maximum=plan.target.device.size, cancel_check=writer.check_cancelled)
