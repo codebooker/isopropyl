@@ -9,8 +9,11 @@ desktop-file-validate data/io.github.codebooker.isopropyl.desktop
 appstreamcli validate --no-net data/io.github.codebooker.isopropyl.metainfo.xml
 ```
 
-Tests must never write to a real `/dev` node. Mock privileged processes and use
-regular files or byte streams. New destructive workflows need an immutable plan,
+Tests must never write to a real `/dev` node or Windows PhysicalDrive. Mock
+privileged processes and use regular files or byte streams on every platform.
+Native platform tests and the supported host matrix are in [CROSS_PLATFORM.md](CROSS_PLATFORM.md).
+
+New destructive workflows need an immutable plan,
 explicit whole-disk validation, target identity rechecks, exact confirmation,
 cancellation, bounded diagnostics, and tests proving that preflight failures run
 no unmount or write command.

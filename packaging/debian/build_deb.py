@@ -27,6 +27,7 @@ SUPPORTED_ARCHITECTURES = frozenset({"amd64", "arm64"})
 PYTHON_PACKAGE_FILES = tuple(
     """
 __init__.py
+__main__.py
 app.py
 authenticode.py
 authenticode_worker.py
@@ -54,16 +55,19 @@ devices.py
 diagnostics.py
 distro_policies.py
 eltorito.py
+entrypoints.py
 erase.py
 extraction.py
 fast_zero.py
 fat_image.py
+fat32_layout.py
 formatting.py
 freedos_downloads.py
 grub_rescue.py
 grub_rescue_device.py
 grub_rescue_device_runner.py
 grub_rescue_workflow.py
+host_platform.py
 images.py
 iso.py
 iso_staging.py
@@ -71,6 +75,25 @@ linux_downloads.py
 locking.py
 logging_setup.py
 media_test.py
+mac_worker.py
+mac_write.py
+mac_windows_iso.py
+native_app.py
+native_style.py
+native_windows_options.py
+windows_media.py
+native_cli.py
+native_devices.py
+native_disk_io.py
+native_elevation.py
+native_writer.py
+native_inputs.py
+native_downloads.py
+native_inspection.py
+native_format.py
+native_tools.py
+native_virtual.py
+portable_io.py
 optical.py
 partition_tables.py
 persistence.py
@@ -124,6 +147,38 @@ windows_to_go.py
 windows_hive.py
 writer.py
 zip_overlay.py
+app_paths.py
+compress_z.py
+data/native-tools-v1.json
+fat32_tree.py
+grub_profile.py
+helper_tools.py
+native_archive.py
+native_authenticode.py
+native_boot.py
+native_exfat.py
+native_extract.py
+native_filesystems.py
+native_fsmetadata.py
+native_layout.py
+native_lock.py
+native_media.py
+native_optical.py
+native_options.py
+native_preferences.py
+native_restore.py
+native_restore_options.py
+native_settings.py
+native_small_fat.py
+native_sparse.py
+native_stream.py
+native_test_options.py
+native_tree.py
+portable_fs.py
+tree_records.py
+data/check.svg
+data/chevron-down.svg
+data/chevron-up.svg
 """.split()
 )
 LICENSE_FILES = (
@@ -138,6 +193,7 @@ RUFUS_PROMPT_MBR_SOURCE_FILES = (
 )
 COMPRESSED_DOCUMENTS = (
     ("README.md", "README.md.gz"),
+    ("CROSS_PLATFORM.md", "CROSS_PLATFORM.md.gz"),
     ("SECURITY.md", "SECURITY.md.gz"),
     ("FEATURE_MATRIX.md", "FEATURE_MATRIX.md.gz"),
     ("ROADMAP.md", "ROADMAP.md.gz"),
@@ -371,6 +427,10 @@ def _copy_python_package(stage: Path) -> None:
     actual: set[str] = set()
     for source in sorted(source_root.rglob("*")):
         relative = source.relative_to(source_root)
+        # Native Mac/Windows helpers are intentionally absent from the Linux
+        # Debian package; those binaries are distributed with native packages.
+        if relative.parts[0] == "helpers":
+            continue
         if "__pycache__" in relative.parts:
             continue
         status = source.lstat()

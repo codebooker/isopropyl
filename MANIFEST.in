@@ -14,3 +14,22 @@ include tools/capture_windows_bcd_oracle.ps1
 include certifications/syslinux-6.03-seabios-2026-08-28.json
 include certifications/grub-2.14-rescue-seabios-2026-08-29.json
 include certifications/windows-11-ltsc-dual-kvm-2026-08-28.json
+include CROSS_PLATFORM.md
+include tools/install_macos.py
+include tools/build_windows_portable.py
+include tools/build_windows_exe.py
+include data/io.github.codebooker.isopropyl.ico
+include tools/macos_launcher.c
+include data/io.github.codebooker.isopropyl.icns
+include PARITY.md
+
+recursive-include isopropyl/helpers *
+recursive-include tools/native *.c *.h *.py *.sh *.json *.manifest *.rc
+include tools/native-helper-sources.json
+
+include tools/build_native_windows.sh
+include tools/bundle_native_helpers.py
+include tools/download_native_sources.py
+include tools/validate_native_helpers.py
+
+recursive-include tests/data/compress *.Z *.json

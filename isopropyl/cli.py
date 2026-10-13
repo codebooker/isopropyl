@@ -433,17 +433,16 @@ def _confirm_preparation(
 ) -> bool:
     if not warnings:
         return True
-    phrase = f"PREPARE RAW {target_path}"
     print("\nAdditional expert warning:", file=stderr)
     for warning in warnings:
         print(f"  - {warning}", file=stderr)
     print(
         "No device will be changed during authenticated snapshot preparation.\n"
-        f"Type this exact phrase to continue: {phrase}",
+        "Continue preparing this image? [y/N]:",
         file=stderr,
         flush=True,
     )
-    return _read_phrase(stdin) == phrase
+    return (_read_phrase(stdin) or "").strip().lower() in {"y", "yes"}
 
 
 def _show_plan(plan: RawDeviceWritePlan, stderr: TextIO) -> None:
@@ -467,7 +466,7 @@ def _show_plan(plan: RawDeviceWritePlan, stderr: TextIO) -> None:
         print(f"  WARNING: {_safe_stage(warning)}", file=stderr)
     print(
         "\nALL DATA ON THIS EXACT TARGET WILL BE ERASED.\n"
-        f"Type this exact phrase to authorize the write: {plan.confirmation_phrase}",
+        "Are you sure you want to erase this drive and write the image? [y/N]:",
         file=stderr,
         flush=True,
     )
@@ -581,11 +580,11 @@ def _run_write(
             )
         _show_plan(plan, stderr)
         phrase = _read_phrase(stdin)
-        if phrase != plan.confirmation_phrase:
-            print("Confirmation did not match; the target was not changed.", file=stderr)
+        if (phrase or "").strip().lower() not in {"y", "yes"}:
+            print("Write cancelled; the target was not changed.", file=stderr)
             return int(ExitCode.CONFIRMATION_REFUSED)
         with cancellation.workflow_call():
-            workflow.confirm(phrase)
+            workflow.confirm(plan.confirmation_phrase)
         cancellation.check()
         with cancellation.workflow_call():
             result = workflow.execute(progress)

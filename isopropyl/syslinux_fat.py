@@ -12,6 +12,7 @@ does not open paths, mount filesystems, or write any byte.
 
 import hashlib
 import os
+from .portable_io import pread
 import re
 import stat
 import struct
@@ -104,7 +105,7 @@ class _Reader:
         ):
             raise SyslinuxPatchError(f"the {label} lies outside the regular-file image")
         try:
-            value = os.pread(self.descriptor, length, offset)
+            value = pread(self.descriptor, length, offset)
         except OSError as error:
             raise SyslinuxPatchError(f"could not read the {label}: {error}") from error
         if len(value) != length:

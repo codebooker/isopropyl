@@ -379,3 +379,29 @@ identifier. The source archive, exact patch, transformation notes, and build
 recipe above provide corresponding-source provenance, but ISOpropyl has not
 independently reproduced the cataloged objects byte-for-byte with a frozen
 toolchain and does not claim that it has.
+
+## Native filesystem, archive, virtual-disk and signature helpers
+
+Native packages include architecture-specific helper executables, their required
+runtime libraries, exact upstream license texts, and a `PROVENANCE.json` file
+under `isopropyl/helpers/<platform>/`. `data/native-tools-v1.json` records the
+selected executables' SHA-256 values. Resolution checks every file recorded in
+the bundle provenance before launching a helper.
+
+The bundled projects are e2fsprogs (GPL-2.0 and component-specific licenses),
+NTFS-3G (GPL-2.0-or-later and LGPL-2.1-or-later), udftools
+(GPL-2.0-or-later), wimlib (GPL-3.0-or-later and LGPL-3.0-or-later),
+7-Zip (LGPL-2.1-or-later, BSD-style code and the unRAR restriction), QEMU
+(GPL-2.0 and LGPL-2.1 components), GLib (LGPL-2.1-or-later), PCRE2
+(BSD-3-Clause), proxy-libintl (LGPL-2.1-or-later), zlib (zlib license),
+GnuPG (GPL-3.0-or-later), Libgcrypt and its supporting libraries (their
+included GPL/LGPL and permissive license texts), and the MinGW-w64
+runtime and winpthreads (their included permissive license texts).
+macOS also includes The Sleuth Kit, with its component-specific license texts.
+
+Pinned upstream source URLs and archive hashes are recorded in
+`tools/native-helper-sources.json`. The corresponding modified helper source
+and build scripts are provided in `tools/native/` and the source distribution;
+Windows bundles include the custom NTFS/UDF portability source beside the
+license texts. Native helpers build private regular image files; physical-drive
+access remains in ISOpropyl's separately guarded native device writer.

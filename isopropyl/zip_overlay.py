@@ -18,7 +18,7 @@ import hashlib
 import io
 import json
 import math
-import os
+from .portable_fs import os
 import re
 import stat
 import time

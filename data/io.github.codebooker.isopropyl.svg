@@ -30,7 +30,6 @@
     <circle cx="105" cy="121" r="19" fill="#161D28"/>
     <circle cx="105" cy="121" r="7.5" fill="#F6922E"/>
 
-    <path d="M58 149C70 178 98 196 132 198C151 199 168 195 182 187" fill="none" stroke="#F6922E" stroke-width="11" stroke-linecap="round"/>
 
     <path d="M182 79C182 79 145 126 145 160C145 188 161 207 182 207C204 207 220 188 220 160C220 126 182 79 182 79Z" fill="url(#amber)" stroke="#FFD291" stroke-width="3.5" stroke-linejoin="round"/>
     <path d="M174 111C165 125 158 143 158 157C158 166 160 174 165 180" fill="none" stroke="#FFF4DF" stroke-opacity="0.78" stroke-width="6" stroke-linecap="round"/>

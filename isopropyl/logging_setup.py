@@ -16,8 +16,9 @@ def setup_logging() -> Path | None:
     if logger.handlers:
         return LOG_PATH
     try:
-        state_root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-        directory = state_root / "isopropyl"
+        from .app_paths import state_root
+        root = state_root()
+        directory = root / "isopropyl"
         directory.mkdir(parents=True, exist_ok=True)
         LOG_PATH = directory / "isopropyl.log"
         handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2)

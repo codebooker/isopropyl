@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 from importlib import resources
 from pathlib import Path
+from .host_platform import x86_binutil
 
 
 RUFUS_PROMPT_MBR_RESOURCE = "data/rufus-prompt-mbr-440.bin"
@@ -108,14 +109,17 @@ def _run(command: tuple[str, ...]) -> None:
 def verify_reproducible_rufus_prompt_mbr(
     source_root: Path,
     *,
-    assembler: Path = Path("/usr/bin/as"),
-    linker: Path = Path("/usr/bin/ld"),
-    objcopy: Path = Path("/usr/bin/objcopy"),
+    assembler: Path | None = None,
+    linker: Path | None = None,
+    objcopy: Path | None = None,
 ) -> bytes:
     """Rebuild Rufus's full MBR and require its 440-byte bootstrap to match."""
 
     if not isinstance(source_root, Path) or not source_root.is_absolute():
         raise RufusPromptMbrError("The source root must be an absolute Path")
+    assembler = assembler if assembler is not None else x86_binutil("as")
+    linker = linker if linker is not None else x86_binutil("ld")
+    objcopy = objcopy if objcopy is not None else x86_binutil("objcopy")
     for tool in (assembler, linker, objcopy):
         _trusted_build_tool(tool)
     source = _source(

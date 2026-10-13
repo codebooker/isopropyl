@@ -119,6 +119,7 @@ class FakeProcess:
         wait_never_exits: bool = False,
     ) -> None:
         reader, writer = socket.socketpair()
+        writer.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,MAX_WORKER_OUTPUT*4)
         self._writer_socket: socket.socket | None = writer
         self.stdout = reader.makefile("rb", buffering=0)
         reader.close()
@@ -587,6 +588,12 @@ class WorkerProcessTests(unittest.TestCase):
             ],
         )
         arguments = command[5:]
+        if sys.platform!='linux':
+            self.assertEqual(len(arguments),9)
+            self.assertEqual(arguments[0],'--source-file')
+            self.assertEqual(Path(arguments[1]).name,'payload.bin')
+            self.assertNotIn('pass_fds',captured['kwargs'])
+            return
         self.assertEqual(len(arguments), 7)
         self.assertEqual(
             arguments[1:],

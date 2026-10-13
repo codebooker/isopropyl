@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """Bounded, read-only FAT images embedded in UEFI El Torito entries.
@@ -14,7 +16,7 @@ and the next El Torito image.
 import enum
 import hashlib
 import json
-import os
+from .portable_fs import os
 import re
 import stat
 import struct
@@ -171,7 +173,7 @@ class _Reader:
         ):
             raise FatImageError(f"{label} lies outside the selected ISO")
         try:
-            value = os.pread(self.descriptor, length, offset)
+            value = pread(self.descriptor, length, offset)
         except OSError as error:
             raise FatImageError(f"Could not read {label}: {error}") from error
         if len(value) != length:
@@ -202,6 +204,27 @@ class _VolumeLayout:
         return self.bytes_per_sector * self.sectors_per_cluster
 
 
+class _BoundedFatTable:
+    """Read large native FATs with a single bounded cache window."""
+    def __init__(self,reader,offset,size):
+        self.reader,self.offset,self.size=reader,offset,size
+        self.cache_start=-1;self.cache=b''
+    def __len__(self):return self.size
+    def __getitem__(self,key):
+        if isinstance(key,int):return self[key:key+1][0]
+        start,stop,step=key.indices(self.size)
+        if step!=1:raise FatImageError('Noncontiguous FAT reads are unsupported')
+        length=stop-start
+        if length<=0:return b''
+        if length>4*1024*1024:return self.reader.exact(self.offset+start,length,'FAT table range')
+        if not self.cache_start<=start or stop>self.cache_start+len(self.cache):
+            self.cache_start=start//(4*1024*1024)*(4*1024*1024)
+            amount=min(4*1024*1024,self.size-self.cache_start)
+            self.cache=self.reader.exact(self.offset+self.cache_start,amount,'FAT cache window')
+        if stop>self.cache_start+len(self.cache):return self.reader.exact(self.offset+start,length,'FAT entry')
+        return self.cache[start-self.cache_start:stop-self.cache_start]
+
+
 class _FatVolume:
     def __init__(
         self,
@@ -214,6 +237,7 @@ class _FatVolume:
         maximum_entries: int = MAX_ENTRIES,
         maximum_directories: int = MAX_DIRECTORIES,
         strict_directories: bool = False,
+        maximum_fat_bytes: int = MAX_FAT_BYTES,
     ) -> None:
         self.reader = reader
         self.layout = layout
@@ -236,21 +260,22 @@ class _FatVolume:
         self._entries: list[FatImageEntry] = []
         self._path_keys: dict[tuple[str, ...], str] = {}
         fat_bytes = layout.sectors_per_fat * layout.bytes_per_sector
-        if fat_bytes <= 0 or fat_bytes > MAX_FAT_BYTES:
+        if type(maximum_fat_bytes) is not int or not 0 < maximum_fat_bytes <= 1024**3:
+            raise FatImageError("The FAT allocation-table limit is invalid")
+        if fat_bytes <= 0 or fat_bytes > maximum_fat_bytes:
             raise FatImageError("The embedded FAT allocation table exceeds the limit")
         fat_offset = (
             layout.filesystem_offset
             + layout.reserved_sectors * layout.bytes_per_sector
         )
-        self.fat = reader.exact(fat_offset, fat_bytes, "embedded FAT allocation table")
-        for copy_index in range(1, layout.fat_count):
-            other = reader.exact(
-                fat_offset + copy_index * fat_bytes,
-                fat_bytes,
-                f"embedded FAT allocation-table copy {copy_index + 1}",
-            )
-            if other != self.fat:
-                raise FatImageError("The embedded FAT allocation-table copies disagree")
+        self.fat = (_BoundedFatTable(reader,fat_offset,fat_bytes) if fat_bytes>MAX_FAT_BYTES else
+                    reader.exact(fat_offset,fat_bytes,"embedded FAT allocation table"))
+        for copy_index in range(1,layout.fat_count):
+            for offset in range(0,fat_bytes,4*1024*1024):
+                self._check_cancelled();length=min(4*1024*1024,fat_bytes-offset)
+                other=reader.exact(fat_offset+copy_index*fat_bytes+offset,length,"FAT table copy")
+                if other!=self.fat[offset:offset+length]:
+                    raise FatImageError("The embedded FAT allocation-table copies disagree")
         self._validate_reserved_fat_entries()
 
     def _check_cancelled(self) -> None:
@@ -268,11 +293,11 @@ class _FatVolume:
             offset = cluster * 2
             if offset + 2 > len(self.fat):
                 raise FatImageError("A FAT16 cluster entry lies outside the table")
-            return struct.unpack_from("<H", self.fat, offset)[0]
+            return struct.unpack("<H", self.fat[offset:offset+2])[0]
         offset = cluster * 4
         if offset + 4 > len(self.fat):
             raise FatImageError("A FAT32 cluster entry lies outside the table")
-        return struct.unpack_from("<I", self.fat, offset)[0] & 0x0FFFFFFF
+        return struct.unpack("<I", self.fat[offset:offset+4])[0] & 0x0FFFFFFF
 
     def _validate_reserved_fat_entries(self) -> None:
         first = self._fat_value(0)
@@ -1095,6 +1120,8 @@ def inspect_regular_fat32_image(
     descriptor: int,
     *,
     cancel_check: CancelCheck | None = None,
+    maximum_image_bytes: int = MAX_REGULAR_FAT32_BYTES,
+    maximum_fat_bytes: int = MAX_FAT_BYTES,
 ) -> RegularFat32Image:
     """Parse every entry in the bounded private FAT32 image profile.
 
@@ -1102,6 +1129,8 @@ def inspect_regular_fat32_image(
     one exact MBR/FAT32 layout, hashes every file, and never mounts the image.
     """
 
+    if type(maximum_image_bytes) is not int or not 0 < maximum_image_bytes <= 2*1024**4:
+        raise FatImageError("The regular FAT32 image-size limit is invalid")
     if type(descriptor) is not int or descriptor < 0:
         raise FatImageError("A valid regular-file image descriptor is required")
     try:
@@ -1111,7 +1140,7 @@ def inspect_regular_fat32_image(
     if (
         not stat.S_ISREG(before_status.st_mode)
         or before_status.st_size <= 0
-        or before_status.st_size > MAX_REGULAR_FAT32_BYTES
+        or before_status.st_size > maximum_image_bytes
     ):
         raise FatImageError("The FAT32 image is not a supported bounded regular file")
     before = _identity(before_status)
@@ -1133,7 +1162,7 @@ def inspect_regular_fat32_image(
         reader,
         filesystem_offset,
         before.size,
-        maximum_filesystem_bytes=MAX_REGULAR_FAT32_BYTES,
+        maximum_filesystem_bytes=maximum_image_bytes,
     )
     boot = reader.exact(filesystem_offset, 512, "regular-file FAT32 boot sector")
     fsinfo_sector = struct.unpack_from("<H", boot, 48)[0]
@@ -1190,27 +1219,26 @@ def inspect_regular_fat32_image(
         layout,
         upper_bound=before.size,
         cancel_check=cancel_check,
-        maximum_content_bytes=MAX_REGULAR_FAT32_BYTES,
+        maximum_content_bytes=maximum_image_bytes,
         strict_directories=True,
+        maximum_fat_bytes=maximum_fat_bytes,
     )
     entries = volume.parse()
     if volume.volume_labels != [boot[71:82]]:
         raise FatImageError("The FAT32 root volume label disagrees with its BPB")
-    first_free = 0xFFFFFFFF
-    for cluster in range(2, layout.cluster_count + 2):
-        if cluster & 0xFFF == 0 and cancel_check is not None:
-            cancel_check()
-        value = volume._fat_value(cluster)
-        claimed = cluster in volume._claimed_clusters
-        if value != 0 and not claimed:
-            raise FatImageError("The FAT32 image contains an unreachable allocated cluster")
-        if value == 0 and first_free == 0xFFFFFFFF:
-            first_free = cluster
-    for cluster in range(layout.cluster_count + 2, len(volume.fat) // 4):
-        if cluster & 0xFFF == 0 and cancel_check is not None:
-            cancel_check()
-        if struct.unpack_from("<I", volume.fat, cluster * 4)[0] != 0:
-            raise FatImageError("The FAT32 table has nonzero entries beyond its data area")
+    first_free=2
+    while first_free in volume._claimed_clusters:first_free+=1
+    if first_free>=layout.cluster_count+2:first_free=0xFFFFFFFF
+    for offset in range(8,len(volume.fat),4*1024*1024):
+        if cancel_check is not None:cancel_check()
+        data=volume.fat[offset:min(offset+4*1024*1024,len(volume.fat))]
+        if not any(data):continue
+        for index,(raw,) in enumerate(struct.iter_unpack('<I',data)):
+            cluster=offset//4+index
+            if cluster>=layout.cluster_count+2:
+                if raw:raise FatImageError("The FAT32 table has nonzero entries beyond its data area")
+            elif raw&0x0fffffff and cluster not in volume._claimed_clusters:
+                raise FatImageError("The FAT32 image contains an unreachable allocated cluster")
     allocated_clusters = len(volume._claimed_clusters)
     free_clusters = layout.cluster_count - allocated_clusters
     if (

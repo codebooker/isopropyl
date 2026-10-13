@@ -183,7 +183,8 @@ class WindowsBiosPbrTests(unittest.TestCase):
                     classify_windows_bootmgr_bios(header, file_size=size)
 
     def test_sources_reproduce_pinned_project_artifacts(self) -> None:
-        if not Path("/usr/bin/as").is_file() or not Path("/usr/bin/ld").is_file():
+        from isopropyl.host_platform import x86_binutil
+        if not x86_binutil("as").is_file() or not x86_binutil("ld").is_file():
             self.skipTest("GNU binutils are unavailable")
         artifacts = verify_reproducible_boot_code(ROOT)
         self.assertEqual(len(artifacts.stage0), SECTOR_SIZE)

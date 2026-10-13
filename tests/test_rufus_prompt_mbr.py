@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import unittest
 from pathlib import Path
+from isopropyl.host_platform import x86_binutil
 
 from isopropyl.rufus_prompt_mbr import (
     RUFUS_PROMPT_MBR_SHA256,
@@ -17,7 +17,8 @@ from isopropyl.rufus_prompt_mbr import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BINUTILS = tuple(shutil.which(name) for name in ("as", "ld", "objcopy"))
+BINUTILS = tuple(str(path) if path.is_file() else None for path in
+                (x86_binutil(name) for name in ("as", "ld", "objcopy")))
 
 
 class RufusPromptMbrTests(unittest.TestCase):

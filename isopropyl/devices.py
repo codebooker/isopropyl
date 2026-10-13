@@ -6,6 +6,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from collections.abc import Callable
 from enum import Enum
@@ -164,6 +165,9 @@ def list_devices(
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> list[Device]:
+    if sys.platform in {"darwin", "win32"}:
+        from .native_devices import discover
+        return [item.device for item in discover(include_usb_hdds, runner=runner)]
     fields = (
         "PATH,SIZE,TYPE,RM,HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,WWN,MAJ:MIN,"
         "MOUNTPOINTS,RO,LOG-SEC"
@@ -215,7 +219,7 @@ def image_is_on_device(image_path: str, device: Device) -> bool:
 
 def path_is_on_device(path: str, device: Device) -> bool:
     """Check an existing path (or a prospective file's parent) against a drive."""
-    candidate = path
+    candidate = os.path.abspath(path)
     while not os.path.exists(candidate):
         parent = os.path.dirname(candidate)
         if parent == candidate:

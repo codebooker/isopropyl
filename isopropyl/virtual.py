@@ -9,7 +9,6 @@ module first inspects them with a fixed, absolute ``qemu-img`` executable and
 then converts the bound container identity into a private raw regular file.
 """
 
-import fcntl
 import json
 import os
 import re
@@ -556,6 +555,7 @@ def _anonymous_output_identity(
     expected_size: int,
 ) -> _AnonymousOutputIdentity:
     """Attest one caller-owned, unlinked, read/write regular-file descriptor."""
+    import fcntl
 
     if type(descriptor) is not int or descriptor < 0:
         raise VirtualDiskError("The anonymous virtual-conversion output is invalid")

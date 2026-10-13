@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
-
 import os
 import tempfile
 import unittest
@@ -12,7 +11,14 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QSettings
-from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QLineEdit, QMessageBox, QPushButton
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+)
 
 import isopropyl.app as app_module
 from isopropyl.app import GrubRescuePreparationToken, Window
@@ -259,9 +265,10 @@ class GrubRescueAppTests(unittest.TestCase):
         def inspect(dialog: QDialog) -> QDialog.DialogCode:
             disclosure = dialog.findChild(QLabel, "grubRescueDisclosure")
             phrase = dialog.findChild(QLineEdit, "grubRescueConfirmationPhrase")
-            assert disclosure is not None and phrase is not None
+            assert disclosure is not None
+            self.assertIsNone(phrase)
             captured["disclosure"] = disclosure.text()
-            captured["placeholder"] = phrase.placeholderText()
+            captured["click_confirmation"] = dialog.findChild(QPushButton,"grubRescueWriteButton").text()
             return QDialog.DialogCode.Rejected
 
         with patch.object(QDialog, "exec", inspect):
@@ -275,7 +282,7 @@ class GrubRescueAppTests(unittest.TestCase):
             "grub rescue>", "normal.mod", "no OS",
         ):
             self.assertIn(phrase, text)
-        self.assertEqual(captured["placeholder"], plan.confirmation_phrase)
+        self.assertIn("Yes",captured["click_confirmation"])
         workflow.close.assert_called_once_with()
         self.assertIsNone(self.window.grub_rescue_workflow)
         self.assertFalse(self.window.operation_active)

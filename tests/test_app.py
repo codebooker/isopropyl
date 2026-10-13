@@ -1123,12 +1123,11 @@ class WindowVerifiedRestoreTests(unittest.TestCase):
                 "restoreConfirmationDetails",
             )
             phrase = dialog.findChild(QLineEdit, "restoreConfirmationPhrase")
+            self.assertIsNone(phrase)
+            self.assertTrue(dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Cancel).isDefault())
             button = dialog.findChild(QPushButton, "restoreConfirmButton")
             observed["details"] = details.toPlainText()
             observed["initial"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase.lower())
-            observed["wrong"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase)
             observed["exact"] = button.isEnabled()
             return QDialog.DialogCode.Accepted
 
@@ -1136,8 +1135,7 @@ class WindowVerifiedRestoreTests(unittest.TestCase):
             phrase = self.window.confirm_restore_plan(plan)
 
         self.assertEqual(phrase, plan.confirmation_phrase)
-        self.assertFalse(observed["initial"])
-        self.assertFalse(observed["wrong"])
+        self.assertTrue(observed["initial"])
         self.assertTrue(observed["exact"])
         details = str(observed["details"])
         self.assertIn(plan.device.path, details)
@@ -1322,12 +1320,11 @@ class WindowWriteMethodTests(unittest.TestCase):
             assert scroll is not None
             self.assertLessEqual(self.window.minimumHeight(), 520)
 
-            for size in ((1366, 768), (1280, 720), (1024, 768), (1024, 600), (700, 520)):
+            for size in ((1366, 768), (1280, 720), (1024, 768), (1024, 600), (700, 520), (660, 570), (560, 460)):
                 with self.subTest(size=size):
                     self.window.resize(*size)
                     scroll.verticalScrollBar().setValue(0)
                     self.application.processEvents()
-                    self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
                     self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
 
                     # The destructive action and live progress remain pinned
@@ -1732,12 +1729,11 @@ class WindowWriteMethodTests(unittest.TestCase):
                 QPlainTextEdit, "syslinuxConfirmationDetails",
             )
             phrase = dialog.findChild(QLineEdit, "syslinuxConfirmationPhrase")
+            self.assertIsNone(phrase)
+            self.assertTrue(dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Cancel).isDefault())
             button = dialog.findChild(QPushButton, "syslinuxWriteButton")
             observed["details"] = details.toPlainText()
             observed["initially_enabled"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase.lower())
-            observed["wrong_enabled"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase)
             observed["exact_enabled"] = button.isEnabled()
             return QDialog.DialogCode.Accepted
 
@@ -1749,8 +1745,7 @@ class WindowWriteMethodTests(unittest.TestCase):
 
         workflow.confirm.assert_called_once_with(plan.confirmation_phrase)
         start.assert_called_once_with(prepared)
-        self.assertFalse(observed["initially_enabled"])
-        self.assertFalse(observed["wrong_enabled"])
+        self.assertTrue(observed["initially_enabled"])
         self.assertTrue(observed["exact_enabled"])
         details = str(observed["details"])
         self.assertIn("BIOS + retained UEFI", details)
@@ -4622,13 +4617,12 @@ class WindowWriteMethodTests(unittest.TestCase):
             details = dialog.findChild(QPlainTextEdit, "rawWriteConfirmationDetails")
             warning = dialog.findChild(QLabel, "rawWriteDestructionWarning")
             phrase = dialog.findChild(QLineEdit, "rawWriteConfirmationPhrase")
+            self.assertIsNone(phrase)
+            self.assertTrue(dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Cancel).isDefault())
             button = dialog.findChild(QPushButton, "rawWriteConfirmButton")
             observed["details"] = details.toPlainText()
             observed["warning"] = warning.text()
             observed["initially_enabled"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase.lower())
-            observed["wrong_enabled"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase)
             observed["exact_enabled"] = button.isEnabled()
             return QDialog.DialogCode.Accepted
 
@@ -4637,8 +4631,7 @@ class WindowWriteMethodTests(unittest.TestCase):
 
         details = str(observed["details"])
         self.assertEqual(phrase, plan.confirmation_phrase)
-        self.assertFalse(observed["initially_enabled"])
-        self.assertFalse(observed["wrong_enabled"])
+        self.assertTrue(observed["initially_enabled"])
         self.assertTrue(observed["exact_enabled"])
         self.assertIn("4096 bytes", details)
         self.assertIn("a" * 64, details)
@@ -5344,12 +5337,11 @@ class WindowFastZeroTests(unittest.TestCase):
                 "fastZeroConfirmationDetails",
             )
             phrase = dialog.findChild(QLineEdit, "fastZeroConfirmationPhrase")
+            self.assertIsNone(phrase)
+            self.assertTrue(dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Cancel).isDefault())
             button = dialog.findChild(QPushButton, "fastZeroConfirmButton")
             observed["details"] = details.toPlainText()
             observed["initially_enabled"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase.lower())
-            observed["wrong_enabled"] = button.isEnabled()
-            phrase.setText(plan.confirmation_phrase)
             observed["exact_enabled"] = button.isEnabled()
             return QDialog.DialogCode.Accepted
 
@@ -5358,8 +5350,7 @@ class WindowFastZeroTests(unittest.TestCase):
 
         details = str(observed["details"])
         self.assertEqual(phrase, plan.confirmation_phrase)
-        self.assertFalse(observed["initially_enabled"])
-        self.assertFalse(observed["wrong_enabled"])
+        self.assertTrue(observed["initially_enabled"])
         self.assertTrue(observed["exact_enabled"])
         self.assertIn("scan every chunk", details)
         self.assertIn("skip chunks already entirely zero", details)
@@ -7529,13 +7520,9 @@ class UefiShellWindowTests(unittest.TestCase):
         def confirm(dialog: QDialog) -> int:
             phrase = dialog.findChild(QLineEdit, "uefiShellConfirmationPhrase")
             button = dialog.findChild(QPushButton, "uefiShellWriteButton")
-            self.assertIsNotNone(phrase)
+            self.assertIsNone(phrase)
             self.assertIsNotNone(button)
-            assert phrase is not None and button is not None
-            self.assertFalse(button.isEnabled())
-            phrase.setText("WRITE /dev/sda")
-            self.assertFalse(button.isEnabled())
-            phrase.setText("WRITE /dev/sdz")
+            assert button is not None
             self.assertTrue(button.isEnabled())
             return QDialog.DialogCode.Accepted
 

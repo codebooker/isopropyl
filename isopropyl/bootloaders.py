@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
+from .portable_fs import os
 import queue
 import re
 import secrets
@@ -266,16 +266,16 @@ def default_catalog_path() -> Path:
 
 
 def default_cache_dir() -> Path:
-    configured = os.environ.get("XDG_CACHE_HOME")
-    root = Path(configured).expanduser() if configured else Path.home() / ".cache"
+    from .app_paths import cache_root
+    root = cache_root().expanduser()
     return root / "isopropyl" / "bootloaders"
 
 
 _DIRECTORY_OPEN_FLAGS = (
-    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    os.O_RDONLY | getattr(os,"O_DIRECTORY",0) | getattr(os,"O_CLOEXEC",0) | getattr(os, "O_NOFOLLOW", 0)
 )
 _FILE_OPEN_FLAGS = (
-    os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    os.O_RDONLY | getattr(os,"O_CLOEXEC",0) | getattr(os,"O_NONBLOCK",0) | getattr(os, "O_NOFOLLOW", 0)
 )
 
 

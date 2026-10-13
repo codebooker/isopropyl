@@ -1,9 +1,9 @@
 # ISOpropyl brand assets
 
 ISOpropyl's visual identity combines a silver image disk with an amber droplet.
-The disk communicates boot media, the curved amber stroke suggests a write in
-progress, and the droplet makes the ISOpropyl name memorable without borrowing
-platform-specific imagery.
+The disk communicates boot media, and the droplet makes the ISOpropyl name
+memorable without borrowing platform-specific imagery. The former curved amber
+stroke has been removed; do not reintroduce it.
 
 ## Official artwork
 
@@ -27,8 +27,8 @@ project pages and release artwork, not as part of the application name.
 | Role | Color |
 |---|---|
 | Amber | `#F6922E` |
-| Deep charcoal | `#0D1118` |
-| Slate | `#1B2230` |
+| Deep charcoal | `#0C0D10` |
+| Graphite | `#1C1E23` |
 | Primary text | `#F8FAFD` |
 | Secondary text | `#D0D7E2` |
 
@@ -45,7 +45,7 @@ raster exports should be derived from them rather than edited independently.
   not redraw or simplify individual elements by hand.
 - Place the hero on a neutral page background with enough width to preserve its
   10:3 aspect ratio. Do not crop the symbol, wordmark, or tagline.
-- Never recolor the amber path independently of the droplet, add third-party
+- Never recolor the disc center independently of the droplet, add third-party
   marks, rotate the icon, or use the droplet by itself as the project logo.
 
 The application icon is also copied into `isopropyl/data/` so installed wheels

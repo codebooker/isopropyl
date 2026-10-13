@@ -1,0 +1,107 @@
+{
+  "e2fsprogs": {
+    "url": "https://github.com/tytso/e2fsprogs/archive/da631e117dcf8797bfda0f48bdaa05ac0fbcf7af.tar.gz",
+    "sha256": "86360777b8e0832f3fcbfc11e333a7a0e9df15ca3b67a8072fcb93d97a2b8ab9",
+    "file": "e2fsprogs.tar.gz"
+  },
+  "ntfs-3g": {
+    "url": "https://github.com/tuxera/ntfs-3g/archive/7f0f841fc52cf719106c5c93bafe465004e36816.tar.gz",
+    "sha256": "ef4c631d943667885347047aaedf48443c96bf4979c1cf2576d94ef65ed90f46",
+    "file": "ntfs-3g.tar.gz"
+  },
+  "sleuthkit": {
+    "url": "https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-4.15.0/sleuthkit-4.15.0.tar.gz",
+    "sha256": "3a8c1e7d18a9b81f3e5e8aa78313974aceaafc6e051d636bc92cd7168286eca9",
+    "file": "sleuthkit.tar.gz"
+  },
+  "llvm-mingw": {
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-ubuntu-22.04-aarch64.tar.xz",
+    "sha256": "e77c4acfa44184f6b0c52b814d724ad63b2ecebb3c3f6f842c0846e717cbd23c",
+    "file": "llvm-mingw.tar.xz"
+  },
+  "wimlib": {
+    "url": "https://github.com/ebiggers/wimlib/archive/cd5e231c348c255ae5088873b5a66ee0eb96fa07.tar.gz",
+    "sha256": "176157527d5f85fb0c61014b7ab3309018b9e75ac370808ff783e3acfe4c667f",
+    "file": "wimlib.tar.gz"
+  },
+  "7zip": {
+    "url": "https://github.com/ip7z/7zip/releases/download/26.04/7z2604-src.tar.xz",
+    "sha256": "9691944c0fe0d01bb49373a704fb983fd33bc98b1738695179dfbf99ac1734f6",
+    "file": "7zip.tar.xz"
+  },
+  "udftools": {
+    "url": "https://github.com/pali/udftools/archive/refs/tags/2.3.tar.gz",
+    "sha256": "095e1c8b947849f5f8a1cade23dd3375532bda305a184eb022df96e43c4d6f7e",
+    "file": "udftools.tar.gz"
+  },
+  "7zip-windows-x64": {
+    "url": "https://www.7-zip.org/a/7z2604-x64.exe",
+    "sha256": "d54bf805f9f3704d1e8db2fa3498ae7ef2df0312b40b558e7c71c734430a665d",
+    "file": "7zip-x64.exe"
+  },
+  "7zip-windows-arm64": {
+    "url": "https://www.7-zip.org/a/7z2604-arm64.exe",
+    "sha256": "d4117b95495b0e925334ae7b5bddf2853513274603de15dee6acf03999fbc09c",
+    "file": "7zip-arm64.exe"
+  },
+  "libgpg-error": {
+    "url": "https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-1.61.tar.bz2",
+    "sha256": "7a85413f2bc354f4f8aa832b718af122e48965e9e0eb9012ee659c13c6385c93",
+    "file": "libgpg-error-1.61.tar.bz2"
+  },
+  "libgcrypt": {
+    "url": "https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.12.4.tar.bz2",
+    "sha256": "d77f68f48879510e79a2f65977ccc68981781ea0923e5bdffac2a193ea3d660e",
+    "file": "libgcrypt-1.12.4.tar.bz2"
+  },
+  "libassuan": {
+    "url": "https://gnupg.org/ftp/gcrypt/libassuan/libassuan-3.0.2.tar.bz2",
+    "sha256": "d2931cdad266e633510f9970e1a2f346055e351bb19f9b78912475b8074c36f6",
+    "file": "libassuan-3.0.2.tar.bz2"
+  },
+  "gnupg": {
+    "url": "https://gnupg.org/ftp/gcrypt/gnupg/gnupg-2.5.24.tar.bz2",
+    "sha256": "bf149d01a2b9fcc0e4589b8ae8697d3d5c557ea48ed95a3fa55dd3b1187e6039",
+    "file": "gnupg-2.5.24.tar.bz2"
+  },
+  "libksba": {
+    "url": "https://gnupg.org/ftp/gcrypt/libksba/libksba-1.6.8.tar.bz2",
+    "sha256": "0f4510f1c7a679c3545990a31479f391ad45d84e039176309d42f80cf41743f5",
+    "file": "libksba-1.6.8.tar.bz2"
+  },
+  "npth": {
+    "url": "https://gnupg.org/ftp/gcrypt/npth/npth-1.8.tar.bz2",
+    "sha256": "8bd24b4f23a3065d6e5b26e98aba9ce783ea4fd781069c1b35d149694e90ca3e",
+    "file": "npth-1.8.tar.bz2"
+  },
+  "qemu": {
+    "url": "https://download.qemu.org/qemu-11.1.2.tar.xz",
+    "sha256": "731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016",
+    "file": "qemu-source.tar.xz"
+  },
+  "qemu-glib": {
+    "url": "https://download.gnome.org/sources/glib/2.90/glib-2.90.1.tar.xz",
+    "sha256": "93c941aa17d5eb1d53fe838365f29a8b4e539c222a256d974ec8f30fc413e396",
+    "file": "qemu-glib.tar.xz"
+  },
+  "qemu-pcre2": {
+    "url": "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.bz2",
+    "sha256": "53c156e1ba416a20da8e65395daa132da0d80e76910424caca3fcdae7831d384",
+    "file": "qemu-pcre2.tar.bz2"
+  },
+  "qemu-zlib": {
+    "url": "https://zlib.net/zlib-1.3.2.tar.gz",
+    "sha256": "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16",
+    "file": "qemu-zlib.tar.gz"
+  },
+  "qemu-proxy-intl": {
+    "url": "https://github.com/frida/proxy-libintl/archive/refs/tags/0.5.tar.gz",
+    "sha256": "f7a1cbd7579baaf575c66f9d99fb6295e9b0684a28b095967cfda17857595303",
+    "file": "proxy-libintl-0.5.tar.gz"
+  },
+  "qemu-zstd": {
+    "url": "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+    "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3",
+    "file": "qemu-zstd.tar.gz"
+  }
+}

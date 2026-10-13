@@ -314,10 +314,16 @@ class BootExTests(unittest.TestCase):
 
     def test_extracted_tree_rejects_casefold_collisions_and_unsafe_fonts(self):
         collision = self.extracted / "Fonts_EX" / "SEGOE_SLBOOT.TTF"
+        original = self.extracted / "Fonts_EX" / "segoe_slboot.ttf"
+        original_data = original.read_bytes()
         collision.write_bytes(b"collision")
-        with self.assertRaisesRegex(BootExSafetyError, "collision"):
-            build_bootex_plan(self.request())
-        collision.unlink()
+        if not collision.samefile(original):
+            with self.assertRaisesRegex(BootExSafetyError, "collision"):
+                build_bootex_plan(self.request())
+            collision.unlink()
+        else:
+            # Case-insensitive macOS volumes cannot create two such entries.
+            original.write_bytes(original_data)
         bad = self.extracted / "Fonts_EX" / "font.otf"
         bad.write_bytes(b"bad")
         with self.assertRaisesRegex(BootExSafetyError, "direct .ttf"):

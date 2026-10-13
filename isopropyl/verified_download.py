@@ -15,6 +15,7 @@ invoked between the final descriptor/path verification and ``os.link()``.
 import hashlib
 import hmac
 import os
+import sys
 import re
 import stat
 import threading
@@ -25,14 +26,15 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from .portable_io import pread
 
 
 FREE_SPACE_RESERVE = 64 * 1024 * 1024
 MAX_DOWNLOAD_TIMEOUT = 24 * 60 * 60
 READ_SIZE = 1024 * 1024
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
 _DIRECTORY_FLAGS |= getattr(os, "O_NOFOLLOW", 0)
-_FILE_FLAGS = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _URL_IN_ERROR = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 _RESUME_STAGE_RE = re.compile(r"\.isopropyl-download-[0-9a-f]{64}\Z")
 _MAX_ERROR_DETAIL = 512
@@ -442,7 +444,7 @@ def hash_partial(
     while offset < size:
         check_cancel(cancel_event, cancel_check, policy=policy)
         deadline_check(deadline, policy=policy)
-        block = os.pread(descriptor, min(READ_SIZE, size - offset), offset)
+        block = pread(descriptor, min(READ_SIZE, size - offset), offset)
         if not block:
             raise policy.error("Partial download changed while it was read")
         digest.update(block)
@@ -529,6 +531,7 @@ def download_image(
     response_status_fn: Callable[[DownloadResponse], int] | None = None,
     response_header_fn: Callable[[DownloadResponse, str], str | None] = response_header,
     parse_decimal_header_fn: Callable[[str | None, str], int] | None = None,
+    available_space: int | None = None,
 ) -> tuple[os.stat_result, str]:
     done = initial.st_size
     hasher = hash_partial_fn or (
@@ -545,8 +548,11 @@ def download_image(
         if progress is not None:
             progress(done, artifact.size)
         return os.fstat(descriptor), value
-    filesystem = os.fstatvfs(descriptor)
-    available = filesystem.f_bavail * filesystem.f_frsize
+    if available_space is None:
+        filesystem = os.fstatvfs(descriptor)
+        available = filesystem.f_bavail * filesystem.f_frsize
+    else:
+        available = available_space
     if available < artifact.size - done + FREE_SPACE_RESERVE:
         raise policy.error("Not enough free space for the image and safety reserve")
     headers = {"Accept-Encoding": "identity"}
@@ -684,6 +690,11 @@ def execute_verified_download(
         raise ValueError("Download destination path primitives are invalid")
     if destination_name != artifact.filename:
         raise ValueError("Download destination must retain the exact cataloged filename")
+    if sys.platform in {'darwin','win32'}:
+        from .native_downloads import execute_windows_download
+        return execute_windows_download(artifact,destination,authorize_source,progress,
+            cancel_event=cancel_event,cancel_check=cancel_check,overall_timeout=overall_timeout,
+            opener=opener,policy=policy)
     resume_name = resume_stage_name(artifact)
 
     open_directory = open_absolute_directory_fn or (

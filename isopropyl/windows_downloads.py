@@ -27,10 +27,11 @@ from dataclasses import dataclass
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 
 from . import verified_download as _verified
-from .images import ImageInspection
+if TYPE_CHECKING:
+    from .images import ImageInspection
 
 
 CATALOG_VERSION = 2
@@ -927,6 +928,7 @@ def windows_inspection_matches_release(
     observed_size: int,
 ) -> bool:
     """Return whether a published ISO matches its exact catalog architecture."""
+    from .images import ImageInspection
 
     if (
         type(release) is not WindowsImageRelease

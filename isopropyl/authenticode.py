@@ -13,7 +13,10 @@ trust.
 """
 
 import enum
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import re
@@ -350,6 +353,9 @@ def _run_worker(
     cancel_check: CancelCheck | None = None,
     popen: PopenFactory | None = None,
 ) -> bytes:
+    if sys.platform != 'linux':
+        from .native_authenticode import run_worker
+        return run_worker(blob,facts,timeout=timeout,cancel_check=cancel_check,popen=popen)
     descriptor = _sealed_memfd(blob)
     entry = facts.entries[0]
     package_parent = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))

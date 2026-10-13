@@ -468,10 +468,10 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("/dev/sdy", output)
         self.assertNotIn("/dev/sdx", output)
 
-    def test_fixed_usb_requires_opt_in_and_second_phrase(self):
+    def test_fixed_usb_requires_opt_in_and_second_confirmation(self):
         self.device = target(removable=False)
-        phrase = "PREPARE RAW /dev/sdz\n"
-        final = "WRITE RAW /dev/sdz 8:240\n"
+        phrase = "yes\n"
+        final = "yes\n"
         code, _, error = self.invoke(
             [
                 "write", os.fspath(self.image), "--target", "/dev/sdz",
@@ -526,14 +526,14 @@ class CliTests(unittest.TestCase):
                 self.assertIn(warning, error)
                 self.assertNotIn("workflow", self.events)
 
-    def test_wrong_final_phrase_never_confirms_or_executes(self):
+    def test_declined_final_confirmation_never_confirms_or_executes(self):
         code, _, error = self.invoke(
             ["write", os.fspath(self.image), "--target", "/dev/sdz"],
             TtyStringIO("WRONG\n"),
             self.dependencies(),
         )
         self.assertEqual(code, ExitCode.CONFIRMATION_REFUSED)
-        self.assertIn("did not match", error)
+        self.assertIn("Write cancelled", error)
         self.assertEqual(
             self.events,
             ["inspect", "discover:False", "workflow", "prepare", "close"],
@@ -541,7 +541,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(self.workflows[0].closed)
 
     def test_success_order_defaults_to_complete_final_verification(self):
-        phrase = "WRITE RAW /dev/sdz 8:240\n"
+        phrase = "yes\n"
         code, _, error = self.invoke(
             ["write", os.fspath(self.image), "--target", "/dev/sdz"],
             TtyStringIO(phrase),
@@ -557,7 +557,7 @@ class CliTests(unittest.TestCase):
 
     def test_verification_opt_out_is_explicit_and_reconfirmed(self):
         stdin = TtyStringIO(
-            "PREPARE RAW /dev/sdz\nWRITE RAW /dev/sdz 8:240\n"
+            "yes\nyes\n"
         )
         code, _, error = self.invoke(
             [
@@ -594,7 +594,7 @@ class CliTests(unittest.TestCase):
                 self.workflows.clear()
                 code, _, error = self.invoke(
                     ["write", os.fspath(self.image), "--target", "/dev/sdz"],
-                    TtyStringIO("WRITE RAW /dev/sdz 8:240\n"),
+                    TtyStringIO("yes\n"),
                     self.dependencies(prepare_error=failure),
                 )
                 self.assertEqual(code, expected)
@@ -607,7 +607,7 @@ class CliTests(unittest.TestCase):
         failure = RawWorkflowError("A" * 1500 + "\nDETAIL\x1b]0;spoof\x07" + "Z" * 1500)
         code, _, error = self.invoke(
             ["write", os.fspath(self.image), "--target", "/dev/sdz"],
-            TtyStringIO("WRITE RAW /dev/sdz 8:240\n"),
+            TtyStringIO("yes\n"),
             self.dependencies(prepare_error=failure),
         )
         self.assertEqual(code, ExitCode.WRITE_FAILED)
@@ -649,7 +649,7 @@ class CliTests(unittest.TestCase):
         self.workflows.clear()
         code, _, error = self.invoke(
             ["write", os.fspath(self.image), "--target", "/dev/sdz"],
-            TtyStringIO("WRITE RAW /dev/sdz 8:240\n"),
+            TtyStringIO("yes\n"),
             dependencies,
         )
         self.assertEqual(code, ExitCode.OK)
@@ -733,7 +733,7 @@ class CliTests(unittest.TestCase):
                 self.workflows.clear()
                 code = run(
                     ["write", os.fspath(self.image), "--target", "/dev/sdz"],
-                    stdin=TtyStringIO("WRITE RAW /dev/sdz 8:240\n"),
+                    stdin=TtyStringIO("yes\n"),
                     stdout=io.StringIO(),
                     stderr=io.StringIO(),
                     dependencies=self.dependencies(workflow_type=workflow_type),
@@ -750,7 +750,7 @@ class CliTests(unittest.TestCase):
         error = io.StringIO()
         code = run(
             ["write", os.fspath(self.image), "--target", "/dev/sdz"],
-            stdin=TtyStringIO("WRITE RAW /dev/sdz 8:240\n"),
+            stdin=TtyStringIO("yes\n"),
             stdout=io.StringIO(),
             stderr=error,
             dependencies=self.dependencies(workflow_type=SignalAfterCommitWorkflow),
@@ -767,7 +767,7 @@ class CliTests(unittest.TestCase):
         error = SignalOnCompletionOutput(signal.SIGINT)
         code = run(
             ["write", os.fspath(self.image), "--target", "/dev/sdz"],
-            stdin=TtyStringIO("WRITE RAW /dev/sdz 8:240\n"),
+            stdin=TtyStringIO("yes\n"),
             stdout=io.StringIO(),
             stderr=error,
             dependencies=self.dependencies(),
@@ -783,7 +783,7 @@ class CliTests(unittest.TestCase):
         error = FailingCompletionOutput()
         code = run(
             ["write", os.fspath(self.image), "--target", "/dev/sdz"],
-            stdin=TtyStringIO("WRITE RAW /dev/sdz 8:240\n"),
+            stdin=TtyStringIO("yes\n"),
             stdout=io.StringIO(),
             stderr=error,
             dependencies=self.dependencies(),
@@ -814,8 +814,8 @@ class CliTests(unittest.TestCase):
         pyproject = (
             Path(__file__).resolve().parents[1] / "pyproject.toml"
         ).read_text(encoding="utf-8")
-        self.assertIn('[project.gui-scripts]\nisopropyl = "isopropyl.app:main"', pyproject)
-        self.assertIn('[project.scripts]\nisopropyl-cli = "isopropyl.cli:main"', pyproject)
+        self.assertIn('[project.gui-scripts]\nisopropyl = "isopropyl.entrypoints:gui"', pyproject)
+        self.assertIn('[project.scripts]\nisopropyl-cli = "isopropyl.entrypoints:cli"', pyproject)
 
     def test_root_is_rejected_before_argument_or_dependency_processing(self):
         dependencies = CliDependencies(

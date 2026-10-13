@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-import os
-import sys
+from isopropyl.entrypoints import gui
 
-if os.geteuid() == 0:
-    print(
-        "ISOpropyl must be run as a regular desktop user, not root.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-from isopropyl.app import main
-
-raise SystemExit(main())
+raise SystemExit(gui())

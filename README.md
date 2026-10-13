@@ -1,34 +1,48 @@
 <div align="center">
 
-![ISOpropyl — Bootable media, without the guesswork](https://raw.githubusercontent.com/codebooker/isopropyl/dbde952ddde89e7b4e0b08533c0e2c5014fc6696/data/isopropyl-hero.svg)
+![ISOpropyl — Bootable media, without the guesswork](https://raw.githubusercontent.com/codebooker/isopropyl/main/data/isopropyl-hero.svg)
 
 [![Tests](https://github.com/codebooker/isopropyl/actions/workflows/test.yml/badge.svg)](https://github.com/codebooker/isopropyl/actions/workflows/test.yml)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-F6922E.svg)](https://github.com/codebooker/isopropyl/blob/main/LICENSE)
-[![Platform: Linux](https://img.shields.io/badge/platform-Linux-252B35.svg?logo=linux&logoColor=white)](#requirements)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-252B35.svg)](CROSS_PLATFORM.md)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-5B6574.svg)](#project-status)
 
 ### Powerful enough for Windows installers. Careful enough for `/dev`.
 
-**A Linux-native image writer with guarded device selection, transparent write
+**An image writer with guarded device selection, transparent write
 plans, Windows customization, and end-to-end verification.**
 
-[Build & install](#build-a-debianubuntu-alpha-package) · [Quick start](#quick-start) · [Capabilities](#capabilities) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
+[Website](https://isopropyl.app) · [Build & install](#build-a-debianubuntu-alpha-package) · [Quick start](#quick-start) · [Capabilities](#capabilities) · [Safety](#safety-by-design) · [Rufus parity](https://github.com/codebooker/isopropyl/blob/main/FEATURE_MATRIX.md) · [Roadmap](https://github.com/codebooker/isopropyl/blob/main/ROADMAP.md)
 
 <sub>DD &nbsp;•&nbsp; FILESYSTEM-AWARE ISO MODE &nbsp;•&nbsp; WINDOWS CUSTOMIZATION &nbsp;•&nbsp; VERIFIED WRITES</sub>
 
 </div>
 
-![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/7156e64dc2b585a4fd90bef901db76b7b84889a0/data/screenshot.png)
+![ISOpropyl inspecting a Windows installer image and a synthetic removable drive](https://raw.githubusercontent.com/codebooker/isopropyl/main/data/screenshot.png)
 
 <p align="center"><sub>Rendered with synthetic image and device metadata. No physical drive was written.</sub></p>
 
-ISOpropyl gives Linux users a polished way to create bootable USB and SD media
-without running an entire graphical application as root. It pairs an
-approachable Qt interface with explicit write methods, detailed media
-inspection, narrow privilege boundaries, and read-back verification.
+ISOpropyl creates bootable USB and SD media on Linux, macOS and Windows. It pairs
+an approachable Qt interface with explicit write methods, detailed media
+inspection, Windows customization and read-back verification.
 
-It is inspired by Rufus, but it is a Linux-native project—not a port and not yet
-a feature-for-feature replacement.
+It is inspired by Rufus and independently implemented. It is not yet a
+feature-for-feature replacement for Rufus.
+
+**Supported hosts:** Linux and Windows **x86-64 / ARM64**, and macOS
+**Apple silicon ARM64**. The macOS and Windows interfaces now include the shared
+Linux media workflows: raw/compressed/sparse/virtual inputs, FAT32/NTFS ISO mode,
+MBR/GPT, installer customization and edition selection, WIM splitting and ESD
+conversion, reviewed BootEx replacement, supported Ubuntu persistence, ZIP
+overlays, complete image/boot analysis, official downloads, backups, optical
+capture, all supported restore filesystems, zeroing, media tests and boot tools.
+Experimental Linux profiles remain experimental on every host.
+
+The main window stays compact; advanced choices live in dialogs. All platforms
+use dark gray with orange accents and a normal **Yes/Cancel** erase confirmation.
+No platform asks you to type an erase phrase or a device path.
+See [cross-platform installation and capabilities](CROSS_PLATFORM.md) and
+[implementation and validation evidence](PARITY.md).
 
 > [!CAUTION]
 > **ISOpropyl is destructive alpha software.** Native test packages are not yet
@@ -40,7 +54,7 @@ a feature-for-feature replacement.
 
 | Inspect first | Keep privilege narrow | Verify the result |
 |---|---|---|
-| See image structure, boot modes, architectures, checksums, Windows editions, and compatibility warnings before erasing anything. | The Qt app and CLI stay unprivileged. Raw/DD writes and fast zero use fixed project PolicyKit actions; other tools elevate bounded system argument arrays without shell text. | Raw writes use mandatory pre-activation read-back. Full post-write verification is on by default and filesystem-aware writes hash every copied file. |
+| See image structure, boot modes, architectures, checksums, Windows editions, and compatibility warnings before erasing anything. | Linux uses bounded PolicyKit actions; macOS authorizes a device descriptor while the app stays at user privilege; Windows uses UAC and native volume locks. | Raw writes use mandatory pre-activation read-back. Full post-write verification is on by default and filesystem-aware writes hash every copied file. |
 
 No unattended confirmation, no internal-disk targets, and no shell-constructed
 root commands. Destructive operations name the exact device, revalidate its
@@ -48,14 +62,17 @@ identity, and require an explicit confirmation.
 
 ## Capabilities
 
+The detailed privilege protocols below describe the Linux backend. Native hosts
+implement the same workflows through their OS adapters; see [the platform matrix](CROSS_PLATFORM.md).
+
 | Capability | What ISOpropyl does |
 |---|---|
-| **Authenticated raw writing** | Expands every supported raw input into a private anonymous snapshot, shows its SHA-256 and exact target in a typed confirmation, then uses a guarded PolicyKit transaction with mandatory pre-activation read-back and optional full verification. Fixed-offset snapshot and device I/O has narrowly bounded, cancellation-aware retries only for Linux-documented zero-progress interruptions; every retry re-attests the same descriptor and source/target generation. |
-| **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and a second typed warning for fixed USB disks or risky image profiles. |
+| **Authenticated raw writing** | Expands every supported raw input into a private anonymous snapshot, shows its SHA-256 and exact target in a Yes/Cancel confirmation, then uses a guarded PolicyKit transaction with mandatory pre-activation read-back and optional full verification. Fixed-offset snapshot and device I/O has narrowly bounded, cancellation-aware retries only for Linux-documented zero-progress interruptions; every retry re-attests the same descriptor and source/target generation. |
+| **Terminal raw writing** | Offers the same authenticated raw workflow through `isopropyl-cli`: exact `/dev/...` selection, no unattended mode, full verification by default, signal-safe cancellation, and explicit confirmation for fixed USB disks or risky image profiles. |
 | **Filesystem-aware ISO mode** | Rebuilds eligible UEFI media as FAT32 or NTFS with a pinned UEFI:NTFS bridge, then SHA-256 verifies every destination file. Up to eight bootable EFI/no-emulation El Torito FAT images are identity-bound, parsed under aggregate limits, merged in physical-offset order, and revalidated before collision-safe materialization. |
-| **Syslinux BIOS developer preview** | For exact supported Syslinux 6.03/6.04 images, an explicit environment-gated preview can add a legacy-BIOS path while retaining the source UEFI files. It uses hash-pinned payloads, a target-bound typed confirmation, MBR-last activation, and mandatory full-device SHA-256 read-back. The normal GUI keeps it hidden pending a native hardened helper and physical-media certification. |
-| **GRUB 2.14 rescue-media developer preview** | `ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1` exposes Rufus's exact blank legacy-BIOS rescue profile for tightly restricted removable media. ISOpropyl validates the pinned `boot.img` and `core.img`, builds a target-sized private MBR/FAT32 image with the core at byte 512 and a zero embedding gap, and activates the 432-byte bootstrap last. A separate target-bound PolicyKit transaction copies non-activation bytes before the MBR, requires the exact typed target phrase, and performs mandatory whole-device SHA-256 read-back without a generic/raw fallback. A sealed image has reached the intentional `grub rescue>` prompt under isolated QEMU/SeaBIOS; the profile contains no menu, configuration, `normal.mod`, kernel, operating system, or UEFI loader, and physical-media validation remains pending. |
-| **Windows BIOS + UEFI developer preview** | `ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL=1` admits only the strict x64 Windows Boot Manager FAT32/active-MBR profile. It stages and witnesses the complete tree, can add ISOpropyl's exact regenerated `autounattend.xml`, splits the sole conventional oversized `install.wim`, builds an anonymous full-device image with the project-authored BIOS loader, and uses a separate typed, target-bound PolicyKit transaction with MBR-last activation and mandatory full SHA-256 read-back. The final confirmation names each selected customization and the answer-file digest. There is no formatter/mount or generic-writer fallback. An uncustomized Windows 11 image has reached Setup under both KVM/SeaBIOS and non-Secure-Boot OVMF; physical-media and customized-install certification remain release gates. |
+| **Syslinux BIOS developer preview** | For exact supported Syslinux 6.03/6.04 images, an explicit environment-gated preview can add a legacy-BIOS path while retaining the source UEFI files. It uses hash-pinned payloads, a target-bound Yes/Cancel confirmation, MBR-last activation, and mandatory full-device SHA-256 read-back. The normal GUI keeps it hidden pending a native hardened helper and physical-media certification. |
+| **GRUB 2.14 rescue-media developer preview** | `ISOPROPYL_EXPERIMENTAL_GRUB_RESCUE=1` exposes Rufus's exact blank legacy-BIOS rescue profile for tightly restricted removable media. ISOpropyl validates the pinned `boot.img` and `core.img`, builds a target-sized private MBR/FAT32 image with the core at byte 512 and a zero embedding gap, and activates the 432-byte bootstrap last. A separate target-bound PolicyKit transaction copies non-activation bytes before the MBR, requires explicit confirmation of the selected target, and performs mandatory whole-device SHA-256 read-back without a generic/raw fallback. A sealed image has reached the intentional `grub rescue>` prompt under isolated QEMU/SeaBIOS; the profile contains no menu, configuration, `normal.mod`, kernel, operating system, or UEFI loader, and physical-media validation remains pending. |
+| **Windows BIOS + UEFI developer preview** | `ISOPROPYL_EXPERIMENTAL_WINDOWS_DUAL=1` admits only the strict x64 Windows Boot Manager FAT32/active-MBR profile. It stages and witnesses the complete tree, can add ISOpropyl's exact regenerated `autounattend.xml`, splits the sole conventional oversized `install.wim`, builds an anonymous full-device image with the project-authored BIOS loader, and uses a separate confirmed, target-bound PolicyKit transaction with MBR-last activation and mandatory full SHA-256 read-back. The final confirmation names each selected customization and the answer-file digest. There is no formatter/mount or generic-writer fallback. An uncustomized Windows 11 image has reached Setup under both KVM/SeaBIOS and non-Secure-Boot OVMF; physical-media and customized-install certification remain release gates. |
 | **Windows installer options** | Selects WIM/ESD editions, splits oversized WIMs when supported, can generate a reviewed `autounattend.xml`, and offers a narrowly profiled Windows 2023-generation installer-boot update for exact supported Microsoft media. |
 | **Compressed and virtual images** | Supports common compression formats plus VHD, VHDX, QCOW, and QCOW2 through identity-bound expansion into authenticated anonymous snapshots. |
 | **Inspection before erasure** | Examines partition tables, El Torito entries, EFI architecture, Windows metadata, bootloader evidence, and image checksums. |
@@ -246,7 +263,7 @@ PolicyKit transaction, activation ordering, and read-back as the GUI. It refuses
 non-interactive input, target indexes, globs, and automatic confirmation. Full
 post-activation SHA-256 verification is enabled by default. The explicit
 `--no-final-verification` switch retains mandatory pre-activation read-back but
-requires an extra typed warning. Fixed USB HDDs/SSDs require both
+requires an extra warning confirmation. Fixed USB HDDs/SSDs require both
 `--include-usb-hard-drives` and that same extra warning; internal disks remain
 ineligible. `SIGINT` and `SIGTERM` request authenticated cancellation and wait for
 the workflow to finish its required cleanup or post-commit verification.
@@ -324,7 +341,7 @@ filesystem metadata without overwriting every previous data byte.
 
 For a removable USB or SD/MMC target with a stable serial/WWN and a supported
 sector size, FAT32 and NTFS also offer **Verified full overwrite + format**.
-After a target-bound typed confirmation, one isolated PolicyKit transaction
+After a target-bound Yes/Cancel confirmation, one isolated PolicyKit transaction
 retains exclusive ownership while it:
 
 1. reads the complete device and zeroes every chunk that is not already zero;
@@ -344,7 +361,7 @@ release-confidence gates.
 
 1. Open **Drive tools…**, choose **Erase drive with zeros…**, and select **Fast
    zero — scan, skip zero blocks, zero the rest, verify all**.
-2. Review the exact target identity and type the displayed authorization phrase.
+2. Review the exact target identity and click Yes in the confirmation dialog.
 3. ISOpropyl scans every byte, skips only chunks that are already entirely zero,
    overwrites every other chunk, flushes device caches, and reads the whole drive
    back before reporting success.
@@ -448,7 +465,7 @@ ISOpropyl treats every target write as a destructive transaction:
   overwriting existing files.
 
 The raw-device broker goes further. Its separate Syslinux, raw/DD, and fast-zero
-profiles bind the kernel's disk-generation sequence before typed confirmation,
+profiles bind the kernel's disk-generation sequence before explicit confirmation,
 check that generation again through sysfs and `BLKGETDISKSEQ`, and retain one
 exclusive target descriptor through writing, durability, cache invalidation,
 and read-back. Generic raw writes first deactivate a 1 MiB front guard plus the
@@ -468,7 +485,8 @@ for the complete threat model and private vulnerability-reporting guidance.
 
 Core requirements:
 
-- Linux, Python 3.10 or newer, and PyQt6 6.5 through 6.x;
+- Linux x86-64 or ARM64, Python 3.10 or newer, and PyQt6 6.5 through 6.x
+  (pip installs require PyQt6 6.8 or newer for the native platform integrations);
 - `lsblk`, `findmnt`, `partprobe`, `udevadm`, `udisksctl`, `pkexec`, GNU `dd`,
   and util-linux `flock` (`dd` remains used by bounded backup, optical, erase,
   and constructed-media tools, but not by the GUI or CLI raw-image writer);

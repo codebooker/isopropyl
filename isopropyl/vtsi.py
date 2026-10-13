@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """Strict, descriptor-bound Ventoy Sparse Image (VTSI) v1 support.
@@ -214,7 +216,7 @@ def _pread_exact(
     _check_cancelled(cancel_check)
     _require_identity(descriptor, identity)
     try:
-        data = os.pread(descriptor, length, offset)
+        data = pread(descriptor, length, offset)
     except OSError as error:
         raise VtsiSafetyError(f"Could not read the VTSI {label}") from error
     _check_cancelled(cancel_check)

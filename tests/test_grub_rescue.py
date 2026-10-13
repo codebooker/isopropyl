@@ -8,6 +8,8 @@ import struct
 import tempfile
 import unittest
 from dataclasses import fields, replace
+from contextlib import ExitStack,contextmanager
+import isopropyl.grub_profile as grub_profile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -57,6 +59,16 @@ def _fake_core_image() -> bytes:
     return bytes(payload)
 
 
+@contextmanager
+def _patch_profile(**constants):
+    # Both the Linux builder's exported profile and the shared pure validator
+    # must see the same independently generated synthetic test artifacts.
+    with ExitStack() as stack:
+        stack.enter_context(patch.multiple(grub_rescue,**constants))
+        stack.enter_context(patch.multiple(grub_profile,**constants))
+        yield
+
+
 class GrubRescueTests(unittest.TestCase):
     def setUp(self) -> None:
         source_tmp = tempfile.TemporaryDirectory()
@@ -79,16 +91,15 @@ class GrubRescueTests(unittest.TestCase):
             // grub_rescue.SECTOR_SIZE
             * grub_rescue.SECTOR_SIZE
         )
-        constants = patch.multiple(
-            grub_rescue,
+        constants = _patch_profile(
             BOOT_IMAGE_SHA256=self.boot_sha256,
             BOOTSTRAP_SHA256=self.bootstrap_sha256,
             CORE_SIZE=len(self.core),
             CORE_SHA256=self.core_sha256,
             CORE_PADDED_SIZE=self.core_padded_size,
         )
-        constants.start()
-        self.addCleanup(constants.stop)
+        constants.__enter__()
+        self.addCleanup(constants.__exit__,None,None,None)
         self.bundle = self.make_bundle()
 
     def make_bundle(
@@ -292,8 +303,7 @@ class GrubRescueTests(unittest.TestCase):
             boot=malformed,
             boot_sha256=full_digest,
         )
-        with patch.multiple(
-            grub_rescue,
+        with _patch_profile(
             BOOT_IMAGE_SHA256=full_digest,
             BOOTSTRAP_SHA256=bootstrap_digest,
         ):
@@ -311,7 +321,7 @@ class GrubRescueTests(unittest.TestCase):
         malformed = bytes(malformed)
         digest = hashlib.sha256(malformed).hexdigest()
         bundle = self.make_bundle(core=malformed, core_sha256=digest)
-        with patch.object(grub_rescue, "CORE_SHA256", digest):
+        with _patch_profile(CORE_SHA256=digest):
             with self.assertRaisesRegex(GrubRescueError, "diskboot blocklist"):
                 build_grub_rescue_plan(
                     bundle,

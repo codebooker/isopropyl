@@ -20,6 +20,7 @@ import selectors
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -386,6 +387,9 @@ MemberReader = Callable[[Path, str], bytes]
 
 
 def _trusted_7z() -> str | None:
+    if sys.platform!='linux':
+        from .native_archive import seven_zip
+        return seven_zip()
     executable = shutil.which("7z", path=_TRUSTED_7Z_PATH)
     if not executable:
         return None
@@ -456,6 +460,13 @@ def _read_archive_member_once(
     max_bytes: int,
     archive_type: str | None,
 ) -> bytes:
+    if sys.platform!='linux':
+        from .native_archive import read_member
+        try:
+            return read_member(executable,image,member,image_fd,cancel_check,
+                               timeout=timeout,max_bytes=max_bytes,archive_type=archive_type)
+        except (OSError,RuntimeError) as error:
+            raise _ArchiveNamespaceUnavailable(str(error)) from error
     source = str(image) if image_fd is None else f"/proc/self/fd/{image_fd}"
     type_switch = () if archive_type is None else (f"-t{archive_type}",)
     process = subprocess.Popen(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """Bounded, read-only MBR and GPT inspection.
@@ -110,7 +112,7 @@ class _FdReader:
         if offset < 0 or length < 0 or offset > self.size or length > self.size - offset:
             return b""
         try:
-            return os.pread(self._descriptor, length, offset)
+            return pread(self._descriptor, length, offset)
         except OSError as error:
             raise PartitionTableError(
                 "Could not read partition-table metadata"

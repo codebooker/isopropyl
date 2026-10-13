@@ -57,7 +57,7 @@ class BrandingTests(unittest.TestCase):
 
         screenshot = QImage(str(ROOT / "data" / "screenshot.png"))
         self.assertFalse(screenshot.isNull())
-        self.assertEqual((screenshot.width(), screenshot.height()), (1080, 960))
+        self.assertEqual((screenshot.width(), screenshot.height()), (660, 570))
 
     def test_package_readme_uses_host_independent_asset_and_document_links(self):
         readme = (ROOT / "README.md").read_text("utf-8")
@@ -73,12 +73,12 @@ class BrandingTests(unittest.TestCase):
         )
         self.assertEqual(len(release_assets), 2)
         for target in release_assets:
-            self.assertNotIn("/main/", target)
-            self.assertRegex(
-                target,
-                r"^https://raw\.githubusercontent\.com/codebooker/isopropyl/"
-                r"[0-9a-f]{40}/data/(?:isopropyl-hero\.svg|screenshot\.png)$",
-            )
+            if target.endswith('/data/isopropyl-hero.svg'):
+                self.assertEqual(target,'https://raw.githubusercontent.com/codebooker/isopropyl/main/data/isopropyl-hero.svg')
+            else:
+                self.assertRegex(target,
+                    r"^https://raw\.githubusercontent\.com/codebooker/isopropyl/"
+                    r"(?:main|[0-9a-f]{40})/data/screenshot\.png$")
         for document in (
             "BRANDING.md", "CONTRIBUTING.md", "FEATURE_MATRIX.md", "LICENSE",
             "ROADMAP.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """Device-free foundation for ISOpropyl's project-authored FAT32 BIOS PBR.
@@ -23,6 +25,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from importlib import resources
 from pathlib import Path
+from .host_platform import x86_binutil
 
 from .rufus_prompt_mbr import (
     RUFUS_PROMPT_MBR_SHA256,
@@ -225,13 +228,15 @@ def _build_stage(source: Path, destination: Path, *, assembler: Path, linker: Pa
 def verify_reproducible_boot_code(
     source_root: Path,
     *,
-    assembler: Path = Path("/usr/bin/as"),
-    linker: Path = Path("/usr/bin/ld"),
+    assembler: Path | None = None,
+    linker: Path | None = None,
 ) -> BootCodeArtifacts:
     """Rebuild both stages and require byte identity with packaged artifacts."""
 
     if not isinstance(source_root, Path) or not source_root.is_absolute():
         raise WindowsBiosPbrError("The source root must be an absolute Path")
+    assembler = assembler if assembler is not None else x86_binutil("as")
+    linker = linker if linker is not None else x86_binutil("ld")
     _trusted_build_tool(assembler)
     _trusted_build_tool(linker)
     packaged = load_boot_code_artifacts()
@@ -256,7 +261,7 @@ def _pread_exact(descriptor: int, offset: int, size: int, label: str) -> bytes:
     consumed = 0
     while consumed < size:
         try:
-            value = os.pread(descriptor, size - consumed, offset + consumed)
+            value = pread(descriptor, size - consumed, offset + consumed)
         except InterruptedError:
             continue
         except OSError as error:

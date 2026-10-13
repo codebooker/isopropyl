@@ -228,6 +228,24 @@ _QOL_FIRST_LOGON_COMMANDS = (
 
 
 @dataclass(frozen=True)
+class WindowsBootExOptions:
+    """User-facing, default-off authorization for the BootEx transform."""
+
+    enabled: bool = False
+    acknowledge_firmware_compatibility: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool or type(
+            self.acknowledge_firmware_compatibility
+        ) is not bool:
+            raise ValueError("Windows BootEx options must be boolean")
+        if self.acknowledge_firmware_compatibility and not self.enabled:
+            raise ValueError(
+                "Windows BootEx firmware acknowledgment requires the feature"
+            )
+
+
+@dataclass(frozen=True)
 class WindowsCustomization:
     """Opt-in settings for an exported Windows unattended-setup profile.
 

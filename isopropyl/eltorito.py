@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """Strict, bounded, read-only El Torito boot-catalog inspection."""
@@ -406,7 +408,7 @@ def inspect_eltorito_file(
             before = _identity(before_status)
 
             def read_at(offset: int, length: int) -> bytes:
-                return os.pread(image_fd, length, offset)
+                return pread(image_fd, length, offset)
 
             result = _inspect(read_at, before.size)
             after = _identity(os.fstat(image_fd))

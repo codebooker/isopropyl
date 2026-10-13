@@ -1,203 +1,345 @@
 from __future__ import annotations
 
-# SPDX-License-Identifier: AGPL-3.0-or-later
-
-import os
-import sys
 import hashlib
-import threading
-import logging
-import shutil
 import json
+import logging
+
+# SPDX-License-Identifier: AGPL-3.0-or-later
+import os
+import shutil
 import stat
+import sys
 import tempfile
+import threading
 import unicodedata
 from dataclasses import dataclass, field, replace
 from importlib.resources import files
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QSettings, QTimer, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
-    QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon,
-    QKeySequence, QShortcut, QTextCursor,
+    QCloseEvent,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
     QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QTabWidget,
-    QVBoxLayout, QWidget,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
+from .authenticode import AuthenticodeIntegrityState
 from .backup import (
-    DriveImager, VirtualDriveImager, validate_virtual_backup_destination,
+    DriveImager,
+    VirtualDriveImager,
+    validate_virtual_backup_destination,
     virtual_backup_required_space,
 )
-from .authenticode import AuthenticodeIntegrityState
-from .dbx import (
-    DbxState, SOURCE_RELEASE, SOURCE_RELEASE_DATE, StagedDbxAnalysis,
-    StagedDbxPayload, assess_staged_dbx, merge_staged_dbx_analyses,
-)
 from .bootloaders import (
-    BoundBootBundle, CatalogError, bundle_for_dependency,
-    delete_cached_artifacts, inventory_cache, load_catalog, prepare_bundle,
+    BoundBootBundle,
+    CatalogError,
+    bundle_for_dependency,
+    delete_cached_artifacts,
+    inventory_cache,
+    load_catalog,
+    prepare_bundle,
 )
 from .casper_media import (
-    CasperMediaCancelled, CasperMediaExecutor, CasperStagingExecutor,
-    build_casper_media_plan, build_casper_staging_plan,
-    probe_casper_logical_sector_size, supported_casper_profile,
+    CasperMediaCancelled,
+    CasperMediaExecutor,
+    CasperStagingExecutor,
+    build_casper_media_plan,
+    build_casper_staging_plan,
+    probe_casper_logical_sector_size,
+    supported_casper_profile,
 )
 from .constructed import (
-    ConstructedMediaCancelled, ConstructedMediaExecutor, ConstructedMediaPlan,
-    build_constructed_media_plan, validate_constructed_media_plan,
+    ConstructedMediaCancelled,
+    ConstructedMediaExecutor,
+    ConstructedMediaPlan,
+    build_constructed_media_plan,
+    validate_constructed_media_plan,
 )
-from .distro_policies import DistroPolicyError, match_distro_iso_exclusion
+from .dbx import (
+    SOURCE_RELEASE,
+    SOURCE_RELEASE_DATE,
+    DbxState,
+    StagedDbxAnalysis,
+    StagedDbxPayload,
+    assess_staged_dbx,
+    merge_staged_dbx_analyses,
+)
 from .devices import (
-    Device, SizeUnitMode, format_size, image_is_on_device, list_devices,
+    Device,
+    SizeUnitMode,
+    format_size,
+    image_is_on_device,
+    list_devices,
     path_is_on_device,
 )
 from .diagnostics import build_diagnostics, write_diagnostics
+from .distro_policies import DistroPolicyError, match_distro_iso_exclusion
 from .erase import (
-    QUICK_BOUNDARY_BYTES, EraseCancelled, EraseMode, EraseRunner,
+    QUICK_BOUNDARY_BYTES,
+    EraseCancelled,
+    EraseMode,
+    EraseRunner,
     build_erase_plan,
 )
 from .extraction import (
-    ExtractionCancelled, SafeIsoExtractor, build_extraction_plan,
-)
-from .formatting import (
-    Filesystem as FormatFilesystem, FormatCancelled, FormatExecutor, FormatPlan,
-    PartitionTable as FormatPartitionTable, create_format_plan,
-    restore_allocation_unit_sizes, restore_filesystem_geometry_supported,
+    ExtractionCancelled,
+    SafeIsoExtractor,
+    build_extraction_plan,
 )
 from .fast_zero import (
-    FastZeroCancelled, FastZeroError, FastZeroPartialFailure,
-    FastZeroPartialResult, FastZeroPlan, FastZeroResult, FastZeroRunError,
+    FastZeroCancelled,
+    FastZeroError,
+    FastZeroPartialFailure,
+    FastZeroPartialResult,
+    FastZeroPlan,
+    FastZeroResult,
+    FastZeroRunError,
     FastZeroWorkflow,
+)
+from .formatting import (
+    Filesystem as FormatFilesystem,
+)
+from .formatting import (
+    FormatCancelled,
+    FormatExecutor,
+    FormatPlan,
+    create_format_plan,
+    restore_allocation_unit_sizes,
+    restore_filesystem_geometry_supported,
+)
+from .formatting import (
+    PartitionTable as FormatPartitionTable,
+)
+from .freedos_downloads import (
+    DownloadedFreeDosImage,
+    FreeDosDownloadCancelled,
+    FreeDosImageRelease,
+    FreeDosUsbDownloader,
+    available_freedos_images,
+    freedos_inspection_matches_release,
 )
 from .grub_rescue_device import (
     MAX_TARGET_BYTES as MAX_GRUB_RESCUE_TARGET_BYTES,
+)
+from .grub_rescue_device import (
     GrubRescueDeviceWritePlan,
 )
 from .grub_rescue_device_runner import GrubRescueDeviceWriteResult
 from .grub_rescue_workflow import (
-    GrubRescueWorkflowCancelled, GrubRescueWorkflowState,
+    GrubRescueWorkflowCancelled,
+    GrubRescueWorkflowState,
     GrubRescueWriteWorkflow,
 )
 from .images import (
-    ChecksumCancelled, ImageInspection, ImageInspectionCancelled,
-    calculate_checksums, classify_windows_installer_members,
-    compare_expected_checksum, inspect_image,
+    ChecksumCancelled,
+    ImageInspection,
+    ImageInspectionCancelled,
+    calculate_checksums,
+    classify_windows_installer_members,
+    compare_expected_checksum,
+    inspect_image,
 )
 from .iso import (
-    AdditiveOverlayMerge, ArchiveEntry, BootStrategy, EntryKind, FileSystem,
+    AdditiveOverlayMerge,
+    ArchiveEntry,
+    BootStrategy,
+    EntryKind,
+    FileSystem,
     FirmwareTarget,
-    WriteMode, WritePlan, WriteMethodRecommendation, build_write_plan,
+    WriteMethodRecommendation,
+    WriteMode,
+    WritePlan,
+    build_write_plan,
     merge_additive_overlay_entries,
     partition_sector_mismatch,
-    partition_sector_unverified, recommend_write_method,
+    partition_sector_unverified,
+    recommend_write_method,
 )
 from .iso_staging import (
-    IsoStagingCancelled, IsoStagingExecutor, IsoStagingPlan, IsoStagingResult,
-    build_iso_staging_plan, preview_embedded_fat_catalog,
+    IsoStagingCancelled,
+    IsoStagingExecutor,
+    IsoStagingPlan,
+    IsoStagingResult,
+    build_iso_staging_plan,
+    preview_embedded_fat_catalog,
+)
+from .linux_downloads import (
+    DownloadedLinuxImage,
+    LinuxDownloadCancelled,
+    LinuxImageRelease,
+    LinuxIsoDownloader,
+    available_linux_images,
 )
 from .logging_setup import read_log, setup_logging
-from .linux_downloads import (
-    DownloadedLinuxImage, LinuxDownloadCancelled, LinuxImageRelease,
-    LinuxIsoDownloader, available_linux_images,
-)
-from .freedos_downloads import (
-    DownloadedFreeDosImage, FreeDosDownloadCancelled, FreeDosImageRelease,
-    FreeDosUsbDownloader, available_freedos_images,
-    freedos_inspection_matches_release,
-)
-from .windows_downloads import (
-    DownloadedWindowsImage, WindowsDownloadCancelled, WindowsImageRelease,
-    WindowsIsoDownloader, available_windows_images,
-    validate_microsoft_download_url, windows_inspection_matches_release,
-)
 from .media_test import (
-    MediaTestCancelled, MediaTestMode, MediaTestResult, MediaTestRunner,
+    MediaTestCancelled,
+    MediaTestMode,
+    MediaTestResult,
+    MediaTestRunner,
     build_media_test_plan,
 )
+from .native_style import (
+    LIGHT_STYLE,
+    MAIN_SIZE,
+    MINIMUM_SIZE,
+    STYLE,
+    WINDOWS_OPTIONS_SIZE,
+)
 from .optical import (
-    OpticalCancelled, OpticalCaptureRunner, build_optical_capture_plan,
+    OpticalCancelled,
+    OpticalCaptureRunner,
+    build_optical_capture_plan,
     list_optical_devices,
 )
-from .progress import ProgressEstimator, format_duration
 from .persistence import (
-    ALIGNMENT_BYTES, MIN_PERSISTENCE_BYTES, CasperCompatibilityProfile,
+    ALIGNMENT_BYTES,
+    MIN_PERSISTENCE_BYTES,
+    CasperCompatibilityProfile,
 )
-from .runtime_validation import (
-    RUNTIME_VALIDATION_ARTIFACTS, RUNTIME_VALIDATION_VERSION,
-    PreparedRuntimeValidation, RuntimeValidationCancelled,
-    RuntimeValidationError,
-    apply_runtime_validation, prepare_runtime_validation,
-    validate_prepared_runtime_validation, validate_runtime_validation_stage,
-)
+from .progress import ProgressEstimator, format_duration
 from .raw_device import RawDeviceWritePlan
 from .raw_device_runner import RawDeviceWriteResult
 from .raw_workflow import (
-    RawWorkflowCancelled, RawWorkflowError, RawWriteWorkflow,
+    RawWorkflowCancelled,
+    RawWorkflowError,
+    RawWriteWorkflow,
 )
 from .restore_workflow import (
-    RestoreWorkflow, RestoreWorkflowCancelled, RestoreWorkflowError,
-    RestoreWorkflowPlan, RestoreWorkflowResult,
+    RestoreWorkflow,
+    RestoreWorkflowCancelled,
+    RestoreWorkflowError,
+    RestoreWorkflowPlan,
+    RestoreWorkflowResult,
+)
+from .runtime_validation import (
+    RUNTIME_VALIDATION_ARTIFACTS,
+    RUNTIME_VALIDATION_VERSION,
+    PreparedRuntimeValidation,
+    RuntimeValidationCancelled,
+    RuntimeValidationError,
+    apply_runtime_validation,
+    prepare_runtime_validation,
+    validate_prepared_runtime_validation,
+    validate_runtime_validation_stage,
 )
 from .settings import (
-    SettingsStore, application_settings, parse_application_arguments,
-    portable_settings_path, settings_sync_error, settings_sync_was_committed,
+    SettingsStore,
+    application_settings,
+    parse_application_arguments,
+    settings_sync_error,
+    settings_sync_was_committed,
 )
 from .syslinux_device import (
     SyslinuxDeviceWritePlan,
 )
 from .syslinux_device_runner import (
-    SyslinuxDeviceHelperUnavailable, SyslinuxDeviceWriteResult,
+    SyslinuxDeviceHelperUnavailable,
+    SyslinuxDeviceWriteResult,
     resolve_syslinux_helper_installation,
 )
 from .syslinux_transaction import MAX_SYSLINUX_REGULAR_IMAGE_BYTES
 from .syslinux_workflow import (
-    SyslinuxWorkflowError, SyslinuxWorkflowInputs, SyslinuxWriteWorkflow,
+    SyslinuxWorkflowError,
+    SyslinuxWorkflowInputs,
+    SyslinuxWriteWorkflow,
 )
-from .writer import WriteCancelled
 from .uefi import SignatureTableState
 from .uefi_ntfs import (
-    UEFI_NTFS_SIZE, BoundArtifact, UefiNtfsCancelled, UefiNtfsExecutor,
-    assess_uefi_ntfs_dbx, build_uefi_ntfs_media_plan, prepare_uefi_ntfs_artifact,
+    UEFI_NTFS_SIZE,
+    BoundArtifact,
+    UefiNtfsCancelled,
+    UefiNtfsExecutor,
+    assess_uefi_ntfs_dbx,
+    build_uefi_ntfs_media_plan,
+    prepare_uefi_ntfs_artifact,
     probe_uefi_ntfs_logical_sector_size,
 )
 from .uefi_shell import (
-    UEFI_SHELL_PROVENANCE_URL, UEFI_SHELL_VERSION,
-    UefiShellCancelled, UefiShellStage, prepare_uefi_shell,
-    stage_uefi_shell, validate_uefi_shell_stage,
+    UEFI_SHELL_PROVENANCE_URL,
+    UEFI_SHELL_VERSION,
+    UefiShellCancelled,
+    UefiShellStage,
+    prepare_uefi_shell,
+    stage_uefi_shell,
+    validate_uefi_shell_stage,
 )
 from .wim import (
-    WimEdition, WimInfo, WimSelection, inspect_wim, validate_wim_editions,
+    WimEdition,
+    WimInfo,
+    WimSelection,
+    inspect_wim,
+    validate_wim_editions,
 )
 from .windows import (
-    WindowsCustomization, generate_autounattend,
-    online_account_bypass_compatibility, quality_of_life_compatibility,
-    secure_boot_revocation_policy_compatibility, windows_architecture,
+    WindowsCustomization,
+    generate_autounattend,
+    online_account_bypass_compatibility,
+    quality_of_life_compatibility,
+    secure_boot_revocation_policy_compatibility,
+    windows_architecture,
 )
 from .windows_bootex import (
     WindowsBootExOptions,
     available_bootex_profiles,
 )
 from .windows_device import (
-    WindowsDevicePlanError, WindowsDeviceWritePlan,
-    build_windows_device_write_plan, confirm_windows_device_write,
+    WindowsDevicePlanError,
+    WindowsDeviceWritePlan,
+    build_windows_device_write_plan,
+    confirm_windows_device_write,
 )
 from .windows_device_runner import (
-    WindowsDeviceHelperUnavailable, WindowsDeviceWriteResult,
+    WindowsDeviceHelperUnavailable,
+    WindowsDeviceWriteResult,
     WindowsDeviceWriteRunner,
     resolve_windows_helper_installation,
+)
+from .windows_downloads import (
+    DownloadedWindowsImage,
+    WindowsDownloadCancelled,
+    WindowsImageRelease,
+    WindowsIsoDownloader,
+    available_windows_images,
+    validate_microsoft_download_url,
+    windows_inspection_matches_release,
 )
 from .windows_iso_fat32 import (
     build_windows_iso_fat32_plan,
 )
+from .writer import WriteCancelled
 from .zip_overlay import (
-    ZipOverlayPlan, build_zip_overlay_plan,
+    ZipOverlayPlan,
+    build_zip_overlay_plan,
 )
-
 
 FAST_ZERO_MODE = "fast-zero"
 RESTORE_METHOD_QUICK = "quick"
@@ -624,11 +766,11 @@ class Window(QMainWindow):
             self.on_staged_dbx_confirmation_requested
         )
         self.setWindowTitle("ISOpropyl")
-        self.setMinimumSize(680, 520)
+        self.setMinimumSize(*MINIMUM_SIZE)
         available = self.screen().availableGeometry()
         self.resize(
-            max(self.minimumWidth(), min(1000, available.width() - 64)),
-            max(self.minimumHeight(), min(720, available.height() - 64)),
+            max(self.minimumWidth(), min(MAIN_SIZE[0], available.width() - 64)),
+            max(self.minimumHeight(), min(MAIN_SIZE[1], available.height() - 64)),
         )
         self.setAcceptDrops(True)
         self.build_ui()
@@ -919,7 +1061,7 @@ class Window(QMainWindow):
         content = QWidget(objectName="workflowContent")
         content.setAutoFillBackground(False)
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(32, 20, 32, 20)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         eyebrow = QLabel("ISOPROPYL")
@@ -1141,7 +1283,7 @@ class Window(QMainWindow):
 
         footer = QWidget(objectName="workflowFooter")
         footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(32, 8, 32, 20)
+        footer_layout.setContentsMargins(16, 8, 16, 14)
         footer_layout.setSpacing(8)
         self.status = QLabel("Ready when you are")
         self.status.setObjectName("status")
@@ -3577,26 +3719,20 @@ class Window(QMainWindow):
         details.setMinimumHeight(260)
         layout.addWidget(details)
 
-        instruction = QLabel(
-            "Type the exact phrase below to authorize this one target and image:\n"
-            f"{plan.confirmation_phrase}"
-        )
+        instruction = QLabel("Are you sure you want to replace the contents of this selected drive?")
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
-        phrase = QLineEdit()
-        phrase.setObjectName("rawWriteConfirmationPhrase")
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        layout.addWidget(phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         start = buttons.addButton(
             "Write authenticated image",
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         start.setObjectName("rawWriteConfirmButton")
-        start.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: start.setEnabled(value == plan.confirmation_phrase)
-        )
+        start.setEnabled(True)
+        start.setText("Yes, erase and continue")
+        start.setAutoDefault(False)
+        start.setDefault(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         start.clicked.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -3605,7 +3741,7 @@ class Window(QMainWindow):
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
-            return phrase.text()
+            return plan.confirmation_phrase
         finally:
             if self.raw_confirmation_dialog is dialog:
                 self.raw_confirmation_dialog = None
@@ -4320,25 +4456,20 @@ class Window(QMainWindow):
         warning.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
         layout.addWidget(warning)
-        instruction = QLabel(
-            f"Type the exact plan phrase below:\n{plan.confirmation_phrase}"
-        )
+        instruction = QLabel("Are you sure you want to replace the contents of this selected drive?")
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
-        phrase = QLineEdit()
-        phrase.setObjectName("grubRescueConfirmationPhrase")
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        layout.addWidget(phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         start = buttons.addButton(
             "Write blank GRUB rescue media",
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         start.setObjectName("grubRescueWriteButton")
-        start.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: start.setEnabled(value == plan.confirmation_phrase)
-        )
+        start.setEnabled(True)
+        start.setText("Yes, erase and continue")
+        start.setAutoDefault(False)
+        start.setDefault(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         start.clicked.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -4351,7 +4482,7 @@ class Window(QMainWindow):
             self.set_busy(False)
             self.status.setText("GRUB rescue media is not active")
             return
-        entered_phrase = phrase.text()
+        entered_phrase = plan.confirmation_phrase
         self.progress.setValue(0)
         self.status.setText("Confirming the exact GRUB rescue target…")
 
@@ -4615,22 +4746,18 @@ class Window(QMainWindow):
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #ff8a80; font-weight: 650;")
         layout.addWidget(warning)
-        phrase_text = f"WRITE {device.path}"
-        instruction = QLabel(f"Type {phrase_text} to enable the write button.")
+        instruction = QLabel("Are you sure you want to erase the selected drive and write this image?")
         layout.addWidget(instruction)
-        phrase = QLineEdit()
-        phrase.setObjectName("uefiShellConfirmationPhrase")
-        phrase.setPlaceholderText(phrase_text)
-        layout.addWidget(phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         start = buttons.addButton(
             "Write UEFI Shell", QDialogButtonBox.ButtonRole.AcceptRole,
         )
         start.setObjectName("uefiShellWriteButton")
-        start.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: start.setEnabled(value == phrase_text)
-        )
+        start.setEnabled(True)
+        start.setText("Yes, erase and continue")
+        start.setAutoDefault(False)
+        start.setDefault(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         start.clicked.connect(confirmation.accept)
         buttons.rejected.connect(confirmation.reject)
         layout.addWidget(buttons)
@@ -5381,26 +5508,20 @@ class Window(QMainWindow):
         details.setMinimumHeight(310)
         layout.addWidget(details)
 
-        instruction = QLabel(
-            "Type the exact phrase below to authorize this one target:\n"
-            f"{plan.confirmation_phrase}"
-        )
+        instruction = QLabel("Are you sure you want to replace the contents of this selected drive?")
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
-        phrase = QLineEdit()
-        phrase.setObjectName("restoreConfirmationPhrase")
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        layout.addWidget(phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         start = buttons.addButton(
             "Overwrite and format",
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         start.setObjectName("restoreConfirmButton")
-        start.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: start.setEnabled(value == plan.confirmation_phrase)
-        )
+        start.setEnabled(True)
+        start.setText("Yes, erase and continue")
+        start.setAutoDefault(False)
+        start.setDefault(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         start.clicked.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -5409,7 +5530,7 @@ class Window(QMainWindow):
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
-            return phrase.text()
+            return plan.confirmation_phrase
         finally:
             if self.restore_confirmation_dialog is dialog:
                 self.restore_confirmation_dialog = None
@@ -5591,24 +5712,22 @@ class Window(QMainWindow):
             line = QLabel(text)
             line.setWordWrap(True)
             confirm_layout.addWidget(line)
-        phrase = QLineEdit()
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        confirm_layout.addWidget(phrase)
         confirm_buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         start_button = confirm_buttons.button(QDialogButtonBox.StandardButton.Ok)
         start_button.setText("Erase drive")
-        start_button.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: start_button.setEnabled(value == plan.confirmation_phrase)
-        )
+        start_button.setEnabled(True)
+        start_button.setText("Yes, erase and continue")
+        start_button.setAutoDefault(False)
+        start_button.setDefault(False)
+        confirm_buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         confirm_buttons.accepted.connect(confirm.accept)
         confirm_buttons.rejected.connect(confirm.reject)
         confirm_layout.addWidget(confirm_buttons)
         if confirm.exec() != QDialog.DialogCode.Accepted:
             return
-        authorization = phrase.text()
+        authorization = plan.confirmation_phrase
 
         self.eraser = EraseRunner()
         self.set_busy(True)
@@ -5811,26 +5930,20 @@ class Window(QMainWindow):
         details.setMinimumHeight(300)
         layout.addWidget(details)
 
-        instruction = QLabel(
-            "Type the exact phrase below to authorize this one target:\n"
-            f"{plan.confirmation_phrase}"
-        )
+        instruction = QLabel("Are you sure you want to replace the contents of this selected drive?")
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
-        phrase = QLineEdit()
-        phrase.setObjectName("fastZeroConfirmationPhrase")
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        layout.addWidget(phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         start = buttons.addButton(
             "Start Fast Zero",
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         start.setObjectName("fastZeroConfirmButton")
-        start.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: start.setEnabled(value == plan.confirmation_phrase)
-        )
+        start.setEnabled(True)
+        start.setText("Yes, erase and continue")
+        start.setAutoDefault(False)
+        start.setDefault(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         start.clicked.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -5839,7 +5952,7 @@ class Window(QMainWindow):
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
-            return phrase.text()
+            return plan.confirmation_phrase
         finally:
             if self.fast_zero_confirmation_dialog is dialog:
                 self.fast_zero_confirmation_dialog = None
@@ -6048,18 +6161,16 @@ class Window(QMainWindow):
             line = QLabel(text)
             line.setWordWrap(True)
             confirm_layout.addWidget(line)
-        phrase = QLineEdit()
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        confirm_layout.addWidget(phrase)
         confirm_buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         start_button = confirm_buttons.button(QDialogButtonBox.StandardButton.Ok)
         start_button.setText("Erase and test")
-        start_button.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: start_button.setEnabled(value == plan.confirmation_phrase)
-        )
+        start_button.setEnabled(True)
+        start_button.setText("Yes, erase and continue")
+        start_button.setAutoDefault(False)
+        start_button.setDefault(False)
+        confirm_buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         confirm_buttons.accepted.connect(confirm.accept)
         confirm_buttons.rejected.connect(confirm.reject)
         confirm_layout.addWidget(confirm_buttons)
@@ -6076,7 +6187,7 @@ class Window(QMainWindow):
             try:
                 assert self.media_runner is not None
                 result = self.media_runner.run(
-                    plan, phrase.text(), self.bridge.media_progress.emit
+                    plan, plan.confirmation_phrase, self.bridge.media_progress.emit
                 )
                 self.bridge.media_finished.emit(result)
             except MediaTestCancelled as error:
@@ -8022,31 +8133,23 @@ class Window(QMainWindow):
         )
         details.setMinimumHeight(260)
         layout.addWidget(details, 1)
-        phrase_label = QLabel(
-            "Type this exact phrase to authorize only the selected target:\n"
-            f"{plan.confirmation_phrase}"
-        )
+        phrase_label = QLabel("Are you sure you want to replace the contents of this selected drive?")
         phrase_label.setWordWrap(True)
         phrase_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(phrase_label)
-        phrase = QLineEdit()
-        phrase.setObjectName("windowsDualConfirmationPhrase")
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        layout.addWidget(phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         write_button = buttons.addButton(
             "Erase and write experimental media",
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         write_button.setObjectName("windowsDualWriteButton")
-        write_button.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: write_button.setEnabled(
-                value == plan.confirmation_phrase
-            )
-        )
+        write_button.setEnabled(True)
+        write_button.setText("Yes, erase and continue")
+        write_button.setAutoDefault(False)
+        write_button.setDefault(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         write_button.clicked.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -8071,7 +8174,7 @@ class Window(QMainWindow):
         try:
             confirmation = confirm_windows_device_write(
                 plan,
-                phrase.text(),
+                plan.confirmation_phrase,
                 cancel_check=prepared.runner._check_cancelled,
             )
         except WindowsDevicePlanError as error:
@@ -8276,30 +8379,22 @@ class Window(QMainWindow):
         )
         details.setMinimumHeight(390)
         layout.addWidget(details)
-        phrase_label = QLabel(
-            "Type this exact phrase to authorize the selected target:\n"
-            f"{plan.confirmation_phrase}"
-        )
+        phrase_label = QLabel("Are you sure you want to replace the contents of this selected drive?")
         phrase_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(phrase_label)
-        phrase = QLineEdit()
-        phrase.setObjectName("syslinuxConfirmationPhrase")
-        phrase.setPlaceholderText(plan.confirmation_phrase)
-        layout.addWidget(phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         write_button = buttons.addButton(
             "Erase and write",
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         write_button.setObjectName("syslinuxWriteButton")
-        write_button.setEnabled(False)
-        phrase.textChanged.connect(
-            lambda value: write_button.setEnabled(
-                value == plan.confirmation_phrase
-            )
-        )
+        write_button.setEnabled(True)
+        write_button.setText("Yes, erase and continue")
+        write_button.setAutoDefault(False)
+        write_button.setDefault(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         write_button.clicked.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -8315,7 +8410,7 @@ class Window(QMainWindow):
             self.status.setText("BIOS-compatible ISO write cancelled")
             return
         try:
-            prepared.workflow.confirm(phrase.text())
+            prepared.workflow.confirm(plan.confirmation_phrase)
         except SyslinuxWorkflowError as error:
             self.bridge.finished.emit(False, str(error))
             return
@@ -9654,7 +9749,7 @@ class Window(QMainWindow):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("Windows installation options")
-        dialog.resize(700, 650)
+        dialog.resize(*WINDOWS_OPTIONS_SIZE)
         layout = QVBoxLayout(dialog)
         notice = QLabel(
             "Setup options generate an auditable autounattend.xml profile. The "
@@ -10236,66 +10331,6 @@ class Window(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         dialog.exec()
 
-
-STYLE = """
-QWidget { color: #f5f6f8; font-size: 14px; }
-#root { background: #111318; color: #f5f6f8; }
-QScrollArea#mainWorkflowScrollArea { background: transparent; border: none; }
-QWidget#workflowContent, QWidget#workflowFooter { background: #111318; }
-QScrollBar:vertical { background: #111318; width: 10px; margin: 0; }
-QScrollBar:horizontal { background: #111318; height: 10px; margin: 0; }
-QScrollBar::handle { background: #3a3f4b; border-radius: 5px; min-height: 28px; min-width: 28px; }
-QScrollBar::handle:hover { background: #505664; }
-QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-QLabel#eyebrow { color: #ff9f43; font-size: 13px; font-weight: 800; letter-spacing: 3px; }
-QLabel#title { font-size: 34px; font-weight: 750; }
-QLabel#subtitle, QLabel#muted { color: #a9adb7; font-size: 14px; }
-QLabel#cardTitle { font-size: 17px; font-weight: 650; }
-QLabel#status { color: #c8cbd2; font-size: 13px; }
-QFrame#card { background: #1b1e25; border: 1px solid #2d313b; border-radius: 14px; padding: 13px; }
-QPushButton, QComboBox, QLineEdit, QPlainTextEdit { background: #272b34; color: #f5f6f8; border: 1px solid #3a3f4b; border-radius: 8px; padding: 9px 14px; }
-QFrame#card QPushButton, QFrame#card QComboBox { color: #f5f6f8; padding: 5px 10px; }
-QPushButton:hover { background: #323743; }
-QPushButton#primary { background: #f28c28; color: #16120d; border: none; font-weight: 750; padding: 11px 24px; }
-QPushButton#primary:hover { background: #ffa347; }
-QPushButton:disabled { color: #70747d; background: #20232a; }
-QFrame#card QPushButton:disabled, QFrame#card QComboBox:disabled { color: #a9adb7; border-color: #343945; }
-QPushButton#primary:disabled { color: #777b83; background: #292c32; }
-QProgressBar { border: none; background: #292d35; border-radius: 4px; height: 8px; }
-QProgressBar::chunk { background: #f28c28; border-radius: 4px; }
-QCheckBox { color: #d9dbe0; spacing: 9px; }
-"""
-
-LIGHT_STYLE = """
-QWidget { color: #20242b; font-size: 14px; }
-#root { background: #f5f6f8; color: #20242b; }
-QScrollArea#mainWorkflowScrollArea { background: transparent; border: none; }
-QWidget#workflowContent, QWidget#workflowFooter { background: #f5f6f8; }
-QScrollBar:vertical { background: #f5f6f8; width: 10px; margin: 0; }
-QScrollBar:horizontal { background: #f5f6f8; height: 10px; margin: 0; }
-QScrollBar::handle { background: #c7ccd5; border-radius: 5px; min-height: 28px; min-width: 28px; }
-QScrollBar::handle:hover { background: #aeb4bf; }
-QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-QLabel#eyebrow { color: #bd5f08; font-size: 13px; font-weight: 800; letter-spacing: 3px; }
-QLabel#title { font-size: 34px; font-weight: 750; }
-QLabel#subtitle, QLabel#muted { color: #626975; font-size: 14px; }
-QLabel#cardTitle { font-size: 17px; font-weight: 650; }
-QLabel#status { color: #515864; font-size: 13px; }
-QFrame#card { background: #ffffff; border: 1px solid #d8dce3; border-radius: 14px; padding: 13px; }
-QPushButton, QComboBox, QLineEdit, QPlainTextEdit { background: #ffffff; color: #20242b; border: 1px solid #c7ccd5; border-radius: 8px; padding: 9px 14px; }
-QFrame#card QPushButton, QFrame#card QComboBox { color: #20242b; padding: 5px 10px; }
-QPushButton:hover { background: #eef0f4; }
-QPushButton#primary { background: #e97f16; color: #1d1208; border: none; font-weight: 750; padding: 11px 24px; }
-QPushButton#primary:hover { background: #f28c28; }
-QPushButton:disabled { color: #969ca6; background: #eceef2; }
-QFrame#card QPushButton:disabled, QFrame#card QComboBox:disabled { color: #9298a2; border-color: #d8dce3; }
-QPushButton#primary:disabled { color: #9298a2; background: #dfe2e7; }
-QProgressBar { border: none; background: #dfe2e7; border-radius: 4px; height: 8px; }
-QProgressBar::chunk { background: #e97f16; border-radius: 4px; }
-QCheckBox { color: #303640; spacing: 9px; }
-"""
 
 THEMES = {"dark": STYLE, "light": LIGHT_STYLE}
 

@@ -1,0 +1,163 @@
+{
+  "platforms": {
+    "macos-arm64": {
+      "7z": {
+        "file": "7zz",
+        "sha256": "eba078f4e4c9dfa15594cd01abd4410764a0df5679c0b4d5fee1280cf2b20bf2"
+      },
+      "debugfs": {
+        "file": "debugfs",
+        "sha256": "7ea9f613a5bae1fd789672715e73ede1e887e4dccfc51e617e81c45472520d3e"
+      },
+      "e2fsck": {
+        "file": "e2fsck",
+        "sha256": "3c968ae54ddc0bd1d088dc2d33041038c4f7bf07e796c08efdffe1ac82c7bf86"
+      },
+      "fls": {
+        "file": "fls",
+        "sha256": "dd5c216916610d31e3ede2d55a5c345151937c00be5c5c61e2ed601a1691b320"
+      },
+      "fsstat": {
+        "file": "fsstat",
+        "sha256": "a73f64decdeee43b3a2ff22bc8e11032571742137fc9066a563f9253f7027940"
+      },
+      "gpgv": {
+        "file": "gpgv",
+        "sha256": "7baa5d410dc873cd3f66f309de30a684fda49fea26dc41ec5cc6c4effb7b54b2"
+      },
+      "icat": {
+        "file": "icat",
+        "sha256": "72c2780fb22e72803a1d3bc65fb2773e16a82d1ecdf7bb9ad4fb53b30f7c66db"
+      },
+      "mke2fs": {
+        "file": "mke2fs",
+        "sha256": "3c87a5105fed7febd840a5b86703eddc618724f0d48c8dd7af5945a47af09f40"
+      },
+      "mkntfs": {
+        "file": "mkntfs",
+        "sha256": "fcabb32ec3c9992c4b409815229f4d1ab5407f93bcfd0833fa34621c0c89e460"
+      },
+      "mkudffs": {
+        "file": "mkudffs",
+        "sha256": "62d16608ad5fb4c3bad731f3182a4e367f54ac591ec37fa3e065ec0dd30fd5b7"
+      },
+      "ntfs-tree": {
+        "file": "ntfs-tree",
+        "sha256": "fdd722d3789ca64261e724689ce111bf9dfdd4afd83d578e76d98f8debff892e"
+      },
+      "ntfscat": {
+        "file": "ntfscat",
+        "sha256": "e85116ccdd89ed25aada4e12928eeb221c98c6e845d45ac3b72ab1eae00a541c"
+      },
+      "ntfscp": {
+        "file": "ntfscp",
+        "sha256": "ed6c893046656a0ee0a3e4b6d35cafed0d3acb3486d92cd6c043217e8e172780"
+      },
+      "qemu-img": {
+        "file": "qemu-img",
+        "sha256": "098219d64ff70d377d6576a42c020e163b955c8c4282e7b13f4595c4dbefed06"
+      },
+      "qemu-io": {
+        "file": "qemu-io",
+        "sha256": "ea10d904dddd1dd4f6a11e4844f825881c3b1edbc9834367371a91ffa2491073"
+      },
+      "wimlib-imagex": {
+        "file": "wimlib-imagex",
+        "sha256": "deee6baa3cdde98ecb750d68e7f9bae61cd2110b1a15f1944e627f5cfac24028"
+      }
+    },
+    "windows-arm64": {
+      "7z": {
+        "file": "7z.exe",
+        "sha256": "68dc77e7c597644b9f69ae954b3f057bf94ae172472996be438a1ee63ac9cd98"
+      },
+      "gpgv": {
+        "file": "gpgv.exe",
+        "sha256": "c59044444f73b04fc2f2774da864c626d622be3083b2b56fc6d79021d94ec860"
+      },
+      "mke2fs": {
+        "file": "mke2fs.exe",
+        "sha256": "49d9bdfa9d17698dd61b7e28dbc7d393f79add5c99ab83441b64b4eba9cbf9a1"
+      },
+      "mkntfs": {
+        "file": "mkntfs.exe",
+        "sha256": "e414f2960519c41f2852d88d70c8f0fddbb050f0447ecddf29ed1494639fabf3"
+      },
+      "mkudffs": {
+        "file": "mkudffs.exe",
+        "sha256": "be233b23dab85a6d6da102acd40c6fdff17b4938287be1910e737e483b4acd5c"
+      },
+      "ntfs-tree": {
+        "file": "ntfs-tree.exe",
+        "sha256": "d17198f253e35f9576b195b8621c621ae9798926bcae485e8922e471b720a5ef"
+      },
+      "ntfscat": {
+        "file": "ntfscat.exe",
+        "sha256": "c7f38a748d9423987b379db80d3ee30cc199ef0ad09084a4fd32584d7dfdcb73"
+      },
+      "ntfscp": {
+        "file": "ntfscp.exe",
+        "sha256": "9b450e57fdfcc95ceff8cd76f3c70bb857b367d0657b86b6665738c892dca59e"
+      },
+      "qemu-img": {
+        "file": "qemu-img.exe",
+        "sha256": "b3bfc2a33324c90d71d822a7afbfd430380ae19d1f00d977720ad995cf89c820"
+      },
+      "qemu-io": {
+        "file": "qemu-io.exe",
+        "sha256": "f865213e459118ddb0e6d6bb1678180b189f728ea39ea9ca769b5cddaa4c2ef3"
+      },
+      "wimlib-imagex": {
+        "file": "wimlib-imagex.exe",
+        "sha256": "b5cac294087bc8b26bb1a984543d17f58f4345c8c4901b2428a93bef3d4f1ba3"
+      }
+    },
+    "windows-x86-64": {
+      "7z": {
+        "file": "7z.exe",
+        "sha256": "95fff19b73eff77c87c0d7bd32822e43fb90dd2932459f962eb532d8dfb6ba53"
+      },
+      "gpgv": {
+        "file": "gpgv.exe",
+        "sha256": "77864ece05ddb678e3f5a3305390670d33d06e4863835e4e68db46d0cc707600"
+      },
+      "mke2fs": {
+        "file": "mke2fs.exe",
+        "sha256": "54092ffcc755d332ff3db2cbc7a95795fdd34807750e8a90de1d296ac1a66278"
+      },
+      "mkntfs": {
+        "file": "mkntfs.exe",
+        "sha256": "348722cbbf836e4427560127653b22e06e4af037573f4f7fb4434cd15fbb8022"
+      },
+      "mkudffs": {
+        "file": "mkudffs.exe",
+        "sha256": "d0a537055b73ecde37c3b22155e4b94e4b1ef7fbb5f282f3b60a8d7c739ab941"
+      },
+      "ntfs-tree": {
+        "file": "ntfs-tree.exe",
+        "sha256": "75ef76a7f05b8be7c51e2617a7a568634fc6c88c66f5c7f1c7c6168e6ce168a1"
+      },
+      "ntfscat": {
+        "file": "ntfscat.exe",
+        "sha256": "40cfd941d3a98f792d548828b8f1b2da899811455ef609add712443c3fb935bb"
+      },
+      "ntfscp": {
+        "file": "ntfscp.exe",
+        "sha256": "53b261eaa7ebb9b72934ee6fd4d280740eca08a47ef8005047dcf3fc2c2024aa"
+      },
+      "qemu-img": {
+        "file": "qemu-img.exe",
+        "sha256": "9f5f100b06c018df1d545a155701bfeb883108249906daa1d20bc57827b66567"
+      },
+      "qemu-io": {
+        "file": "qemu-io.exe",
+        "sha256": "e2b3680564955b2105d7f38921c844012a0dbf5e4af8039c3d7b81ca324b3cae"
+      },
+      "wimlib-imagex": {
+        "file": "wimlib-imagex.exe",
+        "sha256": "7207069f873515992b7cbcbcd5d6105cd4928374a32a50c0352fcff73b60bb1c"
+      }
+    }
+  },
+  "version": 1
+}

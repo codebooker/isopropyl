@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread,regular_status
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import calendar
@@ -13,6 +15,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -595,7 +598,7 @@ def _inspect_embedded_uefi_payloads(
             )
             parsed = inspect_pe_bytes(
                 blob,
-                authenticode_timeout=min(remaining, 10.0),
+                authenticode_timeout=min(remaining, 8.0),
                 authenticode_cancel_check=cancel_check,
             )
         except (FatImageError, OSError, TimeoutError, ValueError) as error:
@@ -695,14 +698,19 @@ def parse_7z_listing(
 
 
 def _trusted_7z() -> str | None:
+    if sys.platform!='linux':
+        from .native_archive import seven_zip
+        return seven_zip()
     executable = shutil.which("7z", path=_TRUSTED_7Z_PATH)
     if not executable:
         return None
     normalized = os.path.normpath(executable)
     if (
+        sys.platform=='linux' and (
         not os.path.isabs(normalized)
         or os.path.dirname(normalized) not in _TRUSTED_7Z_DIRECTORIES
         or os.path.basename(normalized) != "7z"
+        )
     ):
         return None
     return normalized
@@ -716,6 +724,9 @@ def _scan_image_contents_once(
     namespace: SevenZipNamespace | None,
     cancel_check: Callable[[], None] | None,
 ) -> tuple[list[ImageMember], str]:
+    if sys.platform!='linux':
+        from .native_archive import catalog
+        return catalog(path,image_fd,namespace,cancel_check)
     if not executable:
         return [], "failed"
     source = str(path) if image_fd is None else f"/proc/self/fd/{image_fd}"
@@ -827,7 +838,7 @@ def scan_image_catalog(
     if not executable:
         return ImageCatalogScan((), False, None)
     normalized = os.path.normpath(executable)
-    if (
+    if sys.platform=='linux' and (
         not os.path.isabs(normalized)
         or os.path.dirname(normalized) not in _TRUSTED_7Z_DIRECTORIES
         or os.path.basename(normalized) != "7z"
@@ -968,8 +979,8 @@ def _read_partition_evidence(
     ) != expected_identity:
         raise OSError("The selected image changed before it could be inspected")
     size = status.st_size
-    header = os.pread(descriptor_fd, 4096, 0)
-    descriptor = os.pread(descriptor_fd, 2048, 16 * 2048)
+    header = pread(descriptor_fd, 4096, 0)
+    descriptor = pread(descriptor_fd, 2048, 16 * 2048)
     partition_tables = inspect_partition_tables_fd(
         descriptor_fd, expected_identity=expected_identity,
     )
@@ -998,7 +1009,7 @@ def inspect_image(
             )
 
     check_inspection()
-    status = path.stat()
+    status = regular_status(path)
     if not stat.S_ISREG(status.st_mode):
         raise OSError("The selected image is not a regular file")
     observed_identity = (
@@ -1047,7 +1058,7 @@ def inspect_image(
                         "The virtual disk exceeds ISOpropyl's expanded-image limit"
                     )
                 check_inspection()
-                final = path.stat()
+                final = regular_status(path)
                 final_identity = (
                     final.st_dev, final.st_ino, final.st_size,
                     final.st_mtime_ns, final.st_ctime_ns,
@@ -1085,7 +1096,7 @@ def inspect_image(
             virtual.identity.size, virtual.identity.modified_ns,
             virtual.identity.changed_ns,
         )
-        final = path.stat()
+        final = regular_status(path)
         final_identity = (
             final.st_dev, final.st_ino, final.st_size,
             final.st_mtime_ns, final.st_ctime_ns,
@@ -1370,7 +1381,7 @@ def inspect_image(
         squashfs=squashfs,
     )
     check_inspection()
-    final = path.stat()
+    final = regular_status(path)
     final_identity = (
         final.st_dev, final.st_ino, final.st_size,
         final.st_mtime_ns, final.st_ctime_ns,
@@ -1402,7 +1413,7 @@ def calculate_checksums(
     check_cancelled()
     # O_NONBLOCK prevents a pathname race to a FIFO from hanging before fstat
     # can reject it. It does not change ordinary regular-file reads on Linux.
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags = os.O_RDONLY | getattr(os,"O_CLOEXEC",0) | getattr(os,"O_NOFOLLOW",0) | getattr(os,"O_NONBLOCK",0) | getattr(os,"O_BINARY",0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -1444,7 +1455,7 @@ def calculate_checksums(
 
         if done != total:
             raise OSError("The image changed while checksums were being calculated")
-        final = os.lstat(path)
+        final = regular_status(path) if sys.platform=="win32" else os.lstat(path)
         if not stat.S_ISREG(final.st_mode) or identity(final) != opened_identity:
             raise OSError("The selected image changed while checksums were being calculated")
         check_cancelled()

@@ -1,0 +1,23 @@
+[
+  {
+    "file": "bsd-max10.Z",
+    "sha256": "2d28d90f652986a0e63e9145d01ff4bdfa0384719ce32c7d415a7005f6d3103d",
+    "size": 699000,
+    "clears": 16,
+    "width": 10
+  },
+  {
+    "file": "bsd-max12.Z",
+    "sha256": "2d28d90f652986a0e63e9145d01ff4bdfa0384719ce32c7d415a7005f6d3103d",
+    "size": 699000,
+    "clears": 16,
+    "width": 12
+  },
+  {
+    "file": "bsd-max16.Z",
+    "sha256": "2d28d90f652986a0e63e9145d01ff4bdfa0384719ce32c7d415a7005f6d3103d",
+    "size": 699000,
+    "clears": 3,
+    "width": 16
+  }
+]

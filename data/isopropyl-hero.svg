@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
   <title id="title">ISOpropyl — Bootable media, without the guesswork.</title>
-  <desc id="desc">Project banner for the ISOpropyl Linux USB image writer.</desc>
+  <desc id="desc">ISOpropyl: bootable USB media, guarded writes, and end-to-end verification.</desc>
   <defs>
     <linearGradient id="hero-bg" x1="60" y1="20" x2="1130" y2="350" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#1B2433"/>
-      <stop offset="0.58" stop-color="#111720"/>
-      <stop offset="1" stop-color="#0B0F15"/>
+      <stop stop-color="#1C1E23"/>
+      <stop offset="0.58" stop-color="#14161A"/>
+      <stop offset="1" stop-color="#0C0D10"/>
     </linearGradient>
     <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(225 168) rotate(25) scale(310 245)" gradientUnits="userSpaceOnUse">
       <stop stop-color="#F6922E" stop-opacity="0.24"/>
@@ -35,14 +35,13 @@
     <circle cx="105" cy="121" r="52" fill="none" stroke="#AAB5C5" stroke-opacity="0.5" stroke-width="2.5"/>
     <circle cx="105" cy="121" r="19" fill="#161D28"/>
     <circle cx="105" cy="121" r="7.5" fill="#F6922E"/>
-    <path d="M58 149C70 178 98 196 132 198C151 199 168 195 182 187" fill="none" stroke="#F6922E" stroke-width="11" stroke-linecap="round"/>
     <path d="M182 79C182 79 145 126 145 160C145 188 161 207 182 207C204 207 220 188 220 160C220 126 182 79 182 79Z" fill="url(#amber)" stroke="#FFD291" stroke-width="3.5" stroke-linejoin="round"/>
     <path d="M174 111C165 125 158 143 158 157C158 166 160 174 165 180" fill="none" stroke="#FFF4DF" stroke-opacity="0.78" stroke-width="6" stroke-linecap="round"/>
   </g>
 
   <text x="425" y="137" fill="#F8FAFD" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="76" font-weight="700" letter-spacing="-2">ISO<tspan fill="#F6922E">propyl</tspan></text>
   <text x="429" y="198" fill="#D0D7E2" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="27" font-weight="500">Bootable media, without the guesswork.</text>
-  <text x="429" y="244" fill="#929EAF" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="18">Linux-native. Guarded device writes. Verified end to end.</text>
+  <text x="429" y="244" fill="#929EAF" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="18">Bootable USB. Guarded writes. Open source.</text>
 
   <g transform="translate(429 278)" font-family="Noto Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="650" letter-spacing="1.2">
     <rect width="70" height="32" rx="16" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.1"/>

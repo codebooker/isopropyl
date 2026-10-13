@@ -11,6 +11,11 @@ from isopropyl.devices import (
 
 
 class DeviceTests(unittest.TestCase):
+    def setUp(self):
+        platform_patch = patch("isopropyl.devices.sys.platform", "linux")
+        platform_patch.start()
+        self.addCleanup(platform_patch.stop)
+
     def test_filters_fixed_loop_and_root_disk(self):
         payload = {"blockdevices": [
             {"path": "/dev/nvme0n1", "type": "disk", "size": 1000, "rm": False,
@@ -175,7 +180,8 @@ class DeviceTests(unittest.TestCase):
 
     @patch("isopropyl.devices.os.path.exists", side_effect=lambda path: path == "/media/usb")
     @patch("isopropyl.devices.os.stat")
-    def test_detects_prospective_backup_on_source_drive(self, stat, _exists):
+    @patch("isopropyl.devices.os.path.abspath", side_effect=lambda path: path)
+    def test_detects_prospective_backup_on_source_drive(self, _absolute, stat, _exists):
         values = {
             "/media/usb": (2049, 0),
             "/dev/sdb": (0, 2048),

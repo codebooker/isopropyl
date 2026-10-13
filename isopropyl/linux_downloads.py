@@ -28,6 +28,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,10 +54,10 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 FINGERPRINT_RE = re.compile(r"[0-9A-F]{40}\Z")
 SAFE_ID_RE = re.compile(r"[a-z0-9][a-z0-9.-]{0,127}\Z")
 SAFE_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}\Z")
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
 _DIRECTORY_FLAGS |= getattr(os, "O_NOFOLLOW", 0)
-_FILE_FLAGS = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _TRUSTED_PATH = "/usr/bin:/bin"
 _KEYRING_SHA256 = "192b3782ba2e00e05b6521371fbe67847efad3fdd1cfb87621882d833c8703fa"
 _KEYRING_B64 = """
@@ -428,12 +429,17 @@ def _verify_signed_manifest(
     keyring = base64.b64decode(b"".join(_KEYRING_B64.encode("ascii").split()), validate=True)
     if not hmac.compare_digest(hashlib.sha256(keyring).hexdigest(), _KEYRING_SHA256):
         raise LinuxDownloadError("Bundled Ubuntu signing key failed its integrity check")
+    if sys.platform != 'linux':
+        from .native_downloads import verify_native_manifest
+        verify_native_manifest(manifest,signature,keyring,fingerprint,deadline,
+                               cancel_event,cancel_check,_LINUX_DOWNLOAD_POLICY)
+        return
     tool_path = _gpgv_path()
     tool_fd = -1
     with tempfile.TemporaryDirectory(prefix="isopropyl-linux-signature-") as directory:
         root = Path(directory)
         for name, value in (("keyring.gpg", keyring), ("SHA256SUMS", manifest), ("SHA256SUMS.gpg", signature)):
-            descriptor = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+            descriptor = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
             try:
                 view = memoryview(value)
                 while view:
@@ -452,8 +458,8 @@ def _verify_signed_manifest(
                 str(root / "keyring.gpg"), str(root / "SHA256SUMS.gpg"),
                 str(root / "SHA256SUMS"),
             ]
-            output_fd = os.open(root / "gpgv.status", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
-            error_fd = os.open(root / "gpgv.stderr", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+            output_fd = os.open(root / "gpgv.status", os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+            error_fd = os.open(root / "gpgv.stderr", os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
             try:
                 process = subprocess.Popen(
                     command, stdin=subprocess.DEVNULL, stdout=output_fd,

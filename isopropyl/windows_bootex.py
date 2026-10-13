@@ -28,7 +28,7 @@ claimed here.
 import hashlib
 import hmac
 import json
-import os
+from .portable_fs import os
 import re
 import secrets
 import stat
@@ -39,8 +39,8 @@ from pathlib import Path, PurePosixPath
 
 from .authenticode import AuthenticodeIntegrityState, AuthenticodeResult
 from .uefi import PeFormatError, SignatureTableState, inspect_pe_bytes
+from .windows import WindowsBootExOptions as WindowsBootExOptions
 from .windows_downloads import available_windows_images
-
 
 MIB = 1024 * 1024
 MAX_EXTRACTED_FILES = 128
@@ -119,24 +119,6 @@ class BootExProfile:
     fallback_path: str
     trust_basis: str = TRUST_BASIS
     trust_scope: str = TRUST_SCOPE
-
-
-@dataclass(frozen=True)
-class WindowsBootExOptions:
-    """User-facing, default-off authorization for the BootEx transform."""
-
-    enabled: bool = False
-    acknowledge_firmware_compatibility: bool = False
-
-    def __post_init__(self) -> None:
-        if type(self.enabled) is not bool or type(
-            self.acknowledge_firmware_compatibility
-        ) is not bool:
-            raise ValueError("Windows BootEx options must be boolean")
-        if self.acknowledge_firmware_compatibility and not self.enabled:
-            raise ValueError(
-                "Windows BootEx firmware acknowledgment requires the feature"
-            )
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """Checksum-pinned official FreeDOS USB-image downloads.
@@ -19,6 +21,7 @@ import os
 import re
 import stat
 import struct
+import sys
 import threading
 import time
 import urllib.request
@@ -44,10 +47,10 @@ SAFE_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 CRC32_RE = re.compile(r"[0-9a-f]{8}\Z")
 _STAGE_RE = re.compile(r"\.isopropyl-freedos-[0-9a-f]{32}\Z")
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
 _DIRECTORY_FLAGS |= getattr(os, "O_NOFOLLOW", 0)
-_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-_OUTPUT_FLAGS = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+_OUTPUT_FLAGS = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
 class FreeDosDownloadCatalogError(ValueError):
@@ -504,7 +507,7 @@ def _hash_descriptor(
         _check_cancel(cancel_event, cancel_check)
         _deadline_check(deadline)
         try:
-            block = os.pread(descriptor, min(READ_SIZE, size - offset), offset)
+            block = pread(descriptor, min(READ_SIZE, size - offset), offset)
         except OSError as error:
             raise FreeDosDownloadError(
                 f"FreeDOS verification read failed: {_verified.safe_error_detail(error)}"
@@ -634,8 +637,8 @@ def _extract_disk_member(
 
 def _validate_disk_structure(descriptor: int, release: FreeDosImageRelease) -> None:
     try:
-        mbr = os.pread(descriptor, 512, 0)
-        boot_sector = os.pread(descriptor, 512, release.partition_start_lba * 512)
+        mbr = pread(descriptor, 512, 0)
+        boot_sector = pread(descriptor, 512, release.partition_start_lba * 512)
     except OSError as error:
         raise FreeDosDownloadError("FreeDOS disk structure could not be read") from error
     if len(mbr) != 512 or mbr[510:512] != b"\x55\xaa":
@@ -898,6 +901,10 @@ class FreeDosUsbDownloader:
             raise ValueError("FreeDOS destination must be absolute")
         if destination.name != release.image_filename:
             raise ValueError("FreeDOS destination must retain the exact image filename")
+        if sys.platform in {'darwin','win32'}:
+            from .native_downloads import download_freedos
+            return download_freedos(release,destination,progress,cancel_event=self._cancel_event,
+                cancel_check=cancel_check,overall_timeout=overall_timeout,opener=opener)
 
         deadline = time.monotonic() + float(overall_timeout)
         parent_fd = stage_fd = archive_fd = output_fd = -1

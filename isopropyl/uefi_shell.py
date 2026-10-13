@@ -11,7 +11,7 @@ planner and the application's destructive-action confirmation before use.
 
 import hashlib
 import hmac
-import os
+from .portable_fs import os
 import stat
 import threading
 from collections.abc import Iterable

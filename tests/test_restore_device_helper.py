@@ -459,7 +459,7 @@ os._exit(0)
             script = (
                 "import os,time; "
                 "child=os.fork(); "
-                "open(" + repr(evidence.name) + ",'w').write(str(child)); "
+                "open(" + repr(evidence.name) + ",'w').write(str(child)) if child else None; "
                 "time.sleep(30)"
             )
             with (

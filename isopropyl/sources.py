@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .portable_io import pread
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import bz2
@@ -12,6 +14,7 @@ import select
 import shutil
 import stat
 import subprocess
+import sys
 import weakref
 import zipfile
 from collections.abc import Callable, Iterator
@@ -142,7 +145,7 @@ class _DescriptorReader(io.RawIOBase):
         view = memoryview(buffer).cast("B")
         if self._cancel_check is not None:
             self._cancel_check()
-        data = os.pread(self._descriptor, len(view), self._position)
+        data = pread(self._descriptor, len(view), self._position)
         if self._unchanged_check is not None:
             self._unchanged_check()
         if self._cancel_check is not None:
@@ -218,6 +221,7 @@ class ImageSource:
         self.compression = self._detect_compression()
         flags = (
             os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_NONBLOCK", 0)
@@ -354,7 +358,7 @@ class ImageSource:
         size = os.fstat(descriptor).st_size
         tail_size = min(size, 22 + 65535)
         tail_offset = size - tail_size
-        tail = os.pread(descriptor, tail_size, tail_offset)
+        tail = pread(descriptor, tail_size, tail_offset)
         if cancel_check is not None:
             cancel_check()
         signature = b"PK\x05\x06"
@@ -389,7 +393,7 @@ class ImageSource:
         )
         locator_offset = eocd_offset - 20
         locator = (
-            os.pread(descriptor, 20, locator_offset)
+            pread(descriptor, 20, locator_offset)
             if locator_offset >= 0 else b""
         )
         has_zip64_locator = len(locator) == 20 and locator[:4] == b"PK\x06\x07"
@@ -407,7 +411,7 @@ class ImageSource:
             record_offset = locator_offset - 56
             if record_offset < 0 or relative_zip64_offset > record_offset:
                 raise ImageSourceError("The ZIP64 directory locator is invalid")
-            record = os.pread(descriptor, 56, relative_zip64_offset)
+            record = pread(descriptor, 56, relative_zip64_offset)
             record_location = relative_zip64_offset
             extensible_size = record_offset - relative_zip64_offset
             if (
@@ -416,7 +420,7 @@ class ImageSource:
             ):
                 # Self-extracting archives express the locator relative to the
                 # ZIP payload rather than to prepended executable bytes.
-                record = os.pread(descriptor, 56, record_offset)
+                record = pread(descriptor, 56, record_offset)
                 record_location = record_offset
                 extensible_size = 0
             if len(record) != 56 or record[:4] != b"PK\x06\x06":
@@ -458,7 +462,7 @@ class ImageSource:
             or directory_start + directory_size != directory_end
         ):
             raise ImageSourceError("The ZIP central directory lies outside the file")
-        directory = os.pread(descriptor, directory_size, directory_start)
+        directory = pread(descriptor, directory_size, directory_start)
         if cancel_check is not None:
             cancel_check()
         if len(directory) != directory_size:
@@ -785,6 +789,12 @@ class ImageSource:
                 yield stream
             return
         if self.compression == "compress-z":
+            if sys.platform=='win32':
+                from .compress_z import CompressReader
+                with self._open_bound_stream(cancel_check=cancel_check) as compressed:
+                    with io.BufferedReader(CompressReader(compressed,cancel_check)) as stream:
+                        yield stream
+                return
             with self._open_external_decoder(
                 "gzip", ("--decompress", "--stdout", "--quiet", "--"),
                 cancel_check=cancel_check,
@@ -811,7 +821,7 @@ class ImageSource:
             )
         self._ensure_unchanged()
         descriptor = self._require_descriptor()
-        descriptor_path = f"/proc/self/fd/{descriptor}"
+        descriptor_path = f"{'/dev/fd' if sys.platform == 'darwin' else '/proc/self/fd'}/{descriptor}"
         try:
             if _bound_identity(os.stat(descriptor_path)) != self._descriptor_identity:
                 raise OSError("descriptor identity mismatch")

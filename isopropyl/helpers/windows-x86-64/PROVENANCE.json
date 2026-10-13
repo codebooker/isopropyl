@@ -1,0 +1,173 @@
+{
+  "sources": {
+    "e2fsprogs": {
+      "url": "https://github.com/tytso/e2fsprogs/archive/da631e117dcf8797bfda0f48bdaa05ac0fbcf7af.tar.gz",
+      "sha256": "86360777b8e0832f3fcbfc11e333a7a0e9df15ca3b67a8072fcb93d97a2b8ab9",
+      "file": "e2fsprogs.tar.gz"
+    },
+    "ntfs-3g": {
+      "url": "https://github.com/tuxera/ntfs-3g/archive/7f0f841fc52cf719106c5c93bafe465004e36816.tar.gz",
+      "sha256": "ef4c631d943667885347047aaedf48443c96bf4979c1cf2576d94ef65ed90f46",
+      "file": "ntfs-3g.tar.gz"
+    },
+    "llvm-mingw": {
+      "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-ubuntu-22.04-aarch64.tar.xz",
+      "sha256": "e77c4acfa44184f6b0c52b814d724ad63b2ecebb3c3f6f842c0846e717cbd23c",
+      "file": "llvm-mingw.tar.xz"
+    },
+    "wimlib": {
+      "url": "https://github.com/ebiggers/wimlib/archive/cd5e231c348c255ae5088873b5a66ee0eb96fa07.tar.gz",
+      "sha256": "176157527d5f85fb0c61014b7ab3309018b9e75ac370808ff783e3acfe4c667f",
+      "file": "wimlib.tar.gz"
+    },
+    "udftools": {
+      "url": "https://github.com/pali/udftools/archive/refs/tags/2.3.tar.gz",
+      "sha256": "095e1c8b947849f5f8a1cade23dd3375532bda305a184eb022df96e43c4d6f7e",
+      "file": "udftools.tar.gz"
+    },
+    "7zip": {
+      "url": "https://github.com/ip7z/7zip/releases/download/26.04/7z2604-src.tar.xz",
+      "sha256": "9691944c0fe0d01bb49373a704fb983fd33bc98b1738695179dfbf99ac1734f6",
+      "file": "7zip.tar.xz"
+    },
+    "7zip-windows-x64": {
+      "url": "https://www.7-zip.org/a/7z2604-x64.exe",
+      "sha256": "d54bf805f9f3704d1e8db2fa3498ae7ef2df0312b40b558e7c71c734430a665d",
+      "file": "7zip-x64.exe"
+    },
+    "gnupg": {
+      "url": "https://gnupg.org/ftp/gcrypt/gnupg/gnupg-2.5.24.tar.bz2",
+      "sha256": "bf149d01a2b9fcc0e4589b8ae8697d3d5c557ea48ed95a3fa55dd3b1187e6039",
+      "file": "gnupg-2.5.24.tar.bz2"
+    },
+    "libgpg-error": {
+      "url": "https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-1.61.tar.bz2",
+      "sha256": "7a85413f2bc354f4f8aa832b718af122e48965e9e0eb9012ee659c13c6385c93",
+      "file": "libgpg-error-1.61.tar.bz2"
+    },
+    "libgcrypt": {
+      "url": "https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.12.4.tar.bz2",
+      "sha256": "d77f68f48879510e79a2f65977ccc68981781ea0923e5bdffac2a193ea3d660e",
+      "file": "libgcrypt-1.12.4.tar.bz2"
+    },
+    "libassuan": {
+      "url": "https://gnupg.org/ftp/gcrypt/libassuan/libassuan-3.0.2.tar.bz2",
+      "sha256": "d2931cdad266e633510f9970e1a2f346055e351bb19f9b78912475b8074c36f6",
+      "file": "libassuan-3.0.2.tar.bz2"
+    },
+    "libksba": {
+      "url": "https://gnupg.org/ftp/gcrypt/libksba/libksba-1.6.8.tar.bz2",
+      "sha256": "0f4510f1c7a679c3545990a31479f391ad45d84e039176309d42f80cf41743f5",
+      "file": "libksba-1.6.8.tar.bz2"
+    },
+    "npth": {
+      "url": "https://gnupg.org/ftp/gcrypt/npth/npth-1.8.tar.bz2",
+      "sha256": "8bd24b4f23a3065d6e5b26e98aba9ce783ea4fd781069c1b35d149694e90ca3e",
+      "file": "npth-1.8.tar.bz2"
+    },
+    "qemu": {
+      "url": "https://download.qemu.org/qemu-11.1.2.tar.xz",
+      "sha256": "731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016",
+      "file": "qemu-source.tar.xz"
+    },
+    "qemu-glib": {
+      "url": "https://download.gnome.org/sources/glib/2.90/glib-2.90.1.tar.xz",
+      "sha256": "93c941aa17d5eb1d53fe838365f29a8b4e539c222a256d974ec8f30fc413e396",
+      "file": "qemu-glib.tar.xz"
+    },
+    "qemu-pcre2": {
+      "url": "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.bz2",
+      "sha256": "53c156e1ba416a20da8e65395daa132da0d80e76910424caca3fcdae7831d384",
+      "file": "qemu-pcre2.tar.bz2"
+    },
+    "qemu-zlib": {
+      "url": "https://zlib.net/zlib-1.3.2.tar.gz",
+      "sha256": "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16",
+      "file": "qemu-zlib.tar.gz"
+    },
+    "qemu-proxy-intl": {
+      "url": "https://github.com/frida/proxy-libintl/archive/refs/tags/0.5.tar.gz",
+      "sha256": "f7a1cbd7579baaf575c66f9d99fb6295e9b0684a28b095967cfda17857595303",
+      "file": "proxy-libintl-0.5.tar.gz"
+    },
+    "qemu-zstd": {
+      "url": "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+      "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3",
+      "file": "qemu-zstd.tar.gz"
+    }
+  },
+  "files": {
+    "7z.dll": "899cd73d7fc60e1c1c35c7de0f5bed3dc69bfe2cecbd48014d868a347970a0b1",
+    "7z.exe": "95fff19b73eff77c87c0d7bd32822e43fb90dd2932459f962eb532d8dfb6ba53",
+    "gpgv.exe": "77864ece05ddb678e3f5a3305390670d33d06e4863835e4e68db46d0cc707600",
+    "libwinpthread-1.dll": "7658f9e5e89213af287d342c554b8abcb5b2700b4a44d02184b56004b104ceec",
+    "licenses/7ZIP-LICENSE.txt": "9ac2b4a97ab5d523965534d8b2d5868e511b39096d51fff458ab72c38b80fccc",
+    "licenses/E2FS-NOTICE.txt": "5da5ef153e559c1d990d4c3eedbedd4442db892d37eae1f35fff069de8ec9020",
+    "licenses/LLVM-LICENSE.txt": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+    "licenses/MINGW-RUNTIME-COPYING.txt": "1db8da07b436c68833c0673ffee3d9fcb2526047f3820b81661865dfedc79a1f",
+    "licenses/NTFS-COPYING-LIB.txt": "d7bf9d064ac3e5840f9dd02422b7eeec4f1fd03f37fadbd043602be5e882304f",
+    "licenses/NTFS-COPYING.txt": "231f7edcc7352d7734a96eef0b8030f77982678c516876fcb81e25b32d68564c",
+    "licenses/QEMU-ZSTD-LICENSE.txt": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8",
+    "licenses/SOURCE-build_filesystems_macos.sh": "a5631bd4a57c13aaed54eca1d40f58013d164370c3fa5e6590022dd7ceed06a7",
+    "licenses/SOURCE-build_gpg_macos.sh": "e5cd199bb7a7ccc59f71a51ab973dd7945110f5ae3d2c4a7de8d3e8f14de552d",
+    "licenses/SOURCE-build_gpg_windows.sh": "311a6fd552418eb819b511ccad44c8ddb363489bd8dbbf6e5ec4116c10bdaaea",
+    "licenses/SOURCE-build_qemu_macos.sh": "7cc1d128a6c3cc5256777b124ae61e1685bbca0ffeb6e7213ec3e21080d75e63",
+    "licenses/SOURCE-build_qemu_windows.sh": "4a978a66f1fd5d6ecbbc4d2be37fbfc3876f24e33fa3c0596b7eced77589e39d",
+    "licenses/SOURCE-ntfs_abi_check.c": "f30d2b86dfe21d140c0cff8f8d4433a67c2fa2a47b774886a1a6e3f464b8bf1f",
+    "licenses/SOURCE-ntfs_tree.c": "3f8014826485a1a45b0c265a972ae93e5d8c0ac3415a49bc4d6dbe1bbc77c7c9",
+    "licenses/SOURCE-port_e2fs.py": "0a89e763818430c9db7847152f33c951856f9b40b2c506a5d869e7eccb23071b",
+    "licenses/SOURCE-port_ntfs.py": "4f1bae5a2f049531a6649477ec7065517279b9f516d842348fd099998085ac46",
+    "licenses/SOURCE-port_udftools.py": "884ccd9869cac96bd5a60ad5e9eb89af840b177279231e51883b409cde921aa6",
+    "licenses/SOURCE-win_file_abi.h": "50f7ff48c07b737b3232419f9b12b28f0ed00ebd1a240af672a6b5e1b97b548c",
+    "licenses/SOURCE-win_posix_accounts.h": "b8ea3351f844762b9f476a515daefa05a71ef1bedb3d21b4ce44c090dc274f1a",
+    "licenses/SOURCE-win_regular_io.c": "c50184d2e39bf11cc8043192e3b3e986ba44aef0922201ef377ef66178077fe0",
+    "licenses/SOURCE-windows_utf8.manifest": "cb1ed41411494a81899b98f43e97af7ab45727149e20e865e7dea6bf8ea067ee",
+    "licenses/SOURCE-windows_utf8.rc": "06c1092648f84a9da2c1fa376e1b09e9fbdb095ac1fa3055608b32429f3ca73a",
+    "licenses/TSK-Apache-LICENSE-2.0.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "licenses/TSK-GNUv2-COPYING": "92c4e3ba17e2167e0e7b7779e5c975c75684080c006a80f9d76055c7ff6fa67a",
+    "licenses/TSK-GNUv3-COPYING": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+    "licenses/TSK-IBM-LICENSE": "c44ddab37556dec46db7d443004b3479b298ef0518938c1449794292f2fd7765",
+    "licenses/TSK-README.md": "339bdd5d56545644d12cde0a728730598681d14e4ff4c4d65a2afeedbe15027b",
+    "licenses/TSK-bsd.txt": "7cdad98efc2f3aba2eefd732eafd7885a178bce0af7d7a5a89c22bd320c6532e",
+    "licenses/TSK-cpl1.0.txt": "7b47225a5b77cb7825efc6a4d7e0ac57864c790542cf92f5080ec2bf310c00e5",
+    "licenses/TSK-mit.txt": "6f1fcd5e7c1c516d831106390fa786896a37007860f784dd358422802a1fa184",
+    "licenses/UDF-COPYING.txt": "dcc100d4161cc0b7177545ab6e47216f84857cda3843847c792a25289852dcaa",
+    "licenses/UUID-COPYING.txt": "9b718a9460fed5952466421235bc79eb49d4e9eacc920d7a9dd6285ab8fd6c6d",
+    "licenses/WIM-COPYING.GPLv3.txt": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+    "licenses/WIM-COPYING.LGPL.txt": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95",
+    "licenses/WIM-COPYING.txt": "1829e594e80000d0158ffb111491171feb8dc78842e3c0f40954489d30779854",
+    "licenses/WINPTHREADS-COPYING.txt": "63263614cdd29f2f93cba85e992f041b31f9fc7b4033692f31269489a8a1b177",
+    "licenses/glib-COPYING.txt": "fa6f36630bb1e0c571d34b2bbdf188d08495c9dbf58f28cac112f303fc1f58fb",
+    "licenses/gnupg-COPYING.CC0.txt": "ec4a7d97de212428cd53e09e0524616f0f584528e0698203fb4d71d6c55b48c5",
+    "licenses/gnupg-COPYING.GPL2.txt": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+    "licenses/gnupg-COPYING.LGPL21.txt": "d31a714a7ab67eb95ccae12b701e74fe307d771682f8792af7ed4e1ba33074a6",
+    "licenses/gnupg-COPYING.LGPL3.txt": "b40f7806e14dd7aad5e0254c04c61bf1212de37296f1cd5782ffbc9e98cbee87",
+    "licenses/gnupg-COPYING.other.txt": "909878b98dc2eaf3b07bbe1694ecd9f0523b7a621467c508d55daf28e0408be1",
+    "licenses/gnupg-COPYING.txt": "bc2d6664f6276fa0a72d57633b3ae68dc7dcb677b71018bf08c8e93e509f1357",
+    "licenses/libassuan-COPYING.LIB.txt": "a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861",
+    "licenses/libassuan-COPYING.txt": "fc82ca8b6fdb18d4e3e85cfd8ab58d1bcd3f1b29abe782895abd91d64763f8e7",
+    "licenses/libgcrypt-COPYING.LIB.txt": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95",
+    "licenses/libgcrypt-COPYING.txt": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
+    "licenses/libgpg-error-COPYING.LIB.txt": "a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861",
+    "licenses/libgpg-error-COPYING.txt": "231f7edcc7352d7734a96eef0b8030f77982678c516876fcb81e25b32d68564c",
+    "licenses/libksba-COPYING.GPLv2.txt": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+    "licenses/libksba-COPYING.GPLv3.txt": "0abbff814cd00e2b0b6d08395af2b419c1a92026c4b4adacbb65ccda45fa58cf",
+    "licenses/libksba-COPYING.LGPLv3.txt": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+    "licenses/libksba-COPYING.txt": "6197b98c6bf69838c624809c509d84333de1bc847155168c0e84527446a27076",
+    "licenses/npth-COPYING.LIB.txt": "ce64d5f7b49ea6d80fdb6d4cdee6839d1a94274f7493dc797c3b55b65ec8e9ed",
+    "licenses/pcre2-COPYING.txt": "99272c55f3dcfa07a8a7e15a5c1a33096e4727de74241d65fa049fccfdd59507",
+    "licenses/pcre2-LICENCE.md.txt": "197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811",
+    "licenses/proxyintl-COPYING.txt": "d245807f90032872d1438d741ed21e2490e1175dc8aa3afa5ddb6c8e529b58e5",
+    "licenses/qemu-COPYING.LIB.txt": "31c90ce76b6f5aab90a205851e71d5c27e31c0aa3d7017a4383b98a6fe3f1faa",
+    "licenses/qemu-COPYING.txt": "dd3ce02338c3a48abb6ba59b48809f7108a8bd242cb0cc8be90daafa30707c28",
+    "mke2fs.exe": "54092ffcc755d332ff3db2cbc7a95795fdd34807750e8a90de1d296ac1a66278",
+    "mkntfs.exe": "348722cbbf836e4427560127653b22e06e4af037573f4f7fb4434cd15fbb8022",
+    "mkudffs.exe": "d0a537055b73ecde37c3b22155e4b94e4b1ef7fbb5f282f3b60a8d7c739ab941",
+    "ntfs-tree.exe": "75ef76a7f05b8be7c51e2617a7a568634fc6c88c66f5c7f1c7c6168e6ce168a1",
+    "ntfscat.exe": "40cfd941d3a98f792d548828b8f1b2da899811455ef609add712443c3fb935bb",
+    "ntfscp.exe": "53b261eaa7ebb9b72934ee6fd4d280740eca08a47ef8005047dcf3fc2c2024aa",
+    "qemu-img.exe": "9f5f100b06c018df1d545a155701bfeb883108249906daa1d20bc57827b66567",
+    "qemu-io.exe": "e2b3680564955b2105d7f38921c844012a0dbf5e4af8039c3d7b81ca324b3cae",
+    "wimlib-imagex.exe": "7207069f873515992b7cbcbcd5d6105cd4928374a32a50c0352fcff73b60bb1c"
+  }
+}

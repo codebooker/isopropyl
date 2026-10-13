@@ -5,15 +5,21 @@ from __future__ import annotations
 """Isolated worker for bounded Authenticode integrity verification."""
 
 import datetime
+import hashlib
 import importlib.metadata
 import os
 import re
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 import stat
 import struct
 import sys
 from collections.abc import Callable
 from typing import BinaryIO
+from pathlib import Path
+from isopropyl.portable_io import pread
 
 from isopropyl.authenticode import (
     MAX_CERTIFICATES,
@@ -84,6 +90,10 @@ def _sanitize(value: object, limit: int) -> str:
 
 
 def _set_resource_limits() -> None:
+    if sys.platform == 'win32':
+        from isopropyl.native_authenticode import limit_current_process
+        limit_current_process(_ADDRESS_SPACE_LIMIT,_CPU_HARD_LIMIT)
+        return
     limits = (
         (resource.RLIMIT_CORE, 0, 0),
         (resource.RLIMIT_CPU, _CPU_SOFT_LIMIT, _CPU_HARD_LIMIT),
@@ -92,6 +102,10 @@ def _set_resource_limits() -> None:
         (resource.RLIMIT_NOFILE, _FILE_DESCRIPTOR_LIMIT, _FILE_DESCRIPTOR_LIMIT),
     )
     for kind, soft, hard in limits:
+        if sys.platform=='darwin' and kind==resource.RLIMIT_AS:
+            # Darwin maps a very large shared-cache address reservation.
+            # The parent enforces resident memory through proc_pidinfo instead.
+            continue
         _current_soft, current_hard = resource.getrlimit(kind)
         bounded_hard = (
             hard
@@ -165,7 +179,7 @@ def _prime_crypto_backend() -> None:
 def _pread_exact(descriptor: int, length: int, offset: int, label: str) -> bytes:
     if length < 0 or offset < 0:
         raise _Malformed(f"{label} has invalid bounds")
-    data = os.pread(descriptor, length, offset)
+    data = pread(descriptor, length, offset)
     if len(data) != length:
         raise _Malformed(f"{label} lies outside the PE image")
     return data
@@ -417,6 +431,25 @@ def main(argv: list[str] | None = None) -> int:
         _prime_crypto_backend()
         _set_resource_limits()
         arguments = list(sys.argv[1:] if argv is None else argv)
+        source_stream = None
+        if arguments and arguments[0] == '--source-file':
+            if len(arguments)!=9 or sys.platform=='linux':
+                raise _Malformed('Invalid native worker input')
+            source=Path(arguments[1])
+            info=source.lstat();parent=source.parent.lstat()
+            if (source.name!='payload.bin' or not stat.S_ISREG(info.st_mode) or info.st_nlink!=1
+                    or source.is_symlink() or getattr(info,'st_file_attributes',0)&0x400
+                    or not stat.S_ISDIR(parent.st_mode) or source.parent.is_symlink()):
+                raise _Malformed('Unsafe native worker source')
+            source_stream=source.open('rb')
+            opened=os.fstat(source_stream.fileno())
+            if (opened.st_dev,opened.st_ino,opened.st_size)!=(info.st_dev,info.st_ino,info.st_size):
+                raise _Malformed('Native worker source changed')
+            digest=hashlib.sha256()
+            while data:=source_stream.read(1024*1024):digest.update(data)
+            if digest.hexdigest()!=arguments[2]:raise _Malformed('Native worker source digest changed')
+            source_stream.seek(0)
+            arguments=[str(source_stream.fileno()),*arguments[3:]]
         if len(arguments) != 7:
             raise _Malformed("the worker received the wrong number of arguments")
         descriptor = _integer(arguments[0], "descriptor")
@@ -433,6 +466,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         ]
         result = verify_descriptor(descriptor, *values)
+        if source_stream is not None:
+            final=os.fstat(source_stream.fileno())
+            if (final.st_dev,final.st_ino,final.st_size,final.st_mtime_ns,final.st_ctime_ns)!=(opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns):
+                raise _Malformed('Native worker source changed during verification')
+            source_stream.close()
     except BaseException as error:
         result = AuthenticodeResult(
             AuthenticodeIntegrityState.INDETERMINATE,
