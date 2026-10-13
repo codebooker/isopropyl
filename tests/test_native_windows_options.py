@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import QApplication
 
 from isopropyl.mac_windows_iso import WindowsSourceMetadata
 from isopropyl.native_windows_options import WindowsOptionsDialog
-from isopropyl.native_writer import file_identity
+from isopropyl.native_writer import path_file_identity
 from isopropyl.wim import WimEdition, WimSelection
 from isopropyl.windows import WindowsCustomization
 from isopropyl.windows_bootex import WindowsBootExOptions
@@ -31,7 +31,7 @@ class NativeWindowsOptionsTests(unittest.TestCase):
             1, "Windows 11 Pro", "Pro", "Professional", "amd64", 10, 0, 26100, 1
         )
         self.metadata = WindowsSourceMetadata(
-            file_identity(self.source.stat()),
+            path_file_identity(self.source),
             "amd64",
             "sources/install.wim",
             4096,

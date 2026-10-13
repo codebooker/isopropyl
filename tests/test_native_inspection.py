@@ -23,7 +23,32 @@ class InspectionTests(unittest.TestCase):
         self.writer.opener.assert_not_called()
 
     def test_changed_source_and_cancellation_do_not_publish_result(self):
-        def progress(*args):self.path.write_bytes(b'B'*2048)
+        # Change size too so this generic mutation guard does not rely on the
+        # filesystem's timestamp tick on a fast Windows runner.
+        def progress(*args):self.path.write_bytes(b'B'*4096)
         with self.assertRaisesRegex(NativeWriteError,'changed'):inspect_source(self.path,self.writer,progress)
         self.writer.cancel()
         with self.assertRaises(NativeCancelled):inspect_source(self.path,self.writer)
+
+    def test_mutation_between_checksum_and_catalog_is_normalized(self):
+        def progress(stage,*args):
+            if stage=='Inspecting boot records, filesystems and signatures':self.path.write_bytes(b'B'*4096)
+        with self.assertRaisesRegex(NativeWriteError,'changed'):inspect_source(self.path,self.writer,progress)
+        self.writer.opener.assert_not_called()
+
+    def test_disappearance_between_checksum_and_catalog_is_normalized(self):
+        import gzip
+        for suffix in ('.img','.img.gz'):
+            with self.subTest(suffix=suffix):
+                path=self.path.with_suffix(suffix)
+                path.write_bytes(gzip.compress(b'A'*2048) if suffix.endswith('.gz') else b'A'*2048)
+                def progress(stage,done,total):
+                    if stage=='Inspecting boot records, filesystems and signatures' and done==0:path.unlink()
+                with self.assertRaisesRegex(NativeWriteError,'changed'):inspect_source(path,self.writer,progress)
+                self.writer.opener.assert_not_called()
+
+    def test_mutation_after_catalog_does_not_publish_stale_checksums(self):
+        def progress(stage,done,total):
+            if stage=='Inspecting boot records, filesystems and signatures' and done==total:self.path.write_bytes(b'B'*4096)
+        with self.assertRaisesRegex(NativeWriteError,'changed'):inspect_source(self.path,self.writer,progress)
+        self.writer.opener.assert_not_called()

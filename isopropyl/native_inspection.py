@@ -42,17 +42,24 @@ def inspect_source(path, writer, progress=lambda *args: None):
     from .images import inspect_image
     progress('Inspecting boot records, filesystems and signatures',0,1)
     from .native_inputs import PREPARED_SUFFIXES,prepare_image
-    if path.suffix.lower() in PREPARED_SUFFIXES:
-        from types import SimpleNamespace
-        import tempfile
-        from .images import MAX_INSPECTION_EXPANDED_BYTES
-        plan=SimpleNamespace(source=path,source_identity=identity,size=identity[2],expected_sha256=None,
-            target=SimpleNamespace(device=SimpleNamespace(size=MAX_INSPECTION_EXPANDED_BYTES)))
-        with tempfile.TemporaryDirectory(prefix='isopropyl-inspection-') as directory:
-            expanded=prepare_image(plan,Path(directory),writer,progress,return_source=True)
-            inspection=inspect_image(expanded,cancel_check=writer.check_cancelled)
-    else:
-        inspection=inspect_image(path,expected_identity=identity,cancel_check=writer.check_cancelled)
+    try:
+        if path.suffix.lower() in PREPARED_SUFFIXES:
+            from types import SimpleNamespace
+            import tempfile
+            from .images import MAX_INSPECTION_EXPANDED_BYTES
+            plan=SimpleNamespace(source=path,source_identity=identity,size=identity[2],expected_sha256=None,
+                target=SimpleNamespace(device=SimpleNamespace(size=MAX_INSPECTION_EXPANDED_BYTES)))
+            with tempfile.TemporaryDirectory(prefix='isopropyl-inspection-') as directory:
+                expanded=prepare_image(plan,Path(directory),writer,progress,return_source=True)
+                inspection=inspect_image(expanded,cancel_check=writer.check_cancelled)
+        else:
+            inspection=inspect_image(path,expected_identity=identity,cancel_check=writer.check_cancelled)
+    except OSError as error:
+        try:unchanged=path_file_identity(path)==identity
+        except OSError:unchanged=False
+        if not unchanged:
+            raise NativeWriteError('The source image changed during inspection') from error
+        raise
     rows += [f'Type: {inspection.kind}',f'Expanded size: {inspection.size:,} bytes',
              f'Volume label: {inspection.volume_label or "none"}',
              f'Boot modes: {", ".join(inspection.boot_modes) or "none detected"}',
@@ -66,6 +73,11 @@ def inspect_source(path, writer, progress=lambda *args: None):
         if payload.authenticode:rows.append(f'  Authenticode: {payload.authenticode.state.value} {payload.authenticode.error}')
         if payload.dbx:rows.append(f'  DBX: {payload.dbx.state.value}')
     progress('Inspecting boot records, filesystems and signatures',1,1)
+    try:unchanged=path_file_identity(path)==identity
+    except OSError as error:
+        raise NativeWriteError('The source image changed or became unavailable during inspection') from error
+    if not unchanged:
+        raise NativeWriteError('The source image changed during inspection')
     if path.suffix.lower() in {'.img','.raw','.usb','.wic','.iso'} and done >= 512:
         partitions = inspect_partition_tables_capture(prefix,tail,done)
         rows.append('Partition map: ' + (partitions.kind or 'none'))

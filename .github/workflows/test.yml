@@ -42,6 +42,7 @@ jobs:
       - run: mkdir -p build/lib/isopropyl/data && touch build/lib/isopropyl/data/windows-images-v1.json
       - run: python -m pip wheel --no-deps . --wheel-dir /tmp/isopropyl-wheel
       - run: python -c "import glob,zipfile; z=zipfile.ZipFile(glob.glob('/tmp/isopropyl-wheel/*.whl')[0]); n=z.namelist(); assert 'isopropyl/data/io.github.codebooker.isopropyl.svg' in n; assert 'isopropyl/data/distro-write-policies-v1.json' in n; assert 'isopropyl/data/windows-images-v2.json' in n; assert 'isopropyl/data/windows-images-v1.json' not in n; assert any(x.endswith('/THIRD_PARTY_NOTICES.md') for x in n); assert any(x.endswith('/CERTVALIDATOR-MIT.txt') for x in n); e=next(x for x in n if x.endswith('.dist-info/entry_points.txt')); assert 'isopropyl-cli = isopropyl.entrypoints:cli' in z.read(e).decode()"
+      - run: python -m pip install --disable-pip-version-check "setuptools>=77"
       - run: python -c "import pathlib,setuptools.build_meta as b; p=pathlib.Path('/tmp/isopropyl-sdist'); p.mkdir(); b.build_sdist(str(p))"
       - run: python -c "import glob,tarfile; t=tarfile.open(glob.glob('/tmp/isopropyl-sdist/*.tar.gz')[0]); n=t.getnames(); assert any(x.endswith('/tests/windows-profile-observations-v1.json') for x in n); assert not any(x.endswith('/isopropyl/data/windows-images-v1.json') for x in n)"
       - run: /usr/bin/python3 -I packaging/debian/build_deb.py --output-dir /tmp/isopropyl-deb
@@ -79,7 +80,7 @@ jobs:
       - run: python -c "import os; from isopropyl.host_platform import validate_host; assert validate_host()[1] == os.environ['ISOPROPYL_EXPECT_CPU']"
       - run: isopropyl-cli --help
       - run: python -m unittest tests.test_native_platform tests.test_native_devices tests.test_native_writer tests.test_native_inputs tests.test_native_inspection tests.test_native_downloads tests.test_native_tools tests.test_native_virtual tests.test_native_disk_io tests.test_native_app tests.test_native_cli tests.test_native_elevation tests.test_mac_write tests.test_devices -v
-      - run: python -m unittest tests.test_windows_media tests.test_native_drive_parity tests.test_helper_tools tests.test_native_extract tests.test_native_options tests.test_native_media tests.test_compress_z -v
+      - run: python -m unittest tests.test_windows_media tests.test_native_drive_parity tests.test_helper_tools tests.test_native_extract tests.test_native_options tests.test_native_media tests.test_portable_io tests.test_portable_fs_windows tests.test_compress_z -v
       - run: python tools/validate_native_helpers.py --require-all
       - if: runner.os == 'macOS'
         run: python -m unittest tests.test_mac_windows_iso tests.test_native_windows_options tests.test_windows tests.test_windows_bootex -v

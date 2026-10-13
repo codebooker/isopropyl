@@ -16,7 +16,7 @@ from isopropyl.devices import Device
 from isopropyl.native_devices import NativeDevice
 from isopropyl.native_inputs import PreparedImagePlan, prepare_image
 from isopropyl.native_writer import NativeWriteError, NativeWriter, build_plan
-from isopropyl.portable_io import pread
+from isopropyl.portable_io import pread,descriptor_status
 
 
 class InputTests(unittest.TestCase):
@@ -67,7 +67,9 @@ class InputTests(unittest.TestCase):
 
     def test_source_replacement_after_confirmation_never_opens_disk(self):
         path=self.source('.gz',gzip.compress(self.data));plan=build_plan(path,self.target)
-        path.write_bytes(gzip.compress(b'B'*2048))
+        replacement=self.root/'replacement.gz';replacement.write_bytes(gzip.compress(b'B'*2048))
+        os.replace(replacement,path)
+        with path.open('rb') as source:self.assertNotEqual(descriptor_status(source.fileno()).st_ino,plan.source_identity[1])
         with self.assertRaisesRegex(NativeWriteError,'changed'):self.writer.run(plan,plan.confirmation)
         self.assertEqual(self.opened,0)
 

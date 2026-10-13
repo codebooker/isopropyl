@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from isopropyl.portable_io import descriptor_status, _ChangeTimeStatus
 from isopropyl.devices import Device
 from isopropyl.native_devices import NativeDevice
 from isopropyl.native_writer import (
@@ -76,7 +77,10 @@ class WriterTests(unittest.TestCase):
 
     def test_source_change_before_staging_never_opens_target(self):
         self.path.write_bytes(b'B'*2048)
-        with self.assertRaisesRegex(NativeWriteError, 'source image changed'):
+        def changed_status(fd):
+            info=descriptor_status(fd)
+            return _ChangeTimeStatus(info,self.plan.source_identity[4]+100,getattr(info,'st_file_attributes',0))
+        with patch('isopropyl.native_writer.descriptor_status',side_effect=changed_status),self.assertRaisesRegex(NativeWriteError,'source image changed'):
             self.run_write()
         self.assertEqual(self.opened, 0)
 
@@ -90,18 +94,27 @@ class WriterTests(unittest.TestCase):
 
     def test_preserved_mtime_cannot_hide_a_change_during_staging(self):
         import os
-        original = self.path.stat()
+        original = self.path.stat();changed=False
         def change(*args):
+            nonlocal changed
             self.path.write_bytes(b'B'*len(self.content))
-            os.utime(self.path,ns=(original.st_atime_ns,original.st_mtime_ns))
-        with self.assertRaisesRegex(NativeWriteError,'source image changed'):
+            os.utime(self.path,ns=(original.st_atime_ns,original.st_mtime_ns));changed=True
+        def changed_status(fd):
+            info=descriptor_status(fd)
+            return _ChangeTimeStatus(info,self.plan.source_identity[4]+100,getattr(info,'st_file_attributes',0)) if changed else info
+        with patch('isopropyl.native_writer.descriptor_status',side_effect=changed_status),self.assertRaisesRegex(NativeWriteError,'source image changed'):
             self.run_write(progress=change)
         self.assertEqual(self.opened,0)
 
     def test_source_change_during_staging_never_opens_target(self):
+        changed=False
         def progress(*args):
-            self.path.write_bytes(b'B'*2048)
-        with self.assertRaisesRegex(NativeWriteError, 'source image changed'):
+            nonlocal changed
+            self.path.write_bytes(b'B'*2048);changed=True
+        def changed_status(fd):
+            info=descriptor_status(fd)
+            return _ChangeTimeStatus(info,self.plan.source_identity[4]+100,getattr(info,'st_file_attributes',0)) if changed else info
+        with patch('isopropyl.native_writer.descriptor_status',side_effect=changed_status),self.assertRaisesRegex(NativeWriteError,'source image changed'):
             self.run_write(progress=progress)
         self.assertEqual(self.opened, 0)
 

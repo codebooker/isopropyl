@@ -22,6 +22,8 @@ class _ChangeTimeStatus:
 
     def __getattr__(self,name):return getattr(self._status,name)
 
+    def __dir__(self):return sorted(set(dir(self._status))|set(object.__dir__(self)))
+
 
 def _windows_handle_metadata(handle):
     import ctypes

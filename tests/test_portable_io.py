@@ -2,6 +2,8 @@
 import ctypes
 import os
 import tempfile
+import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +38,9 @@ class ChangeTimeTests(unittest.TestCase):
         query.assert_called_once_with(123)
         self.assertEqual((result.st_dev,result.st_ino,result.st_size,result.st_mtime_ns,result.st_nlink),(8,7,6,5,1))
         self.assertEqual(result.st_ctime_ns,987654321);self.assertEqual(result.st_file_attributes,0x20)
+        # Permission/status adapters enumerate stat fields, so delegation must
+        # be visible to dir() as well as normal attribute access.
+        self.assertTrue({'st_dev','st_ino','st_size','st_mtime_ns','st_nlink'}<=set(dir(result)))
 
     def test_failed_windows_change_time_query_cannot_fall_back_to_creation_time(self):
         with patch('isopropyl.portable_io.sys.platform','win32'),patch('isopropyl.portable_io.os.fstat',return_value=SimpleNamespace()), \
@@ -48,6 +53,10 @@ class ChangeTimeTests(unittest.TestCase):
             path=Path(directory)/'source.img';path.write_bytes(b'A'*4096)
             with path.open('rb') as source:
                 before=descriptor_status(source.fileno());original=path.stat()
+                # Windows file timestamps can share a system-clock tick. This
+                # integration check measures a subsequent tick; guard unit
+                # tests inject changed metadata without timing assumptions.
+                if sys.platform=='win32':time.sleep(0.05)
                 path.write_bytes(b'B'*4096);os.utime(path,ns=(original.st_atime_ns,original.st_mtime_ns))
                 after=descriptor_status(source.fileno());named=regular_status(path)
             self.assertEqual(before.st_mtime_ns,after.st_mtime_ns)
@@ -61,5 +70,6 @@ class ChangeTimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);path=root/'payload.bin';path.write_bytes(b'A'*4096)
             original=path.stat();_,files=scan_tree(root,writer)
+            if sys.platform=='win32':time.sleep(0.05)
             path.write_bytes(b'B'*4096);os.utime(path,ns=(original.st_atime_ns,original.st_mtime_ns))
             with self.assertRaisesRegex(NativeWriteError,'staged source file changed'):consume(root,files[0],writer)
