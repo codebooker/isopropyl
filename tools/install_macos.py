@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import plistlib
 import shutil
 import subprocess
@@ -18,6 +19,10 @@ DEFAULT_RUNTIME = Path.home()/'Library/Application Support/ISOpropyl/runtime'
 
 
 def install_app():
+    versions = re.findall(r'^version = "([^"]+)"$', (ROOT/'pyproject.toml').read_text(), re.MULTILINE)
+    if len(versions) != 1:
+        raise RuntimeError('Could not read project version')
+    version = versions[0]
     bundle = Path.home()/'Applications/ISOpropyl.app'
     contents = bundle/'Contents'
     (contents/'MacOS').mkdir(parents=True, exist_ok=True)
@@ -30,7 +35,7 @@ def install_app():
     with (contents/'Info.plist').open('wb') as stream:
         plistlib.dump({'CFBundleExecutable':'ISOpropyl', 'CFBundleIdentifier':'io.github.codebooker.isopropyl',
                       'CFBundleName':'ISOpropyl', 'CFBundleDisplayName':'ISOpropyl', 'CFBundlePackageType':'APPL',
-                      'CFBundleVersion':'1', 'CFBundleShortVersionString':'0.1.0', 'LSMinimumSystemVersion':'13.0',
+                      'CFBundleVersion':version, 'CFBundleShortVersionString':version, 'LSMinimumSystemVersion':'13.0',
                       'CFBundleIconFile':'ISOpropyl.icns',
                       'NSHighResolutionCapable':True,
                       'NSRemovableVolumesUsageDescription':'ISOpropyl reads and writes the USB drive you explicitly select and confirm.'}, stream)

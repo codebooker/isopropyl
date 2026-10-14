@@ -232,7 +232,7 @@ class NativeWindow(QMainWindow):
         body = QWidget(); body.setObjectName('canvas'); scroll.setWidget(body)
         self.setCentralWidget(scroll)
         layout = QVBoxLayout(body); layout.setContentsMargins(16,14,16,14); layout.setSpacing(10)
-        brand_row=QHBoxLayout();brand=QLabel('ISOpropyl');brand.setObjectName('eyebrow');brand_row.addWidget(brand);brand_row.addStretch();self.settings_button=QPushButton('Settings…');self.settings_button.clicked.connect(self.configure_settings);brand_row.addWidget(self.settings_button);self.utilities_button=QPushButton('Utilities…');utilities=QMenu(self.utilities_button);utilities.addAction('Capture optical disc…').triggered.connect(self.capture_optical);utilities.addAction('Extract ISO files…').triggered.connect(self.extract_files);self.utilities_button.setMenu(utilities);brand_row.addWidget(self.utilities_button);layout.addLayout(brand_row)
+        brand_row=QHBoxLayout();brand=QLabel('ISOpropyl');brand.setObjectName('eyebrow');brand_row.addWidget(brand);brand_row.addStretch();self.settings_button=QPushButton('Settings…');self.settings_button.clicked.connect(self.configure_settings);brand_row.addWidget(self.settings_button);self.utilities_button=QPushButton('Utilities…');utilities=QMenu(self.utilities_button);utilities.addAction('Capture optical disc…').triggered.connect(self.capture_optical);utilities.addAction('Extract ISO files…').triggered.connect(self.extract_files);utilities.addSeparator();self.update_action=utilities.addAction('Check for updates…');self.utilities_button.setMenu(utilities);brand_row.addWidget(self.utilities_button);layout.addLayout(brand_row)
         heading = QLabel('Create a bootable USB'); heading.setObjectName('title'); layout.addWidget(heading)
         note = QLabel('Choose an image, configure your installer, and write with automatic verification.')
         note.setObjectName('muted'); note.setWordWrap(True); layout.addWidget(note)
@@ -310,6 +310,9 @@ class NativeWindow(QMainWindow):
         elif getattr(initial,'session_state',None):
             self.media_options,self.windows_options,self.windows_bootex=decode_state(initial.session_state)
         self.update_options_summary()
+        from .update_ui import UpdateController, operation_in_progress
+        self.updater = UpdateController(self, self.settings, lambda: operation_in_progress(self))
+        self.updater.add_action(self.update_action)
         self.refresh()
 
     def image_changed(self):
@@ -382,8 +385,9 @@ class NativeWindow(QMainWindow):
             self.image.setText(path)
 
     def set_busy(self, busy):
+        self._update_operation_busy = bool(busy)
         for control in (self.image, self.browse, self.checksum, self.targets, self.fixed,
-                        self.refresh_button, self.write_button, self.access_button, self.windows_button, self.plan_button, self.utilities_button, self.settings_button, self.media_button, self.tools_button, self.inspect_button, self.download_button):
+                        self.refresh_button, self.write_button, self.access_button, self.windows_button, self.plan_button, self.utilities_button, self.settings_button, self.media_button, self.tools_button, self.inspect_button, self.download_button, self.update_action):
             control.setEnabled(not busy)
         self.cancel_button.setEnabled(busy and self.job is not None)
         if not busy:self.target_changed()
@@ -721,6 +725,9 @@ class NativeWindow(QMainWindow):
             if self.job:
                 self.cancel()
         else:
+            if not self.updater.can_close():
+                event.ignore()
+                return
             self.settings.setValue("include_fixed",self.fixed.isChecked())
             self.settings.sync()
             event.accept()

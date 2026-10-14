@@ -50,6 +50,22 @@ See [cross-platform installation and capabilities](CROSS_PLATFORM.md) and
 > leave verification enabled, and check the target model, capacity, path, and
 > serial before approving a write.
 
+## Updating ISOpropyl
+
+Choose **Check for updates…** in the Linux window or **Utilities → Check for
+updates…** on macOS and Windows. Automatic checks run at most once a day and can
+be disabled in the update dialog. When a newer stable GitHub release is ready,
+review its notes and click **Update and restart**.
+
+The updater selects the package for your OS and CPU, verifies its size and
+SHA-256, and prepares it while the current app stays open. It refuses to install
+during a drive operation. Managed macOS and Windows installations retain the
+previous installation for recovery; failed startup rolls back automatically.
+Linux DEBs update through the system package manager and its normal authorization
+prompt. Source checkouts are kept intact, and virtual environments require
+compatible existing dependencies. See [release preparation](RELEASE.md) for the
+GitHub assets and manifest required to publish an update.
+
 ## Why ISOpropyl
 
 | Inspect first | Keep privilege narrow | Verify the result |

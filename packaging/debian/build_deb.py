@@ -176,6 +176,9 @@ native_test_options.py
 native_tree.py
 portable_fs.py
 tree_records.py
+updates.py
+update_install.py
+update_ui.py
 data/check.svg
 data/chevron-down.svg
 data/chevron-up.svg

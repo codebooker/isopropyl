@@ -1,0 +1,134 @@
+name: prepare release
+
+# Deliberately manual: this workflow never publishes a live release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag matching the project version
+        required: true
+        type: string
+      create_draft:
+        description: Attach verified assets to a new draft GitHub release
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+            cpu: x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+            cpu: arm64
+          - runner: macos-15
+            target: macos-arm64
+            cpu: arm64
+          - runner: windows-2025
+            target: windows-x86_64
+            cpu: x64
+          - runner: windows-11-arm
+            target: windows-arm64
+            cpu: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - name: Require an existing tag at the checked-out commit
+        shell: bash
+        run: |
+          git show-ref --verify "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.cpu }}
+      - name: Check version declarations and release tag
+        run: python tools/release_manifest.py --tag "$env:RELEASE_TAG"
+        if: runner.os == 'Windows'
+      - name: Check version declarations and release tag
+        run: python tools/release_manifest.py --tag "$RELEASE_TAG"
+        if: runner.os != 'Windows'
+      - run: python -m pip install build packaging
+      - run: python -m build --wheel --outdir wheel
+      - if: runner.os == 'Linux'
+        run: /usr/bin/python3 -I packaging/debian/build_deb.py --output-dir release
+      - name: Include universal wheel for dependency-compatible Linux virtual environments
+        if: matrix.target == 'linux-x86_64'
+        run: cp wheel/*.whl release/
+      - name: Build native offline release bundle
+        if: runner.os != 'Linux'
+        shell: bash
+        run: python tools/build_release_asset.py --wheel wheel/*.whl --output-dir release
+      - name: Validate actual native helper binaries
+        if: runner.os != 'Linux'
+        run: |
+          python -m pip install .
+          python tools/validate_native_helpers.py --require-all
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - name: Require an existing tag at the checked-out commit
+        shell: bash
+        run: |
+          git show-ref --verify "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - run: python tools/release_manifest.py --tag "$RELEASE_TAG" --assets release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: complete-release
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  draft:
+    if: inputs.create_draft
+    needs: manifest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: complete-release
+          path: release
+      - name: Create a draft for manual review and publication
+        run: gh release create "$RELEASE_TAG" release/* --verify-tag --draft --title "ISOpropyl $RELEASE_TAG" --generate-notes
