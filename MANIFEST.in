@@ -33,3 +33,7 @@ include tools/download_native_sources.py
 include tools/validate_native_helpers.py
 
 recursive-include tests/data/compress *.Z *.json
+
+include RELEASE.md
+include tools/release_manifest.py
+include tools/build_release_asset.py

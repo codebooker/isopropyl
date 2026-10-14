@@ -27,7 +27,7 @@ jobs:
         run: sudo apt-get install -y binutils-x86-64-linux-gnu
       - run: python -m pip install --disable-pip-version-check .
       - run: cd /tmp && isopropyl-cli --help
-      - run: python -m pip install dissect.ntfs==3.16 dissect.extfs==3.15 dissect.fat==3.13
+      - run: python -m pip install packaging dissect.ntfs==3.16 dissect.extfs==3.15 dissect.fat==3.13
       - run: python -m unittest discover -s tests -v
         env:
           ISOPROPYL_REQUIRE_AUTHENTICODE_FIXTURE: "1"
@@ -79,6 +79,9 @@ jobs:
       - run: python -m pip install --disable-pip-version-check .
       - run: python -c "import os; from isopropyl.host_platform import validate_host; assert validate_host()[1] == os.environ['ISOPROPYL_EXPECT_CPU']"
       - run: isopropyl-cli --help
+      - run: python -m pip install packaging
+      - if: success() || failure()
+        run: python -m unittest tests.test_updates tests.test_update_install tests.test_update_ui tests.test_release_packaging -v
       - run: python -m unittest tests.test_native_platform tests.test_native_devices tests.test_native_writer tests.test_native_inputs tests.test_native_inspection tests.test_native_downloads tests.test_native_tools tests.test_native_virtual tests.test_native_disk_io tests.test_native_app tests.test_native_cli tests.test_native_elevation tests.test_mac_write tests.test_devices -v
       - if: success() || failure()
         run: python -m unittest tests.test_windows_media tests.test_native_drive_parity tests.test_helper_tools tests.test_native_extract tests.test_native_options tests.test_native_media tests.test_portable_io tests.test_portable_fs_windows tests.test_compress_z -v

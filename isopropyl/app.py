@@ -1271,6 +1271,11 @@ class Window(QMainWindow):
         self.settings_button = QPushButton("Settings…")
         self.settings_button.clicked.connect(self.show_settings)
         utility_secondary.addWidget(self.settings_button)
+        self.update_button = QPushButton("Check for updates…")
+        utility_secondary.addWidget(self.update_button)
+        from .update_ui import UpdateController, operation_in_progress
+        self.updater = UpdateController(self, self.settings, lambda: operation_in_progress(self))
+        self.updater.add_action(self.update_button)
         utility_secondary.addWidget(log_button)
         utility_options.addLayout(utility_primary)
         utility_options.addLayout(utility_secondary)
@@ -3912,6 +3917,7 @@ class Window(QMainWindow):
         self.refresh_devices()
 
     def set_busy(self, busy: bool) -> None:
+        self._update_operation_busy = bool(busy)
         if busy:
             self.progress_estimator.reset()
         self.source_card.setEnabled(not busy)
@@ -3929,6 +3935,7 @@ class Window(QMainWindow):
         )
         self.optical_button.setEnabled(not busy)
         self.settings_button.setEnabled(not busy)
+        self.update_button.setEnabled(not busy)
         self.checksum_button.setEnabled(not busy and self.inspection is not None)
         self.windows_button.setEnabled(
             not busy and bool(self.inspection and self.inspection.has_windows_installer)
@@ -4022,6 +4029,9 @@ class Window(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         inspection_active = self.inspection_worker_count > 0
         if not self.operation_active and not inspection_active:
+            if not self.updater.can_close():
+                event.ignore()
+                return
             self.inspection_cancel_event.set()
             if self.zip_overlay_preparer is not None:
                 self.zip_overlay_preparer.cancel()
