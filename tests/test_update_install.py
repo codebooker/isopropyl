@@ -55,6 +55,30 @@ class UpdateInstallTests(unittest.TestCase):
         with self.assertRaises(updater.UpdateInstallError):updater._extract(path,self.root/'links')
         self.assertFalse((self.root.parent/'escape').exists())
 
+    def test_raw_zip_names_are_rejected_before_windows_reader_normalization(self):
+        for index,name in enumerate(('a\\b','safe\x00escape')):
+            with self.subTest(name=name):
+                archive=self.archive([name])
+                # Verify both the local header and central directory contain
+                # hostile raw bytes, independent of ZipInfo writer defaults.
+                self.assertGreaterEqual(archive.read_bytes().count(name.encode()),2)
+                # Exercise Windows ZipInfo parsing even on POSIX test hosts.
+                with patch.object(zipfile.os,'sep','\\'):
+                    with zipfile.ZipFile(archive) as source:
+                        entry,=source.infolist()
+                        self.assertEqual(entry.orig_filename,name)
+                        self.assertNotEqual(entry.filename,name)
+                    destination=self.root/f'raw-{index}'
+                    with self.assertRaises(updater.UpdateInstallError):updater._extract(archive,destination)
+                self.assertEqual(list(destination.iterdir()),[])
+
+    def test_regular_zip_entries_keep_their_original_name_and_file_type(self):
+        archive=self.archive(['package/module.py'])
+        destination=updater._extract(archive,self.root/'regular')
+        path=destination/'package/module.py'
+        self.assertTrue(stat.S_ISREG(path.lstat().st_mode))
+        self.assertEqual(path.read_bytes(),b'content')
+
     def test_checksum_is_rechecked_before_archive_is_consumed(self):
         payload=self.root/'asset.zip';payload.write_bytes(b'changed')
         installation=updater.Installation('portable-zip',True,'',str(self.root/'application'),sys.executable,())

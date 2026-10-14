@@ -167,7 +167,12 @@ def _extract(archive, destination):
             raise UpdateInstallError('The update archive exceeds its extraction limits')
         seen = set();spellings = {}
         for item in entries:
-            pure = _safe_member(item.filename)
+            # ZipInfo normalizes separators on Windows and truncates NULs.
+            # Validate the original stored name before using its parsed form.
+            raw_name = item.orig_filename
+            pure = _safe_member(raw_name)
+            if item.filename != raw_name:
+                raise UpdateInstallError('The update archive contains a normalized filename')
             for index in range(1,len(pure.parts)+1):
                 spelling='/'.join(pure.parts[:index]);folded=spelling.casefold()
                 if folded in spellings and spellings[folded]!=spelling:

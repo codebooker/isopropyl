@@ -177,3 +177,14 @@ class UpdateUiTests(unittest.TestCase):
         self.assertFalse(self.controller.startup.isActive())
         self.assertFalse(self.controller.daily.isActive())
         self.busy = False
+
+    def test_failed_update_result_is_shown_once_when_drive_work_is_idle(self):
+        previous = {'state': 'rolled-back', 'message': 'The previous version was restored.', 'time': 123}
+        with patch('isopropyl.update_install.read_update_status', return_value=previous), \
+             patch.object(self.controller, 'show') as show:
+            self.busy = True
+            self.controller._startup_result(); show.assert_not_called()
+            self.busy = False
+            self.controller._startup_result(); show.assert_called_once()
+            self.controller._startup_result(); show.assert_called_once()
+        self.assertEqual(self.settings.data['updates/seen_result'], '123')

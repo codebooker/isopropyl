@@ -73,6 +73,10 @@ class UpdateController(QObject):
         self.daily.setInterval(3600000)
         self.daily.timeout.connect(self.automatic_check)
         self.daily.start()
+        self.result_timer = QTimer(self)
+        self.result_timer.setSingleShot(True)
+        self.result_timer.timeout.connect(self._startup_result)
+        self.result_timer.start(500)
         QTimer.singleShot(0, self._notify_ready)
 
     def _notify_ready(self):
@@ -84,6 +88,7 @@ class UpdateController(QObject):
             logging.getLogger(__name__).exception("Could not confirm updated application startup")
             self.startup.stop()
             self.daily.stop()
+            self.result_timer.stop()
             self.window.setEnabled(False)
             self._close_failed_startup()
 
@@ -93,6 +98,27 @@ class UpdateController(QObject):
             QTimer.singleShot(50, self._close_failed_startup)
         else:
             self.window.close()
+
+    def _previous_status(self, target):
+        from .update_install import read_update_status
+        try:
+            return read_update_status(target)
+        except (OSError, ValueError):
+            return None
+
+    def _startup_result(self):
+        previous = self._previous_status(self._target())
+        if not previous or previous.get('state') not in {'failed', 'rolled-back'}:
+            return
+        stamp = str(previous.get('time', ''))
+        if stamp == str(self.settings.value('updates/seen_result', '')):
+            return
+        if self.busy() or self.dialog is not None:
+            self.result_timer.start(1000)
+            return
+        self.settings.setValue('updates/seen_result', stamp)
+        self.settings.sync()
+        self.show()
 
     def add_action(self, action):
         self.actions.append(action)
@@ -217,8 +243,7 @@ class UpdateController(QObject):
         self.notes = QPlainTextEdit()
         self.notes.setReadOnly(True)
         self.notes.setPlaceholderText('Release notes')
-        from .update_install import read_update_status
-        previous = read_update_status(self.target)
+        previous = self._previous_status(self.target)
         if previous and previous.get('state') in {'failed', 'rolled-back'}:
             last_status = QLabel('Previous update: ' + str(previous.get('message') or previous.get('state')))
             last_status.setWordWrap(True)
@@ -335,6 +360,7 @@ class UpdateController(QObject):
     def can_close(self):
         self.startup.stop()
         self.daily.stop()
+        self.result_timer.stop()
         if self.job is None:
             return True
         self.closing = True
