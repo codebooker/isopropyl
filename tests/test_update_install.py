@@ -36,7 +36,12 @@ class UpdateInstallTests(unittest.TestCase):
     def archive(self,names):
         path=self.root/'update.zip'
         with zipfile.ZipFile(path,'w') as archive:
-            for name in names:archive.writestr(name,b'content')
+            for name in names:
+                # Preserve intentionally hostile raw names: ZipInfo(name)
+                # normalizes backslashes on Windows before writing the ZIP.
+                info=zipfile.ZipInfo('placeholder')
+                info.filename=info.orig_filename=name
+                archive.writestr(info,b'content')
         return path
 
     def test_archive_rejects_traversal_links_and_case_aliases(self):

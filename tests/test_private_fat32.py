@@ -718,7 +718,8 @@ class PrivateFat32Tests(unittest.TestCase):
         self.assertEqual(next(stream), expected[:1])
         image.close()
         with tempfile.TemporaryFile() as unrelated:
-            self.assertEqual(unrelated.fileno(), owned)
+            # Lower descriptor holes can exist; allocation need not reuse
+            # `owned`. The stream must survive its owner's close either way.
             unrelated.write(b"ZZ")
             unrelated.flush()
             self.assertEqual(next(stream), expected[1:2])
